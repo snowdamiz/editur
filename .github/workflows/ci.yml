@@ -86,7 +86,10 @@ jobs:
           Compress-Archive -Path dist/package/* -DestinationPath "${{ matrix.archive }}"
           Copy-Item target/release/editur.exe "dist/${{ matrix.update_asset }}"
           $hash = (Get-FileHash "dist/${{ matrix.update_asset }}" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -NoNewline "dist/${{ matrix.update_asset }}.sha256" $hash
+          Set-Content -LiteralPath "dist/${{ matrix.update_asset }}.sha256" -Value $hash -NoNewline
+          if ((Get-Content -LiteralPath "dist/${{ matrix.update_asset }}.sha256" -Raw) -ne $hash) {
+            throw "Windows updater checksum was not written correctly"
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
