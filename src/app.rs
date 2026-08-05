@@ -1279,6 +1279,8 @@ impl Shell {
                 );
             }
             self.first_frame_logged = true;
+            #[cfg(target_os = "macos")]
+            set_macos_application_icon();
         }
         if self.editor.should_close {
             event_loop.exit();
@@ -1535,6 +1537,36 @@ fn activate_macos_application() {
         } else {
             let _: () = msg_send![application, activateIgnoringOtherApps: objc::runtime::YES];
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn set_macos_application_icon() {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+    unsafe {
+        let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
+        let name: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: c"Editur".as_ptr()
+        ];
+        let extension: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: c"icns".as_ptr()
+        ];
+        let path: *mut Object = msg_send![bundle, pathForResource: name ofType: extension];
+        if path.is_null() {
+            return;
+        }
+        let icon: *mut Object = msg_send![class!(NSImage), alloc];
+        let icon: *mut Object = msg_send![icon, initWithContentsOfFile: path];
+        if icon.is_null() {
+            return;
+        }
+        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![application, setApplicationIconImage: icon];
+        let _: () = msg_send![icon, release];
     }
 }
 
