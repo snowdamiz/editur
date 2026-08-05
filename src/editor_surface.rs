@@ -9,7 +9,7 @@ use std::{ops::Range, sync::Arc, time::Duration};
 use crate::renderer::mark_retained;
 
 const LINE_HEIGHT: f32 = 18.0;
-const TEXT_LEFT_PADDING: f32 = 4.0;
+const TEXT_LEFT_PADDING: f32 = 8.0;
 pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 25, 30);
 
 struct RetainedLine {
@@ -858,6 +858,31 @@ mod tests {
     fn line_number_gutter_stays_compact_and_grows_with_digit_count() {
         assert_eq!(gutter_width(9), 22.0);
         assert_eq!(gutter_width(999), 32.0);
+    }
+
+    #[test]
+    fn caret_at_line_start_is_inset_from_the_gutter_edge() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, true, None);
+            },
+        );
+        let content = Rect::from_min_max(pos2(20.0, 0.0), pos2(200.0, 200.0));
+
+        assert!(editor.cursor_rect(content).unwrap().left() >= content.left() + 8.0);
     }
 
     #[test]

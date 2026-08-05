@@ -1,4 +1,5 @@
 use egui::{Color32, Id, Rect, Sense, Ui, pos2};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 pub(crate) const WIDTH: f32 = 10.0;
 
@@ -31,6 +32,24 @@ fn geometry(viewport: Rect, content_height: f32, scroll_y: f32) -> Option<Geomet
         ),
         max_scroll,
     })
+}
+
+fn geometry_revision(layout: Geometry, active: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    [
+        layout.track.min.x,
+        layout.track.min.y,
+        layout.track.max.x,
+        layout.track.max.y,
+        layout.thumb.min.x,
+        layout.thumb.min.y,
+        layout.thumb.max.x,
+        layout.thumb.max.y,
+    ]
+    .map(f32::to_bits)
+    .hash(&mut hasher);
+    active.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(crate) fn show(
@@ -72,11 +91,18 @@ pub(crate) fn show(
     }
 
     let painter = ui.painter_at(viewport);
+    let active = response.hovered() || response.dragged();
+    crate::renderer::mark_retained(
+        &painter,
+        viewport,
+        id.value(),
+        geometry_revision(layout, active),
+    );
     painter.rect_filled(layout.track, 3.0, Color32::from_black_alpha(32));
     painter.rect_filled(
         layout.thumb,
         3.0,
-        if response.hovered() || response.dragged() {
+        if active {
             Color32::from_rgb(112, 116, 128)
         } else {
             Color32::from_rgb(78, 82, 94)
@@ -88,7 +114,34 @@ pub(crate) fn show(
 #[cfg(test)]
 mod tests {
     use super::geometry;
-    use egui::{Rect, pos2};
+    use egui::{Id, RawInput, Rect, Vec2, pos2};
+
+    fn retained_scrollbar(viewport: Rect) -> crate::renderer::RetainedPaint {
+        let context = egui::Context::default();
+        let mut scroll_y = 100.0;
+        let mut drag_offset = None;
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(400.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                super::show(
+                    ui,
+                    Id::new("scrollbar"),
+                    viewport,
+                    1_000.0,
+                    &mut scroll_y,
+                    &mut drag_offset,
+                );
+            },
+        );
+        context
+            .tessellate(output.shapes, output.pixels_per_point)
+            .iter()
+            .find_map(|primitive| crate::renderer::retained_paint(&primitive.primitive).unwrap())
+            .unwrap()
+    }
 
     #[test]
     fn scrollbar_thumb_tracks_the_visible_fraction_and_scroll_position() {
@@ -101,5 +154,14 @@ mod tests {
         assert_eq!(middle.thumb.center().y, middle.track.center().y);
         assert_eq!(bottom.thumb.bottom(), bottom.track.bottom());
         assert_eq!(bottom.max_scroll, 1_200.0);
+    }
+
+    #[test]
+    fn retained_scrollbar_geometry_changes_when_its_viewport_moves() {
+        let first = retained_scrollbar(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 200.0)));
+        let moved = retained_scrollbar(Rect::from_min_max(pos2(50.0, 0.0), pos2(150.0, 200.0)));
+
+        assert_eq!(first.key, moved.key);
+        assert_ne!(first.revision, moved.revision);
     }
 }

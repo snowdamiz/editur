@@ -7,8 +7,8 @@ use std::{
 };
 
 use egui::{
-    Align2, Color32, FontId, Id, Key, Label, Layout, RichText, ScrollArea, Sense, TextEdit,
-    TextFormat, UiBuilder, ViewportId, text::LayoutJob,
+    Align2, Color32, CursorIcon, FontId, Id, Key, Label, Layout, RichText, ScrollArea, Sense,
+    TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
 };
 use winit::{
     application::ApplicationHandler,
@@ -193,6 +193,7 @@ pub struct EditorApp {
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     sidebar: bool,
     sidebar_width: f32,
+    sidebar_dragging: bool,
     focus_editor: bool,
     tree_focused: bool,
     cursor: (usize, usize),
@@ -242,6 +243,7 @@ impl EditorApp {
             bracket_pair: None,
             sidebar: true,
             sidebar_width: 220.0,
+            sidebar_dragging: false,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
             cursor: (1, 1),
@@ -353,6 +355,7 @@ impl EditorApp {
         content.max.y = status.top();
         self.draw_statusbar(root, status);
 
+        let mut sidebar_divider = None;
         if self.sidebar {
             self.sidebar_width = self.sidebar_width.clamp(140.0, content.width().min(500.0));
             let sidebar = content.with_max_x(content.left() + self.sidebar_width);
@@ -360,26 +363,54 @@ impl EditorApp {
                 egui::pos2(sidebar.right(), sidebar.center().y),
                 egui::vec2(5.0, sidebar.height()),
             );
-            let resize = root.interact(divider, Id::new("sidebar_resize"), Sense::drag());
-            if resize.dragged() {
-                self.sidebar_width =
-                    (self.sidebar_width + resize.drag_delta().x).clamp(140.0, 500.0);
-                ctx.request_repaint();
-            }
             root.scope_builder(
                 UiBuilder::new().id_salt("sidebar").max_rect(sidebar),
                 |ui| self.draw_sidebar(ui),
             );
-            root.painter().line_segment(
-                [sidebar.right_top(), sidebar.right_bottom()],
-                egui::Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
-            );
+            sidebar_divider = Some((divider, content.left(), content.width().min(500.0)));
             content.min.x = sidebar.right() + 1.0;
         }
         root.scope_builder(
             UiBuilder::new().id_salt("editor_surface").max_rect(content),
             |ui| self.draw_editor(ui),
         );
+        if let Some((divider, left, maximum)) = sidebar_divider {
+            let pointer = ctx.pointer_hover_pos();
+            let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
+            if hovered && ctx.input(|input| input.pointer.primary_pressed()) {
+                self.sidebar_dragging = true;
+            }
+            if !ctx.input(|input| input.pointer.primary_down()) {
+                self.sidebar_dragging = false;
+            }
+            if self.sidebar_dragging
+                && let Some(pointer) = pointer
+            {
+                self.sidebar_width = (pointer.x - left).clamp(140.0, maximum);
+                ctx.request_repaint();
+            }
+            if hovered || self.sidebar_dragging {
+                ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            let active = hovered || self.sidebar_dragging;
+            crate::renderer::mark_retained(
+                root.painter(),
+                divider,
+                0x8000_0000_0000_0000,
+                u64::from(divider.center().x.to_bits()) ^ ((active as u64) << 63),
+            );
+            root.painter().line_segment(
+                [divider.center_top(), divider.center_bottom()],
+                egui::Stroke::new(
+                    if active { 2.0 } else { 1.0 },
+                    if active {
+                        Color32::from_rgb(86, 207, 225)
+                    } else {
+                        Color32::from_rgb(53, 55, 64)
+                    },
+                ),
+            );
+        }
         self.draw_search(&ctx);
         self.draw_dialogs(&ctx);
         self.draw_error(&ctx);
@@ -1525,6 +1556,12 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = renderer.resize(window, size) {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     renderer.resize(size);
                 }
                 self.redraw(event_loop);
@@ -2048,7 +2085,7 @@ mod tests {
         next_find_match, plain_text_job, presentation_job, search_selection_after_navigation,
     };
     use crate::file_io::OpenTarget;
-    use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
+    use egui::{CursorIcon, Event, Id, Key, Modifiers, PointerButton, RawInput, Rect, Vec2, pos2};
     use std::fs;
 
     #[test]
@@ -2132,6 +2169,83 @@ mod tests {
         let job = plain_text_job("large document", 800.0);
 
         assert!(std::ptr::eq(presentation_job(&job, None), &job));
+    }
+
+    #[test]
+    fn sidebar_divider_uses_the_horizontal_resize_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                events: vec![Event::PointerMoved(pos2(220.0, 100.0))],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            CursorIcon::ResizeHorizontal
+        );
+    }
+
+    #[test]
+    fn sidebar_width_tracks_the_pointer_without_accumulating_drag_delta() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let mut draw = |events| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(pos2(221.0, 100.0)),
+            Event::PointerButton {
+                pos: pos2(221.0, 100.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        draw(vec![Event::PointerMoved(pos2(300.0, 100.0))]);
+        draw(vec![Event::PointerMoved(pos2(320.0, 100.0))]);
+
+        assert_eq!(app.sidebar_width, 320.0);
     }
 
     #[test]

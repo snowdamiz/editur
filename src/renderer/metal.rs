@@ -185,10 +185,11 @@ impl Renderer {
         "Metal"
     }
 
-    pub fn resize(&mut self, size: PhysicalSize<u32>) {
+    pub fn resize(&mut self, window: &Window, size: PhysicalSize<u32>) -> Result<(), String> {
         self.size = size;
         self.layer
             .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
+        round_window(window)
     }
 
     pub fn render(
@@ -464,10 +465,6 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
                 .send_message::<_, ()>(Sel::register("setContentsScale:"), (scale,))
                 .map_err(|error| format!("Metal: cannot set the backing scale: {error}"))?;
         }
-        layer_object
-            .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
-            .map_err(|error| format!("Metal: cannot round the window layer: {error}"))?;
-        layer.set_masks_to_bounds(true);
         view.send_message::<_, ()>(Sel::register("setWantsLayer:"), (YES,))
             .map_err(|error| format!("Metal: cannot enable the AppKit backing layer: {error}"))?;
         view.send_message::<_, ()>(
@@ -475,25 +472,93 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
             ((layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>(),),
         )
         .map_err(|error| format!("Metal: cannot attach CAMetalLayer: {error}"))?;
-        let frame_view = view
-            .send_message::<_, *mut Object>(Sel::register("superview"), ())
-            .map_err(|error| format!("Metal: cannot obtain the AppKit frame view: {error}"))?;
-        if let Some(frame_view) = frame_view.as_ref() {
+        round_view_layers(view)?;
+    }
+    Ok(())
+}
+
+fn round_window(window: &Window) -> Result<(), String> {
+    let handle = window
+        .window_handle()
+        .map_err(|error| format!("Metal: cannot obtain the AppKit window handle: {error}"))?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return Err("Metal: winit did not provide an AppKit window handle".to_owned());
+    };
+    let view = unsafe { &*handle.ns_view.as_ptr().cast::<Object>() };
+    unsafe { round_view_layers(view) }
+}
+
+unsafe fn round_view_layers(view: &Object) -> Result<(), String> {
+    let layer = unsafe {
+        view.send_message::<_, *mut Object>(Sel::register("layer"), ())
+            .map_err(|error| format!("Metal: cannot obtain the window layer: {error}"))?
+    };
+    if let Some(layer) = unsafe { layer.as_ref() } {
+        round_layer(layer)?;
+    }
+    let frame_view = unsafe {
+        view.send_message::<_, *mut Object>(Sel::register("superview"), ())
+            .map_err(|error| format!("Metal: cannot obtain the AppKit frame view: {error}"))?
+    };
+    if let Some(frame_view) = unsafe { frame_view.as_ref() } {
+        unsafe {
             frame_view
                 .send_message::<_, ()>(Sel::register("setWantsLayer:"), (YES,))
                 .map_err(|error| format!("Metal: cannot enable the frame layer: {error}"))?;
-            let frame_layer = frame_view
+        }
+        let frame_layer = unsafe {
+            frame_view
                 .send_message::<_, *mut Object>(Sel::register("layer"), ())
-                .map_err(|error| format!("Metal: cannot obtain the AppKit frame layer: {error}"))?;
-            if let Some(frame_layer) = frame_layer.as_ref() {
-                frame_layer
-                    .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
-                    .map_err(|error| format!("Metal: cannot round the AppKit frame: {error}"))?;
-                frame_layer
-                    .send_message::<_, ()>(Sel::register("setMasksToBounds:"), (YES,))
-                    .map_err(|error| format!("Metal: cannot clip the AppKit frame: {error}"))?;
-            }
+                .map_err(|error| format!("Metal: cannot obtain the AppKit frame layer: {error}"))?
+        };
+        if let Some(frame_layer) = unsafe { frame_layer.as_ref() } {
+            round_layer(frame_layer)?;
         }
     }
     Ok(())
+}
+
+fn round_layer(layer: &Object) -> Result<(), String> {
+    unsafe {
+        layer
+            .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
+            .map_err(|error| format!("Metal: cannot round the AppKit layer: {error}"))?;
+        layer
+            .send_message::<_, ()>(Sel::register("setMasksToBounds:"), (YES,))
+            .map_err(|error| format!("Metal: cannot clip the AppKit layer: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use objc::{
+        Message,
+        runtime::{Class, Object, Sel, YES},
+    };
+
+    #[test]
+    fn macos_layer_rounding_sets_radius_and_clips_during_resize() {
+        unsafe {
+            let class = Class::get("CALayer").unwrap();
+            let layer = class
+                .send_message::<_, *mut Object>(Sel::register("new"), ())
+                .unwrap();
+            let layer = layer.as_ref().unwrap();
+
+            super::round_layer(layer).unwrap();
+
+            let radius = layer
+                .send_message::<_, f64>(Sel::register("cornerRadius"), ())
+                .unwrap();
+            let clips = layer
+                .send_message::<_, objc::runtime::BOOL>(Sel::register("masksToBounds"), ())
+                .unwrap();
+            assert_eq!(radius, 10.0);
+            assert_eq!(clips, YES);
+            layer
+                .send_message::<_, ()>(Sel::register("release"), ())
+                .unwrap();
+        }
+    }
 }
