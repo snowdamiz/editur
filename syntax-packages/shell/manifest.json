@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "id": "shell",
+  "display_name": "Bourne Again Shell (bash)",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["sh", "bash", "zsh"],
+  "filenames": [".bashrc", ".zshrc", ".profile", "bashrc", "zshrc"],
+  "grammars": [
+    "syntaxes/Packages/ShellScript/Shell-Unix-Generic.sublime-syntax",
+    "syntaxes/Packages/ShellScript/Bash.sublime-syntax"
+  ],
+  "dependencies": []
+}

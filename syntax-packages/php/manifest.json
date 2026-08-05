@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "php",
+  "display_name": "PHP Source",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["php", "php3", "php4", "php5", "php7", "php8", "phps", "phtml"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/PHP/PHP Source.sublime-syntax"],
+  "dependencies": []
+}

@@ -127,6 +127,22 @@ fn install_unix(executable: &std::path::Path, bytes: &[u8]) -> Result<(), String
         .ok_or_else(|| format!("{} has no parent directory", executable.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("cannot stage update in {}: {error}", parent.display()))?;
+    #[cfg(target_os = "macos")]
+    {
+        let copied = std::process::Command::new("/bin/cp")
+            .arg("-p")
+            .arg(executable)
+            .arg(temporary.path())
+            .status()
+            .map_err(|error| format!("cannot preserve macOS icon metadata: {error}"))?;
+        if !copied.success() {
+            return Err("cannot preserve macOS icon metadata".into());
+        }
+        temporary
+            .as_file()
+            .set_len(0)
+            .map_err(|error| format!("cannot reset staged update: {error}"))?;
+    }
     temporary
         .write_all(bytes)
         .and_then(|()| temporary.flush())
@@ -353,5 +369,33 @@ mod tests {
             fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_updates_preserve_custom_icon_metadata() {
+        use std::{fs, process::Command};
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("editur");
+        fs::write(&executable, b"old").unwrap();
+        assert!(
+            Command::new("/usr/bin/xattr")
+                .args(["-w", "com.editur.icon-test", "preserved"])
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        super::install_unix(&executable, b"new").unwrap();
+
+        let value = Command::new("/usr/bin/xattr")
+            .args(["-p", "com.editur.icon-test"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(value.status.success());
+        assert_eq!(value.stdout, b"preserved\n");
     }
 }

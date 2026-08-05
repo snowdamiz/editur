@@ -5,8 +5,8 @@ release_base=https://github.com/snowdamiz/editur/releases/download/release
 install_dir=${EDITUR_INSTALL_DIR:-"$HOME/.local/bin"}
 
 case "$(uname -s):$(uname -m)" in
-  Darwin:arm64) asset=editur-macos-aarch64.tar.gz; package=app ;;
-  Darwin:x86_64) asset=editur-macos-x86_64.tar.gz; package=app ;;
+  Darwin:arm64) asset=editur-macos-aarch64.zip; package=app ;;
+  Darwin:x86_64) asset=editur-macos-x86_64.zip; package=app ;;
   Linux:x86_64 | Linux:amd64) asset=editur-linux-x86_64; package=binary ;;
   *)
     printf 'editur: no release build for %s/%s\n' "$(uname -s)" "$(uname -m)" >&2
@@ -56,7 +56,7 @@ fi
 mkdir -p "$install_dir"
 if [ "$package" = app ]; then
   mkdir "$download_dir/package"
-  tar -xzf "$download_dir/$asset" -C "$download_dir/package"
+  /usr/bin/ditto -x -k "$download_dir/$asset" "$download_dir/package"
   app_source="$download_dir/package/Editur.app"
   app_destination="$install_dir/Editur.app"
   executable="$app_source/Contents/MacOS/editur"

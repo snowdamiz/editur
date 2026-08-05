@@ -158,6 +158,7 @@ pub struct EditorApp {
     find_match_query: String,
     find_selected: usize,
     scroll_to_find_match: bool,
+    bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     sidebar: bool,
     focus_editor: bool,
     tree_focused: bool,
@@ -203,6 +204,7 @@ impl EditorApp {
             find_match_query: String::new(),
             find_selected: 0,
             scroll_to_find_match: false,
+            bracket_pair: None,
             sidebar: true,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
@@ -241,6 +243,7 @@ impl EditorApp {
                     self.highlight_cache.valid = false;
                     self.find_match_revision = u64::MAX;
                     self.scroll_to_find_match = self.find_open;
+                    self.bracket_pair = None;
                     self.focus_editor = true;
                     self.tree_focused = false;
                 }
@@ -345,11 +348,10 @@ impl EditorApp {
                 .resizable(true)
                 .default_size(220.0)
                 .size_range(140.0..=500.0)
-                .show(root, |ui| self.draw_tree(ui));
+                .show(root, |ui| self.draw_sidebar(ui));
         }
 
         egui::CentralPanel::default().show(root, |ui| self.draw_editor(ui));
-        self.draw_find(&ctx);
         self.draw_search(&ctx);
         self.draw_dialogs(&ctx);
     }
@@ -429,6 +431,7 @@ impl EditorApp {
         if find {
             self.find_open = true;
             self.search_open = false;
+            self.sidebar = true;
             self.focus_find = true;
             self.scroll_to_find_match = !self.find_matches.is_empty();
             self.focus_editor = false;
@@ -471,10 +474,19 @@ impl EditorApp {
         self.highlight_cache.find_valid = false;
     }
 
-    fn draw_find(&mut self, ctx: &egui::Context) {
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        if self.find_open {
+            self.draw_find(ui);
+            ui.separator();
+        }
+        self.draw_tree(ui);
+    }
+
+    fn draw_find(&mut self, ui: &mut egui::Ui) {
         if !self.find_open {
             return;
         }
+        let ctx = ui.ctx().clone();
         let query_focused = ctx.memory(|memory| memory.has_focus(Id::new("file_search_query")));
         let (enter, backwards, mut close) = ctx.input(|input| {
             (
@@ -491,66 +503,46 @@ impl EditorApp {
         } else {
             format!("{} / {}", self.find_selected + 1, self.find_matches.len())
         };
-        let frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
+        egui::Frame::new()
             .fill(Color32::from_rgb(24, 25, 30))
-            .stroke(egui::Stroke::new(
-                1.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-            ))
-            .inner_margin(10)
-            .corner_radius(10)
-            .shadow(egui::Shadow {
-                offset: [0, 6],
-                blur: 20,
-                spread: 1,
-                color: Color32::from_black_alpha(130),
-            });
-        egui::Window::new("Find in file")
-            .id(Id::new("file_search"))
-            .title_bar(false)
-            .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 48.0))
-            .fixed_size(egui::vec2(470.0, 52.0))
-            .resizable(false)
-            .collapsible(false)
-            .frame(frame)
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+            .inner_margin(egui::Margin::symmetric(8, 8))
+            .corner_radius(8)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    let response = egui::Frame::new()
-                        .fill(Color32::from_rgb(33, 35, 42))
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .corner_radius(6)
-                        .show(ui, |ui| {
-                            ui.add_sized(
-                                egui::vec2(240.0, 24.0),
-                                TextEdit::singleline(&mut self.find_query)
-                                    .id(Id::new("file_search_query"))
-                                    .hint_text("Find in current file…")
-                                    .frame(egui::Frame::NONE),
-                            )
-                        })
-                        .inner;
-                    if self.focus_find {
-                        response.request_focus();
-                        self.focus_find = false;
-                    }
-                    query_changed = response.changed();
-                    ui.add_sized(
-                        egui::vec2(62.0, 30.0),
-                        Label::new(RichText::new(&count).small().weak()),
-                    );
-                    previous = ui
-                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("↑"))
-                        .on_hover_text("Previous match (Shift+Enter)")
-                        .clicked();
-                    next = ui
-                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("↓"))
-                        .on_hover_text("Next match (Enter)")
-                        .clicked();
-                    close |= ui
-                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("×"))
-                        .on_hover_text("Close (Esc)")
-                        .clicked();
+                    ui.label(RichText::new("Find in file").strong());
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        close |= close_icon_button(ui).clicked();
+                    });
+                });
+                ui.add_space(4.0);
+                let response = egui::Frame::new()
+                    .fill(Color32::from_rgb(33, 35, 42))
+                    .inner_margin(egui::Margin::symmetric(7, 4))
+                    .corner_radius(6)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            egui::vec2(ui.available_width(), 24.0),
+                            TextEdit::singleline(&mut self.find_query)
+                                .id(Id::new("file_search_query"))
+                                .hint_text("Search current file…")
+                                .frame(egui::Frame::NONE),
+                        )
+                    })
+                    .inner;
+                if self.focus_find {
+                    response.request_focus();
+                    self.focus_find = false;
+                }
+                query_changed = response.changed();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(Label::new(RichText::new(&count).small().weak()));
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        next = chevron_icon_button(ui, false, "Next match (Enter)").clicked();
+                        previous =
+                            chevron_icon_button(ui, true, "Previous match (Shift+Enter)").clicked();
+                    });
                 });
             });
         if query_changed {
@@ -881,6 +873,7 @@ impl EditorApp {
         let find_query = &self.find_query;
         let find_matches = &self.find_matches;
         let find_selected = self.find_selected;
+        let bracket_pair = self.bracket_pair.clone();
         let scroll_match = self
             .scroll_to_find_match
             .then(|| find_matches.get(find_selected).cloned())
@@ -949,23 +942,37 @@ impl EditorApp {
             } else {
                 cache.job.clone()
             };
+            if let Some(pair) = &bracket_pair {
+                job = bracket_highlighted_job(&job, pair);
+            }
             job.wrap.max_width = wrap_width;
             job.wrap.break_anywhere = true;
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
+        let line_count = buffer.text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let gutter_width = (line_count.to_string().len() as f32 * 8.0 + 16.0).max(34.0);
         let output = ScrollArea::vertical()
             .id_salt("editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let viewport = ui.clip_rect();
-                let output = TextEdit::multiline(&mut buffer.text)
-                    .id(Id::new("editor"))
-                    .code_editor()
-                    .desired_width(ui.available_width())
-                    .desired_rows(30)
-                    .frame(egui::Frame::NONE)
-                    .layouter(&mut layouter)
-                    .show(ui);
+                let output = ui
+                    .horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let (gutter, _) =
+                            ui.allocate_exact_size(egui::vec2(gutter_width, 0.0), Sense::hover());
+                        let output = TextEdit::multiline(&mut buffer.text)
+                            .id(Id::new("editor"))
+                            .code_editor()
+                            .desired_width(ui.available_width())
+                            .desired_rows(30)
+                            .frame(egui::Frame::NONE)
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        paint_line_numbers(ui, gutter.right() - 10.0, &output);
+                        output
+                    })
+                    .inner;
                 if output.response.dragged_by(egui::PointerButton::Primary)
                     && let Some(pointer) = output.response.interact_pointer_pos()
                 {
@@ -1010,6 +1017,15 @@ impl EditorApp {
         }
         if let Some(range) = output.cursor_range {
             self.cursor = buffer.line_column(range.primary.index.into());
+            let pair = (!buffer.large_file_warning)
+                .then(|| match_bracket_pair(&buffer.text, range.primary.index.into()))
+                .flatten();
+            if self.bracket_pair != pair {
+                self.bracket_pair = pair;
+                ui.ctx().request_repaint();
+            }
+        } else if self.bracket_pair.take().is_some() {
+            ui.ctx().request_repaint();
         }
         if let Some(error) = highlight_error {
             self.show_error(error);
@@ -1403,7 +1419,7 @@ impl ApplicationHandler<InstanceEvent> for Shell {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
-                window.request_redraw();
+                self.redraw(event_loop);
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
@@ -1556,6 +1572,55 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
     })
 }
 
+fn chevron_icon_button(ui: &mut egui::Ui, upward: bool, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 5.0, Color32::from_white_alpha(14));
+    }
+    let center = rect.center();
+    let direction = if upward { -1.0 } else { 1.0 };
+    let tip = center + egui::vec2(0.0, 3.0 * direction);
+    let stroke = egui::Stroke::new(1.5, Color32::from_rgb(174, 181, 197));
+    ui.painter()
+        .line_segment([center + egui::vec2(-4.0, -2.0 * direction), tip], stroke);
+    ui.painter()
+        .line_segment([tip, center + egui::vec2(4.0, -2.0 * direction)], stroke);
+    response.on_hover_text(label)
+}
+
+fn close_icon_button(ui: &mut egui::Ui) -> egui::Response {
+    let label = "Close (Esc)";
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 5.0, Color32::from_white_alpha(14));
+    }
+    let center = rect.center();
+    let stroke = egui::Stroke::new(1.5, Color32::from_rgb(174, 181, 197));
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-3.5, -3.5),
+            center + egui::vec2(3.5, 3.5),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-3.5, 3.5),
+            center + egui::vec2(3.5, -3.5),
+        ],
+        stroke,
+    );
+    response.on_hover_text(label)
+}
+
 #[cfg(target_os = "macos")]
 fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 34.0), Sense::click());
@@ -1594,6 +1659,29 @@ fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
         },
     );
     job
+}
+
+fn paint_line_numbers(ui: &egui::Ui, gutter_right: f32, output: &egui::text_edit::TextEditOutput) {
+    let mut logical_line = 1;
+    let mut first_visual_row = true;
+    for row in &output.galley.rows {
+        if first_visual_row {
+            ui.painter().text(
+                egui::pos2(
+                    gutter_right,
+                    output.galley_pos.y + row.pos.y + row.size.y * 0.5,
+                ),
+                Align2::RIGHT_CENTER,
+                logical_line,
+                FontId::monospace(12.0),
+                Color32::from_rgb(105, 111, 126),
+            );
+        }
+        first_visual_row = row.ends_with_newline;
+        if row.ends_with_newline {
+            logical_line += 1;
+        }
+    }
 }
 
 fn search_selection_after_navigation(
@@ -1638,6 +1726,87 @@ fn next_find_match(selected: usize, match_count: usize, backwards: bool) -> usiz
         selected.checked_sub(1).unwrap_or(match_count - 1)
     } else {
         (selected + 1) % match_count
+    }
+}
+
+fn match_bracket_pair(
+    text: &str,
+    cursor_character: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let characters: Vec<_> = text.char_indices().collect();
+    let (index, &(byte, bracket)) = cursor_character
+        .checked_sub(1)
+        .and_then(|index| characters.get(index).map(|character| (index, character)))
+        .filter(|(_, (_, character))| is_bracket(*character))
+        .or_else(|| {
+            characters
+                .get(cursor_character)
+                .filter(|(_, character)| is_bracket(*character))
+                .map(|character| (cursor_character, character))
+        })?;
+    let bracket_range = byte..byte + bracket.len_utf8();
+
+    if is_opening_bracket(bracket) {
+        let mut stack = vec![bracket];
+        for &(candidate_byte, candidate) in &characters[index + 1..] {
+            if is_opening_bracket(candidate) {
+                stack.push(candidate);
+            } else if is_closing_bracket(candidate) {
+                if matching_bracket(*stack.last()?) != candidate {
+                    return None;
+                }
+                stack.pop();
+                if stack.is_empty() {
+                    return Some((
+                        bracket_range,
+                        candidate_byte..candidate_byte + candidate.len_utf8(),
+                    ));
+                }
+            }
+        }
+    } else {
+        let mut stack = vec![bracket];
+        for &(candidate_byte, candidate) in characters[..index].iter().rev() {
+            if is_closing_bracket(candidate) {
+                stack.push(candidate);
+            } else if is_opening_bracket(candidate) {
+                if matching_bracket(candidate) != *stack.last()? {
+                    return None;
+                }
+                stack.pop();
+                if stack.is_empty() {
+                    return Some((
+                        candidate_byte..candidate_byte + candidate.len_utf8(),
+                        bracket_range,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+const fn is_opening_bracket(character: char) -> bool {
+    matches!(character, '(' | '[' | '{')
+}
+
+const fn is_closing_bracket(character: char) -> bool {
+    matches!(character, ')' | ']' | '}')
+}
+
+const fn is_bracket(character: char) -> bool {
+    is_opening_bracket(character) || is_closing_bracket(character)
+}
+
+const fn matching_bracket(character: char) -> char {
+    match character {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        _ => character,
     }
 }
 
@@ -1739,6 +1908,25 @@ fn find_highlighted_job(
     highlighted
 }
 
+fn bracket_highlighted_job(
+    base: &LayoutJob,
+    pair: &(std::ops::Range<usize>, std::ops::Range<usize>),
+) -> LayoutJob {
+    let spans = [pair.0.clone(), pair.1.clone()];
+    let mut highlighted = find_highlighted_job(base, &spans, usize::MAX);
+    for section in &mut highlighted.sections {
+        let range = section.byte_range.start.0..section.byte_range.end.0;
+        if spans
+            .iter()
+            .any(|span| range.start < span.end && span.start < range.end)
+        {
+            section.format.background = Color32::from_rgb(50, 57, 72);
+            section.format.underline = egui::Stroke::new(1.0, Color32::from_rgb(86, 207, 225));
+        }
+    }
+    highlighted
+}
+
 fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     if query.is_empty() {
         return Vec::new();
@@ -1761,8 +1949,9 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorApp, TreeState, find_highlighted_job, match_spans, next_find_match, plain_text_job,
-        search_selection_after_navigation, selection_drag_scroll_delta,
+        EditorApp, TreeState, find_highlighted_job, match_bracket_pair, match_spans,
+        next_find_match, plain_text_job, search_selection_after_navigation,
+        selection_drag_scroll_delta,
     };
     use crate::file_io::OpenTarget;
     use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
@@ -1840,6 +2029,22 @@ mod tests {
         assert_eq!(next_find_match(2, 3, false), 0);
         assert_eq!(next_find_match(0, 3, true), 2);
         assert_eq!(next_find_match(0, 0, false), 0);
+    }
+
+    #[test]
+    fn bracket_pair_matching_respects_nested_pairs_on_either_side_of_the_cursor() {
+        let text = "fn call(value: [u8; 2]) { values[index] }";
+        let opening = text.find('[').unwrap();
+        let closing = text[opening..].find(']').unwrap() + opening;
+
+        assert_eq!(
+            match_bracket_pair(text, text[..opening].chars().count()),
+            Some((opening..opening + 1, closing..closing + 1))
+        );
+        assert_eq!(
+            match_bracket_pair(text, text[..closing + 1].chars().count()),
+            Some((opening..opening + 1, closing..closing + 1))
+        );
     }
 
     #[test]
@@ -1946,6 +2151,7 @@ mod tests {
 
         assert!(app.find_open);
         assert!(!app.search_open);
+        assert!(app.sidebar);
         assert!(context.memory(|memory| memory.has_focus(Id::new("file_search_query"))));
 
         let input = RawInput {

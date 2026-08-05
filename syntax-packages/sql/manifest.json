@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "sql",
+  "display_name": "SQL",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["sql", "ddl", "dml"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/SQL/SQL.sublime-syntax"],
+  "dependencies": []
+}

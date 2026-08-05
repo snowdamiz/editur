@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "ruby",
+  "display_name": "Ruby",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["rb", "rbx", "rjs", "rake", "gemspec", "podspec"],
+  "filenames": ["Gemfile", "Rakefile", "Guardfile", "Vagrantfile"],
+  "grammars": ["syntaxes/Packages/Ruby/Ruby.sublime-syntax"],
+  "dependencies": []
+}

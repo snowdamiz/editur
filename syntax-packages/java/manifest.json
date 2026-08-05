@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "java",
+  "display_name": "Java",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["java", "bsh"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/Java/Java.sublime-syntax"],
+  "dependencies": []
+}

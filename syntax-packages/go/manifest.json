@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "go",
+  "display_name": "Go",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["go"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/Go/Go.sublime-syntax"],
+  "dependencies": []
+}

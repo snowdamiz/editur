@@ -139,10 +139,10 @@ impl Manifest {
                 return true;
             };
             filename.is_empty()
-                || filename.contains(['/', '\\'])
                 || !filename.ends_with(".sublime-syntax")
+                || validate_archive_path(grammar).is_err()
         }) {
-            return Err("grammar paths must match syntaxes/*.sublime-syntax".into());
+            return Err("grammar paths must be safe files below syntaxes/".into());
         }
         unique(&self.dependencies, "dependency")?;
         if self
@@ -627,6 +627,14 @@ mod tests {
     }
 
     #[test]
+    fn manifest_accepts_safe_nested_upstream_grammar_paths() {
+        let mut manifest = valid_manifest();
+        manifest.grammars = vec!["syntaxes/Packages/JavaScript/TypeScript.sublime-syntax".into()];
+
+        assert!(manifest.validate("0.1.0").is_ok());
+    }
+
+    #[test]
     fn rejects_unknown_manifest_fields() {
         let json = br#"{
             "format_version": 1,
@@ -658,20 +666,29 @@ mod tests {
     }
 
     #[test]
-    fn shipped_python_and_markdown_packages_validate_and_compile() {
-        let mut builder = syntect::dumps::from_reader::<SyntaxSet, _>(super::super::BUILTIN_DUMP)
+    fn every_shipped_package_validates_and_compiles_independently() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("syntax-packages");
+        let mut directories = fs::read_dir(root)
             .unwrap()
-            .into_builder();
-        for id in ["python", "markdown"] {
-            let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("syntax-packages")
-                .join(id);
-            read_manifest(&directory.join("manifest.json")).unwrap();
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("manifest.json").is_file())
+            .collect::<Vec<_>>();
+        directories.sort();
+        for directory in directories {
+            let manifest = read_manifest(&directory.join("manifest.json")).unwrap();
+            let mut builder =
+                syntect::dumps::from_reader::<SyntaxSet, _>(super::super::BUILTIN_DUMP)
+                    .unwrap()
+                    .into_builder();
             builder.add_from_folder(directory, true).unwrap();
+            let set = build_and_check(builder).unwrap();
+            assert!(
+                set.find_syntax_by_name(&manifest.display_name).is_some(),
+                "{} did not provide {}",
+                manifest.id,
+                manifest.display_name
+            );
         }
-        let set = build_and_check(builder).unwrap();
-        assert!(set.find_syntax_by_name("Python").is_some());
-        assert!(set.find_syntax_by_name("Markdown").is_some());
     }
 
     const PYTHON_SYNTAX: &[u8] = br#"%YAML 1.2

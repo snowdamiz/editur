@@ -33,11 +33,11 @@ jobs:
             update_asset: editur-linux-x86_64
           - os: macos-latest
             artifact: editur-macos-aarch64
-            archive: dist/editur-macos-aarch64.tar.gz
+            archive: dist/editur-macos-aarch64.zip
             update_asset: editur-macos-aarch64
           - os: macos-15-intel
             artifact: editur-macos-x86_64
-            archive: dist/editur-macos-x86_64.tar.gz
+            archive: dist/editur-macos-x86_64.zip
             update_asset: editur-macos-x86_64
           - os: windows-latest
             artifact: editur-windows-x86_64
@@ -78,16 +78,19 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist/package
-          cp target/release/editur dist/package/
           if [ "$RUNNER_OS" = "macOS" ]; then
             mkdir -p dist/package/Editur.app/Contents/MacOS dist/package/Editur.app/Contents/Resources
             cp target/release/editur dist/package/Editur.app/Contents/MacOS/
             cp assets/macos/Info.plist dist/package/Editur.app/Contents/
             cp assets/icons/editur.icns dist/package/Editur.app/Contents/Resources/Editur.icns
+            /usr/bin/Rez -append assets/macos/EditurIcon.r -o dist/package/Editur.app/Contents/MacOS/editur
+            /usr/bin/SetFile -a C dist/package/Editur.app/Contents/MacOS/editur
+            /usr/bin/ditto -c -k --sequesterRsrc dist/package "${{ matrix.archive }}"
           else
+            cp target/release/editur dist/package/
             cp assets/icons/editur.png dist/package/
+            tar -C dist/package -czf "${{ matrix.archive }}" .
           fi
-          tar -C dist/package -czf "${{ matrix.archive }}" .
           cp target/release/editur "dist/${{ matrix.update_asset }}"
           if [ "$RUNNER_OS" = "macOS" ]; then
             shasum -a 256 "dist/${{ matrix.update_asset }}" | awk '{print $1}' > "dist/${{ matrix.update_asset }}.sha256"
@@ -276,6 +279,10 @@ jobs:
         run: |
           install_dir="$RUNNER_TEMP/editur/bin"
           EDITUR_INSTALL_DIR="$install_dir" sh install.sh
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            /usr/bin/xattr -p com.apple.FinderInfo "$install_dir/Editur.app/Contents/MacOS/editur" >/dev/null
+            /usr/bin/xattr -p com.apple.ResourceFork "$install_dir/Editur.app/Contents/MacOS/editur" >/dev/null
+          fi
           "$install_dir/editur" --version
           "$install_dir/editur" --help
           "$install_dir/editur" update

@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "html",
+  "display_name": "HTML",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["html", "htm", "shtml", "xhtml"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/HTML/HTML.sublime-syntax"],
+  "dependencies": []
+}

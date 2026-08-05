@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "csharp",
+  "display_name": "C#",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["cs", "csx"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/C#/C#.sublime-syntax"],
+  "dependencies": []
+}

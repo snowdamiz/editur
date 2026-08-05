@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "json",
+  "display_name": "JSON",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["json", "jsonc"],
+  "filenames": [],
+  "grammars": ["syntaxes/Packages/JSON/JSON.sublime-syntax"],
+  "dependencies": []
+}

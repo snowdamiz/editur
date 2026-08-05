@@ -63,9 +63,15 @@ impl SyntaxManager {
                         .iter()
                         .any(|mapped| mapped.eq_ignore_ascii_case(extension))
                 })
-        }) && let Some(syntax) = self.set.find_syntax_by_name(&manifest.display_name)
-        {
-            return syntax;
+        }) {
+            if let Some(syntax) =
+                extension.and_then(|extension| self.set.find_syntax_by_extension(extension))
+            {
+                return syntax;
+            }
+            if let Some(syntax) = self.set.find_syntax_by_name(&manifest.display_name) {
+                return syntax;
+            }
         }
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -394,6 +400,49 @@ contexts: { main: [] }
             syntaxes.detect(Path::new("SConstruct"), false).name,
             "Python"
         );
+    }
+
+    #[test]
+    fn installed_package_uses_the_matching_grammar_for_each_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let manifest = Manifest {
+            format_version: 1,
+            id: "c-cpp".into(),
+            display_name: "C++".into(),
+            version: "1.0.0".into(),
+            minimum_editur_version: "0.1.0".into(),
+            extensions: vec!["c".into(), "cpp".into()],
+            filenames: vec![],
+            grammars: vec![
+                "syntaxes/C.sublime-syntax".into(),
+                "syntaxes/C++.sublime-syntax".into(),
+            ],
+            dependencies: vec![],
+        };
+        let grammar = |name: &str, extension: &str| {
+            format!(
+                "%YAML 1.2\n---\nname: {name}\nfile_extensions: [{extension}]\nscope: source.{extension}\ncontexts: {{ main: [] }}\n"
+            )
+        };
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        for (path, name, extension) in [
+            ("syntaxes/C.sublime-syntax", "C", "c"),
+            ("syntaxes/C++.sublime-syntax", "C++", "cpp"),
+        ] {
+            zip.start_file(path, SimpleFileOptions::default()).unwrap();
+            zip.write_all(grammar(name, extension).as_bytes()).unwrap();
+        }
+        PackageManager::new(data_dir.clone())
+            .install_bytes(&zip.finish().unwrap().into_inner())
+            .unwrap();
+
+        let syntaxes = SyntaxManager::load(&data_dir).unwrap();
+        assert_eq!(syntaxes.detect(Path::new("main.c"), false).name, "C");
     }
 
     #[test]

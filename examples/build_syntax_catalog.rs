@@ -1,4 +1,8 @@
-use std::{env, fs, io::Cursor, path::PathBuf};
+use std::{
+    env, fs,
+    io::Cursor,
+    path::{Path, PathBuf},
+};
 
 use editur::syntax::package::{Catalog, CatalogEntry, Manifest};
 use sha2::{Digest, Sha256};
@@ -25,8 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compression_method(CompressionMethod::Stored)
         .last_modified_time(zip::DateTime::default());
     let mut packages = Vec::new();
-    for id in ["python", "markdown"] {
-        let source = PathBuf::from("syntax-packages").join(id);
+    for source in package_sources(Path::new("syntax-packages"))? {
         let manifest_bytes = fs::read(source.join("manifest.json"))?;
         let manifest = Manifest::parse(&manifest_bytes)?;
         manifest.validate(env!("CARGO_PKG_VERSION"))?;
@@ -63,6 +66,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn package_sources(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut sources = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("manifest.json").is_file())
+        .collect::<Vec<_>>();
+    sources.sort();
+    Ok(sources)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
@@ -71,4 +84,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::package_sources;
+    use std::path::Path;
+
+    #[test]
+    fn catalog_discovers_every_shipped_package_in_stable_order() {
+        let sources = package_sources(Path::new("syntax-packages")).unwrap();
+        let ids: Vec<_> = sources
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str())
+            .collect();
+
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ids.contains(&"typescript"));
+    }
 }

@@ -32,6 +32,8 @@ editur update
 
 Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle plus a CLI symlink; Linux and Windows install the native executable. Set `EDITUR_INSTALL_DIR` to override the default install directory.
 
+If you installed an older bare-binary macOS build, run the installer once more to migrate it into the icon-preserving app bundle. Later `editur update` calls retain that metadata.
+
 ## Build and install
 
 Install stable Rust, then run:
@@ -47,7 +49,7 @@ On Ubuntu/Debian, install the native window headers and Vulkan loader first:
 sudo apt-get install libwayland-dev libxkbcommon-dev libvulkan1
 ```
 
-Release builds publish `.tar.gz` archives for macOS/Linux and a `.zip` archive for Windows. The macOS archive contains a native `Editur.app` bundle and the CLI binary; every archive includes the native platform icon. macOS release builds require a precompiled Metal shader library, while local builds fall back to runtime compilation when the optional Apple Metal toolchain is absent. Release assets carry GitHub artifact attestations.
+Release builds publish a `.zip` app bundle for macOS, a `.tar.gz` archive for Linux, and a `.zip` archive for Windows. Every archive includes the native platform icon. macOS release builds require a precompiled Metal shader library, while local builds fall back to runtime compilation when the optional Apple Metal toolchain is absent. Release assets carry GitHub artifact attestations.
 
 ## Use
 
@@ -55,9 +57,9 @@ Release builds publish `.tar.gz` archives for macOS/Linux and a `.zip` archive f
 editur [PATH]
 editur update
 editur syntax list
-editur syntax install python
+editur syntax install typescript
 editur syntax install ./language.editur-syntax
-editur syntax remove python
+editur syntax remove typescript
 ```
 
 `PATH` may be an existing file, a directory, or a new filename whose parent exists. While Editur is open, later `editur PATH` commands forward the target to that process and return immediately. Closing the window exits the editor completely after the normal unsaved-change check.
@@ -80,7 +82,15 @@ The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and W
 
 ## Syntax packages
 
-Rust and Plain Text are embedded. Python and Markdown are shipped as data-only sample packages in `syntax-packages/`; tagged CI builds publish their deterministic archives and catalog to the `syntax-v1` release.
+Rust and Plain Text are the only embedded syntaxes. Additional highlighting stays out of the editor binary and is installed only when requested:
+
+```sh
+editur syntax list
+editur syntax install typescript
+editur syntax remove typescript
+```
+
+The published catalog currently includes C/C++, C#, CSS, Go, HTML, Java, JavaScript, JSON, Markdown, PHP, Python, Ruby, Shell, SQL, TOML, TypeScript, XML, and YAML. CI builds deterministic data-only archives from `syntax-packages/` and publishes them to the `syntax-v1` release.
 
 Build that catalog locally with:
 

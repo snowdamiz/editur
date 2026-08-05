@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "toml",
+  "display_name": "TOML",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["toml"],
+  "filenames": ["Cargo.lock"],
+  "grammars": ["syntaxes/TOML.sublime-syntax"],
+  "dependencies": []
+}
