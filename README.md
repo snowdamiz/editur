@@ -64,7 +64,7 @@ editur syntax remove python
 
 The editor wraps long lines and scrolls vertically without a horizontal scrollbar. It preserves LF/CRLF line endings and file permissions. If the file changes externally, saving stops and offers Reload, Save As, or Cancel. Invalid UTF-8 and binary input are rejected.
 
-Core shortcuts follow platform conventions: project file/content search (`Cmd/Ctrl+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). Search results are grouped into filename and content matches as the background index becomes ready.
+Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches as the background index becomes ready.
 
 `editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, and replaces the running installation after verification. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
 
@@ -76,7 +76,7 @@ Push the commit to the dedicated delivery branch:
 git push origin HEAD:release
 ```
 
-The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, and build attestations. Version tags matching `v*` still publish versioned application releases and the syntax catalog.
+The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, build attestations, and syntax catalog. Version tags matching `v*` still publish versioned application releases.
 
 ## Syntax packages
 

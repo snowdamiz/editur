@@ -97,6 +97,11 @@ struct HighlightCache {
     job: LayoutJob,
     valid: bool,
     incremental: IncrementalHighlightCache,
+    find_revision: u64,
+    find_query: String,
+    find_selected: usize,
+    find_job: LayoutJob,
+    find_valid: bool,
 }
 
 pub struct EditorApp {
@@ -110,6 +115,14 @@ pub struct EditorApp {
     search_query: String,
     search_selected: usize,
     focus_search: bool,
+    find_open: bool,
+    find_query: String,
+    focus_find: bool,
+    find_matches: Vec<std::ops::Range<usize>>,
+    find_match_revision: u64,
+    find_match_query: String,
+    find_selected: usize,
+    scroll_to_find_match: bool,
     sidebar: bool,
     focus_editor: bool,
     tree_focused: bool,
@@ -146,6 +159,14 @@ impl EditorApp {
             search_query: String::new(),
             search_selected: 0,
             focus_search: false,
+            find_open: false,
+            find_query: String::new(),
+            focus_find: false,
+            find_matches: Vec::new(),
+            find_match_revision: u64::MAX,
+            find_match_query: String::new(),
+            find_selected: 0,
+            scroll_to_find_match: false,
             sidebar: true,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
@@ -177,6 +198,8 @@ impl EditorApp {
                     self.tree.selected = Some(path);
                     self.buffer = Some(buffer);
                     self.highlight_cache.valid = false;
+                    self.find_match_revision = u64::MAX;
+                    self.scroll_to_find_match = self.find_open;
                     self.focus_editor = true;
                     self.tree_focused = false;
                 }
@@ -226,6 +249,9 @@ impl EditorApp {
     pub fn ui(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         self.shortcuts(&ctx);
+        if self.find_open {
+            self.refresh_find_matches();
+        }
         if self.search_open {
             self.search.poll(&self.search_query);
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -275,16 +301,18 @@ impl EditorApp {
         }
 
         egui::CentralPanel::default().show(root, |ui| self.draw_editor(ui));
+        self.draw_find(&ctx);
         self.draw_search(&ctx);
         self.draw_dialogs(&ctx);
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, search, sidebar, tree, editor, close) = ctx.input(|input| {
+        let (save, project_search, find, sidebar, tree, editor, close) = ctx.input(|input| {
             let command = input.modifiers.command;
             (
                 command && input.key_pressed(Key::S),
-                command && input.key_pressed(Key::F),
+                command && input.modifiers.shift && input.key_pressed(Key::F),
+                command && !input.modifiers.shift && input.key_pressed(Key::F),
                 command && input.key_pressed(Key::B),
                 command && input.key_pressed(Key::Num1),
                 command && input.key_pressed(Key::Num2),
@@ -294,9 +322,19 @@ impl EditorApp {
         if save {
             self.save(None);
         }
-        if search {
+        if project_search {
             self.search_open = true;
+            self.find_open = false;
             self.focus_search = true;
+            self.focus_editor = false;
+            self.tree_focused = false;
+            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+        }
+        if find {
+            self.find_open = true;
+            self.search_open = false;
+            self.focus_find = true;
+            self.scroll_to_find_match = !self.find_matches.is_empty();
             self.focus_editor = false;
             self.tree_focused = false;
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
@@ -316,6 +354,128 @@ impl EditorApp {
         }
         if close {
             self.request_close();
+        }
+    }
+
+    fn refresh_find_matches(&mut self) {
+        let Some(buffer) = self.buffer.as_ref() else {
+            self.find_matches.clear();
+            self.find_selected = 0;
+            return;
+        };
+        if self.find_match_revision == buffer.revision && self.find_match_query == self.find_query {
+            return;
+        }
+        self.find_matches = match_spans(&buffer.text, &self.find_query);
+        self.find_match_revision = buffer.revision;
+        self.find_match_query.clone_from(&self.find_query);
+        self.find_selected = self
+            .find_selected
+            .min(self.find_matches.len().saturating_sub(1));
+        self.highlight_cache.find_valid = false;
+    }
+
+    fn draw_find(&mut self, ctx: &egui::Context) {
+        if !self.find_open {
+            return;
+        }
+        let query_focused = ctx.memory(|memory| memory.has_focus(Id::new("file_search_query")));
+        let (enter, backwards, mut close) = ctx.input(|input| {
+            (
+                query_focused && input.key_pressed(Key::Enter),
+                input.modifiers.shift,
+                input.key_pressed(Key::Escape),
+            )
+        });
+        let mut query_changed = false;
+        let mut previous = false;
+        let mut next = false;
+        let count = if self.find_matches.is_empty() {
+            "0 / 0".to_owned()
+        } else {
+            format!("{} / {}", self.find_selected + 1, self.find_matches.len())
+        };
+        let frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
+            .fill(Color32::from_rgb(24, 25, 30))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            ))
+            .inner_margin(10)
+            .corner_radius(10)
+            .shadow(egui::Shadow {
+                offset: [0, 6],
+                blur: 20,
+                spread: 1,
+                color: Color32::from_black_alpha(130),
+            });
+        egui::Window::new("Find in file")
+            .id(Id::new("file_search"))
+            .title_bar(false)
+            .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 48.0))
+            .fixed_size(egui::vec2(470.0, 52.0))
+            .resizable(false)
+            .collapsible(false)
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.horizontal(|ui| {
+                    let response = egui::Frame::new()
+                        .fill(Color32::from_rgb(33, 35, 42))
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .corner_radius(6)
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                egui::vec2(240.0, 24.0),
+                                TextEdit::singleline(&mut self.find_query)
+                                    .id(Id::new("file_search_query"))
+                                    .hint_text("Find in current file…")
+                                    .frame(egui::Frame::NONE),
+                            )
+                        })
+                        .inner;
+                    if self.focus_find {
+                        response.request_focus();
+                        self.focus_find = false;
+                    }
+                    query_changed = response.changed();
+                    ui.add_sized(
+                        egui::vec2(62.0, 30.0),
+                        Label::new(RichText::new(&count).small().weak()),
+                    );
+                    previous = ui
+                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("↑"))
+                        .on_hover_text("Previous match (Shift+Enter)")
+                        .clicked();
+                    next = ui
+                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("↓"))
+                        .on_hover_text("Next match (Enter)")
+                        .clicked();
+                    close |= ui
+                        .add_sized(egui::vec2(36.0, 30.0), egui::Button::new("×"))
+                        .on_hover_text("Close (Esc)")
+                        .clicked();
+                });
+            });
+        if query_changed {
+            self.find_selected = 0;
+            self.find_match_revision = u64::MAX;
+            self.refresh_find_matches();
+            self.scroll_to_find_match = !self.find_matches.is_empty();
+            ctx.request_repaint();
+        } else if (enter || previous || next) && !self.find_matches.is_empty() {
+            self.find_selected = next_find_match(
+                self.find_selected,
+                self.find_matches.len(),
+                previous || (enter && backwards),
+            );
+            self.highlight_cache.find_valid = false;
+            self.scroll_to_find_match = true;
+            ctx.request_repaint();
+        }
+        if close {
+            self.find_open = false;
+            self.focus_editor = self.buffer.is_some();
         }
     }
 
@@ -344,12 +504,9 @@ impl EditorApp {
                 input.key_pressed(Key::Escape),
             )
         });
-        if down && !hits.is_empty() {
-            self.search_selected = (self.search_selected + 1).min(hits.len() - 1);
-        }
-        if up {
-            self.search_selected = self.search_selected.saturating_sub(1);
-        }
+        let (selection, scroll_to_selection) =
+            search_selection_after_navigation(self.search_selected, hits.len(), down, up);
+        self.search_selected = selection;
 
         let mut query_changed = false;
         let mut selected_path = enter
@@ -471,7 +628,7 @@ impl EditorApp {
                             );
                             let response =
                                 search_result_row(ui, self.search_selected == index, job, 30.0);
-                            if self.search_selected == index {
+                            if scroll_to_selection && self.search_selected == index {
                                 response.scroll_to_me(None);
                             }
                             if response.clicked() {
@@ -505,7 +662,7 @@ impl EditorApp {
                                 ),
                                 44.0,
                             );
-                            if self.search_selected == index {
+                            if scroll_to_selection && self.search_selected == index {
                                 response.scroll_to_me(None);
                             }
                             if response.clicked() {
@@ -625,6 +782,14 @@ impl EditorApp {
     }
 
     fn draw_editor(&mut self, ui: &mut egui::Ui) {
+        let find_open = self.find_open;
+        let find_query = &self.find_query;
+        let find_matches = &self.find_matches;
+        let find_selected = self.find_selected;
+        let scroll_match = self
+            .scroll_to_find_match
+            .then(|| find_matches.get(find_selected).cloned())
+            .flatten();
         let Some(buffer) = self.buffer.as_mut() else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Select a file to begin editing").weak());
@@ -661,6 +826,7 @@ impl EditorApp {
                         cache.revision = revision;
                         cache.syntax.clone_from(&syntax_name);
                         cache.valid = true;
+                        cache.find_valid = false;
                     }
                     Err(error) => {
                         highlight_error = Some(error);
@@ -675,10 +841,26 @@ impl EditorApp {
                             },
                         );
                         cache.job = job;
+                        cache.find_valid = false;
                     }
                 }
             }
-            let mut job = cache.job.clone();
+            let mut job = if find_open && !find_matches.is_empty() {
+                if !cache.find_valid
+                    || cache.find_revision != revision
+                    || cache.find_query != *find_query
+                    || cache.find_selected != find_selected
+                {
+                    cache.find_job = find_highlighted_job(&cache.job, find_matches, find_selected);
+                    cache.find_revision = revision;
+                    cache.find_query.clone_from(find_query);
+                    cache.find_selected = find_selected;
+                    cache.find_valid = true;
+                }
+                cache.find_job.clone()
+            } else {
+                cache.job.clone()
+            };
             job.wrap.max_width = wrap_width;
             job.wrap.break_anywhere = true;
             ui.fonts_mut(|fonts| fonts.layout_job(job))
@@ -687,16 +869,31 @@ impl EditorApp {
             .id_salt("editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                TextEdit::multiline(&mut buffer.text)
+                let output = TextEdit::multiline(&mut buffer.text)
                     .id(Id::new("editor"))
                     .code_editor()
                     .desired_width(ui.available_width())
                     .desired_rows(30)
                     .frame(egui::Frame::NONE)
                     .layouter(&mut layouter)
-                    .show(ui)
+                    .show(ui);
+                if let Some(span) = &scroll_match {
+                    let character = buffer.text[..span.start].chars().count();
+                    let cursor = output
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(character))
+                        .translate(
+                            output.galley_pos.to_vec2()
+                                - egui::vec2(output.galley.rect.left(), 0.0),
+                        );
+                    ui.scroll_to_rect(cursor, Some(egui::Align::Center));
+                }
+                output
             })
             .inner;
+        if self.scroll_to_find_match {
+            self.scroll_to_find_match = false;
+        }
         if self.focus_editor {
             output.response.request_focus();
             self.focus_editor = false;
@@ -1112,6 +1309,35 @@ fn search_result_row(
     response
 }
 
+fn search_selection_after_navigation(
+    selected: usize,
+    hit_count: usize,
+    down: bool,
+    up: bool,
+) -> (usize, bool) {
+    if hit_count == 0 {
+        return (0, false);
+    }
+    let next = if down {
+        (selected + 1).min(hit_count - 1)
+    } else if up {
+        selected.saturating_sub(1)
+    } else {
+        selected.min(hit_count - 1)
+    };
+    (next, next != selected)
+}
+
+fn next_find_match(selected: usize, match_count: usize, backwards: bool) -> usize {
+    if match_count == 0 {
+        0
+    } else if backwards {
+        selected.checked_sub(1).unwrap_or(match_count - 1)
+    } else {
+        (selected + 1) % match_count
+    }
+}
+
 fn content_result_job(hit: &SearchHit, query: &str, wrap_width: f32) -> LayoutJob {
     let font_id = FontId::monospace(13.0);
     let mut job = LayoutJob::default();
@@ -1145,6 +1371,69 @@ fn content_result_job(hit: &SearchHit, query: &str, wrap_width: f32) -> LayoutJo
     }
     job.append(&hit.preview[cursor..], 0.0, normal);
     job
+}
+
+fn find_highlighted_job(
+    base: &LayoutJob,
+    matches: &[std::ops::Range<usize>],
+    active: usize,
+) -> LayoutJob {
+    if matches.is_empty() {
+        return base.clone();
+    }
+    let mut highlighted = base.clone();
+    highlighted.text.clear();
+    highlighted.sections.clear();
+    let mut match_index = 0;
+    for section in &base.sections {
+        let section_start = section.byte_range.start.0;
+        let section_end = section.byte_range.end.0;
+        while match_index < matches.len() && matches[match_index].end <= section_start {
+            match_index += 1;
+        }
+        let mut current_match = match_index;
+        let mut cursor = section_start;
+        let mut leading_space = section.leading_space;
+        while current_match < matches.len() && matches[current_match].start < section_end {
+            let start = matches[current_match].start.max(section_start);
+            let end = matches[current_match].end.min(section_end);
+            if cursor < start {
+                highlighted.append(
+                    &base.text[cursor..start],
+                    leading_space,
+                    section.format.clone(),
+                );
+                leading_space = 0.0;
+            }
+            if start < end {
+                let mut format = section.format.clone();
+                format.background = if current_match == active {
+                    Color32::from_rgb(42, 117, 128)
+                } else {
+                    Color32::from_rgb(30, 79, 89)
+                };
+                highlighted.append(&base.text[start..end], leading_space, format);
+                leading_space = 0.0;
+                cursor = end;
+            }
+            if matches[current_match].end <= section_end {
+                current_match += 1;
+            } else {
+                break;
+            }
+        }
+        if cursor < section_end {
+            highlighted.append(
+                &base.text[cursor..section_end],
+                leading_space,
+                section.format.clone(),
+            );
+        }
+        while match_index < matches.len() && matches[match_index].end <= section_end {
+            match_index += 1;
+        }
+    }
+    highlighted
 }
 
 fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
@@ -1182,7 +1471,10 @@ fn line_column(text: &str, character_offset: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorApp, line_column, match_spans};
+    use super::{
+        EditorApp, find_highlighted_job, line_column, match_spans, next_find_match,
+        search_selection_after_navigation,
+    };
     use crate::file_io::OpenTarget;
     use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
     use std::fs;
@@ -1200,6 +1492,58 @@ mod tests {
             [0..5, 6..11, 12..17]
         );
         assert!(match_spans("Cargo", "").is_empty());
+    }
+
+    #[test]
+    fn project_search_scrolls_only_when_keyboard_navigation_moves_selection() {
+        assert_eq!(
+            search_selection_after_navigation(12, 30, false, false),
+            (12, false)
+        );
+        assert_eq!(
+            search_selection_after_navigation(12, 30, true, false),
+            (13, true)
+        );
+        assert_eq!(
+            search_selection_after_navigation(12, 30, false, true),
+            (11, true)
+        );
+        assert_eq!(
+            search_selection_after_navigation(0, 30, false, true),
+            (0, false)
+        );
+    }
+
+    #[test]
+    fn in_file_search_navigation_wraps_in_both_directions() {
+        assert_eq!(next_find_match(0, 3, false), 1);
+        assert_eq!(next_find_match(2, 3, false), 0);
+        assert_eq!(next_find_match(0, 3, true), 2);
+        assert_eq!(next_find_match(0, 0, false), 0);
+    }
+
+    #[test]
+    fn in_file_search_highlights_every_match_and_distinguishes_the_active_one() {
+        let text = "needle then needle";
+        let base = egui::text::LayoutJob::simple(
+            text.into(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            400.0,
+        );
+        let highlighted = find_highlighted_job(&base, &match_spans(text, "needle"), 1);
+        let backgrounds: Vec<_> = highlighted
+            .sections
+            .iter()
+            .filter_map(|section| {
+                (section.format.background != egui::Color32::TRANSPARENT)
+                    .then_some(section.format.background)
+            })
+            .collect();
+
+        assert_eq!(highlighted.text, text);
+        assert_eq!(backgrounds.len(), 2);
+        assert_ne!(backgrounds[0], backgrounds[1]);
     }
 
     #[test]
@@ -1247,11 +1591,13 @@ mod tests {
     }
 
     #[test]
-    fn command_f_opens_and_focuses_project_search() {
+    fn command_f_and_command_shift_f_open_their_own_searches() {
         let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.rs");
+        fs::write(&file, "needle here\n").unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
-            file: None,
+            file: Some(file),
             create: false,
         })
         .unwrap();
@@ -1278,7 +1624,47 @@ mod tests {
 
         let _ = context.run_ui(input, |root| app.ui(root));
 
+        assert!(app.find_open);
+        assert!(!app.search_open);
+        assert!(context.memory(|memory| memory.has_focus(Id::new("file_search_query"))));
+
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1000.0, 700.0),
+            )),
+            events: vec![Event::Text("needle".into())],
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(input, |root| app.ui(root));
+        assert_eq!(app.find_query, "needle");
+        assert_eq!(app.find_matches.len(), 1);
+        assert_eq!(app.find_matches[0], 0..6);
+
+        let command_shift = Modifiers {
+            command: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1000.0, 700.0),
+            )),
+            modifiers: command_shift,
+            events: vec![Event::Key {
+                key: Key::F,
+                physical_key: Some(Key::F),
+                pressed: true,
+                repeat: false,
+                modifiers: command_shift,
+            }],
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(input, |root| app.ui(root));
+
         assert!(app.search_open);
+        assert!(!app.find_open);
         assert!(context.memory(|memory| memory.has_focus(Id::new("project_search_query"))));
     }
 }

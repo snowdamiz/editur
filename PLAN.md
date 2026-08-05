@@ -26,7 +26,8 @@ The first release must:
 - Open an existing UTF-8 file, a directory, or a new file path.
 - Show a collapsible, keyboard-navigable file tree on the left.
 - Show one editable buffer on the right.
-- Search project filenames and UTF-8 file contents from a floating `Cmd/Ctrl+F` palette, updating results while the user types.
+- Search the current file from `Cmd/Ctrl+F`, highlighting matches while the user types.
+- Search project filenames and UTF-8 file contents from a floating `Cmd/Ctrl+Shift+F` palette, updating results while the user types.
 - Support selection, copy/paste, undo/redo, wrapped lines, vertical scrolling, and standard text input without horizontal scrollbars.
 - Highlight Rust by default and use plain text for unknown file types.
 - Install another language with `editur syntax install <language>`.
@@ -90,7 +91,8 @@ Minimum shortcuts:
 | Action | macOS | Linux/Windows |
 | --- | --- | --- |
 | Save | `Cmd+S` | `Ctrl+S` |
-| Search files and contents | `Cmd+F` | `Ctrl+F` |
+| Search current file | `Cmd+F` | `Ctrl+F` |
+| Search project files and contents | `Cmd+Shift+F` | `Ctrl+Shift+F` |
 | Undo/redo | Platform convention | Platform convention |
 | Toggle sidebar | `Cmd+B` | `Ctrl+B` |
 | Focus tree | `Cmd+1` | `Ctrl+1` |
@@ -354,7 +356,7 @@ Editur v1 is done when a new user can:
 1. Install one native binary on `PATH`.
 2. Run `editur src/main.rs` from a terminal and begin typing in the focused editor.
 3. Navigate the surrounding project from the sidebar.
-4. Search surrounding filenames and file contents from `Cmd/Ctrl+F` with live categorized results.
+4. Search the current file from `Cmd/Ctrl+F` and surrounding project files and contents from `Cmd/Ctrl+Shift+F` with live results.
 5. Save without line-ending damage or silent external-change overwrite.
 6. Install Python highlighting with one command and have it selected automatically for `.py` files.
 7. Use the core workflow entirely by keyboard.

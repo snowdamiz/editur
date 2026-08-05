@@ -221,15 +221,14 @@ jobs:
                 true,
                 true,
               );
-              return;
+            } else {
+              await publish(
+                context.ref.replace('refs/tags/', ''),
+                `Editur ${context.ref.replace('refs/tags/', '')}`,
+                files.filter(file => /^editur-(linux|macos|windows)/.test(path.basename(file))),
+                'Native Editur archives. Verify provenance with GitHub artifact attestations.',
+              );
             }
-
-            await publish(
-              context.ref.replace('refs/tags/', ''),
-              `Editur ${context.ref.replace('refs/tags/', '')}`,
-              files.filter(file => /^editur-(linux|macos|windows)/.test(path.basename(file))),
-              'Native Editur archives. Verify provenance with GitHub artifact attestations.',
-            );
             await publish(
               'syntax-v1',
               'Editur syntax catalog v1',
@@ -260,7 +259,12 @@ jobs:
           install_dir="$RUNNER_TEMP/editur/bin"
           EDITUR_INSTALL_DIR="$install_dir" sh install.sh
           "$install_dir/editur" --version
+          "$install_dir/editur" --help
           "$install_dir/editur" update
+          "$install_dir/editur" syntax list
+          "$install_dir/editur" syntax install python
+          "$install_dir/editur" syntax list
+          "$install_dir/editur" syntax remove python
       - name: Install and update on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -269,4 +273,9 @@ jobs:
           .\install.ps1 -InstallDir $installDir
           $editur = Join-Path $installDir 'editur.exe'
           & $editur --version
+          & $editur --help
           & $editur update
+          & $editur syntax list
+          & $editur syntax install python
+          & $editur syntax list
+          & $editur syntax remove python
