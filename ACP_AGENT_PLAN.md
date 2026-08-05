@@ -23,7 +23,7 @@ The first useful release must:
 - Return only the choice the user selects; never silently approve a request.
 - Keep open buffers coherent when the agent changes files on disk.
 - Repair or reinstall the managed Cursor Agent when it is missing or corrupt, and fail clearly when automatic provisioning, authentication, compatibility, or execution fails.
-- Add no startup work, child process, network request, or idle polling when the Agent view is never opened.
+- Add no work, child process, network request, or idle polling to normal application startup when the Agent view is never opened.
 
 The first release will not include:
 
@@ -132,6 +132,7 @@ At release time, CI selects a tested Cursor entry from the official ACP Registry
 - Target operating system and architecture.
 - Cursor-owned HTTPS archive URL.
 - SHA-256 of the exact archive tested by CI.
+- Relative paths, file types, and SHA-256 values for the extracted package files.
 - Archive format, executable path, and ACP arguments.
 - Maximum compressed and extracted sizes.
 - Cursor license and terms links.
@@ -140,16 +141,16 @@ Publish that small manifest with the signed or attested Editur release. Do not r
 
 ### Installation and update
 
-Both bootstrap installers provision the pinned sidecar after installing Editur. The self-updater provisions the sidecar required by the new Editur release before replacing the current Editur executable.
+Both bootstrap installers state that Cursor Agent is an included third-party dependency, then provision the pinned sidecar after installing Editur without requiring a second setup step. The self-updater provisions the sidecar required by the new Editur release before replacing the current Editur executable.
 
 Provisioning must:
 
-1. Skip the download when the exact version is already installed and its archive or installed-file verification passes.
+1. Skip the download when the exact version is already installed and every managed package file matches the release manifest.
 2. Download only over HTTPS from the pinned Cursor host into a fresh temporary directory.
 3. Enforce the manifest's compressed-size limit while downloading.
 4. Verify SHA-256 before extraction.
 5. Reject archive entries that escape the staging directory and enforce extracted-size and entry-count limits.
-6. Verify that the declared command exists, is the expected file type, and reports the pinned version.
+6. Verify every extracted path, file type, and checksum against the release manifest, then verify that the declared command reports the pinned version.
 7. Move the complete staged version atomically into the private version directory.
 8. Switch the active-version marker only after validation succeeds.
 9. Keep the prior known-good version until the new Editur and sidecar have both launched successfully, then remove only obsolete managed versions.
