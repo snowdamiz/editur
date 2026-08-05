@@ -324,6 +324,7 @@ Exit condition: a clean install can run `editur syntax install python` and immed
 - Test integrated-GPU selection, Vulkan/DXGI swapchain recreation, Metal drawable unavailability, suspend/resume, and monitor/DPI changes.
 - Benchmark release artifacts on each supported OS and profile missed targets.
 - Produce signed archives with the native platform icon and installation instructions that place `editur` on `PATH`.
+- Publish checksum-verifying shell and PowerShell bootstrap installers for a one-command initial installation.
 - Publish checksum-verified native updater assets whenever the `release` branch is pushed, while retaining versioned `v*` releases.
 
 Exit condition: every product requirement and performance gate has reproducible evidence, or a documented platform-specific exception approved before release.

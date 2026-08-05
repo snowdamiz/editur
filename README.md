@@ -6,7 +6,19 @@ It uses the host graphics API directly: Metal on macOS, Direct3D 12 on Windows 1
 
 ## Quick start
 
-Download and extract the archive for your platform from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release), place `editur` (or `editur.exe`) on `PATH`, then run:
+Install on macOS or Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh
+```
+
+Install on Windows from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex
+```
+
+Open a new terminal if instructed, then run:
 
 ```sh
 editur .
@@ -17,6 +29,8 @@ Update that installed binary at any time from the terminal:
 ```sh
 editur update
 ```
+
+Both installers download the native binary from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. Set `EDITUR_INSTALL_DIR` to override the default install directory.
 
 ## Build and install
 
