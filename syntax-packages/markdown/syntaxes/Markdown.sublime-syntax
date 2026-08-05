@@ -1,0 +1,60 @@
+%YAML 1.2
+---
+name: Markdown
+file_extensions: [md, markdown, mdown, mkd]
+scope: text.html.markdown
+contexts:
+  main:
+    - match: '^\s*(#{1,6})\s+(.+)$'
+      captures:
+        1: punctuation.definition.heading.markdown
+        2: markup.heading.markdown
+    - match: '^\s*(```|~~~)'
+      captures:
+        1: punctuation.definition.raw.begin.markdown
+      push: fenced-code
+    - match: '`'
+      scope: punctuation.definition.raw.begin.markdown
+      push: inline-code
+    - match: '!?(\[)([^]]+)(\])(\()([^ )]+)([^)]*)(\))'
+      captures:
+        1: punctuation.definition.link.begin.markdown
+        2: string.other.link.description.markdown
+        3: punctuation.definition.link.end.markdown
+        4: punctuation.definition.metadata.begin.markdown
+        5: markup.underline.link.markdown
+        7: punctuation.definition.metadata.end.markdown
+    - match: '(\*\*|__)(?=\S)'
+      scope: punctuation.definition.bold.begin.markdown
+      push: bold
+    - match: '(\*|_)(?=\S)'
+      scope: punctuation.definition.italic.begin.markdown
+      push: italic
+    - match: '^\s*(>|[-+*]|[0-9]+\.)\s+'
+      scope: punctuation.definition.list.markdown
+  fenced-code:
+    - meta_scope: markup.raw.block.markdown
+    - match: '^\s*(```|~~~)\s*$'
+      scope: punctuation.definition.raw.end.markdown
+      pop: true
+  inline-code:
+    - meta_scope: markup.raw.inline.markdown
+    - match: '`'
+      scope: punctuation.definition.raw.end.markdown
+      pop: true
+    - match: $\n?
+      pop: true
+  bold:
+    - meta_scope: markup.bold.markdown
+    - match: '(\*\*|__)'
+      scope: punctuation.definition.bold.end.markdown
+      pop: true
+    - match: $\n?
+      pop: true
+  italic:
+    - meta_scope: markup.italic.markdown
+    - match: '(\*|_)'
+      scope: punctuation.definition.italic.end.markdown
+      pop: true
+    - match: $\n?
+      pop: true

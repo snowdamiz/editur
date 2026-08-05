@@ -1,0 +1,51 @@
+[package]
+name = "editur"
+version = "0.1.0"
+edition = "2024"
+description = "A small native editor for quick, focused file changes"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+directories = "6.0.0"
+arboard = { version = "3.6.1", default-features = false }
+bytemuck = "1.25.0"
+egui = { version = "0.35.0", default-features = false, features = ["bytemuck", "default_fonts"] }
+egui-winit = { version = "0.35.0", default-features = false, features = ["accesskit"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+sha2 = "0.11.0"
+syntect = { version = "5.3.0", default-features = false, features = ["dump-create", "dump-load", "parsing", "regex-fancy", "yaml-load"] }
+tempfile = "3.27.0"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
+zip = { version = "6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[features]
+default = ["network"]
+network = ["dep:ureq"]
+
+[build-dependencies]
+naga = { version = "29.0.4", features = ["spv-out", "wgsl-in"] }
+syntect = { version = "5.3.0", default-features = false, features = ["dump-create", "dump-load", "parsing", "regex-fancy", "yaml-load"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+ash = { version = "0.38.0" }
+ash-window = { version = "0.13.0" }
+egui-winit = { version = "0.35.0", default-features = false, features = ["wayland", "x11"] }
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics-types = "0.2.0"
+metal = "0.33.0"
+objc = "0.2.7"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Storage_FileSystem"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true

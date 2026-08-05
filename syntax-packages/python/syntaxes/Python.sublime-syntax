@@ -1,0 +1,80 @@
+%YAML 1.2
+---
+name: Python
+file_extensions: [py, pyw, pyi]
+scope: source.python
+contexts:
+  main:
+    - match: '#'
+      scope: punctuation.definition.comment.python
+      push: line-comment
+    - match: '(?i)([rubf]{0,2})(""")'
+      captures:
+        1: storage.type.string.python
+        2: punctuation.definition.string.begin.python
+      push: triple-double-string
+    - match: "(?i)([rubf]{0,2})(''')"
+      captures:
+        1: storage.type.string.python
+        2: punctuation.definition.string.begin.python
+      push: triple-single-string
+    - match: '(?i)([rubf]{0,2})(")'
+      captures:
+        1: storage.type.string.python
+        2: punctuation.definition.string.begin.python
+      push: double-string
+    - match: "(?i)([rubf]{0,2})(')"
+      captures:
+        1: storage.type.string.python
+        2: punctuation.definition.string.begin.python
+      push: single-string
+    - match: '\b(class)\s+([A-Za-z_]\w*)'
+      captures:
+        1: storage.type.class.python
+        2: entity.name.type.class.python
+    - match: '\b(def)\s+([A-Za-z_]\w*)'
+      captures:
+        1: storage.type.function.python
+        2: entity.name.function.python
+    - match: '\b(False|None|True|and|as|assert|async|await|break|case|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|match|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b'
+      scope: keyword.control.python
+    - match: '\b(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*(\.[0-9_]*)?([eE][+-]?[0-9_]+)?j?)\b'
+      scope: constant.numeric.python
+    - match: '\b[A-Z][A-Za-z0-9_]*\b'
+      scope: entity.name.type.python
+  line-comment:
+    - meta_scope: comment.line.number-sign.python
+    - match: $\n?
+      pop: true
+  double-string:
+    - meta_scope: string.quoted.double.python
+    - match: '\\.'
+      scope: constant.character.escape.python
+    - match: '"'
+      scope: punctuation.definition.string.end.python
+      pop: true
+    - match: $\n?
+      pop: true
+  single-string:
+    - meta_scope: string.quoted.single.python
+    - match: '\\.'
+      scope: constant.character.escape.python
+    - match: "'"
+      scope: punctuation.definition.string.end.python
+      pop: true
+    - match: $\n?
+      pop: true
+  triple-double-string:
+    - meta_scope: string.quoted.double.block.python
+    - match: '\\.'
+      scope: constant.character.escape.python
+    - match: '"""'
+      scope: punctuation.definition.string.end.python
+      pop: true
+  triple-single-string:
+    - meta_scope: string.quoted.single.block.python
+    - match: '\\.'
+      scope: constant.character.escape.python
+    - match: "'''"
+      scope: punctuation.definition.string.end.python
+      pop: true

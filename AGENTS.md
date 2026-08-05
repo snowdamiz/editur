@@ -1,0 +1,2 @@
+- Use TDD without writing useless tests
+- Keep an eye on machine disk space, clean up rust incremental builds along the way to manage disk space only from this project

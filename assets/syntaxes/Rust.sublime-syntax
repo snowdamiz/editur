@@ -1,0 +1,50 @@
+%YAML 1.2
+---
+name: Rust
+file_extensions:
+  - rs
+scope: source.rust
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - match: '\b(?:as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while)\b'
+      scope: keyword.control.rust
+    - match: '\b(?:bool|char|f32|f64|i8|i16|i32|i64|i128|isize|str|u8|u16|u32|u64|u128|usize)\b'
+      scope: storage.type.rust
+    - match: '\b[A-Z][A-Za-z0-9_]*\b'
+      scope: entity.name.type.rust
+    - match: '\b[A-Za-z_][A-Za-z0-9_]*!'
+      scope: entity.name.macro.rust
+  comments:
+    - match: '//'
+      push:
+        - meta_scope: comment.line.double-slash.rust
+        - match: '$\n?'
+          pop: true
+    - match: '/\*'
+      push:
+        - meta_scope: comment.block.rust
+        - match: '\*/'
+          pop: true
+        - include: comments
+  strings:
+    - match: 'b?r(#{0,255})"'
+      push:
+        - meta_scope: string.quoted.double.raw.rust
+        - match: '"\1'
+          pop: true
+    - match: 'b"'
+      push:
+        - meta_scope: string.quoted.double.rust
+        - match: '\\.'
+          scope: constant.character.escape.rust
+        - match: '"'
+          pop: true
+    - match: "b?'"
+      push:
+        - meta_scope: string.quoted.single.rust
+        - match: '\\.'
+          scope: constant.character.escape.rust
+        - match: "'"
+          pop: true

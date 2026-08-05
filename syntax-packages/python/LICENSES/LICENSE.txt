@@ -1,0 +1,1 @@
+This Editur sample grammar is available under the MIT OR Apache-2.0 licenses.

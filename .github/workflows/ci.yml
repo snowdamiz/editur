@@ -1,0 +1,228 @@
+name: CI and release artifacts
+
+on:
+  push:
+    branches: [main, release]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: editur-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: editur-linux-x86_64
+            archive: dist/editur-linux-x86_64.tar.gz
+            update_asset: editur-linux-x86_64
+          - os: macos-latest
+            artifact: editur-macos-aarch64
+            archive: dist/editur-macos-aarch64.tar.gz
+            update_asset: editur-macos-aarch64
+          - os: macos-15-intel
+            artifact: editur-macos-x86_64
+            archive: dist/editur-macos-x86_64.tar.gz
+            update_asset: editur-macos-x86_64
+          - os: windows-latest
+            artifact: editur-windows-x86_64
+            archive: dist/editur-windows-x86_64.zip
+            update_asset: editur-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update
+      - name: Install Linux window dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        env:
+          EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
+        run: cargo build --release --locked
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/package
+          cp target/release/editur dist/package/
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cp assets/icons/editur.icns dist/package/
+          else
+            cp assets/icons/editur.png dist/package/
+          fi
+          tar -C dist/package -czf "${{ matrix.archive }}" .
+          cp target/release/editur "dist/${{ matrix.update_asset }}"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "dist/${{ matrix.update_asset }}" | awk '{print $1}' > "dist/${{ matrix.update_asset }}.sha256"
+          else
+            sha256sum "dist/${{ matrix.update_asset }}" | awk '{print $1}' > "dist/${{ matrix.update_asset }}.sha256"
+          fi
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item target/release/editur.exe, assets/icons/editur.ico -Destination dist/package
+          Compress-Archive -Path dist/package/* -DestinationPath "${{ matrix.archive }}"
+          Copy-Item target/release/editur.exe "dist/${{ matrix.update_asset }}"
+          $hash = (Get-FileHash "dist/${{ matrix.update_asset }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -NoNewline "dist/${{ matrix.update_asset }}.sha256" $hash
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.archive }}
+            dist/${{ matrix.update_asset }}
+            dist/${{ matrix.update_asset }}.sha256
+          if-no-files-found: error
+      - name: Sign build provenance
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ matrix.archive }}
+            dist/${{ matrix.update_asset }}
+            dist/${{ matrix.update_asset }}.sha256
+      - name: Build sample syntax catalog
+        if: runner.os == 'Linux'
+        run: >-
+          cargo run --release --locked --example build_syntax_catalog --
+          dist/syntax
+          "https://github.com/${{ github.repository }}/releases/download/syntax-v1"
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
+        with:
+          name: editur-syntax-v1
+          path: dist/syntax
+          if-no-files-found: error
+      - name: Sign syntax-package provenance
+        if: runner.os == 'Linux' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/syntax/*
+
+  publish:
+    name: Publish releases
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
+    needs: native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish application and syntax releases
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const files = fs.readdirSync('dist', { recursive: true })
+              .map(file => path.join('dist', file))
+              .filter(file => fs.statSync(file).isFile());
+
+            async function publish(tag, name, selected, notes, prerelease = false, moveTag = false) {
+              if (selected.length === 0) throw new Error(`No assets found for ${tag}`);
+              let release;
+              try {
+                release = (await github.rest.repos.getReleaseByTag({
+                  owner: context.repo.owner, repo: context.repo.repo, tag,
+                })).data;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                release = (await github.rest.repos.createRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag_name: tag,
+                  target_commitish: context.sha,
+                  name,
+                  body: notes,
+                  prerelease,
+                })).data;
+              }
+              if (moveTag) {
+                await github.rest.git.updateRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${tag}`,
+                  sha: context.sha,
+                  force: true,
+                });
+              }
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id,
+                name,
+                body: notes,
+                prerelease,
+              });
+              const existing = (await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                { owner: context.repo.owner, repo: context.repo.repo, release_id: release.id },
+              ));
+              for (const file of selected) {
+                const asset = existing.find(item => item.name === path.basename(file));
+                if (asset) {
+                  await github.rest.repos.deleteReleaseAsset({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    asset_id: asset.id,
+                  });
+                }
+                await github.rest.repos.uploadReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release.id,
+                  name: path.basename(file),
+                  data: fs.readFileSync(file),
+                });
+              }
+            }
+
+            if (context.ref === 'refs/heads/release') {
+              await publish(
+                'release',
+                'Editur continuous release',
+                files.filter(file => /^editur-(linux|macos|windows)/.test(path.basename(file))),
+                `Latest native builds from the release branch (${context.sha}).`,
+                true,
+                true,
+              );
+              return;
+            }
+
+            await publish(
+              context.ref.replace('refs/tags/', ''),
+              `Editur ${context.ref.replace('refs/tags/', '')}`,
+              files.filter(file => /^editur-(linux|macos|windows)/.test(path.basename(file))),
+              'Native Editur archives. Verify provenance with GitHub artifact attestations.',
+            );
+            await publish(
+              'syntax-v1',
+              'Editur syntax catalog v1',
+              files.filter(file => path.basename(file) === 'catalog.json' || file.endsWith('.editur-syntax')),
+              'Versioned, data-only syntax packages used by Editur.',
+            );

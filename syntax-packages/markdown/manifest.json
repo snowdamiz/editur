@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "markdown",
+  "display_name": "Markdown",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["md", "markdown", "mdown", "mkd"],
+  "filenames": ["README", "CHANGELOG"],
+  "grammars": ["syntaxes/Markdown.sublime-syntax"],
+  "dependencies": []
+}

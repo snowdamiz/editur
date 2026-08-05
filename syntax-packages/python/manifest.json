@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "python",
+  "display_name": "Python",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["py", "pyw", "pyi"],
+  "filenames": ["SConstruct", "SConscript"],
+  "grammars": ["syntaxes/Python.sublime-syntax"],
+  "dependencies": []
+}
