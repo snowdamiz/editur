@@ -142,6 +142,20 @@ impl Highlighter {
                 color(86, 182, 194),
                 FontStyle::empty(),
             ),
+            ("markup.heading", color(97, 175, 239), FontStyle::empty()),
+            ("markup.raw", color(152, 195, 121), FontStyle::empty()),
+            ("markup.bold", color(229, 192, 123), FontStyle::BOLD),
+            ("markup.italic", color(198, 120, 221), FontStyle::ITALIC),
+            (
+                "markup.underline.link, string.other.link",
+                color(86, 182, 194),
+                FontStyle::empty(),
+            ),
+            (
+                "punctuation.definition.heading, punctuation.definition.list",
+                color(86, 182, 194),
+                FontStyle::empty(),
+            ),
         ]
         .into_iter()
         .map(|(selector, foreground, font_style)| {
@@ -470,6 +484,35 @@ contexts: { main: [] }
         assert_ne!(color("raw"), foreground);
         assert_ne!(color("println"), foreground);
         assert_ne!(color("comment"), foreground);
+    }
+
+    #[test]
+    fn highlights_representative_markdown_constructs() {
+        let mut builder = syntect::parsing::SyntaxSetBuilder::new();
+        builder
+            .add_from_folder("syntax-packages/markdown/syntaxes", true)
+            .unwrap();
+        let syntaxes = builder.build();
+        let syntax = syntaxes.find_syntax_by_name("Markdown").unwrap();
+        let source = "# Heading\n\nUse `cargo test` and **bold**.\n";
+        let job = Highlighter::new()
+            .unwrap()
+            .highlight_job(source, syntax, &syntaxes, 800.0)
+            .unwrap();
+        let color = |token: &str| {
+            let offset = source.find(token).unwrap();
+            job.sections
+                .iter()
+                .find(|section| section.byte_range.contains(&offset.into()))
+                .unwrap()
+                .format
+                .color
+        };
+
+        let foreground = color("Use");
+        assert_ne!(color("Heading"), foreground);
+        assert_ne!(color("cargo test"), foreground);
+        assert_ne!(color("bold"), foreground);
     }
 
     #[test]

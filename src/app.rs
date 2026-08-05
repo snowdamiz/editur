@@ -155,6 +155,7 @@ struct HighlightCache {
     find_selected: usize,
     find_job: LayoutJob,
     find_valid: bool,
+    bracket_job: Option<LayoutJob>,
     galley_key: Option<GalleyKey>,
     presentation_revision: u64,
 }
@@ -1052,19 +1053,7 @@ impl EditorApp {
             cache.valid = true;
             cache.find_valid = false;
         }
-        let galley_key = GalleyKey {
-            revision,
-            syntax: syntax_name,
-            wrap_width: wrap_width.round().to_bits(),
-            find: (find_open && !find_matches.is_empty())
-                .then(|| (find_query.clone(), find_selected)),
-            bracket_pair: bracket_pair.clone(),
-        };
-        if cache.galley_key.as_ref() != Some(&galley_key) {
-            cache.galley_key = Some(galley_key);
-            cache.presentation_revision = cache.presentation_revision.wrapping_add(1);
-        }
-        let mut job = if find_open && !find_matches.is_empty() {
+        let job = if find_open && !find_matches.is_empty() {
             if !cache.find_valid
                 || cache.find_revision != revision
                 || cache.find_query != *find_query
@@ -1076,17 +1065,30 @@ impl EditorApp {
                 cache.find_selected = find_selected;
                 cache.find_valid = true;
             }
-            cache.find_job.clone()
+            &cache.find_job
         } else {
-            cache.job.clone()
+            &cache.job
         };
-        if let Some(pair) = &bracket_pair {
-            job = bracket_highlighted_job(&job, pair);
+        let galley_key = GalleyKey {
+            revision,
+            syntax: syntax_name,
+            wrap_width: wrap_width.round().to_bits(),
+            find: (find_open && !find_matches.is_empty())
+                .then(|| (find_query.clone(), find_selected)),
+            bracket_pair: bracket_pair.clone(),
+        };
+        if cache.galley_key.as_ref() != Some(&galley_key) {
+            cache.galley_key = Some(galley_key);
+            cache.presentation_revision = cache.presentation_revision.wrapping_add(1);
+            cache.bracket_job = bracket_pair
+                .as_ref()
+                .map(|pair| bracket_highlighted_job(job, pair));
         }
+        let job = presentation_job(job, cache.bracket_job.as_ref());
         let output = self.editor_surface.show(
             ui,
             &mut buffer.text,
-            &job,
+            job,
             cache.presentation_revision,
             self.focus_editor,
             scroll_character,
@@ -1405,11 +1407,8 @@ impl ApplicationHandler<InstanceEvent> for Shell {
         if self.window.is_some() {
             return;
         }
-        let icon = match Icon::from_rgba(
-            include_bytes!("../assets/icons/editur-64.rgba").to_vec(),
-            64,
-            64,
-        ) {
+        let (pixels, width, height) = application_icon_rgba();
+        let icon = match Icon::from_rgba(pixels.to_vec(), width, height) {
             Ok(icon) => icon,
             Err(error) => {
                 self.fail(event_loop, format!("cannot load application icon: {error}"));
@@ -1647,46 +1646,46 @@ fn activate_macos_application() {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_icon_path(executable: &Path) -> Option<PathBuf> {
-    let macos = executable.parent()?;
-    let contents = macos.parent()?;
-    let bundle = contents.parent()?;
-    (macos.file_name()? == "MacOS"
-        && contents.file_name()? == "Contents"
-        && bundle.extension()? == "app")
-        .then(|| contents.join("Resources/Editur.icns"))
+fn application_icon_rgba() -> (&'static [u8], u32, u32) {
+    (include_bytes!("../assets/icons/editur-64.rgba"), 64, 64)
 }
 
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
 fn set_macos_application_icon() {
     use objc::{class, msg_send, runtime::Object, sel, sel_impl};
-    use std::ffi::CString;
 
-    let Some(path) = std::env::current_exe()
-        .ok()
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .and_then(|path| macos_icon_path(&path))
-    else {
-        return;
-    };
-    let Ok(path) = CString::new(path.to_string_lossy().as_bytes()) else {
-        return;
-    };
+    let (pixels, width, height) = application_icon_rgba();
+    let mut plane = pixels.as_ptr().cast_mut();
     unsafe {
-        let path: *mut Object = msg_send![
+        let color_space: *mut Object = msg_send![
             class!(NSString),
-            stringWithUTF8String: path.as_ptr()
+            stringWithUTF8String: c"NSDeviceRGBColorSpace".as_ptr()
         ];
-        let icon: *mut Object = msg_send![class!(NSImage), alloc];
-        let icon: *mut Object = msg_send![icon, initWithContentsOfFile: path];
-        if icon.is_null() {
+        let bitmap: *mut Object = msg_send![class!(NSBitmapImageRep), alloc];
+        let bitmap: *mut Object = msg_send![
+            bitmap,
+            initWithBitmapDataPlanes: &mut plane as *mut *mut u8
+            pixelsWide: width as isize
+            pixelsHigh: height as isize
+            bitsPerSample: 8_isize
+            samplesPerPixel: 4_isize
+            hasAlpha: objc::runtime::YES
+            isPlanar: objc::runtime::NO
+            colorSpaceName: color_space
+            bitmapFormat: 2_usize
+            bytesPerRow: (width * 4) as isize
+            bitsPerPixel: 32_isize
+        ];
+        if bitmap.is_null() {
             return;
         }
+        let icon: *mut Object = msg_send![class!(NSImage), new];
+        let _: () = msg_send![icon, addRepresentation: bitmap];
         let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![application, setApplicationIconImage: icon];
         let _: () = msg_send![icon, release];
+        let _: () = msg_send![bitmap, release];
     }
 }
 
@@ -2016,6 +2015,13 @@ fn bracket_highlighted_job(
     highlighted
 }
 
+fn presentation_job<'a>(
+    base: &'a LayoutJob,
+    bracket_overlay: Option<&'a LayoutJob>,
+) -> &'a LayoutJob {
+    bracket_overlay.unwrap_or(base)
+}
+
 fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     if query.is_empty() {
         return Vec::new();
@@ -2039,7 +2045,7 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::{
         EditorApp, TreeState, find_highlighted_job, match_bracket_pair, match_spans,
-        next_find_match, plain_text_job, search_selection_after_navigation,
+        next_find_match, plain_text_job, presentation_job, search_selection_after_navigation,
     };
     use crate::file_io::OpenTarget;
     use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
@@ -2119,6 +2125,13 @@ mod tests {
             match_bracket_pair(text, text[..closing + 1].chars().count()),
             Some((opening..opening + 1, closing..closing + 1))
         );
+    }
+
+    #[test]
+    fn unchanged_editor_presentation_borrows_the_highlighted_document() {
+        let job = plain_text_job("large document", 800.0);
+
+        assert!(std::ptr::eq(presentation_job(&job, None), &job));
     }
 
     #[test]
@@ -2270,18 +2283,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_icon_is_resolved_from_the_bundle_containing_the_executable() {
-        let executable = std::path::Path::new("/Applications/Editur.app/Contents/MacOS/editur");
+    fn macos_runtime_icon_uses_the_embedded_pixels() {
+        let (pixels, width, height) = super::application_icon_rgba();
 
-        assert_eq!(
-            super::macos_icon_path(executable),
-            Some(std::path::PathBuf::from(
-                "/Applications/Editur.app/Contents/Resources/Editur.icns"
-            ))
-        );
-        assert_eq!(
-            super::macos_icon_path(std::path::Path::new("/usr/local/bin/editur")),
-            None
-        );
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
     }
 }
