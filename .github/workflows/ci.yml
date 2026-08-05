@@ -91,8 +91,10 @@ jobs:
           cp target/release/editur "dist/${{ matrix.update_asset }}"
           if [ "$RUNNER_OS" = "macOS" ]; then
             shasum -a 256 "dist/${{ matrix.update_asset }}" | awk '{print $1}' > "dist/${{ matrix.update_asset }}.sha256"
+            shasum -a 256 "${{ matrix.archive }}" | awk '{print $1}' > "${{ matrix.archive }}.sha256"
           else
             sha256sum "dist/${{ matrix.update_asset }}" | awk '{print $1}' > "dist/${{ matrix.update_asset }}.sha256"
+            sha256sum "${{ matrix.archive }}" | awk '{print $1}' > "${{ matrix.archive }}.sha256"
           fi
       - name: Package Windows binary
         if: runner.os == 'Windows'
@@ -104,6 +106,8 @@ jobs:
           Copy-Item target/release/editur.exe "dist/${{ matrix.update_asset }}"
           $hash = (Get-FileHash "dist/${{ matrix.update_asset }}" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "dist/${{ matrix.update_asset }}.sha256" -Value $hash -NoNewline
+          $archiveHash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "${{ matrix.archive }}.sha256" -Value $archiveHash -NoNewline
           if ((Get-Content -LiteralPath "dist/${{ matrix.update_asset }}.sha256" -Raw) -ne $hash) {
             throw "Windows updater checksum was not written correctly"
           }
@@ -112,6 +116,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
           if-no-files-found: error
@@ -121,6 +126,7 @@ jobs:
         with:
           subject-path: |
             ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
       - name: Build sample syntax catalog
@@ -259,6 +265,8 @@ jobs:
         include:
           - platform: Unix
             os: ubuntu-latest
+          - platform: macOS
+            os: macos-latest
           - platform: Windows
             os: windows-latest
     steps:

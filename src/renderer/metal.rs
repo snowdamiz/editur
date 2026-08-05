@@ -406,6 +406,7 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
     let view = unsafe { &*handle.ns_view.as_ptr().cast::<Object>() };
     unsafe {
         let layer_object = &*(layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>();
+        layer.set_opaque(false);
         layer_object
             .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
             .map_err(|error| format!("Metal: cannot round the window layer: {error}"))?;
@@ -417,6 +418,25 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
             ((layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>(),),
         )
         .map_err(|error| format!("Metal: cannot attach CAMetalLayer: {error}"))?;
+        let frame_view = view
+            .send_message::<_, *mut Object>(Sel::register("superview"), ())
+            .map_err(|error| format!("Metal: cannot obtain the AppKit frame view: {error}"))?;
+        if let Some(frame_view) = frame_view.as_ref() {
+            frame_view
+                .send_message::<_, ()>(Sel::register("setWantsLayer:"), (YES,))
+                .map_err(|error| format!("Metal: cannot enable the frame layer: {error}"))?;
+            let frame_layer = frame_view
+                .send_message::<_, *mut Object>(Sel::register("layer"), ())
+                .map_err(|error| format!("Metal: cannot obtain the AppKit frame layer: {error}"))?;
+            if let Some(frame_layer) = frame_layer.as_ref() {
+                frame_layer
+                    .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
+                    .map_err(|error| format!("Metal: cannot round the AppKit frame: {error}"))?;
+                frame_layer
+                    .send_message::<_, ()>(Sel::register("setMasksToBounds:"), (YES,))
+                    .map_err(|error| format!("Metal: cannot clip the AppKit frame: {error}"))?;
+            }
+        }
     }
     Ok(())
 }

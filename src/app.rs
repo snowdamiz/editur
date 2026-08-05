@@ -357,7 +357,7 @@ impl EditorApp {
     #[cfg(target_os = "macos")]
     fn draw_titlebar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("titlebar")
-            .exact_size(42.0)
+            .exact_size(34.0)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(27, 27, 36))
@@ -957,6 +957,7 @@ impl EditorApp {
             .id_salt("editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let viewport = ui.clip_rect();
                 let output = TextEdit::multiline(&mut buffer.text)
                     .id(Id::new("editor"))
                     .code_editor()
@@ -965,6 +966,20 @@ impl EditorApp {
                     .frame(egui::Frame::NONE)
                     .layouter(&mut layouter)
                     .show(ui);
+                if output.response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(pointer) = output.response.interact_pointer_pos()
+                {
+                    let delta = selection_drag_scroll_delta(
+                        pointer.y,
+                        viewport.top(),
+                        viewport.bottom(),
+                        ui.input(|input| input.stable_dt),
+                    );
+                    if delta != 0.0 {
+                        ui.scroll_with_delta(egui::vec2(0.0, delta));
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if let Some(span) = &scroll_match {
                     let character = buffer.text[..span.start].chars().count();
                     let cursor = output
@@ -1250,8 +1265,7 @@ impl Shell {
             self.first_frame_logged = true;
         }
         if self.editor.should_close {
-            window.set_visible(false);
-            self.editor.should_close = false;
+            event_loop.exit();
             return;
         }
         let delay = output
@@ -1295,7 +1309,11 @@ impl ApplicationHandler<InstanceEvent> for Shell {
         #[cfg(target_os = "macos")]
         let attributes = attributes.with_decorations(false).with_transparent(true);
         let window_started = Instant::now();
-        let window = match event_loop.create_window(attributes) {
+        #[cfg(target_os = "macos")]
+        let window = create_macos_window_without_native_title(event_loop, attributes);
+        #[cfg(not(target_os = "macos"))]
+        let window = event_loop.create_window(attributes);
+        let window = match window {
             Ok(window) => window,
             Err(error) => {
                 self.fail(event_loop, format!("cannot create window: {error}"));
@@ -1303,11 +1321,6 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             }
         };
         let window_time = window_started.elapsed();
-        #[cfg(target_os = "macos")]
-        if let Err(error) = set_macos_application_icon() {
-            self.fail(event_loop, error);
-            return;
-        }
         let renderer_started = Instant::now();
         let renderer = match Renderer::new(&window) {
             Ok(renderer) => renderer,
@@ -1335,10 +1348,10 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             window.theme(),
             None,
         );
-        window.request_redraw();
         self.egui = Some(state);
         self.renderer = Some(renderer);
         self.window = Some(window);
+        self.redraw(event_loop);
     }
 
     fn window_event(
@@ -1381,8 +1394,7 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             WindowEvent::CloseRequested => {
                 self.editor.request_close();
                 if self.editor.should_close {
-                    window.set_visible(false);
-                    self.editor.should_close = false;
+                    event_loop.exit();
                 } else {
                     window.request_redraw();
                 }
@@ -1448,23 +1460,49 @@ impl ApplicationHandler<InstanceEvent> for Shell {
 
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
-fn set_macos_application_icon() -> Result<(), String> {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+fn create_macos_window_without_native_title(
+    event_loop: &ActiveEventLoop,
+    attributes: winit::window::WindowAttributes,
+) -> Result<Window, winit::error::OsError> {
+    use objc::{
+        class,
+        runtime::{self, Imp, Method, Object, Sel},
+        sel, sel_impl,
+    };
 
-    let png = include_bytes!("../assets/icons/editur.png");
-    unsafe {
-        let data: *mut Object =
-            msg_send![class!(NSData), dataWithBytes: png.as_ptr() length: png.len()];
-        let image: *mut Object = msg_send![class!(NSImage), alloc];
-        let image: *mut Object = msg_send![image, initWithData: data];
-        if image.is_null() {
-            return Err("cannot decode macOS application icon".into());
-        }
-        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![application, setApplicationIconImage: image];
-        let _: () = msg_send![image, release];
+    unsafe extern "C" fn ignore_title(_: *mut Object, _: Sel, _: *mut Object) {}
+
+    struct RestoreMethod {
+        method: *mut Method,
+        implementation: Imp,
     }
-    Ok(())
+
+    impl Drop for RestoreMethod {
+        fn drop(&mut self) {
+            unsafe {
+                runtime::method_setImplementation(self.method, self.implementation);
+            }
+        }
+    }
+
+    unsafe {
+        // macOS 26 blocks for roughly two seconds when winit sets a title on a borderless window.
+        // Editur draws its own titlebar, so suppress only that synchronous creation-time call.
+        let method = runtime::class_getInstanceMethod(class!(NSWindow), sel!(setTitle:));
+        if method.is_null() {
+            return event_loop.create_window(attributes);
+        }
+        let replacement: Imp = std::mem::transmute(
+            ignore_title as unsafe extern "C" fn(*mut Object, Sel, *mut Object),
+        );
+        let restore = RestoreMethod {
+            method: method.cast_mut(),
+            implementation: runtime::method_setImplementation(method.cast_mut(), replacement),
+        };
+        let window = event_loop.create_window(attributes);
+        drop(restore);
+        window
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1520,7 +1558,7 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
 
 #[cfg(target_os = "macos")]
 fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 40.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 34.0), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -1529,7 +1567,7 @@ fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str)
     } else {
         color
     };
-    ui.painter().circle_filled(rect.center(), 6.5, fill);
+    ui.painter().circle_filled(rect.center(), 6.0, fill);
     if response.hovered() {
         ui.painter().text(
             rect.center(),
@@ -1575,6 +1613,22 @@ fn search_selection_after_navigation(
         selected.min(hit_count - 1)
     };
     (next, next != selected)
+}
+
+fn selection_drag_scroll_delta(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    frame_seconds: f32,
+) -> f32 {
+    let outside = if pointer_y < viewport_top {
+        viewport_top - pointer_y
+    } else if pointer_y > viewport_bottom {
+        viewport_bottom - pointer_y
+    } else {
+        return 0.0;
+    };
+    outside.signum() * (240.0 + outside.abs() * 16.0).min(1600.0) * frame_seconds.min(0.05)
 }
 
 fn next_find_match(selected: usize, match_count: usize, backwards: bool) -> usize {
@@ -1708,7 +1762,7 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::{
         EditorApp, TreeState, find_highlighted_job, match_spans, next_find_match, plain_text_job,
-        search_selection_after_navigation,
+        search_selection_after_navigation, selection_drag_scroll_delta,
     };
     use crate::file_io::OpenTarget;
     use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
@@ -1763,6 +1817,20 @@ mod tests {
         assert_eq!(
             search_selection_after_navigation(0, 30, false, true),
             (0, false)
+        );
+    }
+
+    #[test]
+    fn selection_drag_scroll_moves_toward_pointer_only_outside_viewport() {
+        let deltas = [
+            selection_drag_scroll_delta(80.0, 100.0, 500.0, 1.0 / 60.0),
+            selection_drag_scroll_delta(300.0, 100.0, 500.0, 1.0 / 60.0),
+            selection_drag_scroll_delta(520.0, 100.0, 500.0, 1.0 / 60.0),
+        ];
+
+        assert_eq!(
+            deltas.map(|delta| (delta * 60.0).round()),
+            [560.0, 0.0, -560.0]
         );
     }
 

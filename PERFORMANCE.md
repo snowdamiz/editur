@@ -6,17 +6,17 @@ Measured 2026-08-05 from the stripped `--release` build on a MacBook Air with an
 
 | Metric | Result | Target | Status |
 | --- | ---: | ---: | --- |
-| First-process command-to-editable-window, warm system | 2.35 s | 150 ms | Miss; down from 3.02 s with runtime shader compilation |
-| Resident open-request handoff, 10-run median | 10.2 ms | 25 ms | Pass |
-| Resident open-request handoff, 10-run p95 | 17.3 ms | 50 ms | Pass |
+| First-process command-to-editable-window, warm system | 181.00 ms | 150 ms | Near; down from 2.35 s |
+| Running-process open-request handoff, 10-run median | 10.2 ms | 25 ms | Pass |
+| Running-process open-request handoff, 10-run p95 | 17.3 ms | 50 ms | Pass |
 | Path resolution | 0.15 ms | — | Recorded |
-| Native borderless window creation | 2.08 s | — | Dominant first-process cost in this desktop-hosted session |
-| Warm Metal initialization | 3.46 ms | — | Recorded |
+| Native borderless window creation | 45.91 ms | — | Recorded |
+| Warm Metal initialization | 3.26 ms | — | Recorded |
 | Idle CPU | 0.1% | <1% | Pass |
-| Resident memory with `PLAN.md` | 73.4 MiB | 60 MiB | Miss |
+| Memory with `PLAN.md` | 73.4 MiB | 60 MiB | Miss |
 | Stripped arm64 binary | 9,189,360 bytes (8.76 MiB) | 30 MiB | Pass |
 
-The first-process startup and memory misses are release exceptions, not hidden passes. A resident process makes subsequent CLI opens fast, but it does not disguise the initial AppKit/winit window cost. Continuous macOS releases now fail unless the Metal shader library is precompiled; this machine lacks the optional command-line Metal toolchain, so the precompiled release path is compile-checked in CI rather than timed locally. Windows/D3D12 and Linux/Vulkan runtime baselines still require their native release runners.
+The startup path creates a new process, AppKit window, and Metal renderer; it does not keep a hidden resident window. The remaining 31 ms gap to the 150 ms target includes process launch, project discovery, first layout, and presentation. Continuous macOS releases fail unless the Metal shader library is precompiled; this machine lacks the optional command-line Metal toolchain, so the precompiled release path is compile-checked in CI rather than timed locally. Windows/D3D12 and Linux/Vulkan runtime baselines still require their native release runners.
 
 ## Rust highlighting
 

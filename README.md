@@ -1,6 +1,6 @@
 # Editur
 
-Editur is a small native editor for quick, focused file changes. It opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating palette, and saves through conflict-checked atomic replacement. One resident process serves later CLI opens in a few milliseconds.
+Editur is a small native editor for quick, focused file changes. It opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating palette, and saves through conflict-checked atomic replacement.
 
 It uses the host graphics API directly: Metal on macOS, Direct3D 12 on Windows 10+, and Vulkan 1.1 on Linux. There is no `wgpu` renderer or runtime graphics fallback.
 
@@ -30,7 +30,7 @@ Update that installed binary at any time from the terminal:
 editur update
 ```
 
-Both installers download the native binary from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. Set `EDITUR_INSTALL_DIR` to override the default install directory.
+Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle plus a CLI symlink; Linux and Windows install the native executable. Set `EDITUR_INSTALL_DIR` to override the default install directory.
 
 ## Build and install
 
@@ -60,7 +60,7 @@ editur syntax install ./language.editur-syntax
 editur syntax remove python
 ```
 
-`PATH` may be an existing file, a directory, or a new filename whose parent exists. The first process remains attached to its terminal and owns the resident editor. Later `editur PATH` commands forward the target to that process and return immediately; closing the window hides it so another command can reopen it without rebuilding the native window and GPU state. End the original terminal process or use the normal macOS Quit command to stop it completely.
+`PATH` may be an existing file, a directory, or a new filename whose parent exists. While Editur is open, later `editur PATH` commands forward the target to that process and return immediately. Closing the window exits the editor completely after the normal unsaved-change check.
 
 The editor wraps long lines and scrolls vertically without a horizontal scrollbar. It preserves LF/CRLF line endings and file permissions. If the file changes externally, saving stops and offers Reload, Save As, or Cancel. Invalid UTF-8 and binary input are rejected.
 
