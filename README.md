@@ -100,4 +100,4 @@ cargo run --release --locked --example build_syntax_catalog -- dist/syntax BASE_
 
 Set `EDITUR_SYNTAX_CATALOG` to test another HTTPS catalog. `EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline and [PLAN.md](PLAN.md) for the v1 product contract.
+See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, and [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan.
