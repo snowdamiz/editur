@@ -1,0 +1,54 @@
+%YAML 1.2
+---
+name: Swift
+file_extensions: [swift]
+scope: source.swift
+contexts:
+  main:
+    - match: '//'
+      scope: punctuation.definition.comment.swift
+      push: line-comment
+    - match: '/\*'
+      scope: punctuation.definition.comment.swift
+      push: block-comment
+    - match: '"""'
+      scope: punctuation.definition.string.begin.swift
+      push: multiline-string
+    - match: '"'
+      scope: punctuation.definition.string.begin.swift
+      push: string
+    - match: '\b(associatedtype|class|deinit|enum|extension|fileprivate|func|import|init|inout|internal|let|open|operator|precedencegroup|private|protocol|public|rethrows|static|struct|subscript|typealias|var|break|case|catch|continue|default|defer|do|else|fallthrough|for|guard|if|in|repeat|return|throw|switch|where|while|as|Any|false|is|nil|self|Self|super|throws|true|try|await|async|some|any)\b'
+      scope: keyword.control.swift
+    - match: '@[A-Za-z_][A-Za-z0-9_]*'
+      scope: storage.type.attribute.swift
+    - match: '#(available|selector|keyPath|file|fileID|filePath|line|column|function|dsohandle)\b'
+      scope: constant.language.swift
+    - match: '\b(0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*(\.[0-9_]+)?([eE][+-]?[0-9_]+)?)\b'
+      scope: constant.numeric.swift
+  line-comment:
+    - meta_scope: comment.line.double-slash.swift
+    - match: $\n?
+      pop: true
+  block-comment:
+    - meta_scope: comment.block.swift
+    - match: '\*/'
+      scope: punctuation.definition.comment.end.swift
+      pop: true
+  string:
+    - meta_scope: string.quoted.double.swift
+    - match: '\\\([^)]*\)'
+      scope: variable.other.interpolation.swift
+    - match: '\\.'
+      scope: constant.character.escape.swift
+    - match: '"'
+      scope: punctuation.definition.string.end.swift
+      pop: true
+    - match: $\n?
+      pop: true
+  multiline-string:
+    - meta_scope: string.quoted.triple.swift
+    - match: '\\\([^)]*\)'
+      scope: variable.other.interpolation.swift
+    - match: '"""'
+      scope: punctuation.definition.string.end.swift
+      pop: true

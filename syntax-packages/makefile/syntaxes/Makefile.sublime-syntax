@@ -1,0 +1,28 @@
+%YAML 1.2
+---
+name: Makefile
+file_extensions: [mk, mak]
+scope: source.makefile
+contexts:
+  main:
+    - match: '^\s*#'
+      scope: punctuation.definition.comment.makefile
+      push: line-comment
+    - match: '^\s*([A-Za-z0-9_.%/-]+)(\s*:)'
+      captures:
+        1: entity.name.function.target.makefile
+        2: punctuation.separator.key-value.makefile
+    - match: '^\s*([A-Za-z_][A-Za-z0-9_]*)(\s*(?:\?|\+|:)?=)'
+      captures:
+        1: variable.other.assignment.makefile
+        2: keyword.operator.assignment.makefile
+    - match: '^\s*(include|-include|sinclude|define|endef|ifdef|ifndef|ifeq|ifneq|else|endif|override|export|unexport|private|vpath)\b'
+      scope: keyword.control.makefile
+    - match: '\$[(@%<?^+*|)]|\$\([^)]+\)|\$\{[^}]+\}'
+      scope: variable.other.makefile
+    - match: '^\t.*$'
+      scope: meta.function-call.recipe.makefile
+  line-comment:
+    - meta_scope: comment.line.number-sign.makefile
+    - match: $\n?
+      pop: true

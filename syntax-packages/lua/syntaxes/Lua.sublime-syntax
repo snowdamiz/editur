@@ -1,0 +1,58 @@
+%YAML 1.2
+---
+name: Lua
+file_extensions: [lua]
+scope: source.lua
+contexts:
+  main:
+    - match: '--\[\['
+      scope: punctuation.definition.comment.lua
+      push: block-comment
+    - match: '--'
+      scope: punctuation.definition.comment.lua
+      push: line-comment
+    - match: '\[\['
+      scope: punctuation.definition.string.begin.lua
+      push: long-string
+    - match: '"'
+      scope: punctuation.definition.string.begin.lua
+      push: double-string
+    - match: "'"
+      scope: punctuation.definition.string.begin.lua
+      push: single-string
+    - match: '\b(and|break|do|else|elseif|end|false|for|function|goto|if|in|local|nil|not|or|repeat|return|then|true|until|while)\b'
+      scope: keyword.control.lua
+    - match: '\b(0[xX][0-9A-Fa-f]+|[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?)\b'
+      scope: constant.numeric.lua
+  line-comment:
+    - meta_scope: comment.line.double-dash.lua
+    - match: $\n?
+      pop: true
+  block-comment:
+    - meta_scope: comment.block.lua
+    - match: '\]\]'
+      scope: punctuation.definition.comment.end.lua
+      pop: true
+  long-string:
+    - meta_scope: string.unquoted.lua
+    - match: '\]\]'
+      scope: punctuation.definition.string.end.lua
+      pop: true
+  double-string:
+    - meta_scope: string.quoted.double.lua
+    - match: '\\.'
+      scope: constant.character.escape.lua
+    - match: '"'
+      scope: punctuation.definition.string.end.lua
+      pop: true
+    - match: $\n?
+      pop: true
+  single-string:
+    - meta_scope: string.quoted.single.lua
+    - match: '\\.'
+      scope: constant.character.escape.lua
+    - match: "'"
+      scope: punctuation.definition.string.end.lua
+      pop: true
+    - match: $\n?
+      pop: true

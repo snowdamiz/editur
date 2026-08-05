@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "dockerfile",
+  "display_name": "Dockerfile",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["dockerfile"],
+  "filenames": ["Dockerfile", "Dockerfile.dev", "Dockerfile.test", "Dockerfile.production", "Containerfile", "Containerfile.dev"],
+  "grammars": ["syntaxes/Dockerfile.sublime-syntax"],
+  "dependencies": []
+}

@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "lua",
+  "display_name": "Lua",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["lua"],
+  "filenames": [],
+  "grammars": ["syntaxes/Lua.sublime-syntax"],
+  "dependencies": []
+}

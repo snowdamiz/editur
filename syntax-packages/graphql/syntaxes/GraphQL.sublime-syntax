@@ -1,0 +1,44 @@
+%YAML 1.2
+---
+name: GraphQL
+file_extensions: [graphql, gql]
+scope: source.graphql
+contexts:
+  main:
+    - match: '#'
+      scope: punctuation.definition.comment.graphql
+      push: line-comment
+    - match: '\b(query|mutation|subscription|fragment|on|schema|type|interface|union|enum|input|directive|scalar|extend|implements|repeatable)\b'
+      scope: keyword.control.graphql
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.graphql
+    - match: '\$[A-Za-z_][A-Za-z0-9_]*'
+      scope: variable.other.graphql
+    - match: '@[A-Za-z_][A-Za-z0-9_]*'
+      scope: entity.name.function.directive.graphql
+    - match: '\b-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?\b'
+      scope: constant.numeric.graphql
+    - match: '"""'
+      scope: punctuation.definition.string.begin.graphql
+      push: block-string
+    - match: '"'
+      scope: punctuation.definition.string.begin.graphql
+      push: string
+  line-comment:
+    - meta_scope: comment.line.number-sign.graphql
+    - match: $\n?
+      pop: true
+  string:
+    - meta_scope: string.quoted.double.graphql
+    - match: '\\.'
+      scope: constant.character.escape.graphql
+    - match: '"'
+      scope: punctuation.definition.string.end.graphql
+      pop: true
+    - match: $\n?
+      pop: true
+  block-string:
+    - meta_scope: string.quoted.triple.graphql
+    - match: '"""'
+      scope: punctuation.definition.string.end.graphql
+      pop: true

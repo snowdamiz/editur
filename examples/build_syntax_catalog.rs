@@ -100,6 +100,13 @@ mod tests {
             .collect();
 
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ids.contains(&"dockerfile"));
+        assert!(ids.contains(&"dotenv"));
+        assert!(ids.contains(&"graphql"));
+        assert!(ids.contains(&"kotlin"));
+        assert!(ids.contains(&"lua"));
+        assert!(ids.contains(&"makefile"));
+        assert!(ids.contains(&"swift"));
         assert!(ids.contains(&"typescript"));
     }
 }

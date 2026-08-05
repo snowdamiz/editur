@@ -1,0 +1,46 @@
+%YAML 1.2
+---
+name: Dotenv
+file_extensions: [env]
+scope: source.dotenv
+contexts:
+  main:
+    - match: '^\s*#'
+      scope: punctuation.definition.comment.dotenv
+      push: line-comment
+    - match: '^\s*(export)\b'
+      scope: keyword.control.dotenv
+    - match: '^\s*([A-Za-z_][A-Za-z0-9_]*)(\s*=)'
+      captures:
+        1: variable.other.assignment.dotenv
+        2: keyword.operator.assignment.dotenv
+    - match: '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+      scope: variable.other.dotenv
+    - match: '"'
+      scope: punctuation.definition.string.begin.dotenv
+      push: double-string
+    - match: "'"
+      scope: punctuation.definition.string.begin.dotenv
+      push: single-string
+  line-comment:
+    - meta_scope: comment.line.number-sign.dotenv
+    - match: $\n?
+      pop: true
+  double-string:
+    - meta_scope: string.quoted.double.dotenv
+    - match: '\\.'
+      scope: constant.character.escape.dotenv
+    - match: '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?'
+      scope: variable.other.dotenv
+    - match: '"'
+      scope: punctuation.definition.string.end.dotenv
+      pop: true
+    - match: $\n?
+      pop: true
+  single-string:
+    - meta_scope: string.quoted.single.dotenv
+    - match: "'"
+      scope: punctuation.definition.string.end.dotenv
+      pop: true
+    - match: $\n?
+      pop: true

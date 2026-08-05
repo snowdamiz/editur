@@ -90,7 +90,7 @@ editur syntax install typescript
 editur syntax remove typescript
 ```
 
-The published catalog currently includes C/C++, C#, CSS, Go, HTML, Java, JavaScript, JSON, Markdown, PHP, Python, Ruby, Shell, SQL, TOML, TypeScript, XML, and YAML. CI builds deterministic data-only archives from `syntax-packages/` and publishes them to the `syntax-v1` release.
+The published catalog currently includes C/C++, C#, CSS, Dockerfile, dotenv, Go, GraphQL, HTML, Java, JavaScript, JSON, Kotlin, Lua, Makefile, Markdown, PHP, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript, XML, and YAML. CI builds deterministic data-only archives from `syntax-packages/` and publishes them to the `syntax-v1` release.
 
 Build that catalog locally with:
 

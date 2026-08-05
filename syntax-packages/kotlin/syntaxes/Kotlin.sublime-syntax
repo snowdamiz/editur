@@ -1,0 +1,66 @@
+%YAML 1.2
+---
+name: Kotlin
+file_extensions: [kt, kts]
+scope: source.kotlin
+contexts:
+  main:
+    - match: '//'
+      scope: punctuation.definition.comment.kotlin
+      push: line-comment
+    - match: '/\*'
+      scope: punctuation.definition.comment.kotlin
+      push: block-comment
+    - match: '"""'
+      scope: punctuation.definition.string.begin.kotlin
+      push: triple-string
+    - match: '"'
+      scope: punctuation.definition.string.begin.kotlin
+      push: string
+    - match: "'"
+      scope: punctuation.definition.string.begin.kotlin
+      push: character
+    - match: '\b(class|interface|object|fun|val|var|typealias|constructor|init|companion|package|import|as|is|in|this|super|typeof|where|by|get|set|field|property|receiver|param|setparam|delegate|file|expect|actual|const|lateinit|data|sealed|annotation|enum|inner|value|tailrec|operator|infix|inline|noinline|crossinline|reified|suspend|external|override|open|final|abstract|private|protected|internal|public|return|break|continue|if|else|when|try|catch|finally|throw|for|while|do)\b'
+      scope: keyword.control.kotlin
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.kotlin
+    - match: '\b(0[xX][0-9A-Fa-f_]+|0[bB][01_]+|[0-9][0-9_]*(\.[0-9_]+)?([eE][+-]?[0-9_]+)?[fFdDlL]?)\b'
+      scope: constant.numeric.kotlin
+    - match: '@[A-Za-z_][A-Za-z0-9_]*'
+      scope: storage.type.annotation.kotlin
+  line-comment:
+    - meta_scope: comment.line.double-slash.kotlin
+    - match: $\n?
+      pop: true
+  block-comment:
+    - meta_scope: comment.block.kotlin
+    - match: '\*/'
+      scope: punctuation.definition.comment.end.kotlin
+      pop: true
+  string:
+    - meta_scope: string.quoted.double.kotlin
+    - match: '\\.'
+      scope: constant.character.escape.kotlin
+    - match: '\$\{?[_A-Za-z][_A-Za-z0-9]*\}?'
+      scope: variable.other.kotlin
+    - match: '"'
+      scope: punctuation.definition.string.end.kotlin
+      pop: true
+    - match: $\n?
+      pop: true
+  triple-string:
+    - meta_scope: string.quoted.triple.kotlin
+    - match: '\$\{?[_A-Za-z][_A-Za-z0-9]*\}?'
+      scope: variable.other.kotlin
+    - match: '"""'
+      scope: punctuation.definition.string.end.kotlin
+      pop: true
+  character:
+    - meta_scope: string.quoted.single.kotlin
+    - match: '\\.'
+      scope: constant.character.escape.kotlin
+    - match: "'"
+      scope: punctuation.definition.string.end.kotlin
+      pop: true
+    - match: $\n?
+      pop: true

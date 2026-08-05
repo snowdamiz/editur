@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "dotenv",
+  "display_name": "Dotenv",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["env"],
+  "filenames": [".env", ".env.local", ".env.example", ".env.sample", ".env.development", ".env.development.local", ".env.test", ".env.test.local", ".env.staging", ".env.production", ".env.production.local"],
+  "grammars": ["syntaxes/Dotenv.sublime-syntax"],
+  "dependencies": []
+}

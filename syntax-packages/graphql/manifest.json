@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "id": "graphql",
+  "display_name": "GraphQL",
+  "version": "1.0.0",
+  "minimum_editur_version": "0.1.0",
+  "extensions": ["graphql", "gql"],
+  "filenames": [],
+  "grammars": ["syntaxes/GraphQL.sublime-syntax"],
+  "dependencies": []
+}
