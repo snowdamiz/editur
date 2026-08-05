@@ -1,4 +1,5 @@
 use std::{
+    collections::BinaryHeap,
     fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
@@ -7,6 +8,7 @@ use std::{
 };
 
 const MAX_INDEXED_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_INDEXED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const FILE_RESULT_LIMIT: usize = 10;
 const CONTENT_RESULT_LIMIT: usize = 20;
 
@@ -16,7 +18,6 @@ struct IndexedFile {
     relative_lower: String,
     filename_lower: String,
     content: Option<String>,
-    content_lower: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,38 +82,53 @@ impl SearchController {
 
 fn search_worker(root: PathBuf, requests: Receiver<String>, updates: Sender<SearchResults>) {
     let mut documents = Vec::new();
-    let mut query = String::new();
+    let mut query = loop {
+        let Ok(next) = requests.recv() else {
+            return;
+        };
+        if !next.trim().is_empty() {
+            break next;
+        }
+    };
+    drain_query(&requests, &mut query);
     let mut last_update = Instant::now();
     let completed = walk_root(&root, |document| {
         documents.push(document);
         let query_changed = drain_query(&requests, &mut query);
         if query_changed || last_update.elapsed() >= Duration::from_millis(50) {
-            if updates
-                .send(search_documents(&documents, &query, false))
-                .is_err()
-            {
+            if !publish_latest(&documents, &requests, &updates, &mut query, false) {
                 return false;
             }
             last_update = Instant::now();
         }
         true
     });
-    if !completed
-        || updates
-            .send(search_documents(&documents, &query, true))
-            .is_err()
-    {
+    if !completed || !publish_latest(&documents, &requests, &updates, &mut query, true) {
         return;
     }
 
     while let Ok(next) = requests.recv() {
         query = next;
         drain_query(&requests, &mut query);
-        if updates
-            .send(search_documents(&documents, &query, true))
-            .is_err()
-        {
+        if !publish_latest(&documents, &requests, &updates, &mut query, true) {
             break;
+        }
+    }
+}
+
+fn publish_latest(
+    documents: &[IndexedFile],
+    requests: &Receiver<String>,
+    updates: &Sender<SearchResults>,
+    query: &mut String,
+    complete: bool,
+) -> bool {
+    loop {
+        let current = query.clone();
+        if let Some(results) = search_documents_while(documents, &current, complete, || {
+            drain_query(requests, query)
+        }) {
+            return updates.send(results).is_ok();
         }
     }
 }
@@ -138,6 +154,7 @@ fn index_root(root: &Path) -> Vec<IndexedFile> {
 
 fn walk_root(root: &Path, mut visit: impl FnMut(IndexedFile) -> bool) -> bool {
     let mut directories = vec![root.to_path_buf()];
+    let mut remaining_content_bytes = MAX_INDEXED_CONTENT_BYTES;
     while let Some(directory) = directories.pop() {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
@@ -156,7 +173,7 @@ fn walk_root(root: &Path, mut visit: impl FnMut(IndexedFile) -> bool) -> bool {
                     directories.push(entry.path());
                 }
             } else if file_type.is_file()
-                && let Some(document) = index_file(root, entry.path())
+                && let Some(document) = index_file(root, entry.path(), &mut remaining_content_bytes)
                 && !visit(document)
             {
                 return false;
@@ -173,7 +190,11 @@ fn ignored_directory(name: &str) -> bool {
     )
 }
 
-fn index_file(root: &Path, path: PathBuf) -> Option<IndexedFile> {
+fn index_file(
+    root: &Path,
+    path: PathBuf,
+    remaining_content_bytes: &mut usize,
+) -> Option<IndexedFile> {
     let relative = path
         .strip_prefix(root)
         .ok()?
@@ -188,26 +209,39 @@ fn index_file(root: &Path, path: PathBuf) -> Option<IndexedFile> {
     let content = path
         .metadata()
         .ok()
-        .filter(|metadata| metadata.len() <= MAX_INDEXED_FILE_BYTES)
+        .filter(|metadata| {
+            metadata.len() <= MAX_INDEXED_FILE_BYTES
+                && metadata.len() as usize <= *remaining_content_bytes
+        })
         .and_then(|_| fs::read(&path).ok())
         .filter(|bytes| !bytes.contains(&0))
         .and_then(|bytes| String::from_utf8(bytes).ok());
-    let content_lower = content.as_ref().map(|content| {
-        let mut lower = content.clone();
-        lower.make_ascii_lowercase();
-        lower
-    });
+    if let Some(content) = &content {
+        *remaining_content_bytes -= content.len();
+    }
     Some(IndexedFile {
         path,
         relative,
         relative_lower,
         filename_lower,
         content,
-        content_lower,
     })
 }
 
+#[cfg(test)]
 fn search_documents(documents: &[IndexedFile], query: &str, complete: bool) -> SearchResults {
+    match search_documents_while(documents, query, complete, || false) {
+        Some(results) => results,
+        None => unreachable!("an uncancelled search cannot stop early"),
+    }
+}
+
+fn search_documents_while(
+    documents: &[IndexedFile],
+    query: &str,
+    complete: bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> Option<SearchResults> {
     let query = query.trim();
     let mut results = SearchResults {
         query: query.to_owned(),
@@ -216,41 +250,48 @@ fn search_documents(documents: &[IndexedFile], query: &str, complete: bool) -> S
         ..SearchResults::default()
     };
     if query.is_empty() {
-        return results;
+        return Some(results);
     }
     let mut needle = query.to_owned();
     needle.make_ascii_lowercase();
 
-    let mut files: Vec<_> = documents
-        .iter()
-        .filter_map(|document| filename_score(document, &needle).map(|score| (score, document)))
-        .collect();
-    files.sort_by(|(left_score, left), (right_score, right)| {
-        left_score
-            .cmp(right_score)
-            .then_with(|| left.relative.len().cmp(&right.relative.len()))
-            .then_with(|| left.relative.cmp(&right.relative))
-    });
+    let mut files = BinaryHeap::with_capacity(FILE_RESULT_LIMIT + 1);
+    for (index, document) in documents.iter().enumerate() {
+        if index % 64 == 0 && cancelled() {
+            return None;
+        }
+        let Some(score) = filename_score(document, &needle) else {
+            continue;
+        };
+        files.push((
+            score,
+            document.relative.len(),
+            document.relative.as_str(),
+            index,
+        ));
+        if files.len() > FILE_RESULT_LIMIT {
+            files.pop();
+        }
+    }
     results.files = files
+        .into_sorted_vec()
         .into_iter()
-        .take(FILE_RESULT_LIMIT)
-        .map(|(_, document)| SearchHit {
-            path: document.path.clone(),
-            relative: document.relative.clone(),
+        .map(|(_, _, _, index)| SearchHit {
+            path: documents[index].path.clone(),
+            relative: documents[index].relative.clone(),
             line: None,
             preview: "Filename match".into(),
         })
         .collect();
 
-    for document in documents {
-        let Some((content, content_lower)) = document
-            .content
-            .as_ref()
-            .zip(document.content_lower.as_ref())
-        else {
+    for (index, document) in documents.iter().enumerate() {
+        if index % 64 == 0 && cancelled() {
+            return None;
+        }
+        let Some(content) = document.content.as_ref() else {
             continue;
         };
-        if let Some(offset) = content_lower.find(&needle) {
+        if let Some(offset) = find_ascii_case_insensitive(content.as_bytes(), needle.as_bytes()) {
             let (line, preview) = line_preview(content, offset);
             results.contents.push(SearchHit {
                 path: document.path.clone(),
@@ -263,7 +304,13 @@ fn search_documents(documents: &[IndexedFile], query: &str, complete: bool) -> S
             }
         }
     }
-    results
+    Some(results)
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 fn filename_score(document: &IndexedFile, needle: &str) -> Option<u8> {
@@ -308,8 +355,21 @@ fn line_preview(content: &str, offset: usize) -> (usize, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_root, search_documents};
+    use super::{SearchController, index_root, search_documents};
     use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn project_index_stays_idle_until_the_first_nonempty_query() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("needle.txt"), "needle\n").unwrap();
+        let mut search = SearchController::new(temp.path().to_path_buf()).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        search.poll("");
+
+        assert!(!search.results().complete);
+    }
 
     #[test]
     fn categorizes_ranked_filename_and_content_matches() {

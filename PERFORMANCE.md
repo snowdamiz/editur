@@ -1,21 +1,22 @@
 # Performance baseline
 
-Measured 2026-08-04 from the stripped `--release` build on a MacBook Air with an Apple M4, 16 GB RAM, and macOS 26.5.2. Times are emitted by `EDITUR_LOG=debug`; resource usage was sampled after the window settled.
+Measured 2026-08-05 from the stripped `--release` build on a MacBook Air with an Apple M4, 16 GB RAM, and macOS 26.5.2. Times are emitted by `EDITUR_LOG=debug`; resource usage was sampled after the window settled.
 
 ## Native application
 
 | Metric | Result | Target | Status |
 | --- | ---: | ---: | --- |
-| Warm command-to-editable-window, 5-run median | 2.19 s | 150 ms | Miss |
-| Five-run p95 | 2.26 s | 300 ms cold p95 | Miss; this run did not isolate cold cache state |
+| First-process command-to-editable-window, warm system | 2.35 s | 150 ms | Miss; down from 3.02 s with runtime shader compilation |
+| Resident open-request handoff, 10-run median | 10.2 ms | 25 ms | Pass |
+| Resident open-request handoff, 10-run p95 | 17.3 ms | 50 ms | Pass |
 | Path resolution | 0.15 ms | — | Recorded |
-| Native window creation, median | 2.08 s | — | Dominant startup cost in this desktop-hosted session |
-| Metal initialization, median | 3.47 ms | — | Recorded |
-| Idle CPU | 0.0% | <1% | Pass |
-| Resident memory with `PLAN.md` | 67.9 MiB | 60 MiB | Miss |
-| Stripped arm64 binary | 8,029,776 bytes (7.66 MiB) | 30 MiB | Pass |
+| Native borderless window creation | 2.08 s | — | Dominant first-process cost in this desktop-hosted session |
+| Warm Metal initialization | 3.46 ms | — | Recorded |
+| Idle CPU | 0.1% | <1% | Pass |
+| Resident memory with `PLAN.md` | 73.4 MiB | 60 MiB | Miss |
+| Stripped arm64 binary | 9,189,360 bytes (8.76 MiB) | 30 MiB | Pass |
 
-The startup and memory misses are release exceptions, not hidden passes. Startup profiling points to macOS native window creation rather than path loading or Metal initialization. They should be remeasured from a packaged app outside the Codex desktop host before a v1 release is approved. Windows/D3D12 and Linux/Vulkan runtime baselines likewise require their native release runners.
+The first-process startup and memory misses are release exceptions, not hidden passes. A resident process makes subsequent CLI opens fast, but it does not disguise the initial AppKit/winit window cost. Continuous macOS releases now fail unless the Metal shader library is precompiled; this machine lacks the optional command-line Metal toolchain, so the precompiled release path is compile-checked in CI rather than timed locally. Windows/D3D12 and Linux/Vulkan runtime baselines still require their native release runners.
 
 ## Rust highlighting
 
@@ -37,4 +38,4 @@ EDITUR_LOG=debug target/release/editur PLAN.md
 cargo run --release --locked --example benchmark_highlighting
 ```
 
-Metal was launched and rendered on the reference Mac. The DX12 module passes a Windows-target Clippy build locally; its native build/test is encoded in CI. Vulkan source type-checking was exercised on the host, while the normal macOS-to-Linux check is blocked by the absence of a Linux Wayland `pkg-config` sysroot; the Ubuntu CI job is the authoritative native build. Native keyboard-only GUI smoke tests and complete resource baselines remain release-approval checks on Windows and Linux.
+Metal was launched and rendered on the reference Mac with the custom borderless chrome. The DX12 and Vulkan modules pass cross-target Clippy with warnings denied; their native runtime builds remain encoded in CI. Vulkan host checking used a metadata-only `pkg-config` shim because macOS has no Linux Wayland sysroot. Native keyboard-only GUI smoke tests and complete resource baselines remain release-approval checks on Windows and Linux.

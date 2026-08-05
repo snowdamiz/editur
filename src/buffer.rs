@@ -23,6 +23,8 @@ pub struct Buffer {
     pub dirty: bool,
     pub revision: u64,
     pub large_file_warning: bool,
+    line_starts: Vec<usize>,
+    character_len: usize,
 }
 
 impl Buffer {
@@ -47,6 +49,7 @@ impl Buffer {
         } else {
             text
         };
+        let (line_starts, character_len) = line_index(&text);
         Ok(Self {
             path,
             text,
@@ -55,6 +58,8 @@ impl Buffer {
             dirty: false,
             revision: 0,
             large_file_warning,
+            line_starts,
+            character_len,
         })
     }
 
@@ -67,6 +72,8 @@ impl Buffer {
             dirty: true,
             revision: 0,
             large_file_warning: false,
+            line_starts: vec![0],
+            character_len: 0,
         }
     }
 
@@ -80,6 +87,16 @@ impl Buffer {
     pub fn mark_changed(&mut self) {
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
+        (self.line_starts, self.character_len) = line_index(&self.text);
+    }
+
+    pub fn line_column(&self, character_offset: usize) -> (usize, usize) {
+        let offset = character_offset.min(self.character_len);
+        let line = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= offset)
+            .saturating_sub(1);
+        (line + 1, offset - self.line_starts[line] + 1)
     }
 
     pub fn mark_saved(&mut self, path: &Path, fingerprint: DiskFingerprint) {
@@ -87,6 +104,18 @@ impl Buffer {
         self.fingerprint = Some(fingerprint);
         self.dirty = false;
     }
+}
+
+fn line_index(text: &str) -> (Vec<usize>, usize) {
+    let mut starts = vec![0];
+    let mut characters = 0;
+    for character in text.chars() {
+        characters += 1;
+        if character == '\n' {
+            starts.push(characters);
+        }
+    }
+    (starts, characters)
 }
 
 #[cfg(test)]
@@ -129,5 +158,14 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cursor_position_uses_one_based_logical_lines_and_columns() {
+        let mut buffer = Buffer::new(PathBuf::from("indexed.txt"));
+        buffer.text = "one\ntwø\nthree".into();
+        buffer.mark_changed();
+
+        assert_eq!(buffer.line_column(6), (2, 3));
     }
 }

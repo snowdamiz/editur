@@ -16,7 +16,7 @@ This plan is for the engineer implementing Editur. After reading it, they should
 
 ### Assumption
 
-“Opened from the terminal” means the `editur` command launches a native desktop window and remains attached until that window closes. It does not mean the editor itself is a terminal UI. If a terminal-only UI is the actual goal, make that decision before implementation because it changes the UI framework.
+“Opened from the terminal” means the first `editur` command launches a native desktop window and owns a resident process attached to that terminal. Later commands forward their path to that process and return immediately. Closing hides the window for fast reopening; terminating the original process ends the resident editor. It does not mean the editor itself is a terminal UI.
 
 ## 2. Product contract
 
@@ -36,6 +36,7 @@ The first release must:
 - Warn before discarding unsaved work.
 - Run on macOS, Linux, and Windows 10+ from one Rust codebase.
 - Use the Editur logo for the window/application icon on every supported OS.
+- Keep one resident editor instance so subsequent CLI opens reuse the native window and graphics device.
 
 The first release will not include:
 
@@ -155,9 +156,12 @@ Do not create traits for these modules in advance. Add an interface only when a 
 - Keep UI and editor state on the main thread.
 - Do not add Tokio or another async runtime.
 - Start the recursive search index in a background thread; never wait for it before drawing the editor.
+- Do not walk the project until the first non-empty project search; cancel stale queries and cap retained indexed content.
 - Load one immutable compiled syntax set at startup.
 - Request repaint only after input or state changes; the editor should do no work while idle.
 - Create one native graphics device, queue, presentation layer/swapchain, and egui renderer for the window and reuse them for the process lifetime.
+- Reuse geometrically grown vertex/index upload buffers across frames and allow bounded frames in flight.
+- Compile Vulkan and Metal shaders during release builds; a macOS release must not compile its Metal source during application startup.
 - Hold one `String` buffer. It matches the underlying text widget and avoids converting a rope on every frame.
 - Cache the highlighted layout by buffer revision, syntax, theme, and available width.
 
@@ -245,6 +249,7 @@ Record the reference machine and measure release builds. Initial targets are:
 | --- | --- |
 | Warm command-to-editable-window | ≤150 ms median |
 | Cold command-to-editable-window | ≤300 ms at p95 |
+| Resident CLI open-request handoff | ≤25 ms median |
 | Input-to-painted-frame for a 1 MiB Rust file | <16 ms at p95 |
 | Search update after a keystroke once indexed | <50 ms at p95 |
 | Idle CPU after the window settles | <1% |

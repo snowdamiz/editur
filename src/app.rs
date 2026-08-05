@@ -20,8 +20,9 @@ use winit::{
 use crate::{
     buffer::Buffer,
     file_io::{OpenTarget, SaveError, load_buffer, safe_save},
+    instance::{Claim, InstanceEvent, claim, spawn_listener},
     renderer::Renderer,
-    search::{SearchController, SearchHit},
+    search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager, data_dir},
     tree::{TreeEntry, read_directory},
 };
@@ -29,7 +30,17 @@ use crate::{
 #[derive(Clone)]
 enum PendingAction {
     Open(PathBuf),
+    OpenTarget(OpenTarget),
     Close,
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum WindowAction {
+    Close,
+    Minimize,
+    ToggleMaximize,
+    Drag,
 }
 
 #[derive(Clone)]
@@ -43,27 +54,42 @@ struct TreeState {
     children: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     selected: Option<PathBuf>,
+    visible: Vec<VisibleEntry>,
 }
 
 impl TreeState {
     fn new(root: PathBuf, selected: Option<PathBuf>) -> Result<Self, String> {
         let root_entries = read_directory(&root)?;
-        Ok(Self {
+        let mut state = Self {
             children: HashMap::from([(root.clone(), root_entries)]),
             root,
             expanded: HashSet::new(),
             selected,
-        })
+            visible: Vec::new(),
+        };
+        state.refresh_visible();
+        Ok(state)
     }
 
-    fn visible(&self) -> Vec<VisibleEntry> {
-        let mut result = Vec::new();
-        self.append_visible(&self.root, 0, &mut result);
-        result
+    fn refresh_visible(&mut self) {
+        self.visible.clear();
+        Self::append_visible(
+            &self.children,
+            &self.expanded,
+            &self.root,
+            0,
+            &mut self.visible,
+        );
     }
 
-    fn append_visible(&self, directory: &Path, depth: usize, result: &mut Vec<VisibleEntry>) {
-        let Some(entries) = self.children.get(directory) else {
+    fn append_visible(
+        children: &HashMap<PathBuf, Vec<TreeEntry>>,
+        expanded: &HashSet<PathBuf>,
+        directory: &Path,
+        depth: usize,
+        result: &mut Vec<VisibleEntry>,
+    ) {
+        let Some(entries) = children.get(directory) else {
             return;
         };
         for entry in entries {
@@ -71,14 +97,15 @@ impl TreeState {
                 entry: entry.clone(),
                 depth,
             });
-            if entry.is_dir && self.expanded.contains(&entry.path) {
-                self.append_visible(&entry.path, depth + 1, result);
+            if entry.is_dir && expanded.contains(&entry.path) {
+                Self::append_visible(children, expanded, &entry.path, depth + 1, result);
             }
         }
     }
 
     fn toggle(&mut self, path: &Path) -> Result<(), String> {
         if self.expanded.remove(path) {
+            self.refresh_visible();
             return Ok(());
         }
         if !self.children.contains_key(path) {
@@ -86,7 +113,14 @@ impl TreeState {
                 .insert(path.to_path_buf(), read_directory(path)?);
         }
         self.expanded.insert(path.to_path_buf());
+        self.refresh_visible();
         Ok(())
+    }
+
+    fn collapse(&mut self, path: &Path) {
+        if self.expanded.remove(path) {
+            self.refresh_visible();
+        }
     }
 }
 
@@ -132,6 +166,7 @@ pub struct EditorApp {
     save_as: Option<String>,
     error: Option<String>,
     should_close: bool,
+    window_action: Option<WindowAction>,
 }
 
 impl EditorApp {
@@ -176,11 +211,16 @@ impl EditorApp {
             save_as: None,
             error: None,
             should_close: false,
+            window_action: None,
         })
     }
 
     pub fn request_close(&mut self) {
         self.request(PendingAction::Close);
+    }
+
+    fn request_target(&mut self, target: OpenTarget) {
+        self.request(PendingAction::OpenTarget(target));
     }
 
     fn request(&mut self, action: PendingAction) {
@@ -203,6 +243,10 @@ impl EditorApp {
                     self.focus_editor = true;
                     self.tree_focused = false;
                 }
+                Err(error) => self.show_error(error),
+            },
+            PendingAction::OpenTarget(target) => match Self::new(target) {
+                Ok(editor) => *self = editor,
                 Err(error) => self.show_error(error),
             },
             PendingAction::Close => self.should_close = true,
@@ -268,6 +312,9 @@ impl EditorApp {
             });
         }
 
+        #[cfg(target_os = "macos")]
+        self.draw_titlebar(root);
+
         egui::Panel::bottom("status")
             .exact_size(25.0)
             .show(root, |ui| {
@@ -304,6 +351,52 @@ impl EditorApp {
         self.draw_find(&ctx);
         self.draw_search(&ctx);
         self.draw_dialogs(&ctx);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn draw_titlebar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("titlebar")
+            .exact_size(42.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(27, 27, 36))
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(root, |ui| {
+                let rect = ui.max_rect();
+                let drag = ui.interact(rect, Id::new("titlebar_drag"), Sense::click_and_drag());
+                if drag.drag_started() {
+                    self.window_action = Some(WindowAction::Drag);
+                } else if drag.double_clicked() {
+                    self.window_action = Some(WindowAction::ToggleMaximize);
+                }
+
+                ui.horizontal(|ui| {
+                    if titlebar_button(ui, Color32::from_rgb(255, 95, 87), "×", "Close").clicked()
+                    {
+                        self.window_action = Some(WindowAction::Close);
+                    }
+                    if titlebar_button(ui, Color32::from_rgb(254, 188, 46), "−", "Minimize")
+                        .clicked()
+                    {
+                        self.window_action = Some(WindowAction::Minimize);
+                    }
+                    if titlebar_button(ui, Color32::from_rgb(40, 200, 64), "+", "Zoom").clicked() {
+                        self.window_action = Some(WindowAction::ToggleMaximize);
+                    }
+                });
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Editur",
+                    FontId::proportional(14.0),
+                    Color32::from_rgb(188, 188, 198),
+                );
+            });
+    }
+
+    fn take_window_action(&mut self) -> Option<WindowAction> {
+        self.window_action.take()
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -483,17 +576,12 @@ impl EditorApp {
         if !self.search_open {
             return;
         }
-        let results = self.search.results().clone();
-        let hits: Vec<SearchHit> = results
-            .files
-            .iter()
-            .chain(&results.contents)
-            .cloned()
-            .collect();
-        if hits.is_empty() {
+        let results = self.search.results();
+        let hit_count = results.files.len() + results.contents.len();
+        if hit_count == 0 {
             self.search_selected = 0;
         } else {
-            self.search_selected = self.search_selected.min(hits.len() - 1);
+            self.search_selected = self.search_selected.min(hit_count - 1);
         }
 
         let (down, up, enter, escape) = ctx.input(|input| {
@@ -505,12 +593,12 @@ impl EditorApp {
             )
         });
         let (selection, scroll_to_selection) =
-            search_selection_after_navigation(self.search_selected, hits.len(), down, up);
+            search_selection_after_navigation(self.search_selected, hit_count, down, up);
         self.search_selected = selection;
 
         let mut query_changed = false;
         let mut selected_path = enter
-            .then(|| hits.get(self.search_selected).map(|hit| hit.path.clone()))
+            .then(|| search_hit(results, self.search_selected).map(|hit| hit.path.clone()))
             .flatten();
         let empty_query = self.search_query.trim().is_empty();
         let palette_frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
@@ -669,7 +757,7 @@ impl EditorApp {
                                 selected_path = Some(hit.path.clone());
                             }
                         }
-                        if hits.is_empty() && results.complete {
+                        if hit_count == 0 && results.complete {
                             ui.label(RichText::new("No matches").weak());
                         }
                     });
@@ -698,14 +786,14 @@ impl EditorApp {
     }
 
     fn draw_tree(&mut self, ui: &mut egui::Ui) {
-        let entries = self.tree.visible();
         let scroll_to_selected =
-            self.tree_focused && self.pending.is_none() && self.tree_keyboard(ui, &entries);
+            self.tree_focused && self.pending.is_none() && self.tree_keyboard(ui);
+        let mut clicked = None;
         ScrollArea::vertical()
             .id_salt("file_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for visible in entries {
+                for visible in &self.tree.visible {
                     ui.horizontal(|ui| {
                         ui.add_space((visible.depth * 14) as f32);
                         let expanded = self.tree.expanded.contains(&visible.entry.path);
@@ -721,24 +809,28 @@ impl EditorApp {
                             response.scroll_to_me(None);
                         }
                         if response.clicked() && self.pending.is_none() {
-                            self.tree_focused = true;
-                            self.focus_editor = false;
-                            ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
-                            self.tree.selected = Some(visible.entry.path.clone());
-                            if visible.entry.is_dir {
-                                if let Err(error) = self.tree.toggle(&visible.entry.path) {
-                                    self.show_error(error);
-                                }
-                            } else {
-                                self.request(PendingAction::Open(visible.entry.path));
-                            }
+                            clicked = Some(visible.entry.clone());
                         }
                     });
                 }
             });
+        if let Some(entry) = clicked {
+            self.tree_focused = true;
+            self.focus_editor = false;
+            ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+            self.tree.selected = Some(entry.path.clone());
+            if entry.is_dir {
+                if let Err(error) = self.tree.toggle(&entry.path) {
+                    self.show_error(error);
+                }
+            } else {
+                self.request(PendingAction::Open(entry.path));
+            }
+        }
     }
 
-    fn tree_keyboard(&mut self, ui: &egui::Ui, entries: &[VisibleEntry]) -> bool {
+    fn tree_keyboard(&mut self, ui: &egui::Ui) -> bool {
+        let entries = &self.tree.visible;
         if entries.is_empty() {
             return false;
         }
@@ -760,7 +852,7 @@ impl EditorApp {
         if let Some(next) = next {
             self.tree.selected = Some(entries[next].entry.path.clone());
         }
-        let entry = &entries[next.unwrap_or(current)].entry;
+        let entry = entries[next.unwrap_or(current)].entry.clone();
         if ui.input(|input| input.key_pressed(Key::ArrowRight)) && entry.is_dir {
             if !self.tree.expanded.contains(&entry.path)
                 && let Err(error) = self.tree.toggle(&entry.path)
@@ -768,7 +860,7 @@ impl EditorApp {
                 self.show_error(error);
             }
         } else if ui.input(|input| input.key_pressed(Key::ArrowLeft)) && entry.is_dir {
-            self.tree.expanded.remove(&entry.path);
+            self.tree.collapse(&entry.path);
         } else if ui.input(|input| input.key_pressed(Key::Enter)) {
             if entry.is_dir {
                 if let Err(error) = self.tree.toggle(&entry.path) {
@@ -811,39 +903,32 @@ impl EditorApp {
         let cache = &mut self.highlight_cache;
         let highlighter = &self.highlighter;
         let syntaxes = &self.syntaxes;
+        let large_file = buffer.large_file_warning;
         let mut highlight_error = None;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
             if !cache.valid || cache.revision != revision || cache.syntax != syntax_name {
-                match highlighter.highlight_job_incremental(
-                    text.as_str(),
-                    syntax,
-                    syntaxes.set(),
-                    wrap_width,
-                    &mut cache.incremental,
-                ) {
-                    Ok(job) => {
-                        cache.job = job;
-                        cache.revision = revision;
-                        cache.syntax.clone_from(&syntax_name);
-                        cache.valid = true;
-                        cache.find_valid = false;
-                    }
-                    Err(error) => {
-                        highlight_error = Some(error);
-                        let mut job = LayoutJob::default();
-                        job.append(
-                            text.as_str(),
-                            0.0,
-                            TextFormat {
-                                font_id: FontId::monospace(14.0),
-                                color: Color32::LIGHT_GRAY,
-                                ..TextFormat::default()
-                            },
-                        );
-                        cache.job = job;
-                        cache.find_valid = false;
+                if large_file {
+                    cache.job = plain_text_job(text.as_str(), wrap_width);
+                    cache.incremental = IncrementalHighlightCache::default();
+                } else {
+                    match highlighter.highlight_job_incremental(
+                        text.as_str(),
+                        syntax,
+                        syntaxes.set(),
+                        wrap_width,
+                        &mut cache.incremental,
+                    ) {
+                        Ok(job) => cache.job = job,
+                        Err(error) => {
+                            highlight_error = Some(error);
+                            cache.job = plain_text_job(text.as_str(), wrap_width);
+                        }
                     }
                 }
+                cache.revision = revision;
+                cache.syntax.clone_from(&syntax_name);
+                cache.valid = true;
+                cache.find_valid = false;
             }
             let mut job = if find_open && !find_matches.is_empty() {
                 if !cache.find_valid
@@ -906,7 +991,7 @@ impl EditorApp {
             self.highlight_cache.valid = false;
         }
         if let Some(range) = output.cursor_range {
-            self.cursor = line_column(&buffer.text, range.primary.index.into());
+            self.cursor = buffer.line_column(range.primary.index.into());
         }
         if let Some(error) = highlight_error {
             self.show_error(error);
@@ -1015,8 +1100,14 @@ impl EditorApp {
 }
 
 pub fn run(target: OpenTarget, started: Instant) -> Result<(), String> {
-    let event_loop =
-        EventLoop::new().map_err(|error| format!("cannot create event loop: {error}"))?;
+    let listener = match claim(&target)? {
+        Claim::Primary(listener) => listener,
+        Claim::Forwarded => return Ok(()),
+    };
+    let event_loop = EventLoop::<InstanceEvent>::with_user_event()
+        .build()
+        .map_err(|error| format!("cannot create event loop: {error}"))?;
+    spawn_listener(listener, event_loop.create_proxy())?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut shell = Shell::new(EditorApp::new(target)?, started);
     event_loop
@@ -1077,6 +1168,19 @@ impl Shell {
         let input = state.take_egui_input(window);
         let context = state.egui_ctx().clone();
         let output = context.run_ui(input, |root| self.editor.ui(root));
+        if let Some(action) = self.editor.take_window_action() {
+            match action {
+                WindowAction::Close => self.editor.request_close(),
+                WindowAction::Minimize => window.set_minimized(true),
+                WindowAction::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+                WindowAction::Drag => {
+                    if let Err(error) = window.drag_window() {
+                        self.editor
+                            .show_error(format!("cannot drag window: {error}"));
+                    }
+                }
+            }
+        }
         if let Some(clipboard) = &mut self.clipboard {
             for command in &output.platform_output.commands {
                 if let egui::OutputCommand::CopyText(text) = command
@@ -1105,7 +1209,8 @@ impl Shell {
             self.first_frame_logged = true;
         }
         if self.editor.should_close {
-            event_loop.exit();
+            window.set_visible(false);
+            self.editor.should_close = false;
             return;
         }
         let delay = output
@@ -1125,7 +1230,7 @@ impl Shell {
     }
 }
 
-impl ApplicationHandler for Shell {
+impl ApplicationHandler<InstanceEvent> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1146,6 +1251,8 @@ impl ApplicationHandler for Shell {
             .with_inner_size(LogicalSize::new(1000, 700))
             .with_min_inner_size(LogicalSize::new(520, 320))
             .with_window_icon(Some(icon));
+        #[cfg(target_os = "macos")]
+        let attributes = attributes.with_decorations(false);
         let window_started = Instant::now();
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
@@ -1233,7 +1340,8 @@ impl ApplicationHandler for Shell {
             WindowEvent::CloseRequested => {
                 self.editor.request_close();
                 if self.editor.should_close {
-                    event_loop.exit();
+                    window.set_visible(false);
+                    self.editor.should_close = false;
                 } else {
                     window.request_redraw();
                 }
@@ -1257,6 +1365,39 @@ impl ApplicationHandler for Shell {
             self.repaint_at = None;
             if let Some(window) = &self.window {
                 window.request_redraw();
+            }
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: InstanceEvent) {
+        match event {
+            InstanceEvent::Open(target, reply) => {
+                self.editor.request_target(target);
+                if let Some(window) = &self.window {
+                    window.set_visible(true);
+                    window.focus_window();
+                    window.request_redraw();
+                }
+                let _ = reply.send(true);
+            }
+            InstanceEvent::Quit(reply) => {
+                let clean = self
+                    .editor
+                    .buffer
+                    .as_ref()
+                    .is_none_or(|buffer| !buffer.dirty);
+                let _ = reply.send(clean);
+                if clean {
+                    event_loop.exit();
+                } else {
+                    self.editor
+                        .show_error("Save or discard changes before updating Editur.".into());
+                    if let Some(window) = &self.window {
+                        window.set_visible(true);
+                        window.focus_window();
+                        window.request_redraw();
+                    }
+                }
             }
         }
     }
@@ -1307,6 +1448,54 @@ fn search_result_row(
     };
     row.paint(ui);
     response
+}
+
+fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
+    results.files.get(index).or_else(|| {
+        results
+            .contents
+            .get(index.saturating_sub(results.files.len()))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let fill = if response.hovered() {
+        color.gamma_multiply(1.12)
+    } else {
+        color
+    };
+    ui.painter().circle_filled(rect.center(), 6.5, fill);
+    if response.hovered() {
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            symbol,
+            FontId::proportional(10.0),
+            Color32::from_black_alpha(150),
+        );
+    }
+    response.on_hover_text(label)
+}
+
+fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.wrap.break_anywhere = true;
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: FontId::monospace(14.0),
+            color: Color32::LIGHT_GRAY,
+            ..TextFormat::default()
+        },
+    );
+    job
 }
 
 fn search_selection_after_navigation(
@@ -1455,24 +1644,10 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     spans
 }
 
-fn line_column(text: &str, character_offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut column = 1;
-    for character in text.chars().take(character_offset) {
-        if character == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    (line, column)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorApp, find_highlighted_job, line_column, match_spans, next_find_match,
+        EditorApp, TreeState, find_highlighted_job, match_spans, next_find_match, plain_text_job,
         search_selection_after_navigation,
     };
     use crate::file_io::OpenTarget;
@@ -1480,9 +1655,19 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn reports_one_based_line_and_column_from_character_offset() {
-        assert_eq!(line_column("one\ntwø\nthree", 6), (2, 3));
-        assert_eq!(line_column("one\n", 99), (2, 1));
+    fn file_tree_rebuilds_its_cached_rows_only_when_expansion_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("src");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("main.rs"), "").unwrap();
+        fs::write(temp.path().join("README.md"), "").unwrap();
+        let mut tree = TreeState::new(temp.path().to_path_buf(), None).unwrap();
+
+        assert_eq!(tree.visible.len(), 2);
+        tree.toggle(&directory).unwrap();
+        assert_eq!(tree.visible.len(), 3);
+        tree.collapse(&directory);
+        assert_eq!(tree.visible.len(), 2);
     }
 
     #[test]
@@ -1492,6 +1677,13 @@ mod tests {
             [0..5, 6..11, 12..17]
         );
         assert!(match_spans("Cargo", "").is_empty());
+    }
+
+    #[test]
+    fn large_file_plain_layout_preserves_text_without_syntax_sections() {
+        let job = plain_text_job("one\ntwo", 320.0);
+
+        assert_eq!((job.text, job.sections.len()), ("one\ntwo".into(), 1));
     }
 
     #[test]

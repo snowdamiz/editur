@@ -1,6 +1,6 @@
 # Editur
 
-Editur is a small native editor for quick, focused file changes. It opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating palette, and saves through conflict-checked atomic replacement.
+Editur is a small native editor for quick, focused file changes. It opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating palette, and saves through conflict-checked atomic replacement. One resident process serves later CLI opens in a few milliseconds.
 
 It uses the host graphics API directly: Metal on macOS, Direct3D 12 on Windows 10+, and Vulkan 1.1 on Linux. There is no `wgpu` renderer or runtime graphics fallback.
 
@@ -47,7 +47,7 @@ On Ubuntu/Debian, install the native window headers and Vulkan loader first:
 sudo apt-get install libwayland-dev libxkbcommon-dev libvulkan1
 ```
 
-Release builds publish `.tar.gz` archives for macOS/Linux and a `.zip` archive for Windows. Each archive includes the native platform icon. Release assets carry GitHub artifact attestations.
+Release builds publish `.tar.gz` archives for macOS/Linux and a `.zip` archive for Windows. The macOS archive contains a native `Editur.app` bundle and the CLI binary; every archive includes the native platform icon. macOS release builds require a precompiled Metal shader library, while local builds fall back to runtime compilation when the optional Apple Metal toolchain is absent. Release assets carry GitHub artifact attestations.
 
 ## Use
 
@@ -60,13 +60,13 @@ editur syntax install ./language.editur-syntax
 editur syntax remove python
 ```
 
-`PATH` may be an existing file, a directory, or a new filename whose parent exists. The process remains attached to the terminal until the window closes.
+`PATH` may be an existing file, a directory, or a new filename whose parent exists. The first process remains attached to its terminal and owns the resident editor. Later `editur PATH` commands forward the target to that process and return immediately; closing the window hides it so another command can reopen it without rebuilding the native window and GPU state. End the original terminal process or use the normal macOS Quit command to stop it completely.
 
 The editor wraps long lines and scrolls vertically without a horizontal scrollbar. It preserves LF/CRLF line endings and file permissions. If the file changes externally, saving stops and offers Reload, Save As, or Cancel. Invalid UTF-8 and binary input are rejected.
 
-Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches as the background index becomes ready.
+Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches; recursive indexing does not start until the first non-empty project query.
 
-`editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, and replaces the running installation after verification. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
+`editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, asks a clean resident editor to exit, and replaces the installation after verification. An update refuses to discard unsaved work. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
 
 ## Continuous releases
 

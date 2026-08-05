@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, ffi::c_void, mem::size_of_val};
+use std::{collections::HashMap, env, ffi::c_void, mem::size_of_val, ptr};
 
 use core_graphics_types::geometry::CGSize;
 use egui::{
@@ -6,11 +6,13 @@ use egui::{
     TexturesDelta,
     epaint::{ImageDelta, Primitive},
 };
+#[cfg(not(editur_precompiled_metal))]
+use metal::CompileOptions;
 use metal::{
-    CompileOptions, Device, MTLBlendFactor, MTLClearColor, MTLIndexType, MTLLoadAction,
-    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerMinMagFilter, MTLScissorRect, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
+    Buffer as MetalBuffer, CommandBuffer, Device, MTLBlendFactor, MTLClearColor, MTLIndexType,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLScissorRect, MTLStorageMode, MTLStoreAction,
+    MTLTextureType, MTLTextureUsage, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::{
@@ -23,67 +25,58 @@ use winit::{
     window::Window,
 };
 
-use super::choose_adapter;
+use super::{buffer_capacity, choose_adapter};
 
-const SHADER: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
+const FRAMES_IN_FLIGHT: usize = 3;
 
-struct Vertex {
-    packed_float2 pos;
-    packed_float2 uv;
-    uchar4 color;
-};
-
-struct Raster {
-    float4 position [[position]];
-    float2 uv;
-    float4 color;
-};
-
-float srgb_channel_to_linear(float value) {
-    return value <= 0.04045
-        ? value / 12.92
-        : pow((value + 0.055) / 1.055, 2.4);
-}
-
-float3 srgb_to_linear(float3 rgb) {
-    return float3(
-        srgb_channel_to_linear(rgb.r),
-        srgb_channel_to_linear(rgb.g),
-        srgb_channel_to_linear(rgb.b));
-}
-
-vertex Raster vertex_main(
-    device const Vertex *vertices [[buffer(0)]],
-    constant float2 &screen_size [[buffer(1)]],
-    uint vertex_id [[vertex_id]])
-{
-    Vertex v = vertices[vertex_id];
-    Raster out;
-    out.position = float4(
-        2.0 * v.pos.x / screen_size.x - 1.0,
-        1.0 - 2.0 * v.pos.y / screen_size.y,
-        0.0,
-        1.0);
-    out.uv = v.uv;
-    float4 color = float4(v.color) / 255.0;
-    out.color = float4(srgb_to_linear(color.rgb), color.a);
-    return out;
-}
-
-fragment float4 fragment_main(
-    Raster in [[stage_in]],
-    texture2d<float> texture [[texture(0)]],
-    sampler texture_sampler [[sampler(0)]])
-{
-    return in.color * texture.sample(texture_sampler, in.uv);
-}
-"#;
+#[cfg(editur_precompiled_metal)]
+const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.metallib"));
+#[cfg(not(editur_precompiled_metal))]
+const SHADER_SOURCE: &str = include_str!("../../assets/shaders/egui.metal");
 
 struct TextureEntry {
     texture: Texture,
     sampler: SamplerState,
+}
+
+struct FrameBuffers {
+    vertex: MetalBuffer,
+    vertex_capacity: usize,
+    index: MetalBuffer,
+    index_capacity: usize,
+    pending: Option<CommandBuffer>,
+}
+
+impl FrameBuffers {
+    fn new(device: &Device) -> Self {
+        Self {
+            vertex: device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+            vertex_capacity: 1,
+            index: device.new_buffer(1, MTLResourceOptions::StorageModeShared),
+            index_capacity: 1,
+            pending: None,
+        }
+    }
+
+    fn prepare(&mut self, device: &Device, vertex_bytes: usize, index_bytes: usize) {
+        if let Some(command) = self.pending.take() {
+            command.wait_until_completed();
+        }
+        let vertex_capacity = buffer_capacity(self.vertex_capacity, vertex_bytes);
+        if vertex_capacity != self.vertex_capacity {
+            self.vertex = device.new_buffer(
+                vertex_capacity as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            self.vertex_capacity = vertex_capacity;
+        }
+        let index_capacity = buffer_capacity(self.index_capacity, index_bytes);
+        if index_capacity != self.index_capacity {
+            self.index =
+                device.new_buffer(index_capacity as u64, MTLResourceOptions::StorageModeShared);
+            self.index_capacity = index_capacity;
+        }
+    }
 }
 
 pub struct Renderer {
@@ -92,6 +85,8 @@ pub struct Renderer {
     layer: MetalLayer,
     pipeline: RenderPipelineState,
     textures: HashMap<TextureId, TextureEntry>,
+    frames: Vec<FrameBuffers>,
+    next_frame: usize,
     size: PhysicalSize<u32>,
     adapter_name: String,
 }
@@ -116,9 +111,13 @@ impl Renderer {
             .ok_or_else(|| "Metal: selected device disappeared".to_owned())?;
         let adapter_name = device.name().to_owned();
 
-        let compile_options = CompileOptions::new();
+        #[cfg(editur_precompiled_metal)]
         let library = device
-            .new_library_with_source(SHADER, &compile_options)
+            .new_library_with_data(SHADER_LIBRARY)
+            .map_err(|error| format!("Metal shader library loading failed: {error}"))?;
+        #[cfg(not(editur_precompiled_metal))]
+        let library = device
+            .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
             .map_err(|error| format!("Metal shader compilation failed: {error}"))?;
         let vertex = library
             .get_function("vertex_main", None)
@@ -152,12 +151,17 @@ impl Renderer {
         layer.set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
 
         let command_queue = device.new_command_queue();
+        let frames = (0..FRAMES_IN_FLIGHT)
+            .map(|_| FrameBuffers::new(&device))
+            .collect();
         Ok(Self {
             device,
             command_queue,
             layer,
             pipeline,
             textures: HashMap::new(),
+            frames,
+            next_frame: 0,
             size,
             adapter_name,
         })
@@ -226,6 +230,27 @@ impl Renderer {
             screen_size.as_ptr().cast(),
         );
 
+        let total_vertex_bytes = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(size_of_val(mesh.vertices.as_slice())),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let total_index_bytes = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(size_of_val(mesh.indices.as_slice())),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let frame_index = self.next_frame;
+        self.next_frame = (self.next_frame + 1) % self.frames.len();
+        let frame = &mut self.frames[frame_index];
+        frame.prepare(&self.device, total_vertex_bytes, total_index_bytes);
+        let mut vertex_offset = 0;
+        let mut index_offset = 0;
+
         for primitive in primitives {
             let Primitive::Mesh(mesh) = &primitive.primitive else {
                 continue;
@@ -243,32 +268,38 @@ impl Renderer {
                 .ok_or_else(|| format!("Metal: missing egui texture {:?}", mesh.texture_id))?;
             let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
             let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-            let vertex_buffer = self.device.new_buffer_with_data(
-                vertices.as_ptr().cast(),
-                vertices.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let index_buffer = self.device.new_buffer_with_data(
-                indices.as_ptr().cast(),
-                indices.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    vertices.as_ptr(),
+                    frame.vertex.contents().cast::<u8>().add(vertex_offset),
+                    vertices.len(),
+                );
+                ptr::copy_nonoverlapping(
+                    indices.as_ptr(),
+                    frame.index.contents().cast::<u8>().add(index_offset),
+                    indices.len(),
+                );
+            }
             encoder.set_scissor_rect(scissor);
-            encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
+            encoder.set_vertex_buffer(0, Some(&frame.vertex), vertex_offset as u64);
             encoder.set_fragment_texture(0, Some(&texture.texture));
             encoder.set_fragment_sampler_state(0, Some(&texture.sampler));
             encoder.draw_indexed_primitives(
                 MTLPrimitiveType::Triangle,
                 mesh.indices.len() as u64,
                 MTLIndexType::UInt32,
-                &index_buffer,
-                0,
+                &frame.index,
+                index_offset as u64,
             );
+            vertex_offset += vertices.len();
+            index_offset += indices.len();
         }
 
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
+        let pending = command_buffer.to_owned();
         command_buffer.commit();
+        frame.pending = Some(pending);
         self.free_textures(&textures_delta.free);
         Ok(())
     }

@@ -30,14 +30,7 @@ pub fn read_directory(path: &Path) -> Result<Vec<TreeEntry>, String> {
             is_symlink: file_type.is_symlink(),
         });
     }
-    result.sort_by(|left, right| {
-        right.is_dir.cmp(&left.is_dir).then_with(|| {
-            left.name
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&right.name.to_string_lossy().to_lowercase())
-        })
-    });
+    result.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_string_lossy().to_lowercase()));
     Ok(result)
 }
 

@@ -19,10 +19,11 @@ use winit::{
     window::Window,
 };
 
-use super::choose_adapter;
+use super::{buffer_capacity, choose_adapter};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui_vertex.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui_fragment.spv"));
+const FRAMES_IN_FLIGHT: usize = 2;
 
 struct TextureEntry {
     image: vk::Image,
@@ -43,6 +44,19 @@ struct Swapchain {
     framebuffers: Vec<vk::Framebuffer>,
 }
 
+struct Frame {
+    command: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore,
+    fence: vk::Fence,
+    vertex: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    vertex_capacity: usize,
+    index: vk::Buffer,
+    index_memory: vk::DeviceMemory,
+    index_capacity: usize,
+}
+
 pub struct Renderer {
     _entry: Entry,
     instance: Instance,
@@ -61,9 +75,9 @@ pub struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     uniform_buffer: vk::Buffer,
     uniform_memory: vk::DeviceMemory,
-    image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
-    fence: vk::Fence,
+    screen: [f32; 2],
+    frames: Vec<Frame>,
+    next_frame: usize,
     textures: HashMap<TextureId, TextureEntry>,
     size: PhysicalSize<u32>,
     adapter_name: String,
@@ -262,14 +276,34 @@ impl Renderer {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
+        let command_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(FRAMES_IN_FLIGHT as u32);
+        let commands = unsafe { device.allocate_command_buffers(&command_info) }
+            .map_err(|error| format!("Vulkan: frame command allocation failed: {error}"))?;
         let semaphore_info = vk::SemaphoreCreateInfo::default();
-        let image_available = unsafe { device.create_semaphore(&semaphore_info, None) }
-            .map_err(|error| format!("Vulkan: semaphore creation failed: {error}"))?;
-        let render_finished = unsafe { device.create_semaphore(&semaphore_info, None) }
-            .map_err(|error| format!("Vulkan: semaphore creation failed: {error}"))?;
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let fence = unsafe { device.create_fence(&fence_info, None) }
-            .map_err(|error| format!("Vulkan: fence creation failed: {error}"))?;
+        let frames = commands
+            .into_iter()
+            .map(|command| {
+                Ok(Frame {
+                    command,
+                    image_available: unsafe { device.create_semaphore(&semaphore_info, None) }
+                        .map_err(|error| format!("Vulkan: semaphore creation failed: {error}"))?,
+                    render_finished: unsafe { device.create_semaphore(&semaphore_info, None) }
+                        .map_err(|error| format!("Vulkan: semaphore creation failed: {error}"))?,
+                    fence: unsafe { device.create_fence(&fence_info, None) }
+                        .map_err(|error| format!("Vulkan: fence creation failed: {error}"))?,
+                    vertex: vk::Buffer::null(),
+                    vertex_memory: vk::DeviceMemory::null(),
+                    vertex_capacity: 0,
+                    index: vk::Buffer::null(),
+                    index_memory: vk::DeviceMemory::null(),
+                    index_capacity: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let size = window.inner_size();
         let swapchain = create_swapchain(
             &device,
@@ -300,9 +334,9 @@ impl Renderer {
             pipeline_layout,
             uniform_buffer,
             uniform_memory,
-            image_available,
-            render_finished,
-            fence,
+            screen: [0.0; 2],
+            frames,
+            next_frame: 0,
             textures: HashMap::new(),
             size,
             adapter_name,
@@ -327,11 +361,6 @@ impl Renderer {
         primitives: &[ClippedPrimitive],
         textures_delta: &TexturesDelta,
     ) -> Result<(), String> {
-        unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|error| format!("Vulkan: waiting for frame failed: {error}"))?;
-        }
         if primitives
             .iter()
             .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_)))
@@ -350,11 +379,39 @@ impl Renderer {
         {
             self.recreate_swapchain()?;
         }
+        let screen = [
+            self.swapchain.extent.width as f32 / pixels_per_point,
+            self.swapchain.extent.height as f32 / pixels_per_point,
+        ];
+        if screen != self.screen {
+            unsafe {
+                self.device
+                    .device_wait_idle()
+                    .map_err(|error| format!("Vulkan: waiting to resize screen failed: {error}"))?;
+                let mapped = self
+                    .device
+                    .map_memory(self.uniform_memory, 0, 8, vk::MemoryMapFlags::empty())
+                    .map_err(|error| {
+                        format!("Vulkan: mapping screen-size buffer failed: {error}")
+                    })?;
+                ptr::copy_nonoverlapping(screen.as_ptr().cast::<u8>(), mapped.cast(), 8);
+                self.device.unmap_memory(self.uniform_memory);
+            }
+            self.screen = screen;
+        }
+        let frame_index = self.next_frame;
+        let frame_fence = self.frames[frame_index].fence;
+        let image_available = self.frames[frame_index].image_available;
+        unsafe {
+            self.device
+                .wait_for_fences(&[frame_fence], true, u64::MAX)
+                .map_err(|error| format!("Vulkan: waiting for frame failed: {error}"))?;
+        }
         let image_index = match unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain.handle,
                 u64::MAX,
-                self.image_available,
+                image_available,
                 vk::Fence::null(),
             )
         } {
@@ -365,22 +422,61 @@ impl Renderer {
             }
             Err(error) => return Err(format!("Vulkan: acquiring swapchain image failed: {error}")),
         };
-        let screen = [
-            self.swapchain.extent.width as f32 / pixels_per_point,
-            self.swapchain.extent.height as f32 / pixels_per_point,
-        ];
+        let frame = &mut self.frames[frame_index];
+        let vertex_size = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => {
+                    Some(mesh.vertices.len() * size_of::<egui::epaint::Vertex>())
+                }
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let index_size = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(mesh.indices.len() * size_of::<u32>()),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        ensure_frame_buffer(
+            &self.device,
+            &self.memory_properties,
+            &mut frame.vertex,
+            &mut frame.vertex_memory,
+            &mut frame.vertex_capacity,
+            vertex_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        ensure_frame_buffer(
+            &self.device,
+            &self.memory_properties,
+            &mut frame.index,
+            &mut frame.index_memory,
+            &mut frame.index_capacity,
+            index_size,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        )?;
+        copy_meshes(
+            &self.device,
+            primitives,
+            frame.vertex_memory,
+            frame.index_memory,
+        )?;
         unsafe {
-            let mapped = self
-                .device
-                .map_memory(self.uniform_memory, 0, 8, vk::MemoryMapFlags::empty())
-                .map_err(|error| format!("Vulkan: mapping screen-size buffer failed: {error}"))?;
-            ptr::copy_nonoverlapping(screen.as_ptr().cast::<u8>(), mapped.cast(), 8);
-            self.device.unmap_memory(self.uniform_memory);
             self.device
-                .reset_fences(&[self.fence])
+                .reset_fences(&[frame.fence])
                 .map_err(|error| format!("Vulkan: resetting frame fence failed: {error}"))?;
+            self.device
+                .reset_command_buffer(frame.command, vk::CommandBufferResetFlags::empty())
+                .map_err(|error| format!("Vulkan: resetting frame commands failed: {error}"))?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(frame.command, &begin)
+                .map_err(|error| format!("Vulkan: beginning frame commands failed: {error}"))?;
         }
-        let command = self.begin_commands()?;
+        let command = frame.command;
         let clear = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.055, 0.063, 0.082, 1.0],
@@ -402,8 +498,21 @@ impl Renderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.swapchain.pipeline,
             );
+            self.device.cmd_set_viewport(
+                command,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.swapchain.extent.width as f32,
+                    height: self.swapchain.extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
         }
-        let mut frame_buffers = Vec::new();
+        let mut vertex_offset = 0;
+        let mut index_offset = 0;
         for primitive in primitives {
             let Primitive::Mesh(mesh) = &primitive.primitive else {
                 continue;
@@ -411,37 +520,33 @@ impl Renderer {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
             }
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+            let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
             let Some(scissor) =
                 scissor_rect(primitive.clip_rect, pixels_per_point, self.swapchain.extent)
             else {
+                vertex_offset += vertex_bytes.len();
+                index_offset += index_bytes.len();
                 continue;
             };
             let texture = self
                 .textures
                 .get(&mesh.texture_id)
                 .ok_or_else(|| format!("Vulkan: missing egui texture {:?}", mesh.texture_id))?;
-            let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
-            let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-            let vertex = self.upload_buffer(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-            let index = self.upload_buffer(index_bytes, vk::BufferUsageFlags::INDEX_BUFFER)?;
             unsafe {
-                self.device.cmd_set_viewport(
+                self.device.cmd_set_scissor(command, 0, &[scissor]);
+                self.device.cmd_bind_vertex_buffers(
                     command,
                     0,
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: self.swapchain.extent.width as f32,
-                        height: self.swapchain.extent.height as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
+                    &[frame.vertex],
+                    &[vertex_offset as u64],
                 );
-                self.device.cmd_set_scissor(command, 0, &[scissor]);
-                self.device
-                    .cmd_bind_vertex_buffers(command, 0, &[vertex.0], &[0]);
-                self.device
-                    .cmd_bind_index_buffer(command, index.0, 0, vk::IndexType::UINT32);
+                self.device.cmd_bind_index_buffer(
+                    command,
+                    frame.index,
+                    index_offset as u64,
+                    vk::IndexType::UINT32,
+                );
                 self.device.cmd_bind_descriptor_sets(
                     command,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -453,16 +558,16 @@ impl Renderer {
                 self.device
                     .cmd_draw_indexed(command, mesh.indices.len() as u32, 1, 0, 0, 0);
             }
-            frame_buffers.push(vertex);
-            frame_buffers.push(index);
+            vertex_offset += vertex_bytes.len();
+            index_offset += index_bytes.len();
         }
         unsafe {
             self.device.cmd_end_render_pass(command);
             self.device
                 .end_command_buffer(command)
                 .map_err(|error| format!("Vulkan: ending command buffer failed: {error}"))?;
-            let wait_semaphores = [self.image_available];
-            let signal_semaphores = [self.render_finished];
+            let wait_semaphores = [frame.image_available];
+            let signal_semaphores = [frame.render_finished];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let commands = [command];
             let submit = [vk::SubmitInfo::default()
@@ -471,7 +576,7 @@ impl Renderer {
                 .command_buffers(&commands)
                 .signal_semaphores(&signal_semaphores)];
             self.device
-                .queue_submit(self.queue, &submit, self.fence)
+                .queue_submit(self.queue, &submit, frame.fence)
                 .map_err(|error| format!("Vulkan: queue submission failed: {error}"))?;
             let swapchains = [self.swapchain.handle];
             let image_indices = [image_index];
@@ -484,17 +589,16 @@ impl Renderer {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
                 Err(error) => return Err(format!("Vulkan: presenting frame failed: {error}")),
             };
-            self.device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|error| format!("Vulkan: waiting for submitted frame failed: {error}"))?;
-            for (buffer, memory) in frame_buffers {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
-            }
-            self.device
-                .free_command_buffers(self.command_pool, &[command]);
             if recreate {
                 self.recreate_swapchain()?;
+            }
+        }
+        self.next_frame = (frame_index + 1) % self.frames.len();
+        if !textures_delta.free.is_empty() {
+            unsafe {
+                self.device
+                    .device_wait_idle()
+                    .map_err(|error| format!("Vulkan: waiting to free textures failed: {error}"))?;
             }
         }
         self.free_textures(&textures_delta.free);
@@ -530,6 +634,13 @@ impl Renderer {
         let ImageData::Color(image) = &delta.image;
         let [width, height] = image.size;
         if delta.pos.is_none() {
+            if self.textures.contains_key(&id) {
+                unsafe {
+                    self.device.device_wait_idle().map_err(|error| {
+                        format!("Vulkan: waiting to replace texture failed: {error}")
+                    })?;
+                }
+            }
             if let Some(old) = self.textures.remove(&id) {
                 self.destroy_texture(old);
             }
@@ -824,9 +935,19 @@ impl Drop for Renderer {
             }
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain.handle, None);
-            self.device.destroy_fence(self.fence, None);
-            self.device.destroy_semaphore(self.render_finished, None);
-            self.device.destroy_semaphore(self.image_available, None);
+            for frame in self.frames.drain(..) {
+                if frame.vertex != vk::Buffer::null() {
+                    self.device.destroy_buffer(frame.vertex, None);
+                    self.device.free_memory(frame.vertex_memory, None);
+                }
+                if frame.index != vk::Buffer::null() {
+                    self.device.destroy_buffer(frame.index, None);
+                    self.device.free_memory(frame.index_memory, None);
+                }
+                self.device.destroy_fence(frame.fence, None);
+                self.device.destroy_semaphore(frame.render_finished, None);
+                self.device.destroy_semaphore(frame.image_available, None);
+            }
             self.device.destroy_buffer(self.uniform_buffer, None);
             self.device.free_memory(self.uniform_memory, None);
             self.device
@@ -1131,6 +1252,79 @@ fn create_buffer(
     unsafe { device.bind_buffer_memory(buffer, memory, 0) }
         .map_err(|error| format!("Vulkan: binding buffer memory failed: {error}"))?;
     Ok((buffer, memory))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_frame_buffer(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    buffer: &mut vk::Buffer,
+    memory: &mut vk::DeviceMemory,
+    capacity: &mut usize,
+    needed: usize,
+    usage: vk::BufferUsageFlags,
+) -> Result<(), String> {
+    let new_capacity = buffer_capacity(*capacity, needed);
+    if new_capacity == *capacity {
+        return Ok(());
+    }
+    let (new_buffer, new_memory) = create_buffer(
+        device,
+        memory_properties,
+        new_capacity as u64,
+        usage,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    if *buffer != vk::Buffer::null() {
+        unsafe {
+            device.destroy_buffer(*buffer, None);
+            device.free_memory(*memory, None);
+        }
+    }
+    (*buffer, *memory) = (new_buffer, new_memory);
+    *capacity = new_capacity;
+    Ok(())
+}
+
+fn copy_meshes(
+    device: &ash::Device,
+    primitives: &[ClippedPrimitive],
+    vertex_memory: vk::DeviceMemory,
+    index_memory: vk::DeviceMemory,
+) -> Result<(), String> {
+    copy_mesh_bytes(device, primitives, vertex_memory, true)?;
+    copy_mesh_bytes(device, primitives, index_memory, false)
+}
+
+fn copy_mesh_bytes(
+    device: &ash::Device,
+    primitives: &[ClippedPrimitive],
+    memory: vk::DeviceMemory,
+    vertices: bool,
+) -> Result<(), String> {
+    if memory == vk::DeviceMemory::null() {
+        return Ok(());
+    }
+    unsafe {
+        let mapped = device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .map_err(|error| format!("Vulkan: mapping frame buffer failed: {error}"))?;
+        let mut offset = 0;
+        for primitive in primitives {
+            let Primitive::Mesh(mesh) = &primitive.primitive else {
+                continue;
+            };
+            let bytes: &[u8] = if vertices {
+                bytemuck::cast_slice(mesh.vertices.as_slice())
+            } else {
+                bytemuck::cast_slice(mesh.indices.as_slice())
+            };
+            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
+            offset += bytes.len();
+        }
+        device.unmap_memory(memory);
+    }
+    Ok(())
 }
 
 fn memory_type(

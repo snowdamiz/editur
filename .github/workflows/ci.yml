@@ -57,6 +57,12 @@ jobs:
       - name: Install Linux window dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Install Apple Metal compiler
+        if: runner.os == 'macOS'
+        run: |
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
@@ -66,6 +72,7 @@ jobs:
       - name: Build release binary
         env:
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
+          EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
       - name: Package Unix binary
         if: runner.os != 'Windows'
@@ -73,7 +80,10 @@ jobs:
           mkdir -p dist/package
           cp target/release/editur dist/package/
           if [ "$RUNNER_OS" = "macOS" ]; then
-            cp assets/icons/editur.icns dist/package/
+            mkdir -p dist/package/Editur.app/Contents/MacOS dist/package/Editur.app/Contents/Resources
+            cp target/release/editur dist/package/Editur.app/Contents/MacOS/
+            cp assets/macos/Info.plist dist/package/Editur.app/Contents/
+            cp assets/icons/editur.icns dist/package/Editur.app/Contents/Resources/Editur.icns
           else
             cp assets/icons/editur.png dist/package/
           fi

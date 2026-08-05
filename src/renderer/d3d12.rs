@@ -23,7 +23,7 @@ use winit::{
     window::Window,
 };
 
-use super::choose_adapter;
+use super::{buffer_capacity, choose_adapter};
 
 const FRAME_COUNT: u32 = 2;
 const MAX_TEXTURES: u32 = 1024;
@@ -77,12 +77,23 @@ struct TextureEntry {
     height: u32,
 }
 
+struct Frame {
+    allocator: ID3D12CommandAllocator,
+    commands: ID3D12GraphicsCommandList,
+    vertex: Option<ID3D12Resource>,
+    vertex_capacity: usize,
+    index: Option<ID3D12Resource>,
+    index_capacity: usize,
+    fence_value: u64,
+}
+
 pub struct Renderer {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     swapchain: IDXGISwapChain3,
-    allocator: ID3D12CommandAllocator,
-    commands: ID3D12GraphicsCommandList,
+    upload_allocator: ID3D12CommandAllocator,
+    upload_commands: ID3D12GraphicsCommandList,
+    frames: Vec<Frame>,
     root_signature: ID3D12RootSignature,
     pipeline: ID3D12PipelineState,
     rtv_heap: ID3D12DescriptorHeap,
@@ -193,10 +204,6 @@ impl Renderer {
         let swapchain: IDXGISwapChain3 = swapchain1
             .cast()
             .map_err(|error| format!("D3D12: IDXGISwapChain3 is unavailable: {error}"))?;
-        let allocator: ID3D12CommandAllocator =
-            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
-                .map_err(|error| format!("D3D12: command allocator creation failed: {error}"))?;
-
         let ranges = [
             D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -353,12 +360,45 @@ impl Renderer {
         let pipeline: ID3D12PipelineState =
             unsafe { device.CreateGraphicsPipelineState(&pipeline_description) }
                 .map_err(|error| format!("D3D12: graphics pipeline creation failed: {error}"))?;
-        let commands: ID3D12GraphicsCommandList = unsafe {
-            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pipeline)
+        let upload_allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+                .map_err(|error| format!("D3D12: upload allocator creation failed: {error}"))?;
+        let upload_commands: ID3D12GraphicsCommandList = unsafe {
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &upload_allocator, None)
         }
-        .map_err(|error| format!("D3D12: command list creation failed: {error}"))?;
-        unsafe { commands.Close() }
-            .map_err(|error| format!("D3D12: closing initial command list failed: {error}"))?;
+        .map_err(|error| format!("D3D12: upload command list creation failed: {error}"))?;
+        unsafe { upload_commands.Close() }
+            .map_err(|error| format!("D3D12: closing upload command list failed: {error}"))?;
+        let frames = (0..FRAME_COUNT)
+            .map(|_| {
+                let allocator: ID3D12CommandAllocator =
+                    unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+                        .map_err(|error| {
+                            format!("D3D12: frame allocator creation failed: {error}")
+                        })?;
+                let commands: ID3D12GraphicsCommandList = unsafe {
+                    device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        &pipeline,
+                    )
+                }
+                .map_err(|error| format!("D3D12: frame command list creation failed: {error}"))?;
+                unsafe { commands.Close() }.map_err(|error| {
+                    format!("D3D12: closing frame command list failed: {error}")
+                })?;
+                Ok(Frame {
+                    allocator,
+                    commands,
+                    vertex: None,
+                    vertex_capacity: 0,
+                    index: None,
+                    index_capacity: 0,
+                    fence_value: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let rtv_heap =
             descriptor_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, FRAME_COUNT, false)?;
         let srv_heap = descriptor_heap(
@@ -389,8 +429,9 @@ impl Renderer {
             device,
             queue,
             swapchain,
-            allocator,
-            commands,
+            upload_allocator,
+            upload_commands,
+            frames,
             root_signature,
             pipeline,
             rtv_heap,
@@ -446,15 +487,51 @@ impl Renderer {
         if description.Width != self.size.width || description.Height != self.size.height {
             self.recreate_swapchain()?;
         }
+        let frame_index = unsafe { self.swapchain.GetCurrentBackBufferIndex() } as usize;
+        self.wait_for(self.frames[frame_index].fence_value);
+        let vertex_size = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => {
+                    Some(mesh.vertices.len() * size_of::<egui::epaint::Vertex>())
+                }
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let index_size = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(mesh.indices.len() * size_of::<u32>()),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let frame = &mut self.frames[frame_index];
+        ensure_upload_buffer(
+            &self.device,
+            &mut frame.vertex,
+            &mut frame.vertex_capacity,
+            vertex_size,
+        )?;
+        ensure_upload_buffer(
+            &self.device,
+            &mut frame.index,
+            &mut frame.index_capacity,
+            index_size,
+        )?;
+        copy_meshes(primitives, frame.vertex.as_ref(), frame.index.as_ref())?;
         unsafe {
-            self.allocator
+            frame
+                .allocator
                 .Reset()
                 .map_err(|error| format!("D3D12: command allocator reset failed: {error}"))?;
-            self.commands
-                .Reset(&self.allocator, &self.pipeline)
+            frame
+                .commands
+                .Reset(&frame.allocator, &self.pipeline)
                 .map_err(|error| format!("D3D12: command list reset failed: {error}"))?;
-            self.commands.SetGraphicsRootSignature(&self.root_signature);
-            self.commands.SetDescriptorHeaps(&[
+            frame
+                .commands
+                .SetGraphicsRootSignature(&self.root_signature);
+            frame.commands.SetDescriptorHeaps(&[
                 Some(self.srv_heap.clone()),
                 Some(self.sampler_heap.clone()),
             ]);
@@ -462,31 +539,36 @@ impl Renderer {
                 self.size.width as f32 / pixels_per_point,
                 self.size.height as f32 / pixels_per_point,
             ];
-            self.commands
+            frame
+                .commands
                 .SetGraphicsRoot32BitConstants(0, 2, screen.as_ptr().cast::<c_void>(), 0);
-            self.commands
+            frame
+                .commands
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
-        let frame = unsafe { self.swapchain.GetCurrentBackBufferIndex() };
         transition(
-            &self.commands,
-            &self.targets[frame as usize],
+            &frame.commands,
+            &self.targets[frame_index],
             D3D12_RESOURCE_STATE_PRESENT,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
-        let rtv = cpu_handle(&self.rtv_heap, self.rtv_step, frame);
+        let rtv = cpu_handle(&self.rtv_heap, self.rtv_step, frame_index as u32);
         unsafe {
-            self.commands.OMSetRenderTargets(1, Some(&rtv), false, None);
-            self.commands
+            frame
+                .commands
+                .OMSetRenderTargets(1, Some(&rtv), false, None);
+            frame
+                .commands
                 .ClearRenderTargetView(rtv, &[0.055, 0.063, 0.082, 1.0], None);
-            self.commands.RSSetViewports(&[D3D12_VIEWPORT {
+            frame.commands.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: self.size.width as f32,
                 Height: self.size.height as f32,
                 MaxDepth: 1.0,
                 ..Default::default()
             }]);
         }
-        let mut uploads = Vec::new();
+        let mut vertex_offset = 0;
+        let mut index_offset = 0;
         for primitive in primitives {
             let Primitive::Mesh(mesh) = &primitive.primitive else {
                 continue;
@@ -494,57 +576,61 @@ impl Renderer {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
             }
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+            let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
             let Some(scissor) = scissor_rect(primitive.clip_rect, pixels_per_point, self.size)
             else {
+                vertex_offset += vertex_bytes.len();
+                index_offset += index_bytes.len();
                 continue;
             };
             let texture = self
                 .textures
                 .get(&mesh.texture_id)
                 .ok_or_else(|| format!("D3D12: missing egui texture {:?}", mesh.texture_id))?;
-            let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
-            let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-            let vertex = upload_resource(&self.device, vertex_bytes)?;
-            let index = upload_resource(&self.device, index_bytes)?;
             let vertex_view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: unsafe { vertex.GetGPUVirtualAddress() },
+                BufferLocation: unsafe { frame.vertex.as_ref().unwrap().GetGPUVirtualAddress() }
+                    + vertex_offset as u64,
                 SizeInBytes: vertex_bytes.len() as u32,
                 StrideInBytes: size_of::<egui::epaint::Vertex>() as u32,
             };
             let index_view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: unsafe { index.GetGPUVirtualAddress() },
+                BufferLocation: unsafe { frame.index.as_ref().unwrap().GetGPUVirtualAddress() }
+                    + index_offset as u64,
                 SizeInBytes: index_bytes.len() as u32,
                 Format: DXGI_FORMAT_R32_UINT,
             };
             unsafe {
-                self.commands.RSSetScissorRects(&[scissor]);
-                self.commands.IASetVertexBuffers(0, Some(&[vertex_view]));
-                self.commands.IASetIndexBuffer(Some(&index_view));
-                self.commands.SetGraphicsRootDescriptorTable(
+                frame.commands.RSSetScissorRects(&[scissor]);
+                frame.commands.IASetVertexBuffers(0, Some(&[vertex_view]));
+                frame.commands.IASetIndexBuffer(Some(&index_view));
+                frame.commands.SetGraphicsRootDescriptorTable(
                     1,
                     gpu_handle(&self.srv_heap, self.srv_step, texture.slot),
                 );
-                self.commands.SetGraphicsRootDescriptorTable(
+                frame.commands.SetGraphicsRootDescriptorTable(
                     2,
                     gpu_handle(&self.sampler_heap, self.sampler_step, texture.slot),
                 );
-                self.commands
+                frame
+                    .commands
                     .DrawIndexedInstanced(mesh.indices.len() as u32, 1, 0, 0, 0);
             }
-            uploads.push(vertex);
-            uploads.push(index);
+            vertex_offset += vertex_bytes.len();
+            index_offset += index_bytes.len();
         }
         transition(
-            &self.commands,
-            &self.targets[frame as usize],
+            &frame.commands,
+            &self.targets[frame_index],
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             D3D12_RESOURCE_STATE_PRESENT,
         );
         unsafe {
-            self.commands
+            frame
+                .commands
                 .Close()
                 .map_err(|error| format!("D3D12: closing command list failed: {error}"))?;
-            let list: ID3D12CommandList = self
+            let list: ID3D12CommandList = self.frames[frame_index]
                 .commands
                 .cast()
                 .map_err(|error| format!("D3D12: command list interface failed: {error}"))?;
@@ -554,8 +640,13 @@ impl Renderer {
                 .ok()
                 .map_err(|error| format!("D3D12: presenting frame failed: {error}"))?;
         }
-        self.wait_gpu()?;
-        drop(uploads);
+        self.fence_value = self.fence_value.wrapping_add(1);
+        unsafe { self.queue.Signal(&self.fence, self.fence_value) }
+            .map_err(|error| format!("D3D12: signaling frame fence failed: {error}"))?;
+        self.frames[frame_index].fence_value = self.fence_value;
+        if !textures_delta.free.is_empty() {
+            self.wait_gpu()?;
+        }
         self.free_textures(&textures_delta.free);
         Ok(())
     }
@@ -582,6 +673,9 @@ impl Renderer {
         let ImageData::Color(image) = &delta.image;
         let [width, height] = image.size;
         if delta.pos.is_none() {
+            if self.textures.contains_key(&id) {
+                self.wait_gpu()?;
+            }
             if let Some(old) = self.textures.remove(&id) {
                 self.free_slots.push(old.slot);
             }
@@ -674,16 +768,16 @@ impl Renderer {
                 );
             }
             upload.Unmap(0, None);
-            self.allocator
+            self.upload_allocator
                 .Reset()
                 .map_err(|error| format!("D3D12: upload allocator reset failed: {error}"))?;
-            self.commands
-                .Reset(&self.allocator, None)
+            self.upload_commands
+                .Reset(&self.upload_allocator, None)
                 .map_err(|error| format!("D3D12: upload command reset failed: {error}"))?;
         }
         if !is_full {
             transition(
-                &self.commands,
+                &self.upload_commands,
                 texture,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -713,21 +807,27 @@ impl Renderer {
             },
         };
         unsafe {
-            self.commands
-                .CopyTextureRegion(&destination, offset[0], offset[1], 0, &source, None);
+            self.upload_commands.CopyTextureRegion(
+                &destination,
+                offset[0],
+                offset[1],
+                0,
+                &source,
+                None,
+            );
         }
         transition(
-            &self.commands,
+            &self.upload_commands,
             texture,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
         unsafe {
-            self.commands
+            self.upload_commands
                 .Close()
                 .map_err(|error| format!("D3D12: closing texture upload failed: {error}"))?;
             let list: ID3D12CommandList = self
-                .commands
+                .upload_commands
                 .cast()
                 .map_err(|error| format!("D3D12: upload command interface failed: {error}"))?;
             self.queue.ExecuteCommandLists(&[Some(list)]);
@@ -745,6 +845,12 @@ impl Renderer {
             std::thread::yield_now();
         }
         Ok(())
+    }
+
+    fn wait_for(&self, value: u64) {
+        while unsafe { self.fence.GetCompletedValue() } < value {
+            std::thread::yield_now();
+        }
     }
 
     fn free_textures(&mut self, ids: &[TextureId]) {
@@ -862,17 +968,59 @@ fn bytecode(blob: &ID3DBlob) -> D3D12_SHADER_BYTECODE {
     }
 }
 
-fn upload_resource(device: &ID3D12Device, bytes: &[u8]) -> Result<ID3D12Resource, String> {
-    let resource = committed_buffer(device, bytes.len() as u64)?;
+fn ensure_upload_buffer(
+    device: &ID3D12Device,
+    resource: &mut Option<ID3D12Resource>,
+    capacity: &mut usize,
+    needed: usize,
+) -> Result<(), String> {
+    let new_capacity = buffer_capacity(*capacity, needed);
+    if new_capacity == *capacity {
+        return Ok(());
+    }
+    *resource = Some(committed_buffer(device, new_capacity as u64)?);
+    *capacity = new_capacity;
+    Ok(())
+}
+
+fn copy_meshes(
+    primitives: &[ClippedPrimitive],
+    vertex: Option<&ID3D12Resource>,
+    index: Option<&ID3D12Resource>,
+) -> Result<(), String> {
+    copy_mesh_bytes(primitives, vertex, true)?;
+    copy_mesh_bytes(primitives, index, false)
+}
+
+fn copy_mesh_bytes(
+    primitives: &[ClippedPrimitive],
+    resource: Option<&ID3D12Resource>,
+    vertices: bool,
+) -> Result<(), String> {
+    let Some(resource) = resource else {
+        return Ok(());
+    };
     unsafe {
         let mut mapped = ptr::null_mut();
         resource
             .Map(0, None, Some(&mut mapped))
             .map_err(|error| format!("D3D12: mapping upload buffer failed: {error}"))?;
-        ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast(), bytes.len());
+        let mut offset = 0;
+        for primitive in primitives {
+            let Primitive::Mesh(mesh) = &primitive.primitive else {
+                continue;
+            };
+            let bytes: &[u8] = if vertices {
+                bytemuck::cast_slice(mesh.vertices.as_slice())
+            } else {
+                bytemuck::cast_slice(mesh.indices.as_slice())
+            };
+            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
+            offset += bytes.len();
+        }
         resource.Unmap(0, None);
     }
-    Ok(resource)
+    Ok(())
 }
 
 fn committed_buffer(device: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {

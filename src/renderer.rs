@@ -12,6 +12,14 @@ fn choose_adapter(adapters: &[(&str, bool, bool)], requested: Option<&str>) -> O
         .or_else(|| adapters.iter().position(|(_, _, headless)| !headless))
 }
 
+fn buffer_capacity(current: usize, needed: usize) -> usize {
+    if needed <= current {
+        current
+    } else {
+        needed.checked_next_power_of_two().unwrap_or(needed)
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
@@ -32,7 +40,13 @@ compile_error!("editur supports macOS, Windows, and Linux");
 
 #[cfg(test)]
 mod tests {
-    use super::choose_adapter;
+    use super::{buffer_capacity, choose_adapter};
+
+    #[test]
+    fn upload_buffers_grow_geometrically_and_never_shrink() {
+        assert_eq!(buffer_capacity(1024, 1025), 2048);
+        assert_eq!(buffer_capacity(2048, 64), 2048);
+    }
 
     #[test]
     fn explicit_adapter_wins_then_low_power_is_preferred() {

@@ -31,6 +31,9 @@ pub fn run() -> Result<(), String> {
         println!("Editur is already up to date.");
         return Ok(());
     }
+    if !crate::instance::quit_running()? {
+        return Err("save or discard changes in the running editor before updating".into());
+    }
 
     #[cfg(unix)]
     {
