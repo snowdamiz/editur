@@ -10,6 +10,7 @@ use crate::renderer::mark_retained;
 
 const LINE_HEIGHT: f32 = 18.0;
 const TEXT_LEFT_PADDING: f32 = 4.0;
+pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 25, 30);
 
 struct RetainedLine {
     job: LayoutJob,
@@ -34,6 +35,7 @@ pub struct EditorSurface {
     cursor: usize,
     h_pos: Option<f32>,
     scroll_y: f32,
+    scroll_drag_offset: Option<f32>,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     lines: Vec<RetainedLine>,
@@ -120,19 +122,20 @@ impl EditorSurface {
     ) -> EditorOutput {
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
-        let mut response = ui.interact(rect, Id::new("editor"), Sense::click_and_drag());
+        let editor_rect = rect.with_max_x(rect.right() - crate::scrollbar::WIDTH);
+        let mut response = ui.interact(editor_rect, Id::new("editor"), Sense::click_and_drag());
         if ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
-                .is_some_and(|pointer| rect.contains(pointer))
+                .is_some_and(|pointer| editor_rect.contains(pointer))
         }) {
             ui.output_mut(|output| output.cursor_icon = CursorIcon::Text);
         }
         let gutter_width = gutter_width(self.lines.len().max(line_count(text)));
         let content = Rect::from_min_max(
             egui::pos2(rect.left() + gutter_width, rect.top()),
-            rect.right_bottom(),
+            editor_rect.right_bottom(),
         );
         let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
         self.sync_lines(highlighted, visual_revision, wrap_width);
@@ -141,7 +144,12 @@ impl EditorSurface {
         if request_focus {
             response.request_focus();
         }
-        if response.hovered() {
+        if ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pointer| rect.contains(pointer))
+        }) {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 self.scroll_y -= scroll;
@@ -200,6 +208,17 @@ impl EditorSurface {
         self.paint(ui, rect, content, response.has_focus());
         if response.has_focus() {
             self.update_ime(ui, rect, content);
+        }
+        if crate::scrollbar::show(
+            ui,
+            Id::new("editor_scrollbar"),
+            rect,
+            self.offsets.last().copied().unwrap_or(0.0),
+            &mut self.scroll_y,
+            &mut self.scroll_drag_offset,
+        ) {
+            self.clamp_scroll(content.height());
+            ui.ctx().request_repaint();
         }
 
         EditorOutput {
@@ -332,7 +351,7 @@ impl EditorSurface {
             0x1000_0000_0000_0000,
             u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
         );
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 25, 30));
+        painter.rect_filled(rect, 0.0, EDITOR_BACKGROUND);
         painter.line_segment(
             [content.left_top(), content.left_bottom()],
             Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),

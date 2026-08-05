@@ -1,4 +1,10 @@
-use std::{collections::HashMap, env, ffi::c_void, mem::size_of_val, ptr};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    ffi::c_void,
+    mem::size_of_val,
+    ptr,
+};
 
 use core_graphics_types::geometry::CGSize;
 use egui::{
@@ -252,6 +258,7 @@ impl Renderer {
         let mut vertex_offset = 0;
         let mut index_offset = 0;
         let mut retained = None;
+        let mut active_retained = HashSet::new();
 
         for primitive in primitives {
             let mesh = match &primitive.primitive {
@@ -275,6 +282,7 @@ impl Renderer {
             let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
             let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
             let upload = retained.take().map(|paint| {
+                active_retained.insert(paint.key);
                 (
                     paint.key,
                     super::RetainedUpload {
@@ -320,6 +328,7 @@ impl Renderer {
             vertex_offset += vertices.len();
             index_offset += indices.len();
         }
+        super::retain_active_uploads(&mut frame.retained, &active_retained);
 
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     ffi::{CStr, CString, c_void},
     io::Cursor,
@@ -1321,6 +1321,7 @@ fn copy_meshes(
     let mut vertex_offset = 0;
     let mut index_offset = 0;
     let mut uploads = Vec::new();
+    let mut active_retained = HashSet::new();
     for primitive in primitives {
         let mesh = match &primitive.primitive {
             Primitive::Mesh(mesh) => mesh,
@@ -1332,6 +1333,7 @@ fn copy_meshes(
         let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
         let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
         let upload = retained.take().map(|paint| {
+            active_retained.insert(paint.key);
             (
                 paint.key,
                 super::RetainedUpload {
@@ -1350,6 +1352,7 @@ fn copy_meshes(
         vertex_offset += vertex_bytes.len();
         index_offset += index_bytes.len();
     }
+    super::retain_active_uploads(retained_uploads, &active_retained);
     if !uploads.iter().any(|(_, _, dirty, _, _)| *dirty) {
         return Ok(());
     }

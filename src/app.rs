@@ -21,7 +21,7 @@ use winit::{
 
 use crate::{
     buffer::Buffer,
-    editor_surface::EditorSurface,
+    editor_surface::{EDITOR_BACKGROUND, EditorSurface},
     file_io::{OpenTarget, SaveError, load_buffer, safe_save},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     renderer::Renderer,
@@ -1003,6 +1003,8 @@ impl EditorApp {
                     .map_or(0, |buffer| buffer.text[..span.start].chars().count())
             });
         let Some(buffer) = self.buffer.as_mut() else {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, EDITOR_BACKGROUND);
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Select a file to begin editing").weak());
             });
@@ -1374,6 +1376,8 @@ impl Shell {
                 );
             }
             self.first_frame_logged = true;
+            #[cfg(target_os = "macos")]
+            set_macos_application_icon();
         }
         if self.editor.should_close {
             event_loop.exit();
@@ -1640,6 +1644,49 @@ fn activate_macos_application() {
         } else {
             let _: () = msg_send![application, activateIgnoringOtherApps: objc::runtime::YES];
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_icon_path(executable: &Path) -> Option<PathBuf> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then(|| contents.join("Resources/Editur.icns"))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn set_macos_application_icon() {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use std::ffi::CString;
+
+    let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .and_then(|path| macos_icon_path(&path))
+    else {
+        return;
+    };
+    let Ok(path) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return;
+    };
+    unsafe {
+        let path: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: path.as_ptr()
+        ];
+        let icon: *mut Object = msg_send![class!(NSImage), alloc];
+        let icon: *mut Object = msg_send![icon, initWithContentsOfFile: path];
+        if icon.is_null() {
+            return;
+        }
+        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![application, setApplicationIconImage: icon];
+        let _: () = msg_send![icon, release];
     }
 }
 
@@ -2219,5 +2266,22 @@ mod tests {
         assert!(app.search_open);
         assert!(!app.find_open);
         assert!(context.memory(|memory| memory.has_focus(Id::new("project_search_query"))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_icon_is_resolved_from_the_bundle_containing_the_executable() {
+        let executable = std::path::Path::new("/Applications/Editur.app/Contents/MacOS/editur");
+
+        assert_eq!(
+            super::macos_icon_path(executable),
+            Some(std::path::PathBuf::from(
+                "/Applications/Editur.app/Contents/Resources/Editur.icns"
+            ))
+        );
+        assert_eq!(
+            super::macos_icon_path(std::path::Path::new("/usr/local/bin/editur")),
+            None
+        );
     }
 }

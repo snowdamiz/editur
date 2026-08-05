@@ -19,6 +19,7 @@ pub struct TreeRow {
 #[derive(Default)]
 pub struct TreeSurface {
     scroll_y: f32,
+    scroll_drag_offset: Option<f32>,
     hovered: Option<usize>,
     labels: HashMap<u64, Arc<egui::Galley>>,
 }
@@ -36,11 +37,18 @@ impl TreeSurface {
         selected: Option<usize>,
         scroll_to_selected: bool,
     ) -> TreeOutput {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        let (id, rect) = ui.allocate_space(ui.available_size());
+        let content = rect.with_max_x(rect.right() - crate::scrollbar::WIDTH);
+        let response = ui.interact(content, id.with("tree"), Sense::click());
         let pointer = ui
             .input(|input| input.pointer.hover_pos())
-            .filter(|pointer| rect.contains(*pointer));
-        if pointer.is_some() {
+            .filter(|pointer| content.contains(*pointer));
+        if ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pointer| rect.contains(pointer))
+        }) {
             self.scroll_y -= ui.input(|input| input.smooth_scroll_delta.y);
         }
         if scroll_to_selected && let Some(selected) = selected {
@@ -63,7 +71,7 @@ impl TreeSurface {
             let top = rect.top() + index as f32 * ROW_HEIGHT - self.scroll_y;
             let row_rect = Rect::from_min_size(
                 egui::pos2(rect.left(), top),
-                egui::vec2(rect.width(), ROW_HEIGHT),
+                egui::vec2(content.width(), ROW_HEIGHT),
             );
             let fill = if selected == Some(index) {
                 Color32::from_rgb(17, 103, 139)
@@ -139,6 +147,17 @@ impl TreeSurface {
                 Arc::clone(label),
                 Color32::from_rgb(190, 193, 202),
             );
+        }
+        if crate::scrollbar::show(
+            ui,
+            id.with("scrollbar"),
+            rect,
+            rows.len() as f32 * ROW_HEIGHT,
+            &mut self.scroll_y,
+            &mut self.scroll_drag_offset,
+        ) {
+            self.clamp_scroll(rows.len(), rect.height());
+            ui.ctx().request_repaint();
         }
 
         TreeOutput { response, clicked }

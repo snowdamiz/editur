@@ -6,6 +6,7 @@ pub mod file_io;
 mod instance;
 mod network;
 pub mod renderer;
+mod scrollbar;
 pub mod search;
 pub mod syntax;
 pub mod tree;

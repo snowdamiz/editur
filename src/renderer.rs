@@ -1,5 +1,8 @@
 use egui::{PaintCallback, Painter, Rect, epaint::Primitive};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RetainedPaint {
@@ -37,6 +40,13 @@ pub(crate) fn retained_paint(primitive: &Primitive) -> Result<Option<RetainedPai
 
 pub(crate) fn upload_required(current: Option<&RetainedUpload>, next: RetainedUpload) -> bool {
     current != Some(&next)
+}
+
+pub(crate) fn retain_active_uploads(
+    retained: &mut HashMap<u64, RetainedUpload>,
+    active: &HashSet<u64>,
+) {
+    retained.retain(|key, _| active.contains(key));
 }
 
 fn choose_adapter(adapters: &[(&str, bool, bool)], requested: Option<&str>) -> Option<usize> {
@@ -81,7 +91,10 @@ compile_error!("editur supports macOS, Windows, and Linux");
 
 #[cfg(test)]
 mod tests {
-    use super::{RetainedUpload, buffer_capacity, choose_adapter, upload_required};
+    use super::{
+        RetainedUpload, buffer_capacity, choose_adapter, retain_active_uploads, upload_required,
+    };
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn upload_buffers_grow_geometrically_and_never_shrink() {
@@ -121,5 +134,22 @@ mod tests {
                 ..upload
             }
         ));
+    }
+
+    #[test]
+    fn overwritten_retained_ranges_are_not_reused_when_a_line_returns() {
+        let upload = RetainedUpload {
+            revision: 7,
+            vertex_offset: 16,
+            vertex_bytes: 32,
+            index_offset: 8,
+            index_bytes: 12,
+        };
+        let mut retained = HashMap::from([(1, upload), (2, upload)]);
+
+        retain_active_uploads(&mut retained, &HashSet::from([2]));
+
+        assert!(!retained.contains_key(&1));
+        assert!(upload_required(retained.get(&1), upload));
     }
 }
