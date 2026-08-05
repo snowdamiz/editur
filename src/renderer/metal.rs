@@ -17,7 +17,7 @@ use metal::{
 };
 use objc::{
     Message,
-    runtime::{Object, Sel, YES},
+    runtime::{Class, Object, Sel, YES},
 };
 use winit::{
     dpi::PhysicalSize,
@@ -206,6 +206,10 @@ impl Renderer {
             self.free_textures(&textures_delta.free);
             return Ok(());
         };
+        let drawable_size = PhysicalSize::new(
+            drawable.texture().width() as u32,
+            drawable.texture().height() as u32,
+        );
 
         let pass = RenderPassDescriptor::new();
         let attachment = pass
@@ -221,8 +225,8 @@ impl Renderer {
         let encoder = command_buffer.new_render_command_encoder(pass);
         encoder.set_render_pipeline_state(&self.pipeline);
         let screen_size = [
-            self.size.width as f32 / pixels_per_point,
-            self.size.height as f32 / pixels_per_point,
+            drawable_size.width as f32 / pixels_per_point,
+            drawable_size.height as f32 / pixels_per_point,
         ];
         encoder.set_vertex_bytes(
             1,
@@ -258,7 +262,7 @@ impl Renderer {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
             }
-            let Some(scissor) = scissor_rect(primitive.clip_rect, pixels_per_point, self.size)
+            let Some(scissor) = scissor_rect(primitive.clip_rect, pixels_per_point, drawable_size)
             else {
                 continue;
             };
@@ -407,6 +411,28 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
     unsafe {
         let layer_object = &*(layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>();
         layer.set_opaque(false);
+        let strings = Class::get("NSString")
+            .ok_or_else(|| "Metal: NSString class is unavailable".to_owned())?;
+        let gravity = strings
+            .send_message::<_, *mut Object>(
+                Sel::register("stringWithUTF8String:"),
+                (c"topLeft".as_ptr(),),
+            )
+            .map_err(|error| format!("Metal: cannot create layer gravity: {error}"))?;
+        layer_object
+            .send_message::<_, ()>(Sel::register("setContentsGravity:"), (gravity,))
+            .map_err(|error| format!("Metal: cannot set layer gravity: {error}"))?;
+        let window = view
+            .send_message::<_, *mut Object>(Sel::register("window"), ())
+            .map_err(|error| format!("Metal: cannot obtain the AppKit window: {error}"))?;
+        if let Some(window) = window.as_ref() {
+            let scale = window
+                .send_message::<_, f64>(Sel::register("backingScaleFactor"), ())
+                .map_err(|error| format!("Metal: cannot read the backing scale: {error}"))?;
+            layer_object
+                .send_message::<_, ()>(Sel::register("setContentsScale:"), (scale,))
+                .map_err(|error| format!("Metal: cannot set the backing scale: {error}"))?;
+        }
         layer_object
             .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
             .map_err(|error| format!("Metal: cannot round the window layer: {error}"))?;
