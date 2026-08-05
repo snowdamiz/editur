@@ -10,6 +10,7 @@ use syntect::parsing::{ParseState, SyntaxSet, SyntaxSetBuilder};
 
 const MAX_ARCHIVE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_UNPACKED_SIZE: u64 = 8 * 1024 * 1024;
+const MAX_MANIFEST_SIZE: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 128;
 const MAX_CATALOG_SIZE: u64 = 512 * 1024;
 pub const OFFICIAL_CATALOG: &str =
@@ -219,7 +220,7 @@ impl PackageManager {
             .prefix(".install-")
             .tempdir_in(self.data_dir.join("packages"))
             .map_err(|error| format!("cannot stage syntax package: {error}"))?;
-        extract_archive(bytes, staging.path())?;
+        extract_archive(bytes, staging.path(), MAX_UNPACKED_SIZE)?;
         let syntax_set = self.compile(Some(staging.path()), None)?;
         if syntax_set
             .find_syntax_by_name(&manifest.display_name)
@@ -249,6 +250,23 @@ impl PackageManager {
 
     pub fn install(&self, source: &OsStr) -> Result<Manifest, String> {
         let path = Path::new(source);
+        if let Some(id) = bare_language_id(source) {
+            let catalog_url = std::env::var("EDITUR_SYNTAX_CATALOG")
+                .unwrap_or_else(|_| OFFICIAL_CATALOG.to_owned());
+            let catalog = Self::fetch_catalog(&catalog_url)?;
+            let package = catalog
+                .resolve(id)
+                .ok_or_else(|| format!("syntax `{id}` is not in the official catalog"))?;
+            let bytes = download(&package.url, MAX_ARCHIVE_SIZE as u64)?;
+            verify_checksum(&bytes, &package.sha256)?;
+            let manifest = inspect_archive(&bytes)?;
+            if manifest.id != package.id || manifest.version != package.version {
+                return Err(format!(
+                    "catalog metadata does not match downloaded package `{id}`"
+                ));
+            }
+            return self.install_bytes(&bytes);
+        }
         if path.exists()
             || path
                 .extension()
@@ -264,21 +282,7 @@ impl PackageManager {
         if !valid_language_id(id) {
             return Err(format!("invalid language ID `{id}`"));
         }
-        let catalog_url =
-            std::env::var("EDITUR_SYNTAX_CATALOG").unwrap_or_else(|_| OFFICIAL_CATALOG.to_owned());
-        let catalog = Self::fetch_catalog(&catalog_url)?;
-        let package = catalog
-            .resolve(id)
-            .ok_or_else(|| format!("syntax `{id}` is not in the official catalog"))?;
-        let bytes = download(&package.url, MAX_ARCHIVE_SIZE as u64)?;
-        verify_checksum(&bytes, &package.sha256)?;
-        let manifest = inspect_archive(&bytes)?;
-        if manifest.id != package.id || manifest.version != package.version {
-            return Err(format!(
-                "catalog metadata does not match downloaded package `{id}`"
-            ));
-        }
-        self.install_bytes(&bytes)
+        Err(format!("syntax package {} does not exist", path.display()))
     }
 
     pub fn fetch_catalog(url: &str) -> Result<Catalog, String> {
@@ -397,6 +401,11 @@ impl PackageManager {
     }
 }
 
+fn bare_language_id(source: &OsStr) -> Option<&str> {
+    let id = source.to_str()?;
+    (valid_language_id(id) && Path::new(id).components().count() == 1).then_some(id)
+}
+
 fn read_manifest(path: &Path) -> Result<Manifest, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -480,7 +489,7 @@ fn inspect_archive(bytes: &[u8]) -> Result<Manifest, String> {
     let mut unpacked = 0_u64;
     let mut manifest_bytes = None;
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|error| format!("cannot inspect syntax-package entry: {error}"))?;
         let name = entry.name().to_owned();
@@ -505,8 +514,12 @@ fn inspect_archive(bytes: &[u8]) -> Result<Manifest, String> {
         if name == "manifest.json" {
             let mut contents = Vec::new();
             entry
+                .take(MAX_MANIFEST_SIZE as u64 + 1)
                 .read_to_end(&mut contents)
                 .map_err(|error| format!("cannot read manifest.json: {error}"))?;
+            if contents.len() > MAX_MANIFEST_SIZE {
+                return Err(format!("manifest.json exceeds {MAX_MANIFEST_SIZE} bytes"));
+            }
             manifest_bytes = Some(contents);
         }
     }
@@ -553,11 +566,12 @@ fn validate_archive_path(name: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), String> {
+fn extract_archive(bytes: &[u8], destination: &Path, max_unpacked: u64) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("invalid syntax-package archive: {error}"))?;
+    let mut unpacked = 0_u64;
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|error| format!("cannot read syntax-package entry: {error}"))?;
         let relative = validate_archive_path(entry.name())?;
@@ -573,8 +587,15 @@ fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), String> {
         }
         let mut file = fs::File::create(&output)
             .map_err(|error| format!("cannot create {}: {error}", output.display()))?;
-        io::copy(&mut entry, &mut file)
+        let remaining = max_unpacked.saturating_sub(unpacked);
+        let copied = io::copy(&mut entry.take(remaining + 1), &mut file)
             .map_err(|error| format!("cannot extract {}: {error}", output.display()))?;
+        if copied > remaining {
+            return Err(format!(
+                "syntax package expands beyond {max_unpacked} bytes"
+            ));
+        }
+        unpacked += copied;
         file.flush()
             .map_err(|error| format!("cannot flush {}: {error}", output.display()))?;
     }
@@ -668,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn every_shipped_package_validates_and_compiles_independently() {
+    fn every_shipped_package_round_trips_through_the_real_archive_installer() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("syntax-packages");
         let mut directories = fs::read_dir(root)
             .unwrap()
@@ -676,17 +697,65 @@ mod tests {
             .filter(|path| path.join("manifest.json").is_file())
             .collect::<Vec<_>>();
         directories.sort();
+        let temp = tempfile::tempdir().unwrap();
+        let mut combined = syntect::dumps::from_reader::<SyntaxSet, _>(super::super::BUILTIN_DUMP)
+            .unwrap()
+            .into_builder();
+        let mut manifests = Vec::new();
         for directory in directories {
-            let manifest = read_manifest(&directory.join("manifest.json")).unwrap();
-            let mut builder =
-                syntect::dumps::from_reader::<SyntaxSet, _>(super::super::BUILTIN_DUMP)
-                    .unwrap()
-                    .into_builder();
-            builder.add_from_folder(directory, true).unwrap();
-            let set = build_and_check(builder).unwrap();
+            let manifest_bytes = fs::read(directory.join("manifest.json")).unwrap();
+            let manifest = Manifest::parse(&manifest_bytes).unwrap();
+            combined.add_from_folder(&directory, true).unwrap();
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .last_modified_time(zip::DateTime::default());
+            archive.start_file("manifest.json", options).unwrap();
+            archive.write_all(&manifest_bytes).unwrap();
+            for grammar in &manifest.grammars {
+                archive.start_file(grammar, options).unwrap();
+                archive
+                    .write_all(&fs::read(directory.join(grammar)).unwrap())
+                    .unwrap();
+            }
+            archive.start_file("LICENSES/LICENSE.txt", options).unwrap();
+            archive
+                .write_all(&fs::read(directory.join("LICENSES/LICENSE.txt")).unwrap())
+                .unwrap();
+
+            let data_dir = temp.path().join(&manifest.id);
+            let manager = PackageManager::new(data_dir.clone());
+            let installed = manager
+                .install_bytes(&archive.finish().unwrap().into_inner())
+                .unwrap_or_else(|error| panic!("{} failed to install: {error}", manifest.id));
+            assert_eq!(installed.id, manifest.id);
+            let syntaxes = super::super::SyntaxManager::load(&data_dir).unwrap();
+            for extension in &manifest.extensions {
+                let path = PathBuf::from(format!("sample.{extension}"));
+                assert_ne!(
+                    syntaxes.detect(&path, false).name,
+                    "Plain Text",
+                    "{} did not detect extension {extension}",
+                    manifest.id
+                );
+            }
+            for filename in &manifest.filenames {
+                assert_ne!(
+                    syntaxes.detect(Path::new(filename), false).name,
+                    "Plain Text",
+                    "{} did not detect filename {filename}",
+                    manifest.id
+                );
+            }
+            manifests.push(manifest);
+        }
+        let combined = build_and_check(combined).unwrap();
+        for manifest in manifests {
             assert!(
-                set.find_syntax_by_name(&manifest.display_name).is_some(),
-                "{} did not provide {}",
+                combined
+                    .find_syntax_by_name(&manifest.display_name)
+                    .is_some(),
+                "{} does not contain its advertised grammar {}",
                 manifest.id,
                 manifest.display_name
             );
@@ -735,6 +804,25 @@ contexts:
     }
 
     #[test]
+    fn archive_limits_count_actual_decompressed_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = package(&[("syntaxes/Python.sublime-syntax", b"123456789")]);
+        assert!(
+            extract_archive(&archive, temp.path(), 8)
+                .unwrap_err()
+                .contains("expands beyond")
+        );
+
+        let oversized_manifest = vec![b' '; MAX_MANIFEST_SIZE + 1];
+        let archive = package(&[("manifest.json", &oversized_manifest)]);
+        assert!(
+            inspect_archive(&archive)
+                .unwrap_err()
+                .contains("manifest.json exceeds")
+        );
+    }
+
+    #[test]
     fn lists_and_removes_packages_with_an_atomic_cache_rebuild() {
         let temp = tempfile::tempdir().unwrap();
         let manager = PackageManager::new(temp.path().join("data"));
@@ -768,5 +856,19 @@ contexts:
 
         let insecure = json.replace("https://", "http://");
         assert!(Catalog::parse(insecure.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn bare_language_ids_take_precedence_over_same_named_project_files() {
+        assert_eq!(
+            bare_language_id(OsStr::new("dockerfile")),
+            Some("dockerfile")
+        );
+        assert_eq!(bare_language_id(OsStr::new("c-cpp")), Some("c-cpp"));
+        assert_eq!(bare_language_id(OsStr::new("./dockerfile")), None);
+        assert_eq!(
+            bare_language_id(OsStr::new("dockerfile.editur-syntax")),
+            None
+        );
     }
 }

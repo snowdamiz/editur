@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -7,7 +8,7 @@ use std::{
 
 use egui::{
     Align2, Color32, FontId, Id, Key, Label, Layout, RichText, ScrollArea, Sense, TextEdit,
-    TextFormat, ViewportId, text::LayoutJob,
+    TextFormat, UiBuilder, ViewportId, text::LayoutJob,
 };
 use winit::{
     application::ApplicationHandler,
@@ -20,12 +21,14 @@ use winit::{
 
 use crate::{
     buffer::Buffer,
+    editor_surface::EditorSurface,
     file_io::{OpenTarget, SaveError, load_buffer, safe_save},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager, data_dir},
     tree::{TreeEntry, read_directory},
+    tree_surface::{TreeRow, TreeSurface},
 };
 
 #[derive(Clone)]
@@ -44,18 +47,13 @@ enum WindowAction {
     Drag,
 }
 
-#[derive(Clone)]
-struct VisibleEntry {
-    entry: TreeEntry,
-    depth: usize,
-}
-
 struct TreeState {
     root: PathBuf,
     children: HashMap<PathBuf, Vec<TreeEntry>>,
     expanded: HashSet<PathBuf>,
     selected: Option<PathBuf>,
-    visible: Vec<VisibleEntry>,
+    visible: Vec<TreeRow>,
+    selected_index: Option<usize>,
 }
 
 impl TreeState {
@@ -67,6 +65,7 @@ impl TreeState {
             expanded: HashSet::new(),
             selected,
             visible: Vec::new(),
+            selected_index: None,
         };
         state.refresh_visible();
         Ok(state)
@@ -81,6 +80,11 @@ impl TreeState {
             0,
             &mut self.visible,
         );
+        self.selected_index = self.selected.as_ref().and_then(|selected| {
+            self.visible
+                .iter()
+                .position(|row| &row.entry.path == selected)
+        });
     }
 
     fn append_visible(
@@ -88,15 +92,22 @@ impl TreeState {
         expanded: &HashSet<PathBuf>,
         directory: &Path,
         depth: usize,
-        result: &mut Vec<VisibleEntry>,
+        result: &mut Vec<TreeRow>,
     ) {
         let Some(entries) = children.get(directory) else {
             return;
         };
         for entry in entries {
-            result.push(VisibleEntry {
+            let mut hasher = DefaultHasher::new();
+            entry.path.hash(&mut hasher);
+            entry.name.hash(&mut hasher);
+            result.push(TreeRow {
                 entry: entry.clone(),
+                label: entry.name.to_string_lossy().into_owned(),
                 depth,
+                directory: entry.is_dir,
+                expanded: expanded.contains(&entry.path),
+                revision: hasher.finish(),
             });
             if entry.is_dir && expanded.contains(&entry.path) {
                 Self::append_visible(children, expanded, &entry.path, depth + 1, result);
@@ -123,6 +134,13 @@ impl TreeState {
             self.refresh_visible();
         }
     }
+
+    fn select(&mut self, path: Option<PathBuf>) {
+        self.selected_index = path
+            .as_ref()
+            .and_then(|path| self.visible.iter().position(|row| row.entry.path == *path));
+        self.selected = path;
+    }
 }
 
 #[derive(Default)]
@@ -137,14 +155,27 @@ struct HighlightCache {
     find_selected: usize,
     find_job: LayoutJob,
     find_valid: bool,
+    galley_key: Option<GalleyKey>,
+    presentation_revision: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct GalleyKey {
+    revision: u64,
+    syntax: String,
+    wrap_width: u32,
+    find: Option<(String, usize)>,
+    bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
 }
 
 pub struct EditorApp {
     buffer: Option<Buffer>,
     tree: TreeState,
+    tree_surface: TreeSurface,
     syntaxes: SyntaxManager,
     highlighter: Highlighter,
     highlight_cache: HighlightCache,
+    editor_surface: EditorSurface,
     search: SearchController,
     search_open: bool,
     search_query: String,
@@ -160,6 +191,7 @@ pub struct EditorApp {
     scroll_to_find_match: bool,
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     sidebar: bool,
+    sidebar_width: f32,
     focus_editor: bool,
     tree_focused: bool,
     cursor: (usize, usize),
@@ -188,9 +220,11 @@ impl EditorApp {
         Ok(Self {
             buffer,
             tree: TreeState::new(target.root, selected)?,
+            tree_surface: TreeSurface::default(),
             syntaxes,
             highlighter: Highlighter::new()?,
             highlight_cache: HighlightCache::default(),
+            editor_surface: EditorSurface::default(),
             search,
             search_open: false,
             search_query: String::new(),
@@ -206,6 +240,7 @@ impl EditorApp {
             scroll_to_find_match: false,
             bracket_pair: None,
             sidebar: true,
+            sidebar_width: 220.0,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
             cursor: (1, 1),
@@ -238,8 +273,9 @@ impl EditorApp {
         match action {
             PendingAction::Open(path) => match load_buffer(&path) {
                 Ok(buffer) => {
-                    self.tree.selected = Some(path);
+                    self.tree.select(Some(path));
                     self.buffer = Some(buffer);
+                    self.editor_surface = EditorSurface::default();
                     self.highlight_cache.valid = false;
                     self.find_match_revision = u64::MAX;
                     self.scroll_to_find_match = self.find_open;
@@ -305,98 +341,191 @@ impl EditorApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        if let Some(error) = self.error.clone() {
-            egui::Panel::top("error_banner").show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(255, 125, 125), error);
-                    if ui.button("Dismiss").clicked() {
-                        self.error = None;
-                    }
-                });
-            });
-        }
-
+        let mut content = root.max_rect();
         #[cfg(target_os = "macos")]
-        self.draw_titlebar(root);
-
-        egui::Panel::bottom("status")
-            .exact_size(25.0)
-            .show(root, |ui| {
-                ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
-                    if let Some(buffer) = &self.buffer {
-                        let syntax = self
-                            .syntaxes
-                            .detect(&buffer.path, buffer.large_file_warning)
-                            .name
-                            .clone();
-                        ui.label(buffer.path.display().to_string());
-                        ui.separator();
-                        ui.label(if buffer.dirty { "Modified" } else { "Saved" });
-                        ui.separator();
-                        ui.label(syntax);
-                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("Ln {}, Col {}", self.cursor.0, self.cursor.1));
-                        });
-                    } else {
-                        ui.label(self.tree.root.display().to_string());
-                    }
-                });
-            });
+        {
+            let titlebar = content.with_max_y(content.top() + 34.0);
+            self.draw_titlebar(root, titlebar);
+            content.min.y = titlebar.bottom();
+        }
+        let status = content.with_min_y((content.bottom() - 25.0).max(content.top()));
+        content.max.y = status.top();
+        self.draw_statusbar(root, status);
 
         if self.sidebar {
-            egui::Panel::left("files")
-                .resizable(true)
-                .default_size(220.0)
-                .size_range(140.0..=500.0)
-                .show(root, |ui| self.draw_sidebar(ui));
+            self.sidebar_width = self.sidebar_width.clamp(140.0, content.width().min(500.0));
+            let sidebar = content.with_max_x(content.left() + self.sidebar_width);
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(sidebar.right(), sidebar.center().y),
+                egui::vec2(5.0, sidebar.height()),
+            );
+            let resize = root.interact(divider, Id::new("sidebar_resize"), Sense::drag());
+            if resize.dragged() {
+                self.sidebar_width =
+                    (self.sidebar_width + resize.drag_delta().x).clamp(140.0, 500.0);
+                ctx.request_repaint();
+            }
+            root.scope_builder(
+                UiBuilder::new().id_salt("sidebar").max_rect(sidebar),
+                |ui| self.draw_sidebar(ui),
+            );
+            root.painter().line_segment(
+                [sidebar.right_top(), sidebar.right_bottom()],
+                egui::Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
+            );
+            content.min.x = sidebar.right() + 1.0;
         }
-
-        egui::CentralPanel::default().show(root, |ui| self.draw_editor(ui));
+        root.scope_builder(
+            UiBuilder::new().id_salt("editor_surface").max_rect(content),
+            |ui| self.draw_editor(ui),
+        );
         self.draw_search(&ctx);
         self.draw_dialogs(&ctx);
+        self.draw_error(&ctx);
     }
 
     #[cfg(target_os = "macos")]
-    fn draw_titlebar(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("titlebar")
-            .exact_size(34.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(27, 27, 36))
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(root, |ui| {
-                let rect = ui.max_rect();
-                let drag = ui.interact(rect, Id::new("titlebar_drag"), Sense::click_and_drag());
-                if drag.drag_started() {
-                    self.window_action = Some(WindowAction::Drag);
-                } else if drag.double_clicked() {
-                    self.window_action = Some(WindowAction::ToggleMaximize);
-                }
-
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(8.0);
-                    if titlebar_button(ui, Color32::from_rgb(255, 95, 87), "×", "Close").clicked()
-                    {
-                        self.window_action = Some(WindowAction::Close);
-                    }
-                    if titlebar_button(ui, Color32::from_rgb(254, 188, 46), "−", "Minimize")
-                        .clicked()
-                    {
-                        self.window_action = Some(WindowAction::Minimize);
-                    }
-                    if titlebar_button(ui, Color32::from_rgb(40, 200, 64), "+", "Zoom").clicked() {
-                        self.window_action = Some(WindowAction::ToggleMaximize);
-                    }
-                });
+    fn draw_titlebar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let pointer = ui.ctx().pointer_hover_pos();
+        let button_centers =
+            [17.0, 37.0, 57.0].map(|x| egui::pos2(rect.left() + x, rect.center().y));
+        let hovered = button_centers
+            .iter()
+            .position(|center| pointer.is_some_and(|pointer| pointer.distance(*center) <= 10.0));
+        crate::renderer::mark_retained(
+            ui.painter(),
+            rect,
+            0x6000_0000_0000_0000,
+            u64::from(rect.width().to_bits()) ^ ((hovered.unwrap_or(3) as u64) << 32),
+        );
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(27, 27, 36));
+        let drag = ui.interact(rect, Id::new("titlebar_drag"), Sense::click_and_drag());
+        if drag.drag_started() {
+            self.window_action = Some(WindowAction::Drag);
+        } else if drag.double_clicked() {
+            self.window_action = Some(WindowAction::ToggleMaximize);
+        }
+        let actions = [
+            (WindowAction::Close, Color32::from_rgb(255, 95, 87), "×"),
+            (WindowAction::Minimize, Color32::from_rgb(254, 188, 46), "−"),
+            (
+                WindowAction::ToggleMaximize,
+                Color32::from_rgb(40, 200, 64),
+                "+",
+            ),
+        ];
+        for (index, ((action, color, symbol), center)) in
+            actions.into_iter().zip(button_centers).enumerate()
+        {
+            let button = egui::Rect::from_center_size(center, egui::vec2(18.0, 24.0));
+            if ui
+                .interact(button, Id::new(("titlebar_button", index)), Sense::click())
+                .clicked()
+            {
+                self.window_action = Some(action);
+            }
+            ui.painter().circle_filled(center, 6.0, color);
+            if hovered == Some(index) {
                 ui.painter().text(
-                    rect.center(),
+                    center,
                     Align2::CENTER_CENTER,
-                    "Editur",
-                    FontId::proportional(14.0),
-                    Color32::from_rgb(188, 188, 198),
+                    symbol,
+                    FontId::proportional(10.0),
+                    Color32::from_black_alpha(150),
                 );
+            }
+        }
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Editur",
+            FontId::proportional(14.0),
+            Color32::from_rgb(188, 188, 198),
+        );
+    }
+
+    fn draw_statusbar(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let mut hasher = DefaultHasher::new();
+        self.cursor.hash(&mut hasher);
+        let status = self.buffer.as_ref().map(|buffer| {
+            let syntax = self
+                .syntaxes
+                .detect(&buffer.path, buffer.large_file_warning)
+                .name
+                .clone();
+            (buffer.path.display().to_string(), buffer.dirty, syntax)
+        });
+        status.hash(&mut hasher);
+        crate::renderer::mark_retained(
+            &painter,
+            rect,
+            0x7000_0000_0000_0000,
+            hasher.finish() ^ u64::from(rect.width().to_bits()),
+        );
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 25, 30));
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            egui::Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
+        );
+        let color = Color32::from_rgb(151, 155, 166);
+        let font = FontId::proportional(12.0);
+        let mut x = rect.left() + 8.0;
+        if let Some((path, dirty, syntax)) = status {
+            for label in [
+                path,
+                if dirty { "Modified" } else { "Saved" }.into(),
+                syntax,
+            ] {
+                let painted = painter.text(
+                    egui::pos2(x, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
+                    color,
+                );
+                x = painted.right() + 9.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(x - 4.5, rect.top() + 6.0),
+                        egui::pos2(x - 4.5, rect.bottom() - 6.0),
+                    ],
+                    egui::Stroke::new(1.0, Color32::from_rgb(60, 62, 70)),
+                );
+            }
+            painter.text(
+                egui::pos2(rect.right() - 8.0, rect.center().y),
+                Align2::RIGHT_CENTER,
+                format!("Ln {}, Col {}", self.cursor.0, self.cursor.1),
+                font,
+                color,
+            );
+        } else {
+            painter.text(
+                egui::pos2(x, rect.center().y),
+                Align2::LEFT_CENTER,
+                self.tree.root.display().to_string(),
+                font,
+                color,
+            );
+        }
+    }
+
+    fn draw_error(&mut self, ctx: &egui::Context) {
+        let Some(error) = self.error.clone() else {
+            return;
+        };
+        egui::Window::new("Error")
+            .id(Id::new("error_banner"))
+            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 42.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.colored_label(Color32::from_rgb(255, 125, 125), error);
+                if ui.button("Dismiss").clicked() {
+                    self.error = None;
+                }
             });
     }
 
@@ -783,37 +912,21 @@ impl EditorApp {
     fn draw_tree(&mut self, ui: &mut egui::Ui) {
         let scroll_to_selected =
             self.tree_focused && self.pending.is_none() && self.tree_keyboard(ui);
-        let mut clicked = None;
-        ScrollArea::vertical()
-            .id_salt("file_tree_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for visible in &self.tree.visible {
-                    ui.horizontal(|ui| {
-                        ui.add_space((visible.depth * 14) as f32);
-                        let expanded = self.tree.expanded.contains(&visible.entry.path);
-                        let marker = if visible.entry.is_dir {
-                            if expanded { "▾" } else { "▸" }
-                        } else {
-                            " "
-                        };
-                        let label = format!("{marker} {}", visible.entry.name.to_string_lossy());
-                        let selected = self.tree.selected.as_ref() == Some(&visible.entry.path);
-                        let response = ui.selectable_label(selected, label);
-                        if selected && scroll_to_selected {
-                            response.scroll_to_me(None);
-                        }
-                        if response.clicked() && self.pending.is_none() {
-                            clicked = Some(visible.entry.clone());
-                        }
-                    });
-                }
-            });
-        if let Some(entry) = clicked {
+        let output = self.tree_surface.show(
+            ui,
+            &self.tree.visible,
+            self.tree.selected_index,
+            scroll_to_selected,
+        );
+        if output.response.clicked() {
+            self.tree_focused = true;
+        }
+        if let Some(index) = output.clicked.filter(|_| self.pending.is_none()) {
+            let entry = self.tree.visible[index].entry.clone();
             self.tree_focused = true;
             self.focus_editor = false;
             ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
-            self.tree.selected = Some(entry.path.clone());
+            self.tree.select(Some(entry.path.clone()));
             if entry.is_dir {
                 if let Err(error) = self.tree.toggle(&entry.path) {
                     self.show_error(error);
@@ -825,38 +938,44 @@ impl EditorApp {
     }
 
     fn tree_keyboard(&mut self, ui: &egui::Ui) -> bool {
-        let entries = &self.tree.visible;
-        if entries.is_empty() {
+        let entry_count = self.tree.visible.len();
+        if entry_count == 0 {
             return false;
         }
-        let current = self
-            .tree
-            .selected
-            .as_ref()
-            .and_then(|path| entries.iter().position(|entry| &entry.entry.path == path))
-            .unwrap_or(0);
-        let next = ui.input(|input| {
-            if input.key_pressed(Key::ArrowDown) {
-                Some((current + 1).min(entries.len() - 1))
-            } else if input.key_pressed(Key::ArrowUp) {
-                Some(current.saturating_sub(1))
-            } else {
-                None
-            }
+        let (down, up, right, left, enter) = ui.input(|input| {
+            (
+                input.key_pressed(Key::ArrowDown),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::Enter),
+            )
         });
-        if let Some(next) = next {
-            self.tree.selected = Some(entries[next].entry.path.clone());
+        if !(down || up || right || left || enter) {
+            return false;
         }
-        let entry = entries[next.unwrap_or(current)].entry.clone();
-        if ui.input(|input| input.key_pressed(Key::ArrowRight)) && entry.is_dir {
+        let current = self.tree.selected_index.unwrap_or(0).min(entry_count - 1);
+        let next = if down {
+            Some((current + 1).min(entry_count - 1))
+        } else if up {
+            Some(current.saturating_sub(1))
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            let path = self.tree.visible[next].entry.path.clone();
+            self.tree.select(Some(path));
+        }
+        let entry = self.tree.visible[next.unwrap_or(current)].entry.clone();
+        if right && entry.is_dir {
             if !self.tree.expanded.contains(&entry.path)
                 && let Err(error) = self.tree.toggle(&entry.path)
             {
                 self.show_error(error);
             }
-        } else if ui.input(|input| input.key_pressed(Key::ArrowLeft)) && entry.is_dir {
+        } else if left && entry.is_dir {
             self.tree.collapse(&entry.path);
-        } else if ui.input(|input| input.key_pressed(Key::Enter)) {
+        } else if enter {
             if entry.is_dir {
                 if let Err(error) = self.tree.toggle(&entry.path) {
                     self.show_error(error);
@@ -874,10 +993,15 @@ impl EditorApp {
         let find_matches = &self.find_matches;
         let find_selected = self.find_selected;
         let bracket_pair = self.bracket_pair.clone();
-        let scroll_match = self
+        let scroll_character = self
             .scroll_to_find_match
             .then(|| find_matches.get(find_selected).cloned())
-            .flatten();
+            .flatten()
+            .map(|span| {
+                self.buffer
+                    .as_ref()
+                    .map_or(0, |buffer| buffer.text[..span.start].chars().count())
+            });
         let Some(buffer) = self.buffer.as_mut() else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Select a file to begin editing").weak());
@@ -901,130 +1025,87 @@ impl EditorApp {
         let syntaxes = &self.syntaxes;
         let large_file = buffer.large_file_warning;
         let mut highlight_error = None;
-        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-            if !cache.valid || cache.revision != revision || cache.syntax != syntax_name {
-                if large_file {
-                    cache.job = plain_text_job(text.as_str(), wrap_width);
-                    cache.incremental = IncrementalHighlightCache::default();
-                } else {
-                    match highlighter.highlight_job_incremental(
-                        text.as_str(),
-                        syntax,
-                        syntaxes.set(),
-                        wrap_width,
-                        &mut cache.incremental,
-                    ) {
-                        Ok(job) => cache.job = job,
-                        Err(error) => {
-                            highlight_error = Some(error);
-                            cache.job = plain_text_job(text.as_str(), wrap_width);
-                        }
-                    }
-                }
-                cache.revision = revision;
-                cache.syntax.clone_from(&syntax_name);
-                cache.valid = true;
-                cache.find_valid = false;
-            }
-            let mut job = if find_open && !find_matches.is_empty() {
-                if !cache.find_valid
-                    || cache.find_revision != revision
-                    || cache.find_query != *find_query
-                    || cache.find_selected != find_selected
-                {
-                    cache.find_job = find_highlighted_job(&cache.job, find_matches, find_selected);
-                    cache.find_revision = revision;
-                    cache.find_query.clone_from(find_query);
-                    cache.find_selected = find_selected;
-                    cache.find_valid = true;
-                }
-                cache.find_job.clone()
+        let wrap_width = ui.available_width().max(1.0);
+        if !cache.valid || cache.revision != revision || cache.syntax != syntax_name {
+            if large_file {
+                cache.job = plain_text_job(&buffer.text, wrap_width);
+                cache.incremental = IncrementalHighlightCache::default();
             } else {
-                cache.job.clone()
-            };
-            if let Some(pair) = &bracket_pair {
-                job = bracket_highlighted_job(&job, pair);
-            }
-            job.wrap.max_width = wrap_width;
-            job.wrap.break_anywhere = true;
-            ui.fonts_mut(|fonts| fonts.layout_job(job))
-        };
-        let line_count = buffer.text.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let gutter_width = (line_count.to_string().len() as f32 * 8.0 + 16.0).max(34.0);
-        let output = ScrollArea::vertical()
-            .id_salt("editor_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let viewport = ui.clip_rect();
-                let output = ui
-                    .horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let (gutter, _) =
-                            ui.allocate_exact_size(egui::vec2(gutter_width, 0.0), Sense::hover());
-                        let output = TextEdit::multiline(&mut buffer.text)
-                            .id(Id::new("editor"))
-                            .code_editor()
-                            .desired_width(ui.available_width())
-                            .desired_rows(30)
-                            .frame(egui::Frame::NONE)
-                            .layouter(&mut layouter)
-                            .show(ui);
-                        paint_line_numbers(ui, gutter.right() - 10.0, &output);
-                        output
-                    })
-                    .inner;
-                if output.response.dragged_by(egui::PointerButton::Primary)
-                    && let Some(pointer) = output.response.interact_pointer_pos()
-                {
-                    let delta = selection_drag_scroll_delta(
-                        pointer.y,
-                        viewport.top(),
-                        viewport.bottom(),
-                        ui.input(|input| input.stable_dt),
-                    );
-                    if delta != 0.0 {
-                        ui.scroll_with_delta(egui::vec2(0.0, delta));
-                        ui.ctx().request_repaint();
+                match highlighter.highlight_job_incremental(
+                    &buffer.text,
+                    syntax,
+                    syntaxes.set(),
+                    wrap_width,
+                    &mut cache.incremental,
+                ) {
+                    Ok(job) => cache.job = job,
+                    Err(error) => {
+                        highlight_error = Some(error);
+                        cache.job = plain_text_job(&buffer.text, wrap_width);
                     }
                 }
-                if let Some(span) = &scroll_match {
-                    let character = buffer.text[..span.start].chars().count();
-                    let cursor = output
-                        .galley
-                        .pos_from_cursor(egui::text::CCursor::new(character))
-                        .translate(
-                            output.galley_pos.to_vec2()
-                                - egui::vec2(output.galley.rect.left(), 0.0),
-                        );
-                    ui.scroll_to_rect(cursor, Some(egui::Align::Center));
-                }
-                output
-            })
-            .inner;
+            }
+            cache.revision = revision;
+            cache.syntax.clone_from(&syntax_name);
+            cache.valid = true;
+            cache.find_valid = false;
+        }
+        let galley_key = GalleyKey {
+            revision,
+            syntax: syntax_name,
+            wrap_width: wrap_width.round().to_bits(),
+            find: (find_open && !find_matches.is_empty())
+                .then(|| (find_query.clone(), find_selected)),
+            bracket_pair: bracket_pair.clone(),
+        };
+        if cache.galley_key.as_ref() != Some(&galley_key) {
+            cache.galley_key = Some(galley_key);
+            cache.presentation_revision = cache.presentation_revision.wrapping_add(1);
+        }
+        let mut job = if find_open && !find_matches.is_empty() {
+            if !cache.find_valid
+                || cache.find_revision != revision
+                || cache.find_query != *find_query
+                || cache.find_selected != find_selected
+            {
+                cache.find_job = find_highlighted_job(&cache.job, find_matches, find_selected);
+                cache.find_revision = revision;
+                cache.find_query.clone_from(find_query);
+                cache.find_selected = find_selected;
+                cache.find_valid = true;
+            }
+            cache.find_job.clone()
+        } else {
+            cache.job.clone()
+        };
+        if let Some(pair) = &bracket_pair {
+            job = bracket_highlighted_job(&job, pair);
+        }
+        let output = self.editor_surface.show(
+            ui,
+            &mut buffer.text,
+            &job,
+            cache.presentation_revision,
+            self.focus_editor,
+            scroll_character,
+        );
         if self.scroll_to_find_match {
             self.scroll_to_find_match = false;
         }
-        if self.focus_editor {
-            output.response.request_focus();
-            self.focus_editor = false;
-        }
+        self.focus_editor = false;
         if output.response.has_focus() {
             self.tree_focused = false;
         }
-        if output.response.changed() {
+        if output.changed {
             buffer.mark_changed();
             self.highlight_cache.valid = false;
         }
-        if let Some(range) = output.cursor_range {
-            self.cursor = buffer.line_column(range.primary.index.into());
-            let pair = (!buffer.large_file_warning)
-                .then(|| match_bracket_pair(&buffer.text, range.primary.index.into()))
-                .flatten();
-            if self.bracket_pair != pair {
-                self.bracket_pair = pair;
-                ui.ctx().request_repaint();
-            }
-        } else if self.bracket_pair.take().is_some() {
+        self.cursor = buffer.line_column(output.cursor);
+        let pair = (!buffer.large_file_warning)
+            .then(|| match_bracket_pair(&buffer.text, output.cursor))
+            .flatten();
+        if self.bracket_pair != pair {
+            self.bracket_pair = pair;
             ui.ctx().request_repaint();
         }
         if let Some(error) = highlight_error {
@@ -1050,8 +1131,8 @@ impl EditorApp {
                         }
                         if ui.button("Cancel").clicked() {
                             self.pending = None;
-                            self.tree.selected =
-                                self.buffer.as_ref().map(|buffer| buffer.path.clone());
+                            self.tree
+                                .select(self.buffer.as_ref().map(|buffer| buffer.path.clone()));
                         }
                     });
                 });
@@ -1072,6 +1153,7 @@ impl EditorApp {
                             match load_buffer(&path) {
                                 Ok(buffer) => {
                                     self.buffer = Some(buffer);
+                                    self.editor_surface = EditorSurface::default();
                                     self.highlight_cache.valid = false;
                                     self.conflict = false;
                                     if self.pending.is_some() {
@@ -1178,7 +1260,15 @@ pub fn run(target: OpenTarget, started: Instant) -> Result<(), String> {
         .map_err(|error| format!("cannot create event loop: {error}"))?;
     spawn_listener(listener, event_loop.create_proxy())?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut shell = Shell::new(EditorApp::new(target)?, started);
+    let editor_started = Instant::now();
+    let editor = EditorApp::new(target)?;
+    if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
+        eprintln!(
+            "editur: editor state initialized in {:.2?}",
+            editor_started.elapsed()
+        );
+    }
+    let mut shell = Shell::new(editor, started);
     event_loop
         .run_app(&mut shell)
         .map_err(|error| format!("window event loop failed: {error}"))?;
@@ -1198,15 +1288,20 @@ struct Shell {
     first_frame_logged: bool,
 }
 
+fn system_clipboard(
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> Result<&mut arboard::Clipboard, String> {
+    if clipboard.is_none() {
+        *clipboard = Some(
+            arboard::Clipboard::new()
+                .map_err(|error| format!("system clipboard is unavailable: {error}"))?,
+        );
+    }
+    Ok(clipboard.as_mut().expect("clipboard was initialized"))
+}
+
 impl Shell {
     fn new(editor: EditorApp, started: Instant) -> Self {
-        let clipboard = match arboard::Clipboard::new() {
-            Ok(clipboard) => Some(clipboard),
-            Err(error) => {
-                eprintln!("editur: system clipboard is unavailable: {error}");
-                None
-            }
-        };
         Self {
             editor,
             window: None,
@@ -1214,7 +1309,7 @@ impl Shell {
             egui: None,
             repaint_at: None,
             fatal: None,
-            clipboard,
+            clipboard: None,
             modifiers: ModifiersState::default(),
             started,
             first_frame_logged: false,
@@ -1250,18 +1345,20 @@ impl Shell {
                 }
             }
         }
-        if let Some(clipboard) = &mut self.clipboard {
-            for command in &output.platform_output.commands {
-                if let egui::OutputCommand::CopyText(text) = command
-                    && let Err(error) = clipboard.set_text(text)
-                {
-                    self.editor
-                        .show_error(format!("cannot copy to system clipboard: {error}"));
-                }
+        for command in &output.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = command
+                && let Err(error) = system_clipboard(&mut self.clipboard).and_then(|clipboard| {
+                    clipboard.set_text(text).map_err(|error| error.to_string())
+                })
+            {
+                self.editor
+                    .show_error(format!("cannot copy to system clipboard: {error}"));
             }
         }
         state.handle_platform_output_with_event_loop(window, event_loop, output.platform_output);
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        #[cfg(target_os = "linux")]
+        window.pre_present_notify();
         if let Err(error) =
             renderer.render(output.pixels_per_point, &primitives, &output.textures_delta)
         {
@@ -1269,8 +1366,6 @@ impl Shell {
             return;
         }
         if !self.first_frame_logged {
-            #[cfg(target_os = "macos")]
-            activate_macos_application();
             window.focus_window();
             if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
                 eprintln!(
@@ -1279,8 +1374,6 @@ impl Shell {
                 );
             }
             self.first_frame_logged = true;
-            #[cfg(target_os = "macos")]
-            set_macos_application_icon();
         }
         if self.editor.should_close {
             event_loop.exit();
@@ -1366,6 +1459,11 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             window.theme(),
             None,
         );
+        #[cfg(target_os = "macos")]
+        {
+            activate_macos_application();
+            window.focus_window();
+        }
         self.egui = Some(state);
         self.renderer = Some(renderer);
         self.window = Some(window);
@@ -1391,10 +1489,15 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             && key.state.is_pressed()
             && key.physical_key == PhysicalKey::Code(KeyCode::KeyV)
             && (self.modifiers.control_key() || self.modifiers.super_key())
-            && let (Some(clipboard), Some(state)) = (&mut self.clipboard, &mut self.egui)
         {
-            match clipboard.get_text() {
-                Ok(text) => state.set_clipboard_text(text),
+            match system_clipboard(&mut self.clipboard)
+                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
+            {
+                Ok(text) => {
+                    if let Some(state) = &mut self.egui {
+                        state.set_clipboard_text(text);
+                    }
+                }
                 Err(error) => self
                     .editor
                     .show_error(format!("cannot paste from system clipboard: {error}")),
@@ -1540,36 +1643,6 @@ fn activate_macos_application() {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
-fn set_macos_application_icon() {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
-
-    unsafe {
-        let bundle: *mut Object = msg_send![class!(NSBundle), mainBundle];
-        let name: *mut Object = msg_send![
-            class!(NSString),
-            stringWithUTF8String: c"Editur".as_ptr()
-        ];
-        let extension: *mut Object = msg_send![
-            class!(NSString),
-            stringWithUTF8String: c"icns".as_ptr()
-        ];
-        let path: *mut Object = msg_send![bundle, pathForResource: name ofType: extension];
-        if path.is_null() {
-            return;
-        }
-        let icon: *mut Object = msg_send![class!(NSImage), alloc];
-        let icon: *mut Object = msg_send![icon, initWithContentsOfFile: path];
-        if icon.is_null() {
-            return;
-        }
-        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![application, setApplicationIconImage: icon];
-        let _: () = msg_send![icon, release];
-    }
-}
-
 fn search_result_row(
     ui: &mut egui::Ui,
     selected: bool,
@@ -1653,30 +1726,6 @@ fn close_icon_button(ui: &mut egui::Ui) -> egui::Response {
     response.on_hover_text(label)
 }
 
-#[cfg(target_os = "macos")]
-fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 34.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    let fill = if response.hovered() {
-        color.gamma_multiply(1.12)
-    } else {
-        color
-    };
-    ui.painter().circle_filled(rect.center(), 6.0, fill);
-    if response.hovered() {
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            symbol,
-            FontId::proportional(10.0),
-            Color32::from_black_alpha(150),
-        );
-    }
-    response.on_hover_text(label)
-}
-
 fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
@@ -1691,29 +1740,6 @@ fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
         },
     );
     job
-}
-
-fn paint_line_numbers(ui: &egui::Ui, gutter_right: f32, output: &egui::text_edit::TextEditOutput) {
-    let mut logical_line = 1;
-    let mut first_visual_row = true;
-    for row in &output.galley.rows {
-        if first_visual_row {
-            ui.painter().text(
-                egui::pos2(
-                    gutter_right,
-                    output.galley_pos.y + row.pos.y + row.size.y * 0.5,
-                ),
-                Align2::RIGHT_CENTER,
-                logical_line,
-                FontId::monospace(12.0),
-                Color32::from_rgb(105, 111, 126),
-            );
-        }
-        first_visual_row = row.ends_with_newline;
-        if row.ends_with_newline {
-            logical_line += 1;
-        }
-    }
 }
 
 fn search_selection_after_navigation(
@@ -1735,22 +1761,6 @@ fn search_selection_after_navigation(
     (next, next != selected)
 }
 
-fn selection_drag_scroll_delta(
-    pointer_y: f32,
-    viewport_top: f32,
-    viewport_bottom: f32,
-    frame_seconds: f32,
-) -> f32 {
-    let outside = if pointer_y < viewport_top {
-        viewport_top - pointer_y
-    } else if pointer_y > viewport_bottom {
-        viewport_bottom - pointer_y
-    } else {
-        return 0.0;
-    };
-    outside.signum() * (240.0 + outside.abs() * 16.0).min(1600.0) * frame_seconds.min(0.05)
-}
-
 fn next_find_match(selected: usize, match_count: usize, backwards: bool) -> usize {
     if match_count == 0 {
         0
@@ -1765,22 +1775,22 @@ fn match_bracket_pair(
     text: &str,
     cursor_character: usize,
 ) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let characters: Vec<_> = text.char_indices().collect();
-    let (index, &(byte, bracket)) = cursor_character
+    let (byte, bracket) = cursor_character
         .checked_sub(1)
-        .and_then(|index| characters.get(index).map(|character| (index, character)))
-        .filter(|(_, (_, character))| is_bracket(*character))
+        .and_then(|index| text.char_indices().nth(index))
+        .filter(|(_, character)| is_bracket(*character))
         .or_else(|| {
-            characters
-                .get(cursor_character)
+            text.char_indices()
+                .nth(cursor_character)
                 .filter(|(_, character)| is_bracket(*character))
-                .map(|character| (cursor_character, character))
         })?;
     let bracket_range = byte..byte + bracket.len_utf8();
 
     if is_opening_bracket(bracket) {
         let mut stack = vec![bracket];
-        for &(candidate_byte, candidate) in &characters[index + 1..] {
+        let rest = byte + bracket.len_utf8();
+        for (offset, candidate) in text[rest..].char_indices() {
+            let candidate_byte = rest + offset;
             if is_opening_bracket(candidate) {
                 stack.push(candidate);
             } else if is_closing_bracket(candidate) {
@@ -1798,7 +1808,7 @@ fn match_bracket_pair(
         }
     } else {
         let mut stack = vec![bracket];
-        for &(candidate_byte, candidate) in characters[..index].iter().rev() {
+        for (candidate_byte, candidate) in text[..byte].char_indices().rev() {
             if is_closing_bracket(candidate) {
                 stack.push(candidate);
             } else if is_opening_bracket(candidate) {
@@ -1983,7 +1993,6 @@ mod tests {
     use super::{
         EditorApp, TreeState, find_highlighted_job, match_bracket_pair, match_spans,
         next_find_match, plain_text_job, search_selection_after_navigation,
-        selection_drag_scroll_delta,
     };
     use crate::file_io::OpenTarget;
     use egui::{Event, Id, Key, Modifiers, RawInput, Rect, Vec2};
@@ -2038,20 +2047,6 @@ mod tests {
         assert_eq!(
             search_selection_after_navigation(0, 30, false, true),
             (0, false)
-        );
-    }
-
-    #[test]
-    fn selection_drag_scroll_moves_toward_pointer_only_outside_viewport() {
-        let deltas = [
-            selection_drag_scroll_delta(80.0, 100.0, 500.0, 1.0 / 60.0),
-            selection_drag_scroll_delta(300.0, 100.0, 500.0, 1.0 / 60.0),
-            selection_drag_scroll_delta(520.0, 100.0, 500.0, 1.0 / 60.0),
-        ];
-
-        assert_eq!(
-            deltas.map(|delta| (delta * 60.0).round()),
-            [560.0, 0.0, -560.0]
         );
     }
 

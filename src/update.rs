@@ -2,6 +2,12 @@ use std::{env, fs};
 
 const EMBEDDED_UPDATE_BASE: Option<&str> = option_env!("EDITUR_UPDATE_BASE");
 const MAX_BINARY_SIZE: u64 = 64 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_APP_ARCHIVE_SIZE: u64 = 128 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_APP_ENTRIES: usize = 32;
+#[cfg(target_os = "macos")]
+const MAX_APP_UNPACKED_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_SIZE: u64 = 1024;
 
 pub fn run() -> Result<(), String> {
@@ -16,6 +22,13 @@ pub fn run() -> Result<(), String> {
     let (binary_url, checksum_url) = update_urls(&base, asset)?;
     let executable = env::current_exe()
         .map_err(|error| format!("cannot locate the running Editur executable: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let executable = fs::canonicalize(&executable)
+        .map_err(|error| format!("cannot resolve {}: {error}", executable.display()))?;
+    #[cfg(target_os = "macos")]
+    if macos_bundle_root(&executable).is_none() {
+        return migrate_macos_install(&base, &executable);
+    }
     let current = fs::read(&executable)
         .map_err(|error| format!("cannot read {}: {error}", executable.display()))?;
     let checksum = download(&checksum_url, MAX_CHECKSUM_SIZE)?;
@@ -129,22 +142,6 @@ fn install_unix(executable: &std::path::Path, bytes: &[u8]) -> Result<(), String
         .ok_or_else(|| format!("{} has no parent directory", executable.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("cannot stage update in {}: {error}", parent.display()))?;
-    #[cfg(target_os = "macos")]
-    {
-        let copied = std::process::Command::new("/bin/cp")
-            .arg("-p")
-            .arg(executable)
-            .arg(temporary.path())
-            .status()
-            .map_err(|error| format!("cannot preserve macOS icon metadata: {error}"))?;
-        if !copied.success() {
-            return Err("cannot preserve macOS icon metadata".into());
-        }
-        temporary
-            .as_file()
-            .set_len(0)
-            .map_err(|error| format!("cannot reset staged update: {error}"))?;
-    }
     temporary
         .write_all(bytes)
         .and_then(|()| temporary.flush())
@@ -157,6 +154,232 @@ fn install_unix(executable: &std::path::Path, bytes: &[u8]) -> Result<(), String
     temporary
         .persist(executable)
         .map_err(|error| format!("cannot replace {}: {}", executable.display(), error.error))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_root(executable: &std::path::Path) -> Option<&std::path::Path> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then_some(bundle)
+}
+
+#[cfg(target_os = "macos")]
+fn extract_macos_app_archive(
+    bytes: &[u8],
+    destination: &std::path::Path,
+    max_unpacked: u64,
+) -> Result<std::path::PathBuf, String> {
+    use std::{
+        io::{self, Cursor, Read, Write},
+        os::unix::fs::PermissionsExt,
+        path::{Component, Path},
+    };
+
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| format!("invalid macOS update archive: {error}"))?;
+    if archive.len() > MAX_APP_ENTRIES {
+        return Err(format!(
+            "macOS update contains more than {MAX_APP_ENTRIES} entries"
+        ));
+    }
+    let mut unpacked = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| format!("cannot read macOS update entry: {error}"))?;
+        let name = entry.name().to_owned();
+        let relative = Path::new(&name);
+        if name.is_empty()
+            || name.contains('\\')
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || relative
+                .components()
+                .next()
+                .is_none_or(|component| component.as_os_str() != "Editur.app")
+        {
+            return Err(format!("unsafe macOS update path `{name}`"));
+        }
+        let mode = entry.unix_mode();
+        if mode.is_some_and(|mode| {
+            let file_type = mode & 0o170000;
+            file_type != 0 && file_type != 0o040000 && file_type != 0o100000
+        }) {
+            return Err(format!("macOS update contains special file `{name}`"));
+        }
+        let output = destination.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output)
+                .map_err(|error| format!("cannot create {}: {error}", output.display()))?;
+            continue;
+        }
+        if !matches!(
+            name.as_str(),
+            "Editur.app/Contents/MacOS/editur"
+                | "Editur.app/Contents/Info.plist"
+                | "Editur.app/Contents/Resources/Editur.icns"
+        ) {
+            return Err(format!("unexpected macOS update entry `{name}`"));
+        }
+        let parent = output
+            .parent()
+            .ok_or_else(|| format!("macOS update path has no parent: {name}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|error| format!("cannot create {}: {error}", output.display()))?;
+        let remaining = max_unpacked.saturating_sub(unpacked);
+        let copied = io::copy(&mut entry.take(remaining + 1), &mut file)
+            .map_err(|error| format!("cannot extract {}: {error}", output.display()))?;
+        if copied > remaining {
+            return Err(format!("macOS update expands beyond {max_unpacked} bytes"));
+        }
+        unpacked += copied;
+        file.flush()
+            .map_err(|error| format!("cannot flush {}: {error}", output.display()))?;
+        let permissions = mode.map_or_else(
+            || {
+                if name.ends_with("/editur") {
+                    0o755
+                } else {
+                    0o644
+                }
+            },
+            |mode| mode & 0o777,
+        );
+        fs::set_permissions(&output, fs::Permissions::from_mode(permissions))
+            .map_err(|error| format!("cannot set permissions on {}: {error}", output.display()))?;
+    }
+    Ok(destination.join("Editur.app"))
+}
+
+#[cfg(target_os = "macos")]
+fn migrate_macos_install(base: &str, executable: &std::path::Path) -> Result<(), String> {
+    let asset = match env::consts::ARCH {
+        "aarch64" => "editur-macos-aarch64.zip",
+        "x86_64" => "editur-macos-x86_64.zip",
+        architecture => {
+            return Err(format!(
+                "updates are not published for macos/{architecture}"
+            ));
+        }
+    };
+    let (archive_url, checksum_url) = update_urls(base, asset)?;
+    println!("Migrating this older install to the native Editur.app bundle…");
+    let archive = download(&archive_url, MAX_APP_ARCHIVE_SIZE)?;
+    let checksum = download(&checksum_url, MAX_CHECKSUM_SIZE)?;
+    let advertised = advertised_checksum(&checksum)?;
+    if !crate::syntax::package::sha256_hex(&archive).eq_ignore_ascii_case(advertised) {
+        return Err("downloaded update does not match its SHA-256 checksum".into());
+    }
+    if !crate::instance::quit_running()? {
+        return Err("save or discard changes in the running editor before updating".into());
+    }
+
+    let parent = executable
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", executable.display()))?;
+    let extracted = tempfile::Builder::new()
+        .prefix(".editur-app-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("cannot stage Editur.app in {}: {error}", parent.display()))?;
+    let staged = extract_macos_app_archive(&archive, extracted.path(), MAX_APP_UNPACKED_SIZE)?;
+    install_macos_bundle(&staged, executable)?;
+    println!("Updated Editur and migrated it to the native app bundle.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_bundle(
+    staged: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let staged_metadata = fs::symlink_metadata(staged)
+        .map_err(|error| format!("cannot inspect {}: {error}", staged.display()))?;
+    let staged_executable = staged.join("Contents/MacOS/editur");
+    let required_files = [
+        staged_executable,
+        staged.join("Contents/Info.plist"),
+        staged.join("Contents/Resources/Editur.icns"),
+    ];
+    if !staged_metadata.is_dir()
+        || staged_metadata.file_type().is_symlink()
+        || required_files.iter().any(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+                .unwrap_or(true)
+        })
+    {
+        return Err("macOS update does not contain a valid Editur.app".into());
+    }
+    let executable_metadata = fs::symlink_metadata(executable)
+        .map_err(|error| format!("cannot inspect {}: {error}", executable.display()))?;
+    if executable.file_name().is_none_or(|name| name != "editur")
+        || !executable_metadata.is_file()
+        || executable_metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to migrate non-regular executable {}",
+            executable.display()
+        ));
+    }
+    let parent = executable
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", executable.display()))?;
+    let destination = parent.join("Editur.app");
+    if staged == destination {
+        return Err("macOS update staging path matches its destination".into());
+    }
+    let backup = parent.join(format!(".Editur.app.old-{}", std::process::id()));
+    let link = parent.join(format!(".editur-link-{}", std::process::id()));
+    if backup.exists() || link.exists() {
+        return Err("macOS update staging path already exists".into());
+    }
+
+    let had_destination = if destination.exists() {
+        let metadata = fs::symlink_metadata(&destination)
+            .map_err(|error| format!("cannot inspect {}: {error}", destination.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!("refusing to replace {}", destination.display()));
+        }
+        fs::rename(&destination, &backup)
+            .map_err(|error| format!("cannot stage existing {}: {error}", destination.display()))?;
+        true
+    } else {
+        false
+    };
+    if let Err(error) = fs::rename(staged, &destination) {
+        if had_destination {
+            let _ = fs::rename(&backup, &destination);
+        }
+        return Err(format!("cannot install {}: {error}", destination.display()));
+    }
+    if let Err(error) = symlink(destination.join("Contents/MacOS/editur"), &link)
+        .and_then(|()| fs::rename(&link, executable))
+    {
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&destination);
+        if had_destination {
+            let _ = fs::rename(&backup, &destination);
+        }
+        return Err(format!("cannot install the Editur CLI symlink: {error}"));
+    }
+    if had_destination {
+        fs::remove_dir_all(&backup)
+            .map_err(|error| format!("cannot remove {}: {error}", backup.display()))?;
+    }
     Ok(())
 }
 
@@ -375,29 +598,79 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_updates_preserve_custom_icon_metadata() {
-        use std::{fs, process::Command};
+    fn macos_app_extraction_counts_actual_bytes_and_rejects_unsafe_paths() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, contents) in entries {
+                archive
+                    .start_file(*name, SimpleFileOptions::default().unix_permissions(0o755))
+                    .unwrap();
+                archive.write_all(contents).unwrap();
+            }
+            archive.finish().unwrap().into_inner()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = archive(&[("Editur.app/Contents/MacOS/editur", b"123456789")]);
+        assert!(super::extract_macos_app_archive(&oversized, temp.path(), 8).is_err());
+
+        let unsafe_path = archive(&[("../outside", b"no")]);
+        assert!(super::extract_macos_app_archive(&unsafe_path, temp.path(), 1024).is_err());
+        assert!(!temp.path().join("../outside").exists());
+
+        let valid_dir = temp.path().join("valid");
+        std::fs::create_dir(&valid_dir).unwrap();
+        let valid = archive(&[
+            ("Editur.app/Contents/MacOS/editur", b"binary"),
+            ("Editur.app/Contents/Info.plist", b"plist"),
+            ("Editur.app/Contents/Resources/Editur.icns", b"icon"),
+        ]);
+        let app = super::extract_macos_app_archive(&valid, &valid_dir, 1024).unwrap();
+        assert_eq!(
+            std::fs::read(app.join("Contents/Resources/Editur.icns")).unwrap(),
+            b"icon"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bare_install_migrates_to_an_app_bundle_and_cli_symlink() {
+        use std::fs;
 
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("editur");
         fs::write(&executable, b"old").unwrap();
-        assert!(
-            Command::new("/usr/bin/xattr")
-                .args(["-w", "com.editur.icon-test", "preserved"])
-                .arg(&executable)
-                .status()
-                .unwrap()
-                .success()
+        let staged = temp.path().join("staged/Editur.app");
+        fs::create_dir_all(staged.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(staged.join("Contents/Resources")).unwrap();
+        fs::write(staged.join("Contents/MacOS/editur"), b"new").unwrap();
+        fs::write(staged.join("Contents/Info.plist"), b"plist").unwrap();
+        fs::write(staged.join("Contents/Resources/Editur.icns"), b"icon").unwrap();
+
+        super::install_macos_bundle(&staged, &executable).unwrap();
+
+        assert!(super::macos_bundle_root(&executable).is_none());
+        assert_eq!(
+            fs::read_link(&executable).unwrap(),
+            temp.path().join("Editur.app/Contents/MacOS/editur")
         );
+        assert_eq!(
+            fs::read(temp.path().join("Editur.app/Contents/MacOS/editur")).unwrap(),
+            b"new"
+        );
+    }
 
-        super::install_unix(&executable, b"new").unwrap();
-
-        let value = Command::new("/usr/bin/xattr")
-            .args(["-p", "com.editur.icon-test"])
-            .arg(&executable)
-            .output()
-            .unwrap();
-        assert!(value.status.success());
-        assert_eq!(value.stdout, b"preserved\n");
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recognizes_only_executables_inside_a_macos_app_bundle() {
+        let bundled = std::path::Path::new("/tmp/Editur.app/Contents/MacOS/editur");
+        assert_eq!(
+            super::macos_bundle_root(bundled),
+            Some(std::path::Path::new("/tmp/Editur.app"))
+        );
+        assert!(super::macos_bundle_root(std::path::Path::new("/tmp/editur")).is_none());
     }
 }

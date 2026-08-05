@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use editur::syntax::package::{Catalog, CatalogEntry, Manifest};
+use editur::syntax::package::{Catalog, CatalogEntry, Manifest, PackageManager};
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     fs::create_dir_all(&output)?;
+    let validation = tempfile::tempdir()?;
 
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Stored)
@@ -46,6 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &fs::read(source.join("LICENSES/LICENSE.txt"))?,
         )?;
         let bytes = archive.finish()?.into_inner();
+        PackageManager::new(validation.path().join(&manifest.id))
+            .install_bytes(&bytes)
+            .map_err(std::io::Error::other)?;
         let filename = format!("{}-{}.editur-syntax", manifest.id, manifest.version);
         fs::write(output.join(&filename), &bytes)?;
         packages.push(CatalogEntry {

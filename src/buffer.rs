@@ -99,6 +99,10 @@ impl Buffer {
         (line + 1, offset - self.line_starts[line] + 1)
     }
 
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
     pub fn mark_saved(&mut self, path: &Path, fingerprint: DiskFingerprint) {
         self.path = path.to_path_buf();
         self.fingerprint = Some(fingerprint);

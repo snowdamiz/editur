@@ -55,6 +55,7 @@ struct Frame {
     index: vk::Buffer,
     index_memory: vk::DeviceMemory,
     index_capacity: usize,
+    retained: HashMap<u64, super::RetainedUpload>,
 }
 
 pub struct Renderer {
@@ -301,6 +302,7 @@ impl Renderer {
                     index: vk::Buffer::null(),
                     index_memory: vk::DeviceMemory::null(),
                     index_capacity: 0,
+                    retained: HashMap::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -361,12 +363,6 @@ impl Renderer {
         primitives: &[ClippedPrimitive],
         textures_delta: &TexturesDelta,
     ) -> Result<(), String> {
-        if primitives
-            .iter()
-            .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_)))
-        {
-            return Err("Vulkan: egui paint callbacks are unsupported".to_owned());
-        }
         for (id, delta) in &textures_delta.set {
             self.update_texture(*id, delta)?;
         }
@@ -439,6 +435,7 @@ impl Renderer {
                 Primitive::Callback(_) => None,
             })
             .sum();
+        let vertex_capacity = frame.vertex_capacity;
         ensure_frame_buffer(
             &self.device,
             &self.memory_properties,
@@ -448,6 +445,7 @@ impl Renderer {
             vertex_size,
             vk::BufferUsageFlags::VERTEX_BUFFER,
         )?;
+        let index_capacity = frame.index_capacity;
         ensure_frame_buffer(
             &self.device,
             &self.memory_properties,
@@ -457,11 +455,15 @@ impl Renderer {
             index_size,
             vk::BufferUsageFlags::INDEX_BUFFER,
         )?;
+        if vertex_capacity != frame.vertex_capacity || index_capacity != frame.index_capacity {
+            frame.retained.clear();
+        }
         copy_meshes(
             &self.device,
             primitives,
             frame.vertex_memory,
             frame.index_memory,
+            &mut frame.retained,
         )?;
         unsafe {
             self.device
@@ -514,8 +516,12 @@ impl Renderer {
         let mut vertex_offset = 0;
         let mut index_offset = 0;
         for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
-                continue;
+            let mesh = match &primitive.primitive {
+                Primitive::Mesh(mesh) => mesh,
+                Primitive::Callback(_) => {
+                    super::retained_paint(&primitive.primitive)?;
+                    continue;
+                }
             };
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
@@ -985,6 +991,10 @@ fn create_swapchain(
     let formats =
         unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
             .map_err(|error| format!("Vulkan: cannot query surface formats: {error}"))?;
+    let present_modes = unsafe {
+        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+    }
+    .map_err(|error| format!("Vulkan: cannot query surface present modes: {error}"))?;
     let surface_format = formats
         .iter()
         .copied()
@@ -1023,7 +1033,7 @@ fn create_swapchain(
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(capabilities.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .present_mode(vk::PresentModeKHR::FIFO)
+        .present_mode(choose_present_mode(&present_modes))
         .clipped(true)
         .old_swapchain(old_swapchain);
     let handle = unsafe { loader.create_swapchain(&info, None) }
@@ -1097,6 +1107,17 @@ fn create_swapchain(
         pipeline,
         framebuffers,
     })
+}
+
+fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    [
+        vk::PresentModeKHR::MAILBOX,
+        vk::PresentModeKHR::IMMEDIATE,
+        vk::PresentModeKHR::FIFO,
+    ]
+    .into_iter()
+    .find(|mode| modes.contains(mode))
+    .unwrap_or(vk::PresentModeKHR::FIFO)
 }
 
 fn create_pipeline(
@@ -1291,38 +1312,84 @@ fn copy_meshes(
     primitives: &[ClippedPrimitive],
     vertex_memory: vk::DeviceMemory,
     index_memory: vk::DeviceMemory,
+    retained_uploads: &mut HashMap<u64, super::RetainedUpload>,
 ) -> Result<(), String> {
-    copy_mesh_bytes(device, primitives, vertex_memory, true)?;
-    copy_mesh_bytes(device, primitives, index_memory, false)
-}
-
-fn copy_mesh_bytes(
-    device: &ash::Device,
-    primitives: &[ClippedPrimitive],
-    memory: vk::DeviceMemory,
-    vertices: bool,
-) -> Result<(), String> {
-    if memory == vk::DeviceMemory::null() {
+    if vertex_memory == vk::DeviceMemory::null() || index_memory == vk::DeviceMemory::null() {
+        return Ok(());
+    }
+    let mut retained = None;
+    let mut vertex_offset = 0;
+    let mut index_offset = 0;
+    let mut uploads = Vec::new();
+    for primitive in primitives {
+        let mesh = match &primitive.primitive {
+            Primitive::Mesh(mesh) => mesh,
+            Primitive::Callback(_) => {
+                retained = super::retained_paint(&primitive.primitive)?;
+                continue;
+            }
+        };
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+        let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
+        let upload = retained.take().map(|paint| {
+            (
+                paint.key,
+                super::RetainedUpload {
+                    revision: paint.revision,
+                    vertex_offset,
+                    vertex_bytes: vertex_bytes.len(),
+                    index_offset,
+                    index_bytes: index_bytes.len(),
+                },
+            )
+        });
+        let dirty = upload
+            .as_ref()
+            .is_none_or(|(key, next)| super::upload_required(retained_uploads.get(key), *next));
+        uploads.push((mesh, upload, dirty, vertex_offset, index_offset));
+        vertex_offset += vertex_bytes.len();
+        index_offset += index_bytes.len();
+    }
+    if !uploads.iter().any(|(_, _, dirty, _, _)| *dirty) {
         return Ok(());
     }
     unsafe {
-        let mapped = device
-            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        let vertex_mapped = device
+            .map_memory(
+                vertex_memory,
+                0,
+                vk::WHOLE_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
             .map_err(|error| format!("Vulkan: mapping frame buffer failed: {error}"))?;
-        let mut offset = 0;
-        for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
+        let index_mapped = device
+            .map_memory(index_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .map_err(|error| {
+                device.unmap_memory(vertex_memory);
+                format!("Vulkan: mapping frame buffer failed: {error}")
+            })?;
+        for (mesh, upload, dirty, vertex_offset, index_offset) in uploads {
+            if !dirty {
                 continue;
-            };
-            let bytes: &[u8] = if vertices {
-                bytemuck::cast_slice(mesh.vertices.as_slice())
-            } else {
-                bytemuck::cast_slice(mesh.indices.as_slice())
-            };
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
-            offset += bytes.len();
+            }
+            let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+            let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
+            ptr::copy_nonoverlapping(
+                vertices.as_ptr(),
+                vertex_mapped.cast::<u8>().add(vertex_offset),
+                vertices.len(),
+            );
+            ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                index_mapped.cast::<u8>().add(index_offset),
+                indices.len(),
+            );
+            if let Some((key, upload)) = upload {
+                retained_uploads.insert(key, upload);
+            }
         }
-        device.unmap_memory(memory);
+        device.unmap_memory(vertex_memory);
+        device.unmap_memory(index_memory);
     }
     Ok(())
 }
@@ -1436,4 +1503,25 @@ unsafe extern "system" fn debug_callback(
         eprintln!("editur: Vulkan validation: {}", message.to_string_lossy());
     }
     vk::FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_present_mode, vk};
+
+    #[test]
+    fn chooses_the_lowest_latency_supported_present_mode() {
+        assert_eq!(
+            choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]),
+            vk::PresentModeKHR::MAILBOX
+        );
+        assert_eq!(
+            choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE]),
+            vk::PresentModeKHR::IMMEDIATE
+        );
+        assert_eq!(
+            choose_present_mode(&[vk::PresentModeKHR::FIFO]),
+            vk::PresentModeKHR::FIFO
+        );
+    }
 }

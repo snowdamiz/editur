@@ -85,6 +85,7 @@ struct Frame {
     index: Option<ID3D12Resource>,
     index_capacity: usize,
     fence_value: u64,
+    retained: HashMap<u64, super::RetainedUpload>,
 }
 
 pub struct Renderer {
@@ -396,6 +397,7 @@ impl Renderer {
                     index: None,
                     index_capacity: 0,
                     fence_value: 0,
+                    retained: HashMap::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -469,12 +471,6 @@ impl Renderer {
         primitives: &[ClippedPrimitive],
         textures_delta: &TexturesDelta,
     ) -> Result<(), String> {
-        if primitives
-            .iter()
-            .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_)))
-        {
-            return Err("D3D12: egui paint callbacks are unsupported".to_owned());
-        }
         for (id, delta) in &textures_delta.set {
             self.update_texture(*id, delta)?;
         }
@@ -506,19 +502,29 @@ impl Renderer {
             })
             .sum();
         let frame = &mut self.frames[frame_index];
+        let vertex_capacity = frame.vertex_capacity;
         ensure_upload_buffer(
             &self.device,
             &mut frame.vertex,
             &mut frame.vertex_capacity,
             vertex_size,
         )?;
+        let index_capacity = frame.index_capacity;
         ensure_upload_buffer(
             &self.device,
             &mut frame.index,
             &mut frame.index_capacity,
             index_size,
         )?;
-        copy_meshes(primitives, frame.vertex.as_ref(), frame.index.as_ref())?;
+        if vertex_capacity != frame.vertex_capacity || index_capacity != frame.index_capacity {
+            frame.retained.clear();
+        }
+        copy_meshes(
+            primitives,
+            frame.vertex.as_ref(),
+            frame.index.as_ref(),
+            &mut frame.retained,
+        )?;
         unsafe {
             frame
                 .allocator
@@ -570,8 +576,12 @@ impl Renderer {
         let mut vertex_offset = 0;
         let mut index_offset = 0;
         for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
-                continue;
+            let mesh = match &primitive.primitive {
+                Primitive::Mesh(mesh) => mesh,
+                Primitive::Callback(_) => {
+                    super::retained_paint(&primitive.primitive)?;
+                    continue;
+                }
             };
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
@@ -636,7 +646,7 @@ impl Renderer {
                 .map_err(|error| format!("D3D12: command list interface failed: {error}"))?;
             self.queue.ExecuteCommandLists(&[Some(list)]);
             self.swapchain
-                .Present(1, DXGI_PRESENT(0))
+                .Present(0, DXGI_PRESENT(0))
                 .ok()
                 .map_err(|error| format!("D3D12: presenting frame failed: {error}"))?;
         }
@@ -987,38 +997,81 @@ fn copy_meshes(
     primitives: &[ClippedPrimitive],
     vertex: Option<&ID3D12Resource>,
     index: Option<&ID3D12Resource>,
+    retained_uploads: &mut HashMap<u64, super::RetainedUpload>,
 ) -> Result<(), String> {
-    copy_mesh_bytes(primitives, vertex, true)?;
-    copy_mesh_bytes(primitives, index, false)
-}
-
-fn copy_mesh_bytes(
-    primitives: &[ClippedPrimitive],
-    resource: Option<&ID3D12Resource>,
-    vertices: bool,
-) -> Result<(), String> {
-    let Some(resource) = resource else {
+    let (Some(vertex), Some(index)) = (vertex, index) else {
         return Ok(());
     };
-    unsafe {
-        let mut mapped = ptr::null_mut();
-        resource
-            .Map(0, None, Some(&mut mapped))
-            .map_err(|error| format!("D3D12: mapping upload buffer failed: {error}"))?;
-        let mut offset = 0;
-        for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
+    let mut retained = None;
+    let mut vertex_offset = 0;
+    let mut index_offset = 0;
+    let mut uploads = Vec::new();
+    for primitive in primitives {
+        let mesh = match &primitive.primitive {
+            Primitive::Mesh(mesh) => mesh,
+            Primitive::Callback(_) => {
+                retained = super::retained_paint(&primitive.primitive)?;
                 continue;
-            };
-            let bytes: &[u8] = if vertices {
-                bytemuck::cast_slice(mesh.vertices.as_slice())
-            } else {
-                bytemuck::cast_slice(mesh.indices.as_slice())
-            };
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
-            offset += bytes.len();
+            }
+        };
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+        let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
+        let upload = retained.take().map(|paint| {
+            (
+                paint.key,
+                super::RetainedUpload {
+                    revision: paint.revision,
+                    vertex_offset,
+                    vertex_bytes: vertex_bytes.len(),
+                    index_offset,
+                    index_bytes: index_bytes.len(),
+                },
+            )
+        });
+        let dirty = upload
+            .as_ref()
+            .is_none_or(|(key, next)| super::upload_required(retained_uploads.get(key), *next));
+        uploads.push((mesh, upload, dirty, vertex_offset, index_offset));
+        vertex_offset += vertex_bytes.len();
+        index_offset += index_bytes.len();
+    }
+    if !uploads.iter().any(|(_, _, dirty, _, _)| *dirty) {
+        return Ok(());
+    }
+    unsafe {
+        let mut vertex_mapped = ptr::null_mut();
+        vertex
+            .Map(0, None, Some(&mut vertex_mapped))
+            .map_err(|error| format!("D3D12: mapping upload buffer failed: {error}"))?;
+        let mut index_mapped = ptr::null_mut();
+        index
+            .Map(0, None, Some(&mut index_mapped))
+            .map_err(|error| {
+                vertex.Unmap(0, None);
+                format!("D3D12: mapping upload buffer failed: {error}")
+            })?;
+        for (mesh, upload, dirty, vertex_offset, index_offset) in uploads {
+            if !dirty {
+                continue;
+            }
+            let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
+            let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
+            ptr::copy_nonoverlapping(
+                vertices.as_ptr(),
+                vertex_mapped.cast::<u8>().add(vertex_offset),
+                vertices.len(),
+            );
+            ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                index_mapped.cast::<u8>().add(index_offset),
+                indices.len(),
+            );
+            if let Some((key, upload)) = upload {
+                retained_uploads.insert(key, upload);
+            }
         }
-        resource.Unmap(0, None);
+        vertex.Unmap(0, None);
+        index.Unmap(0, None);
     }
     Ok(())
 }

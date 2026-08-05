@@ -1,6 +1,7 @@
 pub mod app;
 pub mod buffer;
 pub mod cli;
+pub mod editor_surface;
 pub mod file_io;
 mod instance;
 mod network;
@@ -8,4 +9,5 @@ pub mod renderer;
 pub mod search;
 pub mod syntax;
 pub mod tree;
+pub mod tree_surface;
 pub mod update;

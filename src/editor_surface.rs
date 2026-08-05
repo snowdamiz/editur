@@ -1,0 +1,882 @@
+use egui::{
+    Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, OutputCommand, Pos2, Rect, Response,
+    Sense, Stroke, TextFormat, Ui, Vec2,
+    epaint::text::{Galley, LayoutJob},
+    text::{ByteIndex, CCursor, CCursorRange, CharIndex, LayoutSection},
+};
+use std::{ops::Range, sync::Arc, time::Duration};
+
+use crate::renderer::mark_retained;
+
+const LINE_HEIGHT: f32 = 18.0;
+const TEXT_LEFT_PADDING: f32 = 4.0;
+
+struct RetainedLine {
+    job: LayoutJob,
+    char_start: usize,
+    height: f32,
+    galley: Option<Arc<Galley>>,
+    revision: u64,
+}
+
+#[derive(Clone)]
+struct Edit {
+    start: usize,
+    deleted: String,
+    inserted: String,
+    before: (usize, usize),
+    after: (usize, usize),
+}
+
+#[derive(Default)]
+pub struct EditorSurface {
+    anchor: usize,
+    cursor: usize,
+    h_pos: Option<f32>,
+    scroll_y: f32,
+    undo: Vec<Edit>,
+    redo: Vec<Edit>,
+    lines: Vec<RetainedLine>,
+    line_numbers: Vec<Option<Arc<Galley>>>,
+    offsets: Vec<f32>,
+    visual_revision: Option<u64>,
+    wrap_width: u32,
+}
+
+pub struct EditorOutput {
+    pub response: Response,
+    pub cursor: usize,
+    pub changed: bool,
+}
+
+impl EditorSurface {
+    pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        self.anchor = anchor;
+        self.cursor = cursor;
+    }
+
+    pub fn selection(&self) -> Range<usize> {
+        self.anchor.min(self.cursor)..self.anchor.max(self.cursor)
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn replace_selection(&mut self, text: &mut String, replacement: &str) -> bool {
+        let range = self.selection();
+        let character_len = text.chars().count();
+        let range = range.start.min(character_len)..range.end.min(character_len);
+        if range.is_empty() && replacement.is_empty() {
+            return false;
+        }
+        let deleted = char_slice(text, range.clone()).to_owned();
+        let before = (self.anchor, self.cursor);
+        replace_chars(text, range.clone(), replacement);
+        let cursor = range.start + replacement.chars().count();
+        self.anchor = cursor;
+        self.cursor = cursor;
+        self.undo.push(Edit {
+            start: range.start,
+            deleted,
+            inserted: replacement.to_owned(),
+            before,
+            after: (cursor, cursor),
+        });
+        self.redo.clear();
+        true
+    }
+
+    pub fn undo(&mut self, text: &mut String) -> bool {
+        let Some(edit) = self.undo.pop() else {
+            return false;
+        };
+        let end = edit.start + edit.inserted.chars().count();
+        replace_chars(text, edit.start..end, &edit.deleted);
+        (self.anchor, self.cursor) = edit.before;
+        self.redo.push(edit);
+        true
+    }
+
+    pub fn redo(&mut self, text: &mut String) -> bool {
+        let Some(edit) = self.redo.pop() else {
+            return false;
+        };
+        let end = edit.start + edit.deleted.chars().count();
+        replace_chars(text, edit.start..end, &edit.inserted);
+        (self.anchor, self.cursor) = edit.after;
+        self.undo.push(edit);
+        true
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        text: &mut String,
+        highlighted: &LayoutJob,
+        visual_revision: u64,
+        request_focus: bool,
+        scroll_to_character: Option<usize>,
+    ) -> EditorOutput {
+        let desired = ui.available_size();
+        let (_, rect) = ui.allocate_space(desired);
+        let mut response = ui.interact(rect, Id::new("editor"), Sense::click_and_drag());
+        if ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pointer| rect.contains(pointer))
+        }) {
+            ui.output_mut(|output| output.cursor_icon = CursorIcon::Text);
+        }
+        let gutter_width = gutter_width(self.lines.len().max(line_count(text)));
+        let content = Rect::from_min_max(
+            egui::pos2(rect.left() + gutter_width, rect.top()),
+            rect.right_bottom(),
+        );
+        let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
+        self.sync_lines(highlighted, visual_revision, wrap_width);
+        self.clamp_selection(text);
+
+        if request_focus {
+            response.request_focus();
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.scroll_y -= scroll;
+            }
+        }
+        self.clamp_scroll(content.height());
+
+        self.layout_visible_lines(ui, content);
+        let mut ensure_cursor_visible = request_focus;
+        if let Some(character) = scroll_to_character {
+            self.scroll_character_into_view(character, content.height());
+            self.layout_visible_lines(ui, content);
+            ensure_cursor_visible = true;
+        }
+
+        if response.clicked() || response.drag_started() {
+            response.request_focus();
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let character = self.character_at(pointer, content);
+                let extend = ui.input(|input| input.modifiers.shift);
+                self.move_cursor(character, extend);
+                ensure_cursor_visible = true;
+            }
+        } else if response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            self.cursor = self.character_at(pointer, content);
+            let delta = selection_drag_scroll_delta(
+                pointer.y,
+                content.top(),
+                content.bottom(),
+                ui.input(|input| input.stable_dt),
+            );
+            if delta != 0.0 {
+                self.scroll_y += delta;
+                self.clamp_scroll(content.height());
+                ui.ctx().request_repaint();
+            }
+        }
+
+        let mut changed = false;
+        let cursor_before_events = self.cursor;
+        if response.has_focus() {
+            changed = self.handle_events(ui, text);
+            if changed {
+                response.mark_changed();
+                ui.ctx().request_repaint();
+            }
+        }
+        ensure_cursor_visible |= self.cursor != cursor_before_events && !response.dragged();
+
+        self.clamp_selection(text);
+        if ensure_cursor_visible {
+            self.scroll_character_into_view(self.cursor, content.height());
+        }
+        self.paint(ui, rect, content, response.has_focus());
+        if response.has_focus() {
+            self.update_ime(ui, rect, content);
+        }
+
+        EditorOutput {
+            response,
+            cursor: self.cursor,
+            changed,
+        }
+    }
+
+    fn sync_lines(&mut self, highlighted: &LayoutJob, revision: u64, wrap_width: f32) {
+        let width = wrap_width.round().to_bits();
+        if self.visual_revision == Some(revision) && self.wrap_width == width {
+            return;
+        }
+        let specs = split_layout_job(highlighted, wrap_width);
+        let old = std::mem::take(&mut self.lines);
+        let old_len = old.len();
+        let new_len = specs.len();
+        let mut old: Vec<_> = old.into_iter().map(Some).collect();
+        let prefix = old
+            .iter()
+            .zip(&specs)
+            .take_while(|(old, spec)| old.as_ref().is_some_and(|line| line.job == spec.job))
+            .count();
+        let mut suffix = 0;
+        while suffix < old_len.saturating_sub(prefix)
+            && suffix < new_len.saturating_sub(prefix)
+            && old[old_len - suffix - 1]
+                .as_ref()
+                .is_some_and(|line| line.job == specs[new_len - suffix - 1].job)
+        {
+            suffix += 1;
+        }
+        self.lines = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let old_index = if index < prefix {
+                    Some(index)
+                } else if index >= new_len - suffix {
+                    Some(old_len - (new_len - index))
+                } else {
+                    None
+                };
+                if let Some(mut line) = old_index.and_then(|index| old[index].take()) {
+                    line.char_start = spec.char_start;
+                    line
+                } else {
+                    RetainedLine {
+                        height: estimated_height(&spec.job.text, wrap_width),
+                        job: spec.job,
+                        char_start: spec.char_start,
+                        galley: None,
+                        revision,
+                    }
+                }
+            })
+            .collect();
+        self.visual_revision = Some(revision);
+        self.wrap_width = width;
+        self.rebuild_offsets();
+    }
+
+    fn rebuild_offsets(&mut self) {
+        self.offsets.clear();
+        self.offsets.reserve(self.lines.len() + 1);
+        let mut y = 0.0;
+        self.offsets.push(y);
+        for line in &self.lines {
+            y += line.height.max(LINE_HEIGHT);
+            self.offsets.push(y);
+        }
+    }
+
+    fn visible_lines(&self, viewport_height: f32) -> Range<usize> {
+        let start = self
+            .offsets
+            .partition_point(|offset| *offset <= self.scroll_y)
+            .saturating_sub(1)
+            .min(self.lines.len());
+        let end = self
+            .offsets
+            .partition_point(|offset| *offset < self.scroll_y + viewport_height)
+            .saturating_add(1)
+            .min(self.lines.len());
+        start.saturating_sub(1)..end
+    }
+
+    fn layout_visible_lines(&mut self, ui: &Ui, content: Rect) {
+        let range = self.visible_lines(content.height());
+        let cursor_line = self.line_for_character(self.cursor);
+        let mut indexes: Vec<_> = range.collect();
+        if !indexes.contains(&cursor_line) && cursor_line < self.lines.len() {
+            indexes.push(cursor_line);
+        }
+        let mut changed_height = false;
+        for index in indexes {
+            let line = &mut self.lines[index];
+            if line.galley.is_none() {
+                let galley = ui.fonts_mut(|fonts| fonts.layout_job(line.job.clone()));
+                let height = galley.size().y.max(LINE_HEIGHT);
+                changed_height |= (height - line.height).abs() > f32::EPSILON;
+                line.height = height;
+                line.galley = Some(galley);
+            }
+            if self.line_numbers.len() <= index {
+                self.line_numbers.resize(index + 1, None);
+            }
+            if self.line_numbers[index].is_none() {
+                self.line_numbers[index] = Some(ui.fonts_mut(|fonts| {
+                    fonts.layout_no_wrap(
+                        (index + 1).to_string(),
+                        FontId::monospace(12.0),
+                        Color32::from_rgb(100, 106, 123),
+                    )
+                }));
+            }
+        }
+        if changed_height {
+            self.rebuild_offsets();
+            self.clamp_scroll(content.height());
+        }
+    }
+
+    fn paint(&self, ui: &Ui, rect: Rect, content: Rect, focused: bool) {
+        let painter = ui.painter_at(rect);
+        mark_retained(
+            &painter,
+            rect,
+            0x1000_0000_0000_0000,
+            u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
+        );
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 25, 30));
+        painter.line_segment(
+            [content.left_top(), content.left_bottom()],
+            Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
+        );
+        let selection = self.selection();
+        let cursor_line = self.line_for_character(self.cursor);
+        for index in self.visible_lines(content.height()) {
+            let line = &self.lines[index];
+            let Some(base_galley) = &line.galley else {
+                continue;
+            };
+            let y = content.top() + self.offsets[index] - self.scroll_y;
+            let line_end = line.char_start + line.job.text.chars().count();
+            let selected = selection.start.max(line.char_start)..selection.end.min(line_end);
+            let selection_state = (selected.start < selected.end).then_some(
+                (selected.start as u64).rotate_left(17) ^ (selected.end as u64).rotate_left(31),
+            );
+            let state = u64::from(y.to_bits())
+                ^ selection_state.unwrap_or(0)
+                ^ u64::from(index == cursor_line && focused);
+            mark_retained(
+                &painter,
+                rect,
+                0x2000_0000_0000_0000 | index as u64,
+                line.revision ^ state,
+            );
+            if index == cursor_line && focused {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(content.left(), y),
+                        egui::vec2(content.width(), line.height),
+                    ),
+                    0.0,
+                    Color32::from_white_alpha(6),
+                );
+            }
+            if let Some(number) = self.line_numbers.get(index).and_then(Option::as_ref) {
+                painter.galley(
+                    egui::pos2(
+                        content.left() - 5.0 - number.size().x,
+                        y + (LINE_HEIGHT - number.size().y) * 0.5,
+                    ),
+                    Arc::clone(number),
+                    Color32::from_rgb(100, 106, 123),
+                );
+            }
+            let mut galley = Arc::clone(base_galley);
+            if selected.start < selected.end {
+                let relative = CCursorRange::two(
+                    CCursor::new(selected.start - line.char_start),
+                    CCursor::new(selected.end - line.char_start),
+                );
+                egui::text_selection::visuals::paint_text_selection(
+                    &mut galley,
+                    &ui.visuals().clone(),
+                    &relative,
+                    None,
+                );
+            }
+            painter.galley(
+                egui::pos2(content.left() + TEXT_LEFT_PADDING, y),
+                galley,
+                Color32::LIGHT_GRAY,
+            );
+        }
+        if focused && ui.input(|input| ((input.time * 2.0) as u64).is_multiple_of(2)) {
+            mark_retained(
+                &painter,
+                rect,
+                0x3000_0000_0000_0000,
+                self.cursor as u64 ^ u64::from(self.scroll_y.to_bits()),
+            );
+            if let Some(caret) = self.cursor_rect(content) {
+                painter.line_segment(
+                    [caret.left_top(), caret.left_bottom()],
+                    Stroke::new(1.5, Color32::from_rgb(185, 205, 235)),
+                );
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    fn handle_events(&mut self, ui: &Ui, text: &mut String) -> bool {
+        let events = ui.input(|input| input.events.clone());
+        let mut changed = false;
+        for event in events {
+            match event {
+                Event::Copy => self.copy(ui, text),
+                Event::Cut => {
+                    self.copy(ui, text);
+                    changed |= self.replace_selection(text, "");
+                }
+                Event::Paste(value) | Event::Text(value) if !value.is_empty() => {
+                    changed |= self.replace_selection(text, &value);
+                }
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => changed |= self.handle_key(ui, text, key, modifiers),
+                Event::Ime(egui::ImeEvent::Commit(value)) if !value.is_empty() => {
+                    changed |= self.replace_selection(text, &value);
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    fn handle_key(&mut self, ui: &Ui, text: &mut String, key: Key, modifiers: Modifiers) -> bool {
+        if modifiers.command {
+            match key {
+                Key::A => {
+                    self.anchor = 0;
+                    self.cursor = text.chars().count();
+                    return false;
+                }
+                Key::Z if modifiers.shift => return self.redo(text),
+                Key::Z => return self.undo(text),
+                Key::Y => return self.redo(text),
+                _ => {}
+            }
+        }
+        match key {
+            Key::Backspace => {
+                if self.selection().is_empty() && self.cursor > 0 {
+                    self.anchor = self.cursor - 1;
+                }
+                self.replace_selection(text, "")
+            }
+            Key::Delete => {
+                if self.selection().is_empty() && self.cursor < text.chars().count() {
+                    self.cursor += 1;
+                }
+                self.replace_selection(text, "")
+            }
+            Key::Enter => self.replace_selection(text, "\n"),
+            Key::Tab if modifiers.shift => self.decrease_indent(text),
+            Key::Tab => self.replace_selection(text, "    "),
+            Key::ArrowLeft => {
+                let next = if modifiers.alt {
+                    previous_word(text, self.cursor)
+                } else {
+                    self.cursor.saturating_sub(1)
+                };
+                self.move_cursor(next, modifiers.shift);
+                self.h_pos = None;
+                false
+            }
+            Key::ArrowRight => {
+                let next = if modifiers.alt {
+                    next_word(text, self.cursor)
+                } else {
+                    (self.cursor + 1).min(text.chars().count())
+                };
+                self.move_cursor(next, modifiers.shift);
+                self.h_pos = None;
+                false
+            }
+            Key::ArrowUp => {
+                self.move_vertical(-1, modifiers.shift);
+                false
+            }
+            Key::ArrowDown => {
+                self.move_vertical(1, modifiers.shift);
+                false
+            }
+            Key::Home => {
+                let line = self.line_for_character(self.cursor);
+                let start = self.lines.get(line).map_or(0, |line| line.char_start);
+                self.move_cursor(start, modifiers.shift);
+                false
+            }
+            Key::End => {
+                let line = self.line_for_character(self.cursor);
+                let end = self.lines.get(line).map_or_else(
+                    || text.chars().count(),
+                    |line| line.char_start + line.job.text.chars().count(),
+                );
+                self.move_cursor(end, modifiers.shift);
+                false
+            }
+            Key::Escape => {
+                ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn decrease_indent(&mut self, text: &mut String) -> bool {
+        let line = self.line_for_character(self.cursor);
+        let start = self.lines.get(line).map_or(0, |line| line.char_start);
+        let remove = text
+            .chars()
+            .skip(start)
+            .take(4)
+            .take_while(|character| *character == ' ')
+            .count();
+        if remove == 0 {
+            return false;
+        }
+        self.set_selection(start, start + remove);
+        self.replace_selection(text, "")
+    }
+
+    fn copy(&self, ui: &Ui, text: &str) {
+        let selection = self.selection();
+        if !selection.is_empty() {
+            ui.output_mut(|output| {
+                output.commands.push(OutputCommand::CopyText(
+                    char_slice(text, selection).to_owned(),
+                ));
+            });
+        }
+    }
+
+    fn move_cursor(&mut self, cursor: usize, extend: bool) {
+        self.cursor = cursor;
+        if !extend {
+            self.anchor = cursor;
+        }
+    }
+
+    fn move_vertical(&mut self, direction: i8, extend: bool) {
+        let line_index = self.line_for_character(self.cursor);
+        let Some(line) = self.lines.get(line_index) else {
+            return;
+        };
+        let Some(galley) = &line.galley else {
+            return;
+        };
+        let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
+        let (within, h_pos) = if direction < 0 {
+            galley.cursor_up_one_row(&relative, self.h_pos)
+        } else {
+            galley.cursor_down_one_row(&relative, self.h_pos)
+        };
+        let at_edge = if direction < 0 {
+            within.index == CharIndex::ZERO
+                && galley.layout_from_cursor(relative).row == 0
+                && line_index > 0
+        } else {
+            within.index == galley.end().index
+                && galley.layout_from_cursor(relative).row + 1 == galley.rows.len()
+                && line_index + 1 < self.lines.len()
+        };
+        let cursor = if at_edge {
+            let target = if direction < 0 {
+                line_index - 1
+            } else {
+                line_index + 1
+            };
+            let target_line = &self.lines[target];
+            let Some(target_galley) = &target_line.galley else {
+                return;
+            };
+            let x = self.h_pos.or(h_pos).unwrap_or(0.0);
+            let y = if direction < 0 {
+                target_galley.size().y
+            } else {
+                0.0
+            };
+            target_line.char_start + target_galley.cursor_from_pos(Vec2::new(x, y)).index.0
+        } else {
+            line.char_start + within.index.0
+        };
+        self.h_pos = h_pos;
+        self.move_cursor(cursor, extend);
+    }
+
+    fn line_for_character(&self, character: usize) -> usize {
+        self.lines
+            .partition_point(|line| line.char_start <= character)
+            .saturating_sub(1)
+            .min(self.lines.len().saturating_sub(1))
+    }
+
+    fn character_at(&self, pointer: Pos2, content: Rect) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        let document_y = (pointer.y - content.top() + self.scroll_y).max(0.0);
+        let line_index = self
+            .offsets
+            .partition_point(|offset| *offset <= document_y)
+            .saturating_sub(1)
+            .min(self.lines.len() - 1);
+        let line = &self.lines[line_index];
+        let Some(galley) = &line.galley else {
+            return line.char_start;
+        };
+        let local = egui::vec2(
+            pointer.x - content.left() - TEXT_LEFT_PADDING,
+            document_y - self.offsets[line_index],
+        );
+        line.char_start + galley.cursor_from_pos(local).index.0
+    }
+
+    fn cursor_rect(&self, content: Rect) -> Option<Rect> {
+        let line_index = self.line_for_character(self.cursor);
+        let line = self.lines.get(line_index)?;
+        let galley = line.galley.as_ref()?;
+        let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
+        let local = galley.pos_from_cursor(relative);
+        Some(local.translate(egui::vec2(
+            content.left() + TEXT_LEFT_PADDING,
+            content.top() + self.offsets[line_index] - self.scroll_y,
+        )))
+    }
+
+    fn scroll_character_into_view(&mut self, character: usize, viewport_height: f32) {
+        let index = self.line_for_character(character);
+        let Some(line) = self.lines.get(index) else {
+            return;
+        };
+        let top = self.offsets[index];
+        let bottom = top + line.height;
+        if top < self.scroll_y {
+            self.scroll_y = top;
+        } else if bottom > self.scroll_y + viewport_height {
+            self.scroll_y = bottom - viewport_height;
+        }
+        self.clamp_scroll(viewport_height);
+    }
+
+    fn clamp_selection(&mut self, text: &str) {
+        let len = text.chars().count();
+        self.anchor = self.anchor.min(len);
+        self.cursor = self.cursor.min(len);
+    }
+
+    fn clamp_scroll(&mut self, viewport_height: f32) {
+        let total = self.offsets.last().copied().unwrap_or(0.0);
+        self.scroll_y = self.scroll_y.clamp(0.0, (total - viewport_height).max(0.0));
+    }
+
+    fn update_ime(&self, ui: &Ui, rect: Rect, content: Rect) {
+        if let Some(cursor_rect) = self.cursor_rect(content) {
+            ui.output_mut(|output| {
+                output.ime = Some(egui::output::IMEOutput {
+                    rect,
+                    cursor_rect,
+                    should_interrupt_composition: false,
+                });
+            });
+        }
+    }
+}
+
+struct LineSpec {
+    job: LayoutJob,
+    char_start: usize,
+}
+
+fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (index, byte) in highlighted.text.bytes().enumerate() {
+        if byte == b'\n' {
+            ranges.push(start..index);
+            start = index + 1;
+        }
+    }
+    ranges.push(start..highlighted.text.len());
+
+    let mut char_start = 0;
+    ranges
+        .into_iter()
+        .map(|range| {
+            let text = highlighted.text[range.clone()].to_owned();
+            let mut sections = Vec::new();
+            for section in &highlighted.sections {
+                let start = section.byte_range.start.0.max(range.start);
+                let end = section.byte_range.end.0.min(range.end);
+                if start < end {
+                    sections.push(LayoutSection {
+                        leading_space: section.leading_space,
+                        byte_range: ByteIndex(start - range.start)..ByteIndex(end - range.start),
+                        format: section.format.clone(),
+                    });
+                }
+            }
+            if sections.is_empty() && !text.is_empty() {
+                sections.push(LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: ByteIndex(0)..ByteIndex(text.len()),
+                    format: TextFormat {
+                        font_id: FontId::monospace(14.0),
+                        color: Color32::LIGHT_GRAY,
+                        ..TextFormat::default()
+                    },
+                });
+            }
+            let line_start = char_start;
+            char_start += text.chars().count() + 1;
+            LineSpec {
+                job: LayoutJob {
+                    text,
+                    sections,
+                    wrap: egui::text::TextWrapping {
+                        max_width: wrap_width,
+                        break_anywhere: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                char_start: line_start,
+            }
+        })
+        .collect()
+}
+
+fn estimated_height(text: &str, wrap_width: f32) -> f32 {
+    let width = text.chars().count() as f32 * 8.4;
+    LINE_HEIGHT * (width / wrap_width.max(1.0)).ceil().max(1.0)
+}
+
+fn line_count(text: &str) -> usize {
+    text.bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+fn gutter_width(lines: usize) -> f32 {
+    let digits = lines.max(1).ilog10() + 1;
+    (digits as f32 * 7.0 + 11.0).max(22.0)
+}
+
+fn previous_word(text: &str, cursor: usize) -> usize {
+    let characters: Vec<_> = text.chars().collect();
+    let mut index = cursor.min(characters.len());
+    while index > 0 && characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn next_word(text: &str, cursor: usize) -> usize {
+    let characters: Vec<_> = text.chars().collect();
+    let mut index = cursor.min(characters.len());
+    while index < characters.len() && !characters[index].is_whitespace() {
+        index += 1;
+    }
+    while index < characters.len() && characters[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn selection_drag_scroll_delta(pointer_y: f32, top: f32, bottom: f32, dt: f32) -> f32 {
+    let distance = if pointer_y < top {
+        pointer_y - top
+    } else if pointer_y > bottom {
+        pointer_y - bottom
+    } else {
+        return 0.0;
+    };
+    distance.signum() * (distance.abs() * 12.0).clamp(100.0, 1_200.0) * dt
+}
+
+fn char_slice(text: &str, range: Range<usize>) -> &str {
+    &text[byte_index(text, range.start)..byte_index(text, range.end)]
+}
+
+fn replace_chars(text: &mut String, range: Range<usize>, replacement: &str) {
+    let bytes = byte_index(text, range.start)..byte_index(text, range.end);
+    text.replace_range(bytes, replacement);
+}
+
+fn byte_index(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map_or(text.len(), |(index, _)| index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditorSurface, gutter_width, selection_drag_scroll_delta};
+    use egui::{CursorIcon, Event, RawInput, Rect, Vec2, pos2};
+
+    #[test]
+    fn retained_editor_replaces_selections_and_replays_delta_history() {
+        let mut editor = EditorSurface::default();
+        let mut text = "hello world".to_owned();
+        editor.set_selection(6, 11);
+
+        assert!(editor.replace_selection(&mut text, "Editur"));
+        assert_eq!(text, "hello Editur");
+        assert_eq!(editor.selection(), 12..12);
+
+        assert!(editor.undo(&mut text));
+        assert_eq!(text, "hello world");
+        assert_eq!(editor.selection(), 6..11);
+
+        assert!(editor.redo(&mut text));
+        assert_eq!(text, "hello Editur");
+        assert_eq!(editor.selection(), 12..12);
+    }
+
+    #[test]
+    fn line_number_gutter_stays_compact_and_grows_with_digit_count() {
+        assert_eq!(gutter_width(9), 22.0);
+        assert_eq!(gutter_width(999), 32.0);
+    }
+
+    #[test]
+    fn selection_drag_scroll_moves_only_toward_an_outside_pointer() {
+        let deltas = [
+            selection_drag_scroll_delta(80.0, 100.0, 500.0, 1.0 / 60.0),
+            selection_drag_scroll_delta(300.0, 100.0, 500.0, 1.0 / 60.0),
+            selection_drag_scroll_delta(520.0, 100.0, 500.0, 1.0 / 60.0),
+        ];
+
+        assert_eq!(
+            deltas.map(|delta| (delta * 60.0).round()),
+            [-240.0, 0.0, 240.0]
+        );
+    }
+
+    #[test]
+    fn hovering_the_editor_uses_the_native_text_cursor() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                events: vec![Event::PointerMoved(pos2(100.0, 100.0))],
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            },
+        );
+
+        assert_eq!(output.platform_output.cursor_icon, CursorIcon::Text);
+    }
+}

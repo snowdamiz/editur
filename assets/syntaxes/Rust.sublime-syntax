@@ -34,7 +34,7 @@ contexts:
         - meta_scope: string.quoted.double.raw.rust
         - match: '"\1'
           pop: true
-    - match: 'b"'
+    - match: 'b?"'
       push:
         - meta_scope: string.quoted.double.rust
         - match: '\\.'

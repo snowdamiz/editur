@@ -83,9 +83,7 @@ jobs:
             cp target/release/editur dist/package/Editur.app/Contents/MacOS/
             cp assets/macos/Info.plist dist/package/Editur.app/Contents/
             cp assets/icons/editur.icns dist/package/Editur.app/Contents/Resources/Editur.icns
-            /usr/bin/Rez -append assets/macos/EditurIcon.r -o dist/package/Editur.app/Contents/MacOS/editur
-            /usr/bin/SetFile -a C dist/package/Editur.app/Contents/MacOS/editur
-            /usr/bin/ditto -c -k --sequesterRsrc dist/package "${{ matrix.archive }}"
+            /usr/bin/ditto -c -k --keepParent dist/package/Editur.app "${{ matrix.archive }}"
           else
             cp target/release/editur dist/package/
             cp assets/icons/editur.png dist/package/
@@ -279,16 +277,24 @@ jobs:
         run: |
           install_dir="$RUNNER_TEMP/editur/bin"
           EDITUR_INSTALL_DIR="$install_dir" sh install.sh
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            /usr/bin/xattr -p com.apple.FinderInfo "$install_dir/Editur.app/Contents/MacOS/editur" >/dev/null
-            /usr/bin/xattr -p com.apple.ResourceFork "$install_dir/Editur.app/Contents/MacOS/editur" >/dev/null
-          fi
           "$install_dir/editur" --version
           "$install_dir/editur" --help
           "$install_dir/editur" update
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            bare_dir="$RUNNER_TEMP/editur/bare-bin"
+            mkdir -p "$bare_dir"
+            cp "$install_dir/Editur.app/Contents/MacOS/editur" "$bare_dir/editur"
+            "$bare_dir/editur" update
+            test -L "$bare_dir/editur"
+            test -f "$bare_dir/Editur.app/Contents/Resources/Editur.icns"
+            "$bare_dir/editur" --version
+          fi
           "$install_dir/editur" syntax list
           "$install_dir/editur" syntax install python
+          touch Dockerfile
+          "$install_dir/editur" syntax install dockerfile
           "$install_dir/editur" syntax list
+          "$install_dir/editur" syntax remove dockerfile
           "$install_dir/editur" syntax remove python
       - name: Install and update on Windows
         if: runner.os == 'Windows'
@@ -302,5 +308,8 @@ jobs:
           & $editur update
           & $editur syntax list
           & $editur syntax install python
+          Set-Content -LiteralPath Dockerfile -Value 'FROM scratch'
+          & $editur syntax install dockerfile
           & $editur syntax list
+          & $editur syntax remove dockerfile
           & $editur syntax remove python

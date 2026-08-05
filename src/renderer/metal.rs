@@ -27,7 +27,7 @@ use winit::{
 
 use super::{buffer_capacity, choose_adapter};
 
-const FRAMES_IN_FLIGHT: usize = 3;
+const FRAMES_IN_FLIGHT: usize = 2;
 
 #[cfg(editur_precompiled_metal)]
 const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.metallib"));
@@ -45,6 +45,7 @@ struct FrameBuffers {
     index: MetalBuffer,
     index_capacity: usize,
     pending: Option<CommandBuffer>,
+    retained: HashMap<u64, super::RetainedUpload>,
 }
 
 impl FrameBuffers {
@@ -55,6 +56,7 @@ impl FrameBuffers {
             index: device.new_buffer(1, MTLResourceOptions::StorageModeShared),
             index_capacity: 1,
             pending: None,
+            retained: HashMap::new(),
         }
     }
 
@@ -69,12 +71,14 @@ impl FrameBuffers {
                 MTLResourceOptions::StorageModeShared,
             );
             self.vertex_capacity = vertex_capacity;
+            self.retained.clear();
         }
         let index_capacity = buffer_capacity(self.index_capacity, index_bytes);
         if index_capacity != self.index_capacity {
             self.index =
                 device.new_buffer(index_capacity as u64, MTLResourceOptions::StorageModeShared);
             self.index_capacity = index_capacity;
+            self.retained.clear();
         }
     }
 }
@@ -191,13 +195,6 @@ impl Renderer {
             self.update_texture(*id, delta)?;
         }
 
-        if primitives
-            .iter()
-            .any(|primitive| matches!(primitive.primitive, Primitive::Callback(_)))
-        {
-            return Err("Metal: egui paint callbacks are unsupported".to_owned());
-        }
-
         if self.size.width == 0 || self.size.height == 0 {
             self.free_textures(&textures_delta.free);
             return Ok(());
@@ -254,10 +251,15 @@ impl Renderer {
         frame.prepare(&self.device, total_vertex_bytes, total_index_bytes);
         let mut vertex_offset = 0;
         let mut index_offset = 0;
+        let mut retained = None;
 
         for primitive in primitives {
-            let Primitive::Mesh(mesh) = &primitive.primitive else {
-                continue;
+            let mesh = match &primitive.primitive {
+                Primitive::Mesh(mesh) => mesh,
+                Primitive::Callback(_) => {
+                    retained = super::retained_paint(&primitive.primitive)?;
+                    continue;
+                }
             };
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 continue;
@@ -272,17 +274,37 @@ impl Renderer {
                 .ok_or_else(|| format!("Metal: missing egui texture {:?}", mesh.texture_id))?;
             let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
             let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    vertices.as_ptr(),
-                    frame.vertex.contents().cast::<u8>().add(vertex_offset),
-                    vertices.len(),
-                );
-                ptr::copy_nonoverlapping(
-                    indices.as_ptr(),
-                    frame.index.contents().cast::<u8>().add(index_offset),
-                    indices.len(),
-                );
+            let upload = retained.take().map(|paint| {
+                (
+                    paint.key,
+                    super::RetainedUpload {
+                        revision: paint.revision,
+                        vertex_offset,
+                        vertex_bytes: vertices.len(),
+                        index_offset,
+                        index_bytes: indices.len(),
+                    },
+                )
+            });
+            let upload_needed = upload
+                .as_ref()
+                .is_none_or(|(key, next)| super::upload_required(frame.retained.get(key), *next));
+            if upload_needed {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        vertices.as_ptr(),
+                        frame.vertex.contents().cast::<u8>().add(vertex_offset),
+                        vertices.len(),
+                    );
+                    ptr::copy_nonoverlapping(
+                        indices.as_ptr(),
+                        frame.index.contents().cast::<u8>().add(index_offset),
+                        indices.len(),
+                    );
+                }
+                if let Some((key, upload)) = upload {
+                    frame.retained.insert(key, upload);
+                }
             }
             encoder.set_scissor_rect(scissor);
             encoder.set_vertex_buffer(0, Some(&frame.vertex), vertex_offset as u64);

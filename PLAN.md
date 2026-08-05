@@ -111,7 +111,8 @@ The tree reads a directory only when the user expands it, sorts directories befo
 | Need | Choice | Reason |
 | --- | --- | --- |
 | Native window and input | `winit`, `egui-winit`, and text-only `arboard` | One cross-platform event loop with IME, keyboard, pointer, DPI, accessibility, and a small explicit system-clipboard bridge. |
-| Widgets | `egui` | Built-in multiline text editing, panels, scrolling, selection, undo/redo, and accessibility semantics without coupling the app to a renderer framework. |
+| Hot UI surfaces | Retained in-repo editor, tree, titlebar, and status surfaces | Visible rows/lines keep layout and GPU upload state; input changes only the affected text, selection, caret, or hover layer. |
+| Transient UI | `egui` | Keep its input/accessibility integration and use widgets only for infrequent search palettes, prompts, and error dialogs. |
 | Renderer | Direct Metal, Direct3D 12, and Vulkan modules | Each release contains only its platform API. A small in-repo egui mesh/texture renderer avoids `wgpu`, translation layers, and a second rendering abstraction. |
 | Highlighting | `syntect` with its `fancy-regex` backend | Mature Sublime-compatible grammar support, a pure-Rust regex path, and precompiled syntax dumps for fast startup. |
 | Syntax manifests | `serde` and JSON | A small, versioned package format with broad tooling support. |
@@ -120,7 +121,7 @@ The tree reads a directory only when the user expands it, sorts directories befo
 | User data location | `directories` | Correct per-platform application data paths without custom OS branches. |
 | Safe temporary files | `tempfile` | Same-directory temporary writes before replacement. |
 
-Keep dependency features narrow. In particular, do not enable image loaders, web support, persistence, alternate graphics APIs, or every bundled `syntect` syntax. Use `egui` with default fonts, `egui-winit` with accessibility, a text-only clipboard backend, and target-gated graphics bindings so macOS never compiles Vulkan or D3D12, Windows never compiles Metal or Vulkan, and Linux never compiles Metal or D3D12. Disable `syntect` default features and select the `regex-fancy`, parsing, YAML-load, dump-load, and dump-create features explicitly; otherwise Cargo can pull in the native Oniguruma library and violate the Rust-only requirement.
+Keep dependency features narrow. In particular, do not enable image loaders, web support, persistence, alternate graphics APIs, or every bundled `syntect` syntax. Use `egui` with default fonts and `egui-winit` with accessibility for transient UI and input plumbing, a text-only clipboard backend, and target-gated graphics bindings so macOS never compiles Vulkan or D3D12, Windows never compiles Metal or Vulkan, and Linux never compiles Metal or D3D12. Disable `syntect` default features and select the `regex-fancy`, parsing, YAML-load, dump-load, and dump-create features explicitly; otherwise Cargo can pull in the native Oniguruma library and violate the Rust-only requirement.
 
 ### Renderer configuration
 
@@ -141,12 +142,14 @@ Prefer an integrated or low-power device because a text editor does not need a d
 Start with one binary crate, not a workspace. Keep the implementation in a few concrete modules:
 
 - `cli`: parse arguments and route editor or syntax-package commands.
-- `app`: own UI state and draw the three window regions.
+- `app`: own UI state and compose retained surfaces with transient dialogs.
 - `buffer`: text, cursor-facing metadata, dirty state, line endings, and disk fingerprint.
+- `editor_surface`: retain per-line layout, selection, caret, scrolling, editing history, and paint revisions.
 - `file_io`: open, conflict-check, and safe save.
 - `renderer`: expose the same small lifecycle from target-gated Metal, D3D12, and Vulkan modules.
 - `search`: build and query the background filename/content index.
 - `tree`: lazily list and sort directory entries.
+- `tree_surface`: retain and virtualize visible file rows and hover/selection paint state.
 - `syntax`: detect languages, load the syntax cache, highlight text, and manage packages.
 
 Do not create traits for these modules in advance. Add an interface only when a second real implementation exists.
@@ -160,12 +163,12 @@ Do not create traits for these modules in advance. Add an interface only when a 
 - Load one immutable compiled syntax set at startup.
 - Request repaint only after input or state changes; the editor should do no work while idle.
 - Create one native graphics device, queue, presentation layer/swapchain, and egui renderer for the window and reuse them for the process lifetime.
-- Reuse geometrically grown vertex/index upload buffers across frames and allow bounded frames in flight.
+- Reuse geometrically grown vertex/index upload buffers across frames and allow bounded frames in flight. Retained paint markers keep unchanged buffer segments in each in-flight buffer, so caret, selection, and hover updates upload only dirty regions.
 - Compile Vulkan and Metal shaders during release builds; a macOS release must not compile its Metal source during application startup.
-- Hold one `String` buffer. It matches the underlying text widget and avoids converting a rope on every frame.
-- Cache the highlighted layout by buffer revision, syntax, theme, and available width.
+- Hold one `String` buffer while normal source files remain the measured product ceiling; the retained editor edits it with deltas and never clones it per frame.
+- Cache highlighting by buffer revision and parser state, then retain layout and GPU upload state per logical line and available width.
 
-The deliberate v1 ceiling is normal source files up to 1 MiB. Files above 5 MiB open as plain text with a warning. If real usage demands larger files, replace the editor widget and `String` together with a virtualized rope-backed implementation; adding a rope alone would only add conversions.
+The deliberate v1 ceiling is normal source files up to 1 MiB. Files above 5 MiB open as plain text with a warning. If measured editing costs demand larger files, replace the `String` with a rope or piece table behind `EditorSurface`; the UI is already line-virtualized and no longer depends on a widget-owned string.
 
 ## 6. File safety
 
@@ -258,7 +261,7 @@ Record the reference machine and measure release builds. Initial targets are:
 
 Milestone 0 establishes the real baseline before further optimization. Use release builds and profile any missed budget; do not add a custom allocator, rope, background worker pool, render graph, or renderer framework based on assumption alone.
 
-Start with full-buffer re-highlighting when the buffer revision changes and reuse the cached layout at all other times. If the typing budget fails on the 1 MiB fixture, change only the highlighter to cache parser state per line and reparse from the first changed line until state converges.
+Incremental highlighting caches parser state per line and reparses from the first changed line until state converges. The editor and tree lay out only visible dirty rows, while the native renderers retain unchanged marked vertex/index segments in their existing in-flight upload buffers.
 
 ## 9. Error handling and observability
 
@@ -286,7 +289,7 @@ Exit condition: `editur` reliably opens and closes a blank window through the pl
 
 ### Milestone 1: safe single-file editing
 
-- Implement path resolution, UTF-8 loading, one wrapping multiline editor, dirty state, and status bar.
+- Implement path resolution, UTF-8 loading, the retained wrapping `EditorSurface`, dirty state, and retained status bar.
 - Implement LF/CRLF preservation, external-change detection, safe replacement, and unsaved-change prompts.
 - Wire standard save, undo/redo, and close behavior.
 - Add focused tests for path resolution, line-ending round trips, conflict detection, and failed-save dirty state.
@@ -295,7 +298,7 @@ Exit condition: opening, editing, saving, and creating a file cannot silently di
 
 ### Milestone 2: file tree
 
-- Add the resizable/collapsible sidebar.
+- Add the resizable/collapsible sidebar and retained virtualized `TreeSurface`.
 - Read directories lazily, sort entries, hide `.git`, and avoid following directory symlinks.
 - Add mouse and keyboard navigation.
 - Route file changes through the same unsaved-buffer prompt used on close.
@@ -308,7 +311,8 @@ Exit condition: a user can open a directory, navigate or search to a file withou
 
 - Embed the precompiled Rust and Plain Text syntax set.
 - Detect syntax from the selected file.
-- Cache layout so idle frames never re-highlight unchanged text.
+- Cache parser state and per-line layout so idle frames never re-highlight or re-layout unchanged text.
+- Mark retained editor/tree/chrome paint regions and verify Metal, D3D12, and Vulkan skip unchanged upload-buffer segments.
 - Add a representative Rust fixture and measure typing latency at small, medium, and 1 MiB sizes.
 
 Exit condition: Rust highlighting is correct enough for comments, strings, raw strings, macros, keywords, and types while meeting the measured interaction budget.
@@ -379,7 +383,7 @@ Anything beyond that is a candidate for a later release, not a prerequisite for 
 - [`windows` Direct3D 12 bindings](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Graphics/Direct3D12/)
 - [`ash` Vulkan bindings](https://docs.rs/ash/latest/ash/)
 - [Vulkan swapchain extension](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_swapchain.html)
-- [egui multiline `TextEdit`](https://docs.rs/egui/latest/egui/widgets/text_edit/struct.TextEdit.html)
+- [egui custom paint callbacks](https://docs.rs/egui/latest/egui/struct.PaintCallback.html)
 - [`syntect` syntax-set builder](https://docs.rs/syntect/latest/syntect/parsing/struct.SyntaxSetBuilder.html)
 - [`syntect` binary syntax dumps](https://docs.rs/syntect/latest/syntect/dumps/)
 - [`directories` project-data locations](https://docs.rs/directories/latest/directories/struct.ProjectDirs.html)

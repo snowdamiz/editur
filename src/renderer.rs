@@ -1,3 +1,44 @@
+use egui::{PaintCallback, Painter, Rect, epaint::Primitive};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedPaint {
+    pub key: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedUpload {
+    pub revision: u64,
+    pub vertex_offset: usize,
+    pub vertex_bytes: usize,
+    pub index_offset: usize,
+    pub index_bytes: usize,
+}
+
+pub(crate) fn mark_retained(painter: &Painter, rect: Rect, key: u64, revision: u64) {
+    painter.add(PaintCallback {
+        rect,
+        callback: Arc::new(RetainedPaint { key, revision }),
+    });
+}
+
+pub(crate) fn retained_paint(primitive: &Primitive) -> Result<Option<RetainedPaint>, String> {
+    let Primitive::Callback(callback) = primitive else {
+        return Ok(None);
+    };
+    callback
+        .callback
+        .downcast_ref::<RetainedPaint>()
+        .copied()
+        .map(Some)
+        .ok_or_else(|| "unsupported egui paint callback".to_owned())
+}
+
+pub(crate) fn upload_required(current: Option<&RetainedUpload>, next: RetainedUpload) -> bool {
+    current != Some(&next)
+}
+
 fn choose_adapter(adapters: &[(&str, bool, bool)], requested: Option<&str>) -> Option<usize> {
     if let Some(requested) = requested {
         let requested = requested.to_ascii_lowercase();
@@ -40,7 +81,7 @@ compile_error!("editur supports macOS, Windows, and Linux");
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_capacity, choose_adapter};
+    use super::{RetainedUpload, buffer_capacity, choose_adapter, upload_required};
 
     #[test]
     fn upload_buffers_grow_geometrically_and_never_shrink() {
@@ -59,5 +100,26 @@ mod tests {
         assert_eq!(choose_adapter(&adapters, Some("discrete")), Some(0));
         assert_eq!(choose_adapter(&adapters, None), Some(1));
         assert_eq!(choose_adapter(&[("Headless", true, true)], None), None);
+    }
+
+    #[test]
+    fn retained_uploads_change_only_when_geometry_or_offsets_change() {
+        let upload = RetainedUpload {
+            revision: 7,
+            vertex_offset: 16,
+            vertex_bytes: 32,
+            index_offset: 8,
+            index_bytes: 12,
+        };
+
+        assert!(upload_required(None, upload));
+        assert!(!upload_required(Some(&upload), upload));
+        assert!(upload_required(
+            Some(&upload),
+            RetainedUpload {
+                revision: 8,
+                ..upload
+            }
+        ));
     }
 }

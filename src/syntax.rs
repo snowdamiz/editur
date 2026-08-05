@@ -473,6 +473,30 @@ contexts: { main: [] }
     }
 
     #[test]
+    fn rust_string_with_apostrophe_does_not_leak_into_following_lines() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let syntax = syntaxes.detect(Path::new("main.rs"), false);
+        let source = "fn first() {\n    let error = Err(\"Editur's local instance port\".into());\n}\npub fn second() {}\n";
+        let job = Highlighter::new()
+            .unwrap()
+            .highlight_job(source, syntax, syntaxes.set(), 800.0)
+            .unwrap();
+        let color_at = |offset: usize| {
+            job.sections
+                .iter()
+                .find(|section| section.byte_range.contains(&offset.into()))
+                .unwrap()
+                .format
+                .color
+        };
+
+        let string = color_at(source.find("Editur").unwrap());
+        let keyword = color_at(source.rfind("pub").unwrap());
+        assert_ne!(string, keyword);
+        assert_eq!(keyword, Color32::from_rgb(198, 120, 221));
+    }
+
+    #[test]
     fn incremental_highlighting_matches_a_fresh_parse_after_line_edits() {
         let syntaxes = SyntaxManager::built_in().unwrap();
         let syntax = syntaxes.detect(Path::new("main.rs"), false);

@@ -32,7 +32,7 @@ editur update
 
 Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle plus a CLI symlink; Linux and Windows install the native executable. Set `EDITUR_INSTALL_DIR` to override the default install directory.
 
-If you installed an older bare-binary macOS build, run the installer once more to migrate it into the icon-preserving app bundle. Later `editur update` calls retain that metadata.
+`editur update` migrates older bare-binary macOS installs into the icon-preserving app bundle. Very old builds may need the command twice—the first update installs the migration-capable CLI—or you can run the installer once.
 
 ## Build and install
 
@@ -89,6 +89,8 @@ editur syntax list
 editur syntax install typescript
 editur syntax remove typescript
 ```
+
+Bare names such as `dockerfile` always refer to catalog packages, even when the current project contains a `Dockerfile`. Prefix local archives with a path, such as `./language.editur-syntax`.
 
 The published catalog currently includes C/C++, C#, CSS, Dockerfile, dotenv, Go, GraphQL, HTML, Java, JavaScript, JSON, Kotlin, Lua, Makefile, Markdown, PHP, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript, XML, and YAML. CI builds deterministic data-only archives from `syntax-packages/` and publishes them to the `syntax-v1` release.
 
