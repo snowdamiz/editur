@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod cli;
 pub mod file_io;
 mod instance;
+mod network;
 pub mod renderer;
 pub mod search;
 pub mod syntax;

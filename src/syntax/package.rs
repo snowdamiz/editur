@@ -416,15 +416,17 @@ fn read_limited_file(path: &Path) -> Result<Vec<u8>, String> {
 
 #[cfg(feature = "network")]
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    let mut response = ureq::get(url)
-        .call()
-        .map_err(|error| format!("cannot download {url}: {error}"))?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|error| format!("cannot read download from {url}: {error}"))
+    crate::network::retry(|| {
+        let mut response = ureq::get(url)
+            .call()
+            .map_err(|error| format!("cannot download {url}: {error}"))?;
+        response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .read_to_vec()
+            .map_err(|error| format!("cannot read download from {url}: {error}"))
+    })
 }
 
 #[cfg(not(feature = "network"))]
