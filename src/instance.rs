@@ -29,6 +29,14 @@ pub enum Claim {
     Forwarded,
 }
 
+pub fn open_running(target: &OpenTarget) -> Result<bool, String> {
+    match forward_request(instance_address()?, &Request::Open(target.clone()))? {
+        Some(true) => Ok(true),
+        Some(false) => Err("running editor refused the open request".into()),
+        None => Ok(false),
+    }
+}
+
 pub fn claim(target: &OpenTarget) -> Result<Claim, String> {
     let address = instance_address()?;
     if forward_request(address, &Request::Open(target.clone()))? == Some(true) {

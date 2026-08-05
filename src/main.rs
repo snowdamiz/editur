@@ -46,7 +46,12 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
             if env::var("EDITUR_LOG").as_deref() == Ok("debug") {
                 eprintln!("editur: path ready in {:.2?}", started.elapsed());
             }
-            app::run(target, started)
+            app::launch(target)
+        }
+        Command::Resident(path) => {
+            let cwd = env::current_dir()
+                .map_err(|error| format!("cannot determine current directory: {error}"))?;
+            app::run(resolve_target(&cwd, Some(&path))?, started)
         }
         Command::Syntax(command) => syntax_command(command),
         Command::Update => editur::update::run(),

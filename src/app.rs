@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -20,7 +21,7 @@ use winit::{
 use crate::{
     buffer::Buffer,
     file_io::{OpenTarget, SaveError, load_buffer, safe_save},
-    instance::{Claim, InstanceEvent, claim, spawn_listener},
+    instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager, data_dir},
@@ -372,6 +373,8 @@ impl EditorApp {
                 }
 
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(8.0);
                     if titlebar_button(ui, Color32::from_rgb(255, 95, 87), "×", "Close").clicked()
                     {
                         self.window_action = Some(WindowAction::Close);
@@ -1099,6 +1102,41 @@ impl EditorApp {
     }
 }
 
+pub fn launch(target: OpenTarget) -> Result<(), String> {
+    if open_running(&target)? {
+        return Ok(());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the Editur executable: {error}"))?;
+    let path = target.file.as_ref().unwrap_or(&target.root);
+    let mut command = Command::new(executable);
+    command
+        .arg("--resident")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach(&mut command);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("cannot start the editor resident: {error}"))
+}
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
 pub fn run(target: OpenTarget, started: Instant) -> Result<(), String> {
     let listener = match claim(&target)? {
         Claim::Primary(listener) => listener,
@@ -1200,6 +1238,9 @@ impl Shell {
             return;
         }
         if !self.first_frame_logged {
+            #[cfg(target_os = "macos")]
+            activate_macos_application();
+            window.focus_window();
             if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
                 eprintln!(
                     "editur: first editable frame in {:.2?}",
@@ -1252,7 +1293,7 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             .with_min_inner_size(LogicalSize::new(520, 320))
             .with_window_icon(Some(icon));
         #[cfg(target_os = "macos")]
-        let attributes = attributes.with_decorations(false);
+        let attributes = attributes.with_decorations(false).with_transparent(true);
         let window_started = Instant::now();
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
@@ -1375,6 +1416,8 @@ impl ApplicationHandler<InstanceEvent> for Shell {
                 self.editor.request_target(target);
                 if let Some(window) = &self.window {
                     window.set_visible(true);
+                    #[cfg(target_os = "macos")]
+                    activate_macos_application();
                     window.focus_window();
                     window.request_redraw();
                 }
@@ -1424,6 +1467,23 @@ fn set_macos_application_icon() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn activate_macos_application() {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+    unsafe {
+        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let modern: objc::runtime::BOOL =
+            msg_send![application, respondsToSelector: sel!(activate)];
+        if modern == objc::runtime::YES {
+            let _: () = msg_send![application, activate];
+        } else {
+            let _: () = msg_send![application, activateIgnoringOtherApps: objc::runtime::YES];
+        }
+    }
+}
+
 fn search_result_row(
     ui: &mut egui::Ui,
     selected: bool,
@@ -1460,7 +1520,7 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
 
 #[cfg(target_os = "macos")]
 fn titlebar_button(ui: &mut egui::Ui, color: Color32, symbol: &str, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 40.0), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });

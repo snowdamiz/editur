@@ -405,6 +405,11 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
     };
     let view = unsafe { &*handle.ns_view.as_ptr().cast::<Object>() };
     unsafe {
+        let layer_object = &*(layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>();
+        layer_object
+            .send_message::<_, ()>(Sel::register("setCornerRadius:"), (10.0_f64,))
+            .map_err(|error| format!("Metal: cannot round the window layer: {error}"))?;
+        layer.set_masks_to_bounds(true);
         view.send_message::<_, ()>(Sel::register("setWantsLayer:"), (YES,))
             .map_err(|error| format!("Metal: cannot enable the AppKit backing layer: {error}"))?;
         view.send_message::<_, ()>(

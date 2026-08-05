@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
     Open(Option<PathBuf>),
+    Resident(PathBuf),
     Syntax(SyntaxCommand),
     Update,
     #[cfg(windows)]
@@ -29,6 +30,18 @@ where
     let Some(first) = args.next() else {
         return Ok(Command::Open(None));
     };
+
+    if first == "--resident" {
+        let target = args
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "missing internal resident target".to_owned())?;
+        if args.next().is_some() {
+            return Err("too many internal resident arguments".into());
+        }
+        return Ok(Command::Resident(target));
+    }
 
     #[cfg(windows)]
     if first == "--finish-update" || first == "--cleanup-update" {
@@ -127,6 +140,15 @@ mod tests {
         assert_eq!(parse(&["--help"]), Ok(Command::Help));
         assert_eq!(parse(&["--version"]), Ok(Command::Version));
         assert_eq!(parse(&["update"]), Ok(Command::Update));
+    }
+
+    #[test]
+    fn parses_hidden_resident_command_with_its_target() {
+        assert_eq!(
+            parse(&["--resident", "/tmp/project"]),
+            Ok(Command::Resident(PathBuf::from("/tmp/project")))
+        );
+        assert!(parse(&["--resident"]).is_err());
     }
 
     #[test]
