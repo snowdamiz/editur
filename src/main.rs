@@ -46,7 +46,7 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
             if env::var("EDITUR_LOG").as_deref() == Ok("debug") {
                 eprintln!("editur: path ready in {:.2?}", started.elapsed());
             }
-            app::launch(target)
+            app::launch(target, started)
         }
         Command::Resident(path) => {
             let cwd = env::current_dir()

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -1137,7 +1138,7 @@ impl EditorApp {
         }
         self.cursor = buffer.line_column(output.cursor);
         let pair = (!buffer.large_file_warning)
-            .then(|| match_bracket_pair(&buffer.text, output.cursor))
+            .then(|| match_bracket_pair(buffer, output.cursor))
             .flatten();
         if self.bracket_pair != pair {
             self.bracket_pair = pair;
@@ -1250,7 +1251,14 @@ impl EditorApp {
     }
 }
 
-pub fn launch(target: OpenTarget) -> Result<(), String> {
+pub fn launch(target: OpenTarget, started: Instant) -> Result<(), String> {
+    if launch_in_current_process(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        return run(target, started);
+    }
     if open_running(&target)? {
         return Ok(());
     }
@@ -1269,6 +1277,14 @@ pub fn launch(target: OpenTarget) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("cannot start the editor resident: {error}"))
+}
+
+const fn launch_in_current_process(
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    stderr_terminal: bool,
+) -> bool {
+    !(stdin_terminal || stdout_terminal || stderr_terminal)
 }
 
 #[cfg(unix)]
@@ -1855,16 +1871,20 @@ fn next_find_match(selected: usize, match_count: usize, backwards: bool) -> usiz
 }
 
 fn match_bracket_pair(
-    text: &str,
+    buffer: &Buffer,
     cursor_character: usize,
 ) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let (byte, bracket) = cursor_character
-        .checked_sub(1)
-        .and_then(|index| text.char_indices().nth(index))
+    let text = &buffer.text;
+    let cursor_byte = buffer.byte_index(cursor_character);
+    let (byte, bracket) = text[..cursor_byte]
+        .char_indices()
+        .next_back()
         .filter(|(_, character)| is_bracket(*character))
         .or_else(|| {
-            text.char_indices()
-                .nth(cursor_character)
+            text[cursor_byte..]
+                .char_indices()
+                .next()
+                .map(|(offset, character)| (cursor_byte + offset, character))
                 .filter(|(_, character)| is_bracket(*character))
         })?;
     let bracket_range = byte..byte + bracket.len_utf8();
@@ -2081,12 +2101,23 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorApp, TreeState, find_highlighted_job, match_bracket_pair, match_spans,
-        next_find_match, plain_text_job, presentation_job, search_selection_after_navigation,
+        EditorApp, TreeState, find_highlighted_job, launch_in_current_process, match_bracket_pair,
+        match_spans, next_find_match, plain_text_job, presentation_job,
+        search_selection_after_navigation,
     };
-    use crate::file_io::OpenTarget;
+    use crate::{buffer::Buffer, file_io::OpenTarget};
     use egui::{CursorIcon, Event, Id, Key, Modifiers, PointerButton, RawInput, Rect, Vec2, pos2};
     use std::fs;
+
+    #[test]
+    fn graphical_launch_runs_in_the_current_process() {
+        assert!(launch_in_current_process(false, false, false));
+    }
+
+    #[test]
+    fn terminal_launch_preserves_the_detached_cli() {
+        assert!(!launch_in_current_process(true, false, false));
+    }
 
     #[test]
     fn file_tree_rebuilds_its_cached_rows_only_when_expansion_changes() {
@@ -2150,16 +2181,19 @@ mod tests {
 
     #[test]
     fn bracket_pair_matching_respects_nested_pairs_on_either_side_of_the_cursor() {
-        let text = "fn call(value: [u8; 2]) { values[index] }";
+        let mut buffer = Buffer::new("nested.rs".into());
+        buffer.text = "fn call(value: [u8; 2]) { values[index] }".into();
+        buffer.mark_changed();
+        let text = &buffer.text;
         let opening = text.find('[').unwrap();
         let closing = text[opening..].find(']').unwrap() + opening;
 
         assert_eq!(
-            match_bracket_pair(text, text[..opening].chars().count()),
+            match_bracket_pair(&buffer, text[..opening].chars().count()),
             Some((opening..opening + 1, closing..closing + 1))
         );
         assert_eq!(
-            match_bracket_pair(text, text[..closing + 1].chars().count()),
+            match_bracket_pair(&buffer, text[..closing + 1].chars().count()),
             Some((opening..opening + 1, closing..closing + 1))
         );
     }

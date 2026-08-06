@@ -24,6 +24,7 @@ pub struct Buffer {
     pub revision: u64,
     pub large_file_warning: bool,
     line_starts: Vec<usize>,
+    line_byte_starts: Vec<usize>,
     character_len: usize,
 }
 
@@ -49,7 +50,7 @@ impl Buffer {
         } else {
             text
         };
-        let (line_starts, character_len) = line_index(&text);
+        let (line_starts, line_byte_starts, character_len) = line_index(&text);
         Ok(Self {
             path,
             text,
@@ -59,6 +60,7 @@ impl Buffer {
             revision: 0,
             large_file_warning,
             line_starts,
+            line_byte_starts,
             character_len,
         })
     }
@@ -73,6 +75,7 @@ impl Buffer {
             revision: 0,
             large_file_warning: false,
             line_starts: vec![0],
+            line_byte_starts: vec![0],
             character_len: 0,
         }
     }
@@ -87,7 +90,7 @@ impl Buffer {
     pub fn mark_changed(&mut self) {
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
-        (self.line_starts, self.character_len) = line_index(&self.text);
+        (self.line_starts, self.line_byte_starts, self.character_len) = line_index(&self.text);
     }
 
     pub fn line_column(&self, character_offset: usize) -> (usize, usize) {
@@ -103,6 +106,19 @@ impl Buffer {
         self.line_starts.len()
     }
 
+    pub fn byte_index(&self, character_offset: usize) -> usize {
+        let offset = character_offset.min(self.character_len);
+        let line = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= offset)
+            .saturating_sub(1);
+        let byte_start = self.line_byte_starts[line];
+        self.text[byte_start..]
+            .char_indices()
+            .nth(offset - self.line_starts[line])
+            .map_or(self.text.len(), |(index, _)| byte_start + index)
+    }
+
     pub fn mark_saved(&mut self, path: &Path, fingerprint: DiskFingerprint) {
         self.path = path.to_path_buf();
         self.fingerprint = Some(fingerprint);
@@ -110,16 +126,18 @@ impl Buffer {
     }
 }
 
-fn line_index(text: &str) -> (Vec<usize>, usize) {
+fn line_index(text: &str) -> (Vec<usize>, Vec<usize>, usize) {
     let mut starts = vec![0];
+    let mut byte_starts = vec![0];
     let mut characters = 0;
-    for character in text.chars() {
+    for (byte, character) in text.char_indices() {
         characters += 1;
         if character == '\n' {
             starts.push(characters);
+            byte_starts.push(byte + 1);
         }
     }
-    (starts, characters)
+    (starts, byte_starts, characters)
 }
 
 #[cfg(test)]
@@ -171,5 +189,19 @@ mod tests {
         buffer.mark_changed();
 
         assert_eq!(buffer.line_column(6), (2, 3));
+    }
+
+    #[test]
+    fn character_to_byte_lookup_handles_unicode_without_crossing_lines() {
+        let mut buffer = Buffer::new(PathBuf::from("indexed.txt"));
+        buffer.text = "αβ\nx💡z".into();
+        buffer.mark_changed();
+
+        assert_eq!(
+            (0..=6)
+                .map(|character| buffer.byte_index(character))
+                .collect::<Vec<_>>(),
+            [0, 2, 4, 5, 6, 10, 11]
+        );
     }
 }

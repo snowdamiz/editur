@@ -4,7 +4,7 @@ use egui::{
     epaint::text::{Galley, LayoutJob},
     text::{ByteIndex, CCursor, CCursorRange, CharIndex, LayoutSection},
 };
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc};
 
 use crate::renderer::mark_retained;
 
@@ -417,7 +417,7 @@ impl EditorSurface {
                 Color32::LIGHT_GRAY,
             );
         }
-        if focused && ui.input(|input| ((input.time * 2.0) as u64).is_multiple_of(2)) {
+        if focused {
             mark_retained(
                 &painter,
                 rect,
@@ -430,7 +430,6 @@ impl EditorSurface {
                     Stroke::new(1.5, Color32::from_rgb(185, 205, 235)),
                 );
             }
-            ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
     }
 
@@ -833,7 +832,7 @@ fn byte_index(text: &str, character: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{EditorSurface, gutter_width, selection_drag_scroll_delta};
-    use egui::{CursorIcon, Event, RawInput, Rect, Vec2, pos2};
+    use egui::{CursorIcon, Event, Key, Modifiers, RawInput, Rect, Vec2, pos2};
 
     #[test]
     fn retained_editor_replaces_selections_and_replays_delta_history() {
@@ -883,6 +882,88 @@ mod tests {
         let content = Rect::from_min_max(pos2(20.0, 0.0), pos2(200.0, 200.0));
 
         assert!(editor.cursor_rect(content).unwrap().left() >= content.left() + 8.0);
+    }
+
+    #[test]
+    fn focused_caret_is_painted_during_the_former_hidden_blink_phase() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                time: Some(0.75),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, true, None);
+            },
+        );
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+
+        assert!(primitives.iter().any(|primitive| {
+            crate::renderer::retained_paint(&primitive.primitive)
+                .ok()
+                .flatten()
+                .is_some_and(|paint| paint.key == 0x3000_0000_0000_0000)
+        }));
+    }
+
+    #[test]
+    fn arrow_navigation_paints_the_caret_at_its_new_position() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, true, None);
+            },
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                time: Some(0.75),
+                events: vec![Event::Key {
+                    key: Key::ArrowRight,
+                    physical_key: Some(Key::ArrowRight),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            },
+        );
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+
+        assert_eq!(
+            primitives.iter().find_map(|primitive| {
+                crate::renderer::retained_paint(&primitive.primitive)
+                    .ok()
+                    .flatten()
+                    .filter(|paint| paint.key == 0x3000_0000_0000_0000)
+                    .map(|paint| paint.revision)
+            }),
+            Some(1)
+        );
     }
 
     #[test]
