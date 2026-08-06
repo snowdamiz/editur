@@ -53,6 +53,21 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
                 .map_err(|error| format!("cannot determine current directory: {error}"))?;
             app::run(resolve_target(&cwd, Some(&path))?, started)
         }
+        Command::AgentProcess(project_root) => editur::agent::run_managed_process(&project_root),
+        Command::AgentProvision => {
+            let manifest = editur::agent::provision::embedded_manifest()?;
+            let sidecar = editur::agent::provision::ensure(&manifest, &data_dir()?, |progress| {
+                if let Some(total) = progress.total {
+                    eprint!(
+                        "\rProvisioning Cursor Agent: {}/{} MiB",
+                        progress.downloaded / 1_048_576,
+                        total / 1_048_576
+                    );
+                }
+            })?;
+            println!("\nProvisioned Cursor Agent {}.", sidecar.version);
+            Ok(())
+        }
         Command::Syntax(command) => syntax_command(command),
         Command::Update => editur::update::run(),
         #[cfg(windows)]

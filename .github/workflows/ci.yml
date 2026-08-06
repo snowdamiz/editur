@@ -31,18 +31,26 @@ jobs:
             artifact: editur-linux-x86_64
             archive: dist/editur-linux-x86_64.tar.gz
             update_asset: editur-linux-x86_64
+            agent_os: linux
+            agent_arch: x86_64
           - os: macos-latest
             artifact: editur-macos-aarch64
             archive: dist/editur-macos-aarch64.zip
             update_asset: editur-macos-aarch64
+            agent_os: macos
+            agent_arch: aarch64
           - os: macos-15-intel
             artifact: editur-macos-x86_64
             archive: dist/editur-macos-x86_64.zip
             update_asset: editur-macos-x86_64
+            agent_os: macos
+            agent_arch: x86_64
           - os: windows-latest
             artifact: editur-windows-x86_64
             archive: dist/editur-windows-x86_64.zip
             update_asset: editur-windows-x86_64.exe
+            agent_os: windows
+            agent_arch: x86_64
     steps:
       - uses: actions/checkout@v6
       - name: Install stable Rust
@@ -69,8 +77,16 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Generate pinned Cursor Agent manifest
+        run: >-
+          cargo run --locked --example build_agent_manifest --
+          assets/agent/cursor-release.json
+          ${{ matrix.agent_os }}
+          ${{ matrix.agent_arch }}
+          dist/${{ matrix.update_asset }}.agent.json
       - name: Build release binary
         env:
+          EDITUR_AGENT_MANIFEST: dist/${{ matrix.update_asset }}.agent.json
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
           EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
@@ -120,6 +136,7 @@ jobs:
             ${{ matrix.archive }}.sha256
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
+            dist/${{ matrix.update_asset }}.agent.json
           if-no-files-found: error
       - name: Sign build provenance
         if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
@@ -130,6 +147,7 @@ jobs:
             ${{ matrix.archive }}.sha256
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
+            dist/${{ matrix.update_asset }}.agent.json
       - name: Build sample syntax catalog
         if: runner.os == 'Linux'
         run: >-

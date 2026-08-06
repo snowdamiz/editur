@@ -1,0 +1,38 @@
+{
+  "version": "2026.07.23-e383d2b",
+  "distributions": [
+    {
+      "os": "macos",
+      "architecture": "aarch64",
+      "archive_url": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/arm64/agent-cli-package.tar.gz",
+      "command": "dist-package/cursor-agent",
+      "args": ["--disable-auto-update", "acp"],
+      "archive_format": "tar_gz"
+    },
+    {
+      "os": "macos",
+      "architecture": "x86_64",
+      "archive_url": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/x64/agent-cli-package.tar.gz",
+      "command": "dist-package/cursor-agent",
+      "args": ["--disable-auto-update", "acp"],
+      "archive_format": "tar_gz"
+    },
+    {
+      "os": "linux",
+      "architecture": "x86_64",
+      "archive_url": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/linux/x64/agent-cli-package.tar.gz",
+      "command": "dist-package/cursor-agent",
+      "args": ["--disable-auto-update", "acp"],
+      "archive_format": "tar_gz"
+    },
+    {
+      "os": "windows",
+      "architecture": "x86_64",
+      "archive_url": "https://downloads.cursor.com/lab/2026.07.23-e383d2b/windows/x64/agent-cli-package.zip",
+      "command": "dist-package/node.exe",
+      "entrypoint": "dist-package/index.js",
+      "args": ["--disable-auto-update", "acp"],
+      "archive_format": "zip"
+    }
+  ]
+}

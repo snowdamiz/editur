@@ -32,6 +32,8 @@ editur update
 
 Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle plus a CLI symlink; Linux and Windows install the native executable. Set `EDITUR_INSTALL_DIR` to override the default install directory.
 
+The installers also download the pinned proprietary Cursor Agent package directly from Cursor. Editur verifies the archive and every installed file, keeps it private to Editur, disables Cursor's own auto-updater, and never adds Cursor Agent to `PATH` or changes a global Cursor installation. Cursor Agent is subject to [Cursor's terms](https://cursor.com/terms-of-service).
+
 `editur update` migrates older bare-binary macOS installs into the icon-preserving app bundle. Very old builds may need the command twice—the first update installs the migration-capable CLI—or you can run the installer once.
 
 ## Build and install
@@ -69,6 +71,18 @@ The editor wraps long lines and scrolls vertically without a horizontal scrollba
 Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches; recursive indexing does not start until the first non-empty project query.
 
 `editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, asks a clean resident editor to exit, and replaces the installation after verification. An update refuses to discard unsaved work. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
+
+## Cursor Agent sidebar
+
+Choose **Agent** in the sidebar to start the managed Cursor Agent for the current project. Nothing agent-related is launched, inspected, or downloaded during normal editor startup. The Agent view supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
+
+Official release builds embed a tested per-platform Cursor manifest. Plain local source builds intentionally omit it unless `EDITUR_AGENT_MANIFEST` points to a generated manifest, and the Agent view reports that clearly instead of resolving a mutable package at runtime.
+
+Cursor authentication is handled by Cursor Agent. Choose its advertised login method in the sidebar to open the browser flow; Editur does not ask for, print, or store Cursor credentials. A Cursor account is required. Agent use consumes the limits or usage-based billing of that account and selected model; check [Cursor's current pricing](https://cursor.com/pricing) before use.
+
+Prompts, relevant project code, tool results, and conversation context may be sent by Cursor Agent to Cursor and its model providers. Editur does not add its own telemetry or persist the agent transcript, but Cursor's retention and training behavior depends on the account's Privacy Mode and provider choices. Review [Cursor's data-use policy](https://cursor.com/data-use), use `.cursorignore` for files Cursor should avoid, and do not submit regulated or third-party data unless your agreements permit it.
+
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. This integration uses the beta Cursor CLI/ACP surface and currently provides one local process, one active session, and one active turn. It has no cloud agents, parallel chats, persistent history, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
 
 ## Continuous releases
 

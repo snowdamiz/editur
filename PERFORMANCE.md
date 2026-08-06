@@ -18,6 +18,31 @@ Measured 2026-08-05 from the stripped `--release` build on a MacBook Air with an
 
 The startup path creates a new process, AppKit window, and Metal renderer; it does not keep a hidden resident window. The remaining 31 ms gap to the 150 ms target includes process launch, project discovery, first layout, and presentation. Continuous macOS releases fail unless the Metal shader library is precompiled; this machine lacks the optional command-line Metal toolchain, so the precompiled release path is compile-checked in CI rather than timed locally. Windows/D3D12 and Linux/Vulkan runtime baselines still require their native release runners.
 
+## ACP Agent integration
+
+Measured 2026-08-06 on the same Apple M4 reference machine. The comparison used five alternating warm `--resident` runs of the unmodified `HEAD` build and the manifest-embedded ACP build, opening the same file with the Agent view unopened.
+
+| Metric | Baseline | ACP build | Change / target |
+| --- | ---: | ---: | ---: |
+| First editable frame, 5-run median | 60.95 ms | 61.12 ms | +0.17 ms / ≤5 ms |
+| Idle CPU, Agent unopened | 0.1% baseline | 0.0% point sample | No measurable regression |
+| Resident memory, Agent unopened | — | 45.2–47.3 MiB (5 samples) | Recorded |
+| Stripped arm64 binary | 8,393,056 bytes | 9,675,504 bytes | +1.22 MiB / <30 MiB |
+| Installed, signed-out Cursor process to ACP initialize | — | 291 ms | Recorded |
+
+Normal startup constructs inert sidebar state only: it performs no sidecar lookup, ACP initialization, network request, child-process launch, or agent repaint polling. Agent events wake egui immediately and are drained 64 at a time; while a turn is active, open-file reconciliation requests a frame at 500 ms intervals. A native input-to-present trace during authenticated streaming remains part of the release smoke test.
+
+The pinned package is Cursor Agent `2026.07.23-e383d2b`. A direct managed-command spike negotiated stable protocol v1 and advertised load-session, HTTP/SSE MCP, image prompt, session-list, and `cursor_login` authentication capabilities. Starting it with its supported `--disable-auto-update` option left the executable and entrypoint hashes unchanged. Deterministic tests cover streaming, split tool updates and supplied diffs, same-session follow-ups, exact allow/reject decisions, cancellation, unknown notifications, malformed stdout, bounded stderr, unexpected exit, and descendant-free shutdown without credentials or network access. Windows release tests additionally put the wrapper and a fake descendant in the same kill-on-close job object and verify that closing the job releases the descendant's marker socket.
+
+| Cursor release target | Archive | Extracted package | Entries |
+| --- | ---: | ---: | ---: |
+| macOS arm64 | 66.48 MiB | 198.84 MiB | 337 |
+| macOS x86_64 | 68.65 MiB | 203.91 MiB | 337 |
+| Linux x86_64 | 78.70 MiB | 223.20 MiB | 341 |
+| Windows x86_64 | 60.15 MiB | 160.15 MiB | 249 |
+
+Before promoting a continuous build to stable, the release owner must repeat the authenticated paid smoke on native macOS, Linux, and Windows: streaming, follow-up context, permission allow/reject coverage, cancellation, a reported file edit, browser authentication, and child-tree teardown. The project owner confirmed on 2026-08-06 that the direct installer-mediated Cursor ACP package flow is permitted; each stable release must still recheck that Cursor's registry distribution and terms have not changed.
+
 ## Rust highlighting
 
 Run `cargo run --release --locked --example benchmark_highlighting`. Each edit alternately inserts and removes one character near the start of the file; the p95 is selected from 20 edits after the initial parse.

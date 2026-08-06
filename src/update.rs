@@ -9,6 +9,7 @@ const MAX_APP_ENTRIES: usize = 32;
 #[cfg(target_os = "macos")]
 const MAX_APP_UNPACKED_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_SIZE: u64 = 1024;
+const MAX_AGENT_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
 
 pub fn run() -> Result<(), String> {
     let base = env::var("EDITUR_UPDATE_BASE")
@@ -47,6 +48,7 @@ pub fn run() -> Result<(), String> {
     if !crate::instance::quit_running()? {
         return Err("save or discard changes in the running editor before updating".into());
     }
+    provision_sidecar(&sidecar_manifest_url(&binary_url))?;
 
     #[cfg(unix)]
     {
@@ -86,6 +88,17 @@ fn update_urls(base: &str, asset: &str) -> Result<(String, String), String> {
     let binary = format!("{base}/{asset}");
     let checksum = format!("{binary}.sha256");
     Ok((binary, checksum))
+}
+
+fn sidecar_manifest_url(binary_url: &str) -> String {
+    format!("{binary_url}.agent.json")
+}
+
+fn provision_sidecar(url: &str) -> Result<(), String> {
+    let bytes = download(url, MAX_AGENT_MANIFEST_SIZE)?;
+    let manifest = crate::agent::provision::SidecarManifest::parse(&bytes)?;
+    crate::agent::provision::ensure(&manifest, &crate::syntax::data_dir()?, |_| {})?;
+    Ok(())
 }
 
 fn verify_update(current: &[u8], downloaded: &[u8], checksum: &[u8]) -> Result<bool, String> {
@@ -285,6 +298,12 @@ fn migrate_macos_install(base: &str, executable: &std::path::Path) -> Result<(),
     if !crate::instance::quit_running()? {
         return Err("save or discard changes in the running editor before updating".into());
     }
+    let update_asset = format!("editur-macos-{}", env::consts::ARCH);
+    provision_sidecar(&sidecar_manifest_url(&format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        update_asset
+    )))?;
 
     let parent = executable
         .parent()
@@ -539,7 +558,7 @@ fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_name_for, update_urls, verify_update};
+    use super::{asset_name_for, sidecar_manifest_url, update_urls, verify_update};
 
     #[test]
     fn selects_only_published_platform_assets() {
@@ -573,6 +592,10 @@ mod tests {
                 "https://example.com/releases/editur-linux-x86_64".into(),
                 "https://example.com/releases/editur-linux-x86_64.sha256".into(),
             ))
+        );
+        assert_eq!(
+            sidecar_manifest_url("https://example.com/releases/editur-linux-x86_64"),
+            "https://example.com/releases/editur-linux-x86_64.agent.json"
         );
         assert!(update_urls("http://example.com/releases", "editur-linux-x86_64").is_err());
     }

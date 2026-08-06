@@ -46,6 +46,34 @@ pub fn disk_fingerprint(path: &Path) -> Result<DiskFingerprint, String> {
     Ok(fingerprint_from(&metadata, &bytes))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconcileOutcome {
+    Unchanged,
+    Reloaded,
+    Conflict,
+}
+
+pub fn reconcile_buffer(buffer: &mut Buffer) -> Result<ReconcileOutcome, String> {
+    let metadata = fs::metadata(&buffer.path)
+        .map_err(|error| format!("cannot inspect {}: {error}", buffer.path.display()))?;
+    if buffer.fingerprint.as_ref().is_some_and(|fingerprint| {
+        fingerprint.size == metadata.len()
+            && fingerprint.modified.is_some()
+            && fingerprint.modified == metadata.modified().ok()
+    }) {
+        return Ok(ReconcileOutcome::Unchanged);
+    }
+    let fingerprint = disk_fingerprint(&buffer.path)?;
+    if buffer.fingerprint.as_ref() == Some(&fingerprint) {
+        return Ok(ReconcileOutcome::Unchanged);
+    }
+    if buffer.dirty {
+        return Ok(ReconcileOutcome::Conflict);
+    }
+    *buffer = load_buffer(&buffer.path)?;
+    Ok(ReconcileOutcome::Reloaded)
+}
+
 fn fingerprint_from(metadata: &fs::Metadata, bytes: &[u8]) -> DiskFingerprint {
     DiskFingerprint {
         size: metadata.len(),
@@ -345,6 +373,32 @@ mod tests {
         safe_save(&mut buffer, &copy).unwrap();
         assert_eq!(fs::read_to_string(copy).unwrap(), "fn edited() {}\n");
         assert!(!buffer.dirty);
+    }
+
+    #[test]
+    fn reconciliation_reloads_clean_buffers_but_preserves_dirty_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-edit.txt");
+        fs::write(&path, "before\n").unwrap();
+        let mut buffer = load_buffer(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&path, "agent clean edit\n").unwrap();
+
+        assert_eq!(
+            reconcile_buffer(&mut buffer).unwrap(),
+            ReconcileOutcome::Reloaded
+        );
+        assert_eq!(buffer.text, "agent clean edit\n");
+
+        buffer.text.push_str("user work\n");
+        buffer.mark_changed();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&path, "agent dirty edit\n").unwrap();
+        assert_eq!(
+            reconcile_buffer(&mut buffer).unwrap(),
+            ReconcileOutcome::Conflict
+        );
+        assert!(buffer.text.ends_with("user work\n"));
     }
 
     #[cfg(unix)]

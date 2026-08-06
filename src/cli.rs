@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub enum Command {
     Open(Option<PathBuf>),
     Resident(PathBuf),
+    AgentProcess(PathBuf),
+    AgentProvision,
     Syntax(SyntaxCommand),
     Update,
     #[cfg(windows)]
@@ -31,16 +33,27 @@ where
         return Ok(Command::Open(None));
     };
 
-    if first == "--resident" {
+    if first == "--resident" || first == "--agent-process" {
         let target = args
             .next()
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .ok_or_else(|| "missing internal resident target".to_owned())?;
+            .ok_or_else(|| "missing internal process target".to_owned())?;
         if args.next().is_some() {
-            return Err("too many internal resident arguments".into());
+            return Err("too many internal process arguments".into());
         }
-        return Ok(Command::Resident(target));
+        return Ok(if first == "--resident" {
+            Command::Resident(target)
+        } else {
+            Command::AgentProcess(target)
+        });
+    }
+
+    if first == "--provision-agent" {
+        if args.next().is_some() {
+            return Err("too many internal provision arguments".into());
+        }
+        return Ok(Command::AgentProvision);
     }
 
     #[cfg(windows)]
@@ -149,6 +162,16 @@ mod tests {
             Ok(Command::Resident(PathBuf::from("/tmp/project")))
         );
         assert!(parse(&["--resident"]).is_err());
+    }
+
+    #[test]
+    fn parses_hidden_managed_agent_launcher_with_its_project_root() {
+        assert_eq!(
+            parse(&["--agent-process", "/tmp/project"]),
+            Ok(Command::AgentProcess(PathBuf::from("/tmp/project")))
+        );
+        assert!(parse(&["--agent-process"]).is_err());
+        assert_eq!(parse(&["--provision-agent"]), Ok(Command::AgentProvision));
     }
 
     #[test]

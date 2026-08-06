@@ -34,6 +34,13 @@ try {
         throw 'The downloaded binary failed SHA-256 verification.'
     }
 
+    Write-Host 'Editur includes Cursor Agent as a proprietary third-party dependency.'
+    Write-Host 'It is downloaded directly from Cursor and is subject to https://cursor.com/terms-of-service.'
+    & $binary --provision-agent
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cursor Agent provisioning failed with exit code $LASTEXITCODE."
+    }
+
     [IO.Directory]::CreateDirectory($InstallDir) | Out-Null
     $destination = Join-Path $InstallDir 'editur.exe'
     Copy-Item -LiteralPath $binary -Destination "$destination.new" -Force

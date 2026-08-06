@@ -53,6 +53,9 @@ if [ "$actual_hash" != "$expected_hash" ]; then
   exit 1
 fi
 
+printf '%s\n' 'Editur includes Cursor Agent as a proprietary third-party dependency.'
+printf '%s\n' 'It is downloaded directly from Cursor and is subject to https://cursor.com/terms-of-service.'
+
 mkdir -p "$install_dir"
 if [ "$package" = app ]; then
   mkdir "$download_dir/package"
@@ -64,6 +67,7 @@ if [ "$package" = app ]; then
     printf 'editur: release archive does not contain a valid Editur.app\n' >&2
     exit 1
   fi
+  "$executable" --provision-agent
   staged_app="$install_dir/.Editur.app.new.$$"
   if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
     printf 'editur: staging path already exists: %s\n' "$staged_app" >&2
@@ -93,6 +97,8 @@ if [ "$package" = app ]; then
   rm -f -- "$install_dir/editur"
   ln -s "$app_destination/Contents/MacOS/editur" "$install_dir/editur"
 else
+  chmod 0755 "$download_dir/$asset"
+  "$download_dir/$asset" --provision-agent
   install -m 0755 "$download_dir/$asset" "$install_dir/editur"
 fi
 printf 'Installed Editur to %s/editur\n' "$install_dir"

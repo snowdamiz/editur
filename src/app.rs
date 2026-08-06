@@ -21,9 +21,16 @@ use winit::{
 };
 
 use crate::{
+    agent::{
+        controller::{
+            AgentController, Command as AgentCommand, ConfigValue, ConnectionState,
+            Event as AgentEvent,
+        },
+        state::{AgentState, TranscriptItem},
+    },
     buffer::Buffer,
     editor_surface::{EDITOR_BACKGROUND, EditorSurface},
-    file_io::{OpenTarget, SaveError, load_buffer, safe_save},
+    file_io::{OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, safe_save},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
@@ -46,6 +53,12 @@ enum WindowAction {
     Minimize,
     ToggleMaximize,
     Drag,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SidebarView {
+    Files,
+    Agent,
 }
 
 struct TreeState {
@@ -195,6 +208,11 @@ pub struct EditorApp {
     sidebar: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
+    sidebar_view: SidebarView,
+    agent: AgentState,
+    agent_controller: Option<AgentController>,
+    pending_agent_prompt: bool,
+    last_agent_reconcile: Instant,
     focus_editor: bool,
     tree_focused: bool,
     cursor: (usize, usize),
@@ -245,6 +263,11 @@ impl EditorApp {
             sidebar: true,
             sidebar_width: 220.0,
             sidebar_dragging: false,
+            sidebar_view: SidebarView::Files,
+            agent: AgentState::default(),
+            agent_controller: None,
+            pending_agent_prompt: false,
+            last_agent_reconcile: Instant::now(),
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
             cursor: (1, 1),
@@ -336,6 +359,14 @@ impl EditorApp {
 
     pub fn ui(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
+        self.poll_agent(&ctx);
+        if self.agent.active {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            if self.last_agent_reconcile.elapsed() >= Duration::from_millis(500) {
+                self.reconcile_open_buffer();
+                self.last_agent_reconcile = Instant::now();
+            }
+        }
         self.shortcuts(&ctx);
         if self.find_open {
             self.refresh_find_matches();
@@ -645,10 +676,462 @@ impl EditorApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        if self.find_open {
-            self.draw_find(ui);
+        let mut selected = self.sidebar_view;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(26, 27, 31))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(selected == SidebarView::Files, "Files")
+                        .clicked()
+                    {
+                        selected = SidebarView::Files;
+                    }
+                    let agent_label = if self.agent.waiting_permission() {
+                        "Agent •"
+                    } else {
+                        "Agent"
+                    };
+                    if ui
+                        .selectable_label(selected == SidebarView::Agent, agent_label)
+                        .clicked()
+                    {
+                        selected = SidebarView::Agent;
+                    }
+                });
+            });
+        if selected != self.sidebar_view {
+            self.sidebar_view = selected;
+            if selected == SidebarView::Agent {
+                self.open_agent(ui.ctx());
+            }
         }
-        self.draw_tree(ui);
+        if self.sidebar_view == SidebarView::Agent {
+            self.draw_agent(ui);
+        } else {
+            if self.find_open {
+                self.draw_find(ui);
+            }
+            self.draw_tree(ui);
+        }
+    }
+
+    fn open_agent(&mut self, ctx: &egui::Context) {
+        if self.agent_controller.is_some() {
+            return;
+        }
+        let wake = ctx.clone();
+        self.agent.session_ready = false;
+        self.agent.active = false;
+        self.agent.connection = ConnectionState::Starting;
+        self.agent_controller = Some(AgentController::start_with_wake(
+            self.tree.root.clone(),
+            move || wake.request_repaint(),
+        ));
+    }
+
+    fn reconnect_agent(&mut self, ctx: &egui::Context) {
+        self.agent_controller = None;
+        self.open_agent(ctx);
+    }
+
+    fn poll_agent(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(controller) = &self.agent_controller {
+            for _ in 0..64 {
+                let Ok(event) = controller.events().try_recv() else {
+                    break;
+                };
+                events.push(event);
+            }
+        }
+        if events.len() == 64 {
+            ctx.request_repaint();
+        }
+        for event in events {
+            let reconcile_path = match &event {
+                AgentEvent::ToolCallUpdated(tool) => self
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| tool.paths.iter().any(|path| path == &buffer.path)),
+                _ => false,
+            };
+            let turn_finished = matches!(event, AgentEvent::TurnFinished { .. });
+            let refresh_project =
+                turn_finished || matches!(event, AgentEvent::ProcessExited { .. });
+            self.agent.apply(event);
+            if reconcile_path || turn_finished {
+                self.reconcile_open_buffer();
+            }
+            if refresh_project {
+                self.refresh_after_agent();
+            }
+        }
+    }
+
+    fn reconcile_open_buffer(&mut self) {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return;
+        };
+        match reconcile_buffer(buffer) {
+            Ok(ReconcileOutcome::Unchanged) => {}
+            Ok(ReconcileOutcome::Reloaded) => {
+                let cursor = self.editor_surface.cursor();
+                self.editor_surface = EditorSurface::default();
+                self.editor_surface.set_selection(cursor, cursor);
+                self.highlight_cache.valid = false;
+                self.find_match_revision = u64::MAX;
+            }
+            Ok(ReconcileOutcome::Conflict) => self.conflict = true,
+            Err(error) if self.error.is_none() => self.show_error(error),
+            Err(_) => {}
+        }
+    }
+
+    fn refresh_after_agent(&mut self) {
+        let changed = std::mem::take(&mut self.agent.changed_paths);
+        let directories = if changed.is_empty() {
+            self.tree.children.keys().cloned().collect::<HashSet<_>>()
+        } else {
+            changed
+                .iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect()
+        };
+        for directory in directories {
+            let error = match self.tree.children.entry(directory) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    match read_directory(entry.key()) {
+                        Ok(entries) => {
+                            entry.insert(entries);
+                            None
+                        }
+                        Err(error) => Some(error),
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(_) => None,
+            };
+            if let Some(error) = error
+                && self.error.is_none()
+            {
+                self.show_error(error);
+            }
+        }
+        self.tree.refresh_visible();
+        if !changed.is_empty() {
+            match SearchController::new(self.tree.root.clone()) {
+                Ok(search) => {
+                    self.search = search;
+                    if !self.search_query.trim().is_empty() {
+                        let _ = self.search.set_query(&self.search_query);
+                    }
+                }
+                Err(error) => self.show_error(error),
+            }
+        }
+    }
+
+    fn queue_agent_prompt(&mut self) {
+        if self.buffer.as_ref().is_some_and(|buffer| buffer.dirty) {
+            self.pending_agent_prompt = true;
+        } else {
+            self.send_agent_prompt();
+        }
+    }
+
+    fn send_agent_prompt(&mut self) {
+        let Some(controller) = &self.agent_controller else {
+            return;
+        };
+        let prompt = self.agent.prompt.trim().to_owned();
+        if prompt.is_empty() || self.agent.active || !self.agent.session_ready {
+            return;
+        }
+        self.agent.active = true;
+        if let Err(error) = controller.send(AgentCommand::Prompt(prompt)) {
+            self.agent.active = false;
+            self.show_error(error);
+        }
+    }
+
+    fn draw_agent(&mut self, ui: &mut egui::Ui) {
+        let mut reconnect = false;
+        let mut new_session = false;
+        let mut authenticate = None;
+        let status = self.agent.connection.clone();
+        egui::Frame::new()
+            .fill(Color32::from_rgb(27, 28, 33))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| match &status {
+                ConnectionState::Provisioning { downloaded, total } => {
+                    let total =
+                        total.map_or_else(|| "?".into(), |value| (value / 1_048_576).to_string());
+                    ui.label(format!(
+                        "Installing Cursor Agent… {} / {total} MiB",
+                        downloaded / 1_048_576
+                    ));
+                }
+                ConnectionState::Starting => {
+                    ui.label("Starting Cursor Agent…");
+                }
+                ConnectionState::Ready => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Cursor Agent ready").color(Color32::LIGHT_GREEN));
+                        if ui.small_button("New Session").clicked() {
+                            new_session = true;
+                        }
+                    });
+                }
+                ConnectionState::AuthenticationRequired(methods) => {
+                    ui.label("Sign in to Cursor to continue.");
+                    for method in methods {
+                        if ui.button(&method.name).clicked() {
+                            authenticate = Some(method.id.clone());
+                        }
+                    }
+                }
+                ConnectionState::Failed(error) => {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                    reconnect = ui.button("Retry").clicked();
+                }
+                ConnectionState::Disconnected => {
+                    ui.label("Cursor Agent is disconnected.");
+                    reconnect = ui.button("Connect").clicked();
+                }
+            });
+
+        let mut mode_change = None;
+        let mut config_changes = Vec::new();
+        if !self.agent.modes.is_empty() || !self.agent.config_options.is_empty() {
+            egui::CollapsingHeader::new("Session options")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(!self.agent.active, |ui| {
+                        if !self.agent.modes.is_empty() {
+                            let mut selected = self.agent.current_mode.clone().unwrap_or_default();
+                            let label = self
+                                .agent
+                                .modes
+                                .iter()
+                                .find(|mode| mode.id == selected)
+                                .map_or(selected.as_str(), |mode| mode.name.as_str());
+                            ui.label("Mode");
+                            egui::ComboBox::from_id_salt("agent_mode")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for mode in &self.agent.modes {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            mode.id.clone(),
+                                            &mode.name,
+                                        );
+                                    }
+                                });
+                            if self.agent.current_mode.as_deref() != Some(selected.as_str()) {
+                                mode_change = Some(selected);
+                            }
+                        }
+                        for option in &self.agent.config_options {
+                            match &option.value {
+                                ConfigValue::Select(current) => {
+                                    let mut selected = current.clone();
+                                    let label = option
+                                        .options
+                                        .iter()
+                                        .find(|value| value.id == selected)
+                                        .map_or(selected.as_str(), |value| value.name.as_str());
+                                    ui.label(&option.name);
+                                    egui::ComboBox::from_id_salt(("agent_config", &option.id))
+                                        .selected_text(label)
+                                        .show_ui(ui, |ui| {
+                                            for value in &option.options {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    value.id.clone(),
+                                                    &value.name,
+                                                );
+                                            }
+                                        });
+                                    if selected != *current {
+                                        config_changes.push((
+                                            option.id.clone(),
+                                            ConfigValue::Select(selected),
+                                        ));
+                                    }
+                                }
+                                ConfigValue::Boolean(current) => {
+                                    let mut selected = *current;
+                                    if ui.checkbox(&mut selected, &option.name).changed() {
+                                        config_changes.push((
+                                            option.id.clone(),
+                                            ConfigValue::Boolean(selected),
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(description) = &option.description {
+                                ui.label(RichText::new(description).small().weak());
+                            }
+                        }
+                    });
+                });
+        }
+        if let Some(usage) = &self.agent.usage {
+            let cost = usage
+                .cost
+                .as_deref()
+                .map_or_else(String::new, |cost| format!(" · {cost}"));
+            ui.label(
+                RichText::new(format!("Context {} / {}{cost}", usage.used, usage.size))
+                    .small()
+                    .weak(),
+            );
+        }
+
+        let mut permission_decisions = Vec::new();
+        ScrollArea::vertical()
+            .id_salt("agent_transcript")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for item in &mut self.agent.transcript {
+                    match item {
+                        TranscriptItem::User(text) => {
+                            ui.label(RichText::new("You").strong());
+                            ui.label(text.as_str());
+                        }
+                        TranscriptItem::Assistant(text) => {
+                            ui.label(RichText::new("Agent").strong());
+                            ui.label(text.as_str());
+                        }
+                        TranscriptItem::Plan(plan) => {
+                            egui::CollapsingHeader::new("Plan")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for item in plan {
+                                        ui.label(format!("{} — {}", item.status, item.content));
+                                    }
+                                });
+                        }
+                        TranscriptItem::Tool(tool) => {
+                            let title = tool.title.as_deref().unwrap_or("Tool activity");
+                            let open = tool
+                                .status
+                                .as_deref()
+                                .is_none_or(|status| status != "Completed");
+                            egui::CollapsingHeader::new(title)
+                                .default_open(open)
+                                .show(ui, |ui| {
+                                    if let Some(status) = &tool.status {
+                                        ui.label(status);
+                                    }
+                                    for path in &tool.paths {
+                                        ui.label(path.display().to_string());
+                                    }
+                                    if let Some(detail) = &tool.detail {
+                                        ui.label(RichText::new(detail).monospace().small());
+                                    }
+                                });
+                        }
+                        TranscriptItem::Permission(card) => {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(46, 40, 29))
+                                .inner_margin(egui::Margin::same(8))
+                                .corner_radius(5)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("Permission required").strong());
+                                    ui.label(&card.action);
+                                    ui.horizontal_wrapped(|ui| {
+                                        for option in &card.options {
+                                            let enabled = card.selected.is_none();
+                                            if ui
+                                                .add_enabled(
+                                                    enabled,
+                                                    egui::Button::new(&option.name),
+                                                )
+                                                .clicked()
+                                            {
+                                                permission_decisions
+                                                    .push((card.request_id, option.id.clone()));
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                        TranscriptItem::Error(error) => {
+                            ui.colored_label(Color32::LIGHT_RED, error.as_str());
+                        }
+                        TranscriptItem::Truncated => {
+                            ui.label(RichText::new("Earlier agent output was truncated.").weak());
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
+            });
+
+        for (request_id, option_id) in permission_decisions {
+            if self.agent.decide_permission(request_id, &option_id)
+                && let Some(controller) = &self.agent_controller
+            {
+                let _ = controller.send(AgentCommand::DecidePermission {
+                    request_id,
+                    option_id,
+                });
+            }
+        }
+        if let Some(controller) = &self.agent_controller {
+            if let Some(mode) = mode_change {
+                let _ = controller.send(AgentCommand::SetMode(mode));
+            }
+            for (id, value) in config_changes {
+                let _ = controller.send(AgentCommand::SetConfig { id, value });
+            }
+        }
+
+        ui.separator();
+        let input = ui.add_enabled(
+            !self.agent.active && self.agent.session_ready,
+            TextEdit::multiline(&mut self.agent.prompt)
+                .id(Id::new("agent_prompt"))
+                .hint_text("Ask Cursor Agent…")
+                .desired_rows(3),
+        );
+        let submit_shortcut = input.has_focus()
+            && ui.input(|input| input.modifiers.command && input.key_pressed(Key::Enter));
+        let mut send = false;
+        if self.agent.active {
+            if ui.button("Stop").clicked()
+                && let Some(controller) = &self.agent_controller
+            {
+                let _ = controller.send(AgentCommand::Cancel);
+            }
+        } else {
+            send = ui
+                .add_enabled(
+                    self.agent.session_ready && !self.agent.prompt.trim().is_empty(),
+                    egui::Button::new("Send"),
+                )
+                .clicked()
+                || submit_shortcut;
+        }
+        if send {
+            self.queue_agent_prompt();
+        }
+        if new_session {
+            self.agent.transcript.clear();
+            if let Some(controller) = &self.agent_controller {
+                let _ = controller.send(AgentCommand::NewSession);
+            }
+        }
+        if let Some(method) = authenticate
+            && let Some(controller) = &self.agent_controller
+        {
+            let _ = controller.send(AgentCommand::Authenticate(method));
+        }
+        if reconnect {
+            self.reconnect_agent(ui.ctx());
+        }
     }
 
     fn draw_find(&mut self, ui: &mut egui::Ui) {
@@ -1159,6 +1642,28 @@ impl EditorApp {
     }
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        if self.pending_agent_prompt {
+            let mut save_and_run = false;
+            let mut cancel = false;
+            egui::Window::new("Save before running Agent")
+                .id(Id::new("agent_save_dialog"))
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Cursor Agent reads files from disk. Save the current buffer first?");
+                    ui.horizontal(|ui| {
+                        save_and_run = ui.button("Save and Run").clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            if save_and_run && self.save(None) {
+                self.pending_agent_prompt = false;
+                self.send_agent_prompt();
+            } else if cancel {
+                self.pending_agent_prompt = false;
+            }
+        }
         if self.pending.is_some() && !self.conflict && self.save_as.is_none() {
             egui::Window::new("Unsaved changes")
                 .id(Id::new("unsaved_dialog"))
@@ -1597,6 +2102,10 @@ impl ApplicationHandler<InstanceEvent> for Shell {
                     renderer.resize(size);
                 }
                 self.redraw(event_loop);
+            }
+            WindowEvent::Focused(true) => {
+                self.editor.reconcile_open_buffer();
+                window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
@@ -2231,7 +2740,7 @@ mod tests {
             .expect("file-tree background");
 
         assert!(
-            tree.rect.top() <= 115.0,
+            tree.rect.top() <= 145.0,
             "tree starts at {}",
             tree.rect.top()
         );
