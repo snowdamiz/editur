@@ -1307,7 +1307,14 @@ mod tests {
     #[test]
     fn manifest_parser_refuses_a_different_platform() {
         let mut json = serde_json::to_value(manifest()).unwrap();
-        json["os"] = serde_json::Value::String("windows".into());
+        json["os"] = serde_json::Value::String(
+            if cfg!(target_os = "windows") {
+                "linux"
+            } else {
+                "windows"
+            }
+            .into(),
+        );
 
         let error = SidecarManifest::parse(&serde_json::to_vec(&json).unwrap()).unwrap_err();
 
