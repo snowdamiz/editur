@@ -1,8 +1,8 @@
 use egui::{
-    Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, OutputCommand, Pos2, Rect, Response,
-    Sense, Stroke, TextFormat, Ui, Vec2,
+    Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Modifiers, OutputCommand, Pos2, Rect,
+    Response, Sense, Stroke, TextFormat, Ui, Vec2,
     epaint::text::{Galley, LayoutJob},
-    text::{ByteIndex, CCursor, CCursorRange, CharIndex, LayoutSection},
+    text::{ByteIndex, CCursor, CCursorRange, LayoutSection},
 };
 use std::{ops::Range, sync::Arc};
 
@@ -193,6 +193,17 @@ impl EditorSurface {
         let mut changed = false;
         let cursor_before_events = self.cursor;
         if response.has_focus() {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
             changed = self.handle_events(ui, text);
             if changed {
                 response.mark_changed();
@@ -585,19 +596,14 @@ impl EditorSurface {
             return;
         };
         let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
-        let (within, h_pos) = if direction < 0 {
-            galley.cursor_up_one_row(&relative, self.h_pos)
-        } else {
-            galley.cursor_down_one_row(&relative, self.h_pos)
-        };
+        let row = galley.layout_from_cursor(relative).row;
+        let h_pos = self
+            .h_pos
+            .unwrap_or_else(|| galley.pos_from_cursor(relative).left());
         let at_edge = if direction < 0 {
-            within.index == CharIndex::ZERO
-                && galley.layout_from_cursor(relative).row == 0
-                && line_index > 0
+            row == 0 && line_index > 0
         } else {
-            within.index == galley.end().index
-                && galley.layout_from_cursor(relative).row + 1 == galley.rows.len()
-                && line_index + 1 < self.lines.len()
+            row + 1 == galley.rows.len() && line_index + 1 < self.lines.len()
         };
         let cursor = if at_edge {
             let target = if direction < 0 {
@@ -609,17 +615,21 @@ impl EditorSurface {
             let Some(target_galley) = &target_line.galley else {
                 return;
             };
-            let x = self.h_pos.or(h_pos).unwrap_or(0.0);
             let y = if direction < 0 {
                 target_galley.size().y
             } else {
                 0.0
             };
-            target_line.char_start + target_galley.cursor_from_pos(Vec2::new(x, y)).index.0
+            target_line.char_start + target_galley.cursor_from_pos(Vec2::new(h_pos, y)).index.0
         } else {
+            let (within, _) = if direction < 0 {
+                galley.cursor_up_one_row(&relative, Some(h_pos))
+            } else {
+                galley.cursor_down_one_row(&relative, Some(h_pos))
+            };
             line.char_start + within.index.0
         };
-        self.h_pos = h_pos;
+        self.h_pos = Some(h_pos);
         self.move_cursor(cursor, extend);
     }
 
@@ -832,7 +842,7 @@ fn byte_index(text: &str, character: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{EditorSurface, gutter_width, selection_drag_scroll_delta};
-    use egui::{CursorIcon, Event, Key, Modifiers, RawInput, Rect, Vec2, pos2};
+    use egui::{Color32, CursorIcon, Event, Id, Key, Modifiers, RawInput, Rect, Vec2, pos2};
 
     #[test]
     fn retained_editor_replaces_selections_and_replays_delta_history() {
@@ -908,10 +918,13 @@ mod tests {
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
 
         assert!(primitives.iter().any(|primitive| {
-            crate::renderer::retained_paint(&primitive.primitive)
-                .ok()
-                .flatten()
-                .is_some_and(|paint| paint.key == 0x3000_0000_0000_0000)
+            match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh
+                    .vertices
+                    .iter()
+                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
+                egui::epaint::Primitive::Callback(_) => false,
+            }
         }));
     }
 
@@ -954,16 +967,64 @@ mod tests {
         );
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
 
-        assert_eq!(
-            primitives.iter().find_map(|primitive| {
-                crate::renderer::retained_paint(&primitive.primitive)
-                    .ok()
-                    .flatten()
-                    .filter(|paint| paint.key == 0x3000_0000_0000_0000)
-                    .map(|paint| paint.revision)
-            }),
-            Some(1)
+        assert_eq!(editor.cursor(), 1);
+        assert!(primitives.iter().any(|primitive| {
+            match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh
+                    .vertices
+                    .iter()
+                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
+                egui::epaint::Primitive::Callback(_) => false,
+            }
+        }));
+        assert!(context.memory(|memory| memory.has_focus(Id::new("editor"))));
+    }
+
+    #[test]
+    fn vertical_arrows_preserve_the_column_across_logical_lines() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        editor.set_selection(1, 1);
+        let mut text = "one\ntwo".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
         );
+        let raw_input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(raw_input(), |ui| {
+            editor.show(ui, &mut text, &job, 1, true, None);
+        });
+        let mut input = raw_input();
+        input.events.push(Event::Key {
+            key: Key::ArrowDown,
+            physical_key: Some(Key::ArrowDown),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _ = context.run_ui(input, |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        assert_eq!(editor.cursor(), 5);
+
+        let mut input = raw_input();
+        input.events.push(Event::Key {
+            key: Key::ArrowUp,
+            physical_key: Some(Key::ArrowUp),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _ = context.run_ui(input, |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+
+        assert_eq!(editor.cursor(), 1);
     }
 
     #[test]

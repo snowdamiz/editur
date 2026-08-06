@@ -1256,6 +1256,7 @@ pub fn launch(target: OpenTarget, started: Instant) -> Result<(), String> {
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
         std::io::stderr().is_terminal(),
+        cfg!(target_os = "macos") && std::env::var_os("__CFBundleIdentifier").is_some(),
     ) {
         return run(target, started);
     }
@@ -1266,6 +1267,10 @@ pub fn launch(target: OpenTarget, started: Instant) -> Result<(), String> {
         .map_err(|error| format!("cannot locate the Editur executable: {error}"))?;
     let path = target.file.as_ref().unwrap_or(&target.root);
     let mut command = Command::new(executable);
+    #[cfg(target_os = "macos")]
+    command
+        .env_remove("__CFBundleIdentifier")
+        .env_remove("XPC_SERVICE_NAME");
     command
         .arg("--resident")
         .arg(path)
@@ -1283,8 +1288,9 @@ const fn launch_in_current_process(
     stdin_terminal: bool,
     stdout_terminal: bool,
     stderr_terminal: bool,
+    macos_bundle_launch: bool,
 ) -> bool {
-    !(stdin_terminal || stdout_terminal || stderr_terminal)
+    !macos_bundle_launch && !(stdin_terminal || stdout_terminal || stderr_terminal)
 }
 
 #[cfg(unix)]
@@ -1306,7 +1312,10 @@ pub fn run(target: OpenTarget, started: Instant) -> Result<(), String> {
         Claim::Primary(listener) => listener,
         Claim::Forwarded => return Ok(()),
     };
-    let event_loop = EventLoop::<InstanceEvent>::with_user_event()
+    let mut event_loop = EventLoop::<InstanceEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    winit::platform::macos::EventLoopBuilderExtMacOS::with_default_menu(&mut event_loop, false);
+    let event_loop = event_loop
         .build()
         .map_err(|error| format!("cannot create event loop: {error}"))?;
     spawn_listener(listener, event_loop.create_proxy())?;
@@ -1425,8 +1434,6 @@ impl Shell {
                 );
             }
             self.first_frame_logged = true;
-            #[cfg(target_os = "macos")]
-            set_macos_application_icon();
         }
         if self.editor.should_close {
             event_loop.exit();
@@ -1701,45 +1708,6 @@ fn activate_macos_application() {
 
 fn application_icon_rgba() -> (&'static [u8], u32, u32) {
     (include_bytes!("../assets/icons/editur-64.rgba"), 64, 64)
-}
-
-#[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
-fn set_macos_application_icon() {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
-
-    let (pixels, width, height) = application_icon_rgba();
-    let mut plane = pixels.as_ptr().cast_mut();
-    unsafe {
-        let color_space: *mut Object = msg_send![
-            class!(NSString),
-            stringWithUTF8String: c"NSDeviceRGBColorSpace".as_ptr()
-        ];
-        let bitmap: *mut Object = msg_send![class!(NSBitmapImageRep), alloc];
-        let bitmap: *mut Object = msg_send![
-            bitmap,
-            initWithBitmapDataPlanes: &mut plane as *mut *mut u8
-            pixelsWide: width as isize
-            pixelsHigh: height as isize
-            bitsPerSample: 8_isize
-            samplesPerPixel: 4_isize
-            hasAlpha: objc::runtime::YES
-            isPlanar: objc::runtime::NO
-            colorSpaceName: color_space
-            bitmapFormat: 2_usize
-            bytesPerRow: (width * 4) as isize
-            bitsPerPixel: 32_isize
-        ];
-        if bitmap.is_null() {
-            return;
-        }
-        let icon: *mut Object = msg_send![class!(NSImage), new];
-        let _: () = msg_send![icon, addRepresentation: bitmap];
-        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![application, setApplicationIconImage: icon];
-        let _: () = msg_send![icon, release];
-        let _: () = msg_send![bitmap, release];
-    }
 }
 
 fn search_result_row(
@@ -2111,12 +2079,17 @@ mod tests {
 
     #[test]
     fn graphical_launch_runs_in_the_current_process() {
-        assert!(launch_in_current_process(false, false, false));
+        assert!(launch_in_current_process(false, false, false, false));
+    }
+
+    #[test]
+    fn macos_bundle_launch_skips_the_slow_launchservices_process() {
+        assert!(!launch_in_current_process(false, false, false, true));
     }
 
     #[test]
     fn terminal_launch_preserves_the_detached_cli() {
-        assert!(!launch_in_current_process(true, false, false));
+        assert!(!launch_in_current_process(true, false, false, false));
     }
 
     #[test]
@@ -2343,6 +2316,7 @@ mod tests {
         draw(&mut app, Vec::new());
         draw(&mut app, vec![arrow_down()]);
         assert_eq!(app.tree.selected.as_ref(), Some(&first));
+        assert!(context.memory(|memory| memory.has_focus(Id::new("editor"))));
 
         app.tree_focused = true;
         context.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
@@ -2427,13 +2401,5 @@ mod tests {
         assert!(app.search_open);
         assert!(!app.find_open);
         assert!(context.memory(|memory| memory.has_focus(Id::new("project_search_query"))));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_runtime_icon_uses_the_embedded_pixels() {
-        let (pixels, width, height) = super::application_icon_rgba();
-
-        assert_eq!(pixels.len(), (width * height * 4) as usize);
     }
 }
