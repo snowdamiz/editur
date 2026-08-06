@@ -8,8 +8,8 @@ use std::{
 };
 
 use egui::{
-    Align2, Color32, CursorIcon, FontId, Id, Key, Label, Layout, RichText, ScrollArea, Sense,
-    TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
+    Align, Align2, Color32, CursorIcon, FontId, Id, Key, Label, Layout, RichText, ScrollArea,
+    Sense, TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
 };
 use winit::{
     application::ApplicationHandler,
@@ -32,6 +32,7 @@ use crate::{
     editor_surface::{EDITOR_BACKGROUND, EditorSurface},
     file_io::{OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, safe_save},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
+    markdown,
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager, data_dir},
@@ -233,6 +234,7 @@ pub struct EditorApp {
     find_selected: usize,
     scroll_to_find_match: bool,
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    markdown_preview: bool,
     sidebar: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
@@ -291,6 +293,7 @@ impl EditorApp {
             find_selected: 0,
             scroll_to_find_match: false,
             bracket_pair: None,
+            markdown_preview: false,
             sidebar: true,
             sidebar_width: 248.0,
             sidebar_dragging: false,
@@ -341,6 +344,7 @@ impl EditorApp {
                     self.find_match_revision = u64::MAX;
                     self.scroll_to_find_match = self.find_open;
                     self.bracket_pair = None;
+                    self.markdown_preview = false;
                     self.focus_editor = true;
                     self.tree_focused = false;
                 }
@@ -866,6 +870,7 @@ impl EditorApp {
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
         }
         if find {
+            self.markdown_preview = false;
             self.find_open = true;
             self.search_open = false;
             self.sidebar = true;
@@ -885,6 +890,7 @@ impl EditorApp {
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
         }
         if editor {
+            self.markdown_preview = false;
             self.focus_editor = true;
             self.tree_focused = false;
         }
@@ -1801,6 +1807,20 @@ impl EditorApp {
     }
 
     fn draw_editor(&mut self, ui: &mut egui::Ui) {
+        let markdown = self
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| markdown::is_markdown(&buffer.path));
+        if !markdown {
+            self.markdown_preview = false;
+        } else {
+            self.draw_markdown_toolbar(ui);
+            if self.markdown_preview {
+                let buffer = self.buffer.as_ref().expect("checked above");
+                draw_markdown_preview(ui, &buffer.text);
+                return;
+            }
+        }
         let find_open = self.find_open;
         let find_query = &self.find_query;
         let find_matches = &self.find_matches;
@@ -1927,6 +1947,45 @@ impl EditorApp {
         if let Some(error) = highlight_error {
             self.show_error(error);
         }
+    }
+
+    fn draw_markdown_toolbar(&mut self, ui: &mut egui::Ui) {
+        let rect = ui
+            .available_rect_before_wrap()
+            .with_max_y(ui.cursor().top() + 36.0);
+        ui.allocate_rect(rect, Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(27, 28, 34));
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
+        );
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt("markdown_toolbar")
+                .max_rect(rect.shrink2(egui::vec2(8.0, 5.0)))
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                let label = if self.markdown_preview {
+                    "Edit"
+                } else {
+                    "Preview"
+                };
+                if ui
+                    .add(egui::Button::selectable(self.markdown_preview, label))
+                    .on_hover_text(if self.markdown_preview {
+                        "Return to Markdown source"
+                    } else {
+                        "Preview rendered Markdown"
+                    })
+                    .clicked()
+                {
+                    self.markdown_preview = !self.markdown_preview;
+                    self.focus_editor = !self.markdown_preview;
+                    ui.ctx().request_repaint();
+                }
+            },
+        );
     }
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
@@ -2630,6 +2689,29 @@ fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
         },
     );
     job
+}
+
+fn draw_markdown_preview(ui: &mut egui::Ui, source: &str) {
+    let rect = ui.available_rect_before_wrap();
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_rgb(24, 25, 30));
+    let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
+    let side = ((rect.width() - content_width) * 0.5).max(0.0);
+    let job = markdown::layout(source, content_width);
+    ScrollArea::vertical()
+        .id_salt("markdown_preview")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(24.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side);
+                ui.vertical(|ui| {
+                    ui.set_width(content_width);
+                    ui.add(Label::new(job).selectable(true).wrap());
+                });
+            });
+            ui.add_space(32.0);
+        });
 }
 
 fn search_selection_after_navigation(

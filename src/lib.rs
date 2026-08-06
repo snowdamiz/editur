@@ -5,6 +5,7 @@ pub mod cli;
 pub mod editor_surface;
 pub mod file_io;
 mod instance;
+mod markdown;
 mod network;
 pub mod renderer;
 mod scrollbar;
