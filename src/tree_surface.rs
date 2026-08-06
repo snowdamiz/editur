@@ -19,7 +19,7 @@ pub struct TreeRow {
 #[derive(Default)]
 pub struct TreeSurface {
     scroll_y: f32,
-    scroll_drag_offset: Option<f32>,
+    scrollbar: crate::scrollbar::State,
     hovered: Option<usize>,
     labels: HashMap<u64, Arc<egui::Galley>>,
 }
@@ -38,17 +38,18 @@ impl TreeSurface {
         scroll_to_selected: bool,
     ) -> TreeOutput {
         let (id, rect) = ui.allocate_space(ui.available_size());
-        let content = rect.with_max_x(rect.right() - crate::scrollbar::WIDTH);
+        let content = rect;
         let response = ui.interact(content, id.with("tree"), Sense::click());
         let pointer = ui
             .input(|input| input.pointer.hover_pos())
             .filter(|pointer| content.contains(*pointer));
-        if ui.input(|input| {
+        let scrolling = ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
                 .is_some_and(|pointer| rect.contains(pointer))
-        }) {
+        }) && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+        if scrolling {
             self.scroll_y -= ui.input(|input| input.smooth_scroll_delta.y);
         }
         if scroll_to_selected && let Some(selected) = selected {
@@ -220,7 +221,8 @@ impl TreeSurface {
             rect,
             rows.len() as f32 * ROW_HEIGHT,
             &mut self.scroll_y,
-            &mut self.scroll_drag_offset,
+            &mut self.scrollbar,
+            scrolling,
         ) {
             self.clamp_scroll(rows.len(), rect.height());
             ui.ctx().request_repaint();

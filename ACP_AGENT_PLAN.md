@@ -169,7 +169,7 @@ Capture stderr into a bounded diagnostic buffer. Normal protocol messages belong
 
 ## 7. Sidebar interaction
 
-Keep the Files explorer as the collapsible left sidebar and add an independently collapsible Agent sidebar on the right. A narrow right rail keeps Agent discoverable without launching Cursor; expanding it starts the managed agent lazily. Preserve the existing Files-sidebar toggle shortcut.
+Keep the Files explorer as the collapsible left sidebar and add an independently collapsible Agent sidebar on the right. A sidebar icon in the titlebar keeps Agent discoverable without consuming workspace or launching Cursor; opening it starts the managed agent lazily. Preserve the existing Files-sidebar toggle shortcut.
 
 The Agent view contains, from top to bottom:
 
@@ -187,7 +187,7 @@ For the first release:
 - Show the tool title, status, affected path, command, and working directory when ACP supplies them.
 - Show unknown tool input in a plain expandable details view rather than guessing its meaning.
 - Render model and mode controls only when the session advertises supported options. Do not hardcode model identifiers.
-- Keep an outstanding approval visible when Agent is collapsed, and mark the right rail as waiting.
+- Keep an outstanding approval visible when Agent is collapsed, and mark the titlebar toggle as waiting.
 
 Conversation history, transcript search, Markdown-rich rendering, images, and parallel chats are not required for the first release.
 
@@ -322,7 +322,7 @@ Exit condition: a test can start the fake agent, stream one prompt, complete it,
 
 ### Phase 3: Minimal Agent view
 
-- Add the independent right Agent sidebar, collapsed rail, and in-memory transcript.
+- Add the independent right Agent sidebar, titlebar toggle, and in-memory transcript.
 - Connect lazily on first Agent view open.
 - Send one prompt, render streaming text and tool updates, then send a follow-up.
 - Keep idle rendering event-driven.
@@ -334,7 +334,7 @@ Exit condition: a real read-only Cursor prompt can be completed entirely from th
 - Render ACP permission requests using the returned choices.
 - Wire decisions and prevent duplicate responses.
 - Add Stop and protocol cancellation.
-- Keep pending approval visible on the collapsed Agent rail.
+- Keep pending approval visible on the collapsed Agent titlebar toggle.
 
 Exit condition: the user can inspect, allow, or reject a sensitive command, and can stop a long-running turn.
 

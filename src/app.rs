@@ -47,7 +47,6 @@ enum PendingAction {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum WindowAction {
     Close,
     Minimize,
@@ -55,7 +54,7 @@ enum WindowAction {
     Drag,
 }
 
-const AGENT_RAIL_WIDTH: f32 = 36.0;
+const TITLEBAR_HEIGHT: f32 = 34.0;
 
 fn split_workspace(
     content: egui::Rect,
@@ -67,7 +66,7 @@ fn split_workspace(
     let right_width = if agent_open {
         agent_width.max(240.0).min(content.width() * 0.45)
     } else {
-        AGENT_RAIL_WIDTH
+        0.0
     };
     let explorer_width = explorer_width
         .max(120.0)
@@ -75,12 +74,17 @@ fn split_workspace(
     let explorer = explorer_open
         .then(|| content.with_max_x((content.left() + explorer_width).min(content.right())));
     let agent = content.with_min_x((content.right() - right_width).max(content.left()));
+    let editor_right = if agent_open {
+        (agent.left() - 1.0).max(content.left())
+    } else {
+        content.right()
+    };
     let editor = egui::Rect::from_min_max(
         egui::pos2(
             explorer.map_or(content.left(), |rect| rect.right() + 1.0),
             content.top(),
         ),
-        egui::pos2((agent.left() - 1.0).max(content.left()), content.bottom()),
+        egui::pos2(editor_right, content.bottom()),
     );
     (explorer, editor, agent)
 }
@@ -235,6 +239,7 @@ pub struct EditorApp {
     agent_sidebar: bool,
     agent_sidebar_width: f32,
     agent_sidebar_dragging: bool,
+    scrollbar_activity: crate::scrollbar::Activity,
     agent: AgentState,
     agent_controller: Option<AgentController>,
     pending_agent_prompt: bool,
@@ -292,6 +297,7 @@ impl EditorApp {
             agent_sidebar: false,
             agent_sidebar_width: 360.0,
             agent_sidebar_dragging: false,
+            scrollbar_activity: crate::scrollbar::Activity::default(),
             agent: AgentState::default(),
             agent_controller: None,
             pending_agent_prompt: false,
@@ -386,6 +392,7 @@ impl EditorApp {
     }
 
     pub fn ui(&mut self, root: &mut egui::Ui) {
+        self.scrollbar_activity.style_egui(root);
         let ctx = root.ctx().clone();
         self.poll_agent(&ctx);
         if self.agent.active {
@@ -405,12 +412,9 @@ impl EditorApp {
         }
 
         let mut content = root.max_rect();
-        #[cfg(target_os = "macos")]
-        {
-            let titlebar = content.with_max_y(content.top() + 34.0);
-            self.draw_titlebar(root, titlebar);
-            content.min.y = titlebar.bottom();
-        }
+        let titlebar = content.with_max_y(content.top() + TITLEBAR_HEIGHT);
+        self.draw_titlebar(root, titlebar);
+        content.min.y = titlebar.bottom();
         let status = content.with_min_y((content.bottom() - 25.0).max(content.top()));
         content.max.y = status.top();
         self.draw_statusbar(root, status);
@@ -432,10 +436,12 @@ impl EditorApp {
             UiBuilder::new().id_salt("editor_surface").max_rect(editor),
             |ui| self.draw_editor(ui),
         );
-        root.scope_builder(
-            UiBuilder::new().id_salt("agent_sidebar").max_rect(agent),
-            |ui| self.draw_agent_sidebar(ui),
-        );
+        if self.agent_sidebar {
+            root.scope_builder(
+                UiBuilder::new().id_salt("agent_sidebar").max_rect(agent),
+                |ui| self.draw_agent_sidebar(ui),
+            );
+        }
         if let Some(sidebar) = sidebar {
             let divider = egui::Rect::from_center_size(
                 egui::pos2(sidebar.right(), sidebar.center().y),
@@ -523,28 +529,125 @@ impl EditorApp {
         self.draw_error(&ctx);
     }
 
-    #[cfg(target_os = "macos")]
     fn draw_titlebar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(27, 27, 36));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, Color32::from_rgb(49, 51, 60)),
+        );
+
+        #[cfg(target_os = "macos")]
+        let agent_button = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 38.0, rect.top()),
+            rect.right_bottom(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let agent_button = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 3.0 * 46.0 - 38.0, rect.top()),
+            egui::pos2(rect.right() - 3.0 * 46.0, rect.bottom()),
+        );
+
+        let drag_rect = rect.with_max_x(agent_button.left());
+        let drag = ui.interact(drag_rect, Id::new("titlebar_drag"), Sense::click_and_drag());
+        if drag.drag_started() {
+            self.window_action = Some(WindowAction::Drag);
+        } else if drag.double_clicked() {
+            self.window_action = Some(WindowAction::ToggleMaximize);
+        }
+
+        let agent_response = ui
+            .interact(
+                agent_button,
+                Id::new("agent_sidebar_toggle"),
+                Sense::click(),
+            )
+            .on_hover_text(if self.agent_sidebar {
+                "Close Cursor Agent"
+            } else {
+                "Open Cursor Agent"
+            });
+        if agent_response.hovered() {
+            ui.painter().rect_filled(
+                agent_button.shrink2(egui::vec2(3.0, 2.0)),
+                4.0,
+                Color32::from_rgb(38, 40, 48),
+            );
+        }
+        let icon = egui::Rect::from_center_size(agent_button.center(), egui::vec2(16.0, 13.0));
+        let icon_color = if self.agent_sidebar {
+            Color32::from_rgb(112, 215, 228)
+        } else {
+            Color32::from_rgb(155, 163, 177)
+        };
+        ui.painter().rect_stroke(
+            icon,
+            2.0,
+            egui::Stroke::new(1.2, icon_color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().vline(
+            icon.right() - 4.5,
+            icon.y_range(),
+            egui::Stroke::new(1.2, icon_color),
+        );
+        if self.agent_sidebar {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(icon.right() - 4.5, icon.top()),
+                    icon.right_bottom(),
+                ),
+                1.0,
+                Color32::from_rgba_unmultiplied(86, 207, 225, 55),
+            );
+        }
+        if self.agent.waiting_permission() {
+            ui.painter().circle_filled(
+                agent_button.center() + egui::vec2(8.0, -7.0),
+                3.0,
+                Color32::from_rgb(245, 184, 77),
+            );
+        }
+        if agent_response.clicked() {
+            self.agent_sidebar = !self.agent_sidebar;
+            self.agent_sidebar_dragging = false;
+            if self.agent_sidebar {
+                self.open_agent(ui.ctx());
+            }
+            ui.ctx().request_repaint();
+        }
+
+        #[cfg(target_os = "macos")]
+        self.draw_macos_titlebar_controls(ui, rect);
+        #[cfg(not(target_os = "macos"))]
+        self.draw_windows_titlebar_controls(ui, rect);
+
+        #[cfg(target_os = "macos")]
+        let title_position = rect.center();
+        #[cfg(not(target_os = "macos"))]
+        let title_position = egui::pos2(rect.left() + 12.0, rect.center().y);
+        #[cfg(target_os = "macos")]
+        let title_align = Align2::CENTER_CENTER;
+        #[cfg(not(target_os = "macos"))]
+        let title_align = Align2::LEFT_CENTER;
+        ui.painter().text(
+            title_position,
+            title_align,
+            "Editur",
+            FontId::proportional(14.0),
+            Color32::from_rgb(188, 188, 198),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn draw_macos_titlebar_controls(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let pointer = ui.ctx().pointer_hover_pos();
         let button_centers =
             [17.0, 37.0, 57.0].map(|x| egui::pos2(rect.left() + x, rect.center().y));
         let hovered = button_centers
             .iter()
             .position(|center| pointer.is_some_and(|pointer| pointer.distance(*center) <= 10.0));
-        crate::renderer::mark_retained(
-            ui.painter(),
-            rect,
-            0x6000_0000_0000_0000,
-            u64::from(rect.width().to_bits()) ^ ((hovered.unwrap_or(3) as u64) << 32),
-        );
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(27, 27, 36));
-        let drag = ui.interact(rect, Id::new("titlebar_drag"), Sense::click_and_drag());
-        if drag.drag_started() {
-            self.window_action = Some(WindowAction::Drag);
-        } else if drag.double_clicked() {
-            self.window_action = Some(WindowAction::ToggleMaximize);
-        }
         let actions = [
             (WindowAction::Close, Color32::from_rgb(255, 95, 87), "×"),
             (WindowAction::Minimize, Color32::from_rgb(254, 188, 46), "−"),
@@ -575,13 +678,71 @@ impl EditorApp {
                 );
             }
         }
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "Editur",
-            FontId::proportional(14.0),
-            Color32::from_rgb(188, 188, 198),
-        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn draw_windows_titlebar_controls(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let actions = [
+            WindowAction::Minimize,
+            WindowAction::ToggleMaximize,
+            WindowAction::Close,
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let button = egui::Rect::from_min_max(
+                egui::pos2(rect.right() - (3 - index) as f32 * 46.0, rect.top()),
+                egui::pos2(rect.right() - (2 - index) as f32 * 46.0, rect.bottom()),
+            );
+            let response = ui.interact(button, Id::new(("titlebar_button", index)), Sense::click());
+            if response.hovered() {
+                ui.painter().rect_filled(
+                    button,
+                    0.0,
+                    if index == 2 {
+                        Color32::from_rgb(196, 43, 28)
+                    } else {
+                        Color32::from_rgb(45, 47, 56)
+                    },
+                );
+            }
+            let center = button.center();
+            let color = Color32::from_rgb(205, 208, 218);
+            match index {
+                0 => {
+                    ui.painter().hline(
+                        (center.x - 5.0)..=(center.x + 5.0),
+                        center.y + 3.0,
+                        egui::Stroke::new(1.0, color),
+                    );
+                }
+                1 => {
+                    ui.painter().rect_stroke(
+                        egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                        0.0,
+                        egui::Stroke::new(1.0, color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                _ => {
+                    ui.painter().line_segment(
+                        [
+                            center + egui::vec2(-4.0, -4.0),
+                            center + egui::vec2(4.0, 4.0),
+                        ],
+                        egui::Stroke::new(1.0, color),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            center + egui::vec2(4.0, -4.0),
+                            center + egui::vec2(-4.0, 4.0),
+                        ],
+                        egui::Stroke::new(1.0, color),
+                    );
+                }
+            }
+            if response.clicked() {
+                self.window_action = Some(action);
+            }
+        }
     }
 
     fn draw_statusbar(&self, ui: &egui::Ui, rect: egui::Rect) {
@@ -804,38 +965,6 @@ impl EditorApp {
         let rect = ui.max_rect();
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 27));
-        if !self.agent_sidebar {
-            let response = ui
-                .put(
-                    egui::Rect::from_min_size(
-                        rect.min + egui::vec2(5.0, 7.0),
-                        egui::vec2(26.0, 30.0),
-                    ),
-                    egui::Button::new(
-                        RichText::new("A")
-                            .monospace()
-                            .strong()
-                            .color(Color32::from_rgb(137, 221, 231)),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("Open Cursor Agent");
-            if self.agent.waiting_permission() {
-                ui.painter().circle_filled(
-                    egui::pos2(rect.right() - 7.0, rect.top() + 9.0),
-                    3.0,
-                    Color32::from_rgb(245, 184, 77),
-                );
-            }
-            if response.clicked() {
-                self.agent_sidebar = true;
-                self.open_agent(ui.ctx());
-                ui.ctx().request_repaint();
-            }
-            return;
-        }
-
-        let mut collapse = false;
         egui::Frame::new()
             .fill(Color32::from_rgb(23, 25, 30))
             .inner_margin(egui::Margin::symmetric(10, 8))
@@ -859,12 +988,6 @@ impl EditorApp {
                             .strong()
                             .color(Color32::from_rgb(176, 184, 198)),
                     );
-                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        collapse = ui
-                            .add(egui::Button::new(RichText::new(">").monospace()).frame(false))
-                            .on_hover_text("Collapse Agent")
-                            .clicked();
-                    });
                 });
             });
         ui.painter().hline(
@@ -872,15 +995,9 @@ impl EditorApp {
             ui.cursor().top(),
             egui::Stroke::new(1.0, Color32::from_rgb(42, 45, 53)),
         );
-        if collapse {
-            self.agent_sidebar = false;
-            self.agent_sidebar_dragging = false;
-            ui.ctx().request_repaint();
-        } else {
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| self.draw_agent(ui));
-        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| self.draw_agent(ui));
     }
 
     fn open_agent(&mut self, ctx: &egui::Context) {
@@ -2174,9 +2291,10 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             .with_title("Editur")
             .with_inner_size(LogicalSize::new(1000, 700))
             .with_min_inner_size(LogicalSize::new(520, 320))
-            .with_window_icon(Some(icon));
+            .with_window_icon(Some(icon))
+            .with_decorations(false);
         #[cfg(target_os = "macos")]
-        let attributes = attributes.with_decorations(false).with_transparent(true);
+        let attributes = attributes.with_transparent(true);
         let window_started = Instant::now();
         #[cfg(target_os = "macos")]
         let window = create_macos_window_without_native_title(event_loop, attributes);
@@ -2803,6 +2921,15 @@ mod tests {
         assert_eq!(agent.right(), content.right());
         assert!(explorer.right() < editor.left());
         assert!(editor.right() < agent.left());
+    }
+
+    #[test]
+    fn collapsed_agent_leaves_no_rail_or_empty_space() {
+        let content = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (_, editor, agent) = split_workspace(content, true, 240.0, false, 340.0);
+
+        assert_eq!(agent.width(), 0.0);
+        assert_eq!(editor.right(), content.right());
     }
 
     #[test]

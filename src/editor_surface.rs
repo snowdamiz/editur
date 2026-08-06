@@ -35,7 +35,7 @@ pub struct EditorSurface {
     cursor: usize,
     h_pos: Option<f32>,
     scroll_y: f32,
-    scroll_drag_offset: Option<f32>,
+    scrollbar: crate::scrollbar::State,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     lines: Vec<RetainedLine>,
@@ -122,7 +122,7 @@ impl EditorSurface {
     ) -> EditorOutput {
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
-        let editor_rect = rect.with_max_x(rect.right() - crate::scrollbar::WIDTH);
+        let editor_rect = rect;
         let mut response = ui.interact(editor_rect, Id::new("editor"), Sense::click_and_drag());
         if ui.input(|input| {
             input
@@ -144,16 +144,15 @@ impl EditorSurface {
         if request_focus {
             response.request_focus();
         }
-        if ui.input(|input| {
+        let scrolling = ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
                 .is_some_and(|pointer| rect.contains(pointer))
-        }) {
+        }) && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+        if scrolling {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.scroll_y -= scroll;
-            }
+            self.scroll_y -= scroll;
         }
         self.clamp_scroll(content.height());
 
@@ -226,7 +225,8 @@ impl EditorSurface {
             rect,
             self.offsets.last().copied().unwrap_or(0.0),
             &mut self.scroll_y,
-            &mut self.scroll_drag_offset,
+            &mut self.scrollbar,
+            scrolling,
         ) {
             self.clamp_scroll(content.height());
             ui.ctx().request_repaint();

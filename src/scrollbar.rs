@@ -1,7 +1,67 @@
 use egui::{Color32, Id, Rect, Sense, Ui, pos2};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 
 pub(crate) const WIDTH: f32 = 10.0;
+pub(crate) const HOLD_SECONDS: f64 = 0.25;
+pub(crate) const FADE_SECONDS: f64 = 0.18;
+
+#[derive(Default)]
+pub(crate) struct Activity {
+    last_active: Option<f64>,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
+    drag_offset: Option<f32>,
+    activity: Activity,
+}
+
+impl Activity {
+    fn opacity(&mut self, ui: &Ui, active: bool) -> f32 {
+        let now = ui.input(|input| input.time);
+        if active {
+            self.last_active = Some(now);
+        }
+        let opacity = opacity_at(self.last_active, now);
+        if opacity > 0.0 && !active {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+        opacity
+    }
+
+    pub(crate) fn style_egui(&mut self, ui: &mut Ui) {
+        let scrolling = ui.input(|input| input.smooth_scroll_delta != egui::Vec2::ZERO);
+        let opacity = self.opacity(ui, scrolling);
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.floating = true;
+        scroll.floating_allocated_width = 0.0;
+        scroll.dormant_background_opacity = 0.0;
+        scroll.dormant_handle_opacity = 0.0;
+        scroll.active_background_opacity = 0.0;
+        scroll.active_handle_opacity = opacity * 0.75;
+        scroll.interact_background_opacity = 0.15;
+        scroll.interact_handle_opacity = 1.0;
+    }
+}
+
+fn opacity_at(last_active: Option<f64>, now: f64) -> f32 {
+    let Some(elapsed) = last_active.map(|last| (now - last).max(0.0)) else {
+        return 0.0;
+    };
+    if elapsed <= HOLD_SECONDS {
+        1.0
+    } else if elapsed >= HOLD_SECONDS + FADE_SECONDS {
+        0.0
+    } else {
+        let opacity = 1.0 - (elapsed - HOLD_SECONDS) / FADE_SECONDS;
+        if opacity <= f32::EPSILON as f64 {
+            0.0
+        } else {
+            opacity as f32
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
@@ -34,7 +94,7 @@ fn geometry(viewport: Rect, content_height: f32, scroll_y: f32) -> Option<Geomet
     })
 }
 
-fn geometry_revision(layout: Geometry, active: bool) -> u64 {
+fn geometry_revision(layout: Geometry, active: bool, opacity: f32) -> u64 {
     let mut hasher = DefaultHasher::new();
     [
         layout.track.min.x,
@@ -49,6 +109,7 @@ fn geometry_revision(layout: Geometry, active: bool) -> u64 {
     .map(f32::to_bits)
     .hash(&mut hasher);
     active.hash(&mut hasher);
+    opacity.to_bits().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -58,10 +119,11 @@ pub(crate) fn show(
     viewport: Rect,
     content_height: f32,
     scroll_y: &mut f32,
-    drag_offset: &mut Option<f32>,
+    state: &mut State,
+    scrolling: bool,
 ) -> bool {
     let Some(mut layout) = geometry(viewport, content_height, *scroll_y) else {
-        *drag_offset = None;
+        state.drag_offset = None;
         return false;
     };
     let response = ui.interact(layout.track.expand(2.0), id, Sense::click_and_drag());
@@ -69,7 +131,7 @@ pub(crate) fn show(
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = pointer
     {
-        *drag_offset = Some(if layout.thumb.contains(pointer) {
+        state.drag_offset = Some(if layout.thumb.contains(pointer) {
             pointer.y - layout.thumb.top()
         } else {
             layout.thumb.height() * 0.5
@@ -77,7 +139,7 @@ pub(crate) fn show(
     }
     let mut changed = false;
     if (response.dragged() || response.clicked())
-        && let (Some(pointer), Some(offset)) = (pointer, *drag_offset)
+        && let (Some(pointer), Some(offset)) = (pointer, state.drag_offset)
     {
         let travel = layout.track.height() - layout.thumb.height();
         let ratio = ((pointer.y - layout.track.top() - offset) / travel).clamp(0.0, 1.0);
@@ -87,18 +149,26 @@ pub(crate) fn show(
         layout = geometry(viewport, content_height, *scroll_y).expect("scrollbar remains visible");
     }
     if !ui.input(|input| input.pointer.primary_down()) {
-        *drag_offset = None;
+        state.drag_offset = None;
     }
 
-    let painter = ui.painter_at(viewport);
     let active = response.hovered() || response.dragged();
+    let opacity = state.activity.opacity(ui, scrolling || active);
+    if opacity <= 0.0 {
+        return changed;
+    }
+    let painter = ui.painter_at(viewport);
     crate::renderer::mark_retained(
         &painter,
         viewport,
         id.value(),
-        geometry_revision(layout, active),
+        geometry_revision(layout, active, opacity),
     );
-    painter.rect_filled(layout.track, 3.0, Color32::from_black_alpha(32));
+    painter.rect_filled(
+        layout.track,
+        3.0,
+        Color32::from_black_alpha(32).gamma_multiply(opacity),
+    );
     painter.rect_filled(
         layout.thumb,
         3.0,
@@ -106,20 +176,21 @@ pub(crate) fn show(
             Color32::from_rgb(112, 116, 128)
         } else {
             Color32::from_rgb(78, 82, 94)
-        },
+        }
+        .gamma_multiply(opacity),
     );
     changed
 }
 
 #[cfg(test)]
 mod tests {
-    use super::geometry;
+    use super::{FADE_SECONDS, HOLD_SECONDS, geometry, opacity_at};
     use egui::{Id, RawInput, Rect, Vec2, pos2};
 
     fn retained_scrollbar(viewport: Rect) -> crate::renderer::RetainedPaint {
         let context = egui::Context::default();
         let mut scroll_y = 100.0;
-        let mut drag_offset = None;
+        let mut state = super::State::default();
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(400.0))),
@@ -132,7 +203,8 @@ mod tests {
                     viewport,
                     1_000.0,
                     &mut scroll_y,
-                    &mut drag_offset,
+                    &mut state,
+                    true,
                 );
             },
         );
@@ -163,5 +235,16 @@ mod tests {
 
         assert_eq!(first.key, moved.key);
         assert_ne!(first.revision, moved.revision);
+    }
+
+    #[test]
+    fn scrollbar_is_hidden_until_activity_then_fades_out() {
+        assert_eq!(opacity_at(None, 10.0), 0.0);
+        assert_eq!(opacity_at(Some(10.0), 10.0), 1.0);
+        assert_eq!(opacity_at(Some(10.0), 10.0 + HOLD_SECONDS), 1.0);
+        assert_eq!(
+            opacity_at(Some(10.0), 10.0 + HOLD_SECONDS + FADE_SECONDS),
+            0.0
+        );
     }
 }
