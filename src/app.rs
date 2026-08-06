@@ -567,19 +567,27 @@ impl EditorApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (save, project_search, find, sidebar, tree, editor, close) = ctx.input(|input| {
-            let command = input.modifiers.command;
-            (
-                command && input.key_pressed(Key::S),
-                command && input.modifiers.shift && input.key_pressed(Key::F),
-                command && !input.modifiers.shift && input.key_pressed(Key::F),
-                command && input.key_pressed(Key::B),
-                command && input.key_pressed(Key::Num1),
-                command && input.key_pressed(Key::Num2),
-                command && input.key_pressed(Key::W),
-            )
-        });
-        if save {
+        let (save, save_quit, project_search, find, sidebar, tree, editor, close) =
+            ctx.input(|input| {
+                let command = input.modifiers.command;
+                (
+                    command && input.key_pressed(Key::S),
+                    command
+                        && ((input.key_pressed(Key::Q) && input.key_down(Key::S))
+                            || (input.key_pressed(Key::S) && input.key_down(Key::Q))),
+                    command && input.modifiers.shift && input.key_pressed(Key::F),
+                    command && !input.modifiers.shift && input.key_pressed(Key::F),
+                    command && input.key_pressed(Key::B),
+                    command && input.key_pressed(Key::Num1),
+                    command && input.key_pressed(Key::Num2),
+                    command && input.key_pressed(Key::W),
+                )
+            });
+        if save_quit {
+            if self.save(None) {
+                self.request_close();
+            }
+        } else if save {
             self.save(None);
         }
         if project_search {
@@ -639,7 +647,6 @@ impl EditorApp {
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         if self.find_open {
             self.draw_find(ui);
-            ui.separator();
         }
         self.draw_tree(ui);
     }
@@ -666,40 +673,41 @@ impl EditorApp {
             format!("{} / {}", self.find_selected + 1, self.find_matches.len())
         };
         egui::Frame::new()
-            .fill(Color32::from_rgb(24, 25, 30))
-            .inner_margin(egui::Margin::symmetric(8, 8))
-            .corner_radius(8)
+            .fill(Color32::from_rgb(26, 27, 31))
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.x = 4.0;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Find in file").strong());
-                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        close |= close_icon_button(ui).clicked();
-                    });
+                    let input_width = (ui.available_width() - 34.0).max(40.0);
+                    let response = egui::Frame::new()
+                        .fill(Color32::from_rgb(31, 32, 37))
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .corner_radius(4)
+                        .show(ui, |ui| {
+                            ui.set_width((input_width - 12.0).max(28.0));
+                            ui.add_sized(
+                                egui::vec2(ui.available_width(), 22.0),
+                                TextEdit::singleline(&mut self.find_query)
+                                    .id(Id::new("file_search_query"))
+                                    .font(FontId::proportional(13.0))
+                                    .hint_text("Find in current file…")
+                                    .frame(egui::Frame::NONE),
+                            )
+                        })
+                        .inner;
+                    close |= close_icon_button(ui).clicked();
+                    if self.focus_find {
+                        response.request_focus();
+                        self.focus_find = false;
+                    }
+                    query_changed = response.changed();
                 });
-                ui.add_space(4.0);
-                let response = egui::Frame::new()
-                    .fill(Color32::from_rgb(33, 35, 42))
-                    .inner_margin(egui::Margin::symmetric(7, 4))
-                    .corner_radius(6)
-                    .show(ui, |ui| {
-                        ui.add_sized(
-                            egui::vec2(ui.available_width(), 24.0),
-                            TextEdit::singleline(&mut self.find_query)
-                                .id(Id::new("file_search_query"))
-                                .hint_text("Search current file…")
-                                .frame(egui::Frame::NONE),
-                        )
-                    })
-                    .inner;
-                if self.focus_find {
-                    response.request_focus();
-                    self.focus_find = false;
-                }
-                query_changed = response.changed();
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.add(Label::new(RichText::new(&count).small().weak()));
+                    ui.add(Label::new(
+                        RichText::new(&count).monospace().size(11.0).weak(),
+                    ));
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                         next = chevron_icon_button(ui, false, "Next match (Enter)").clicked();
                         previous =
@@ -775,6 +783,7 @@ impl EditorApp {
         egui::Window::new("Project search")
             .id(Id::new("project_search"))
             .title_bar(false)
+            .fade_in(false)
             .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
             .fixed_size(egui::vec2(680.0, if empty_query { 185.0 } else { 430.0 }))
             .resizable(false)
@@ -2074,7 +2083,10 @@ mod tests {
         search_selection_after_navigation,
     };
     use crate::{buffer::Buffer, file_io::OpenTarget};
-    use egui::{CursorIcon, Event, Id, Key, Modifiers, PointerButton, RawInput, Rect, Vec2, pos2};
+    use egui::{
+        Color32, CursorIcon, Event, Id, Key, Modifiers, PointerButton, RawInput, Rect, Vec2,
+        epaint::Shape, pos2,
+    };
     use std::fs;
 
     #[test]
@@ -2141,6 +2153,87 @@ mod tests {
         assert_eq!(
             search_selection_after_navigation(0, 30, false, true),
             (0, false)
+        );
+    }
+
+    #[test]
+    fn project_search_palette_is_opaque_on_its_first_visible_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.search_open = true;
+        let context = egui::Context::default();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            time: Some(0.0),
+            ..RawInput::default()
+        };
+        for _ in 0..3 {
+            let _ = context.run_ui(input(), |root| app.ui(root));
+        }
+        let output = context.run_ui(input(), |root| app.ui(root));
+        fn contains_opaque_palette(shape: &Shape) -> bool {
+            match shape {
+                Shape::Rect(rect) => {
+                    rect.rect.width() > 650.0
+                        && (150.0..250.0).contains(&rect.rect.height())
+                        && rect.fill == Color32::from_rgb(24, 25, 30)
+                }
+                Shape::Vec(shapes) => shapes.iter().any(contains_opaque_palette),
+                _ => false,
+            }
+        }
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_opaque_palette(&shape.shape))
+        );
+    }
+
+    #[test]
+    fn in_file_search_keeps_the_tree_near_the_top_of_the_sidebar() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.find_open = true;
+        let context = egui::Context::default();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let tree = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Rect(rect) if rect.fill == Color32::from_rgb(26, 27, 31) => Some(rect),
+                _ => None,
+            })
+            .max_by(|left, right| left.rect.height().total_cmp(&right.rect.height()))
+            .expect("file-tree background");
+
+        assert!(
+            tree.rect.top() <= 115.0,
+            "tree starts at {}",
+            tree.rect.top()
         );
     }
 
@@ -2401,5 +2494,50 @@ mod tests {
         assert!(app.search_open);
         assert!(!app.find_open);
         assert!(context.memory(|memory| memory.has_focus(Id::new("project_search_query"))));
+    }
+
+    #[test]
+    fn command_s_q_saves_before_quitting() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.rs");
+        fs::write(&file, "before\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file.clone()),
+            create: false,
+        })
+        .unwrap();
+        let buffer = app.buffer.as_mut().unwrap();
+        buffer.text = "after\n".into();
+        buffer.mark_changed();
+        let command = Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        };
+        let context = egui::Context::default();
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                modifiers: command,
+                events: [Key::S, Key::Q]
+                    .into_iter()
+                    .map(|key| Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: command,
+                    })
+                    .collect(),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(app.should_close);
+        assert_eq!(fs::read_to_string(file).unwrap(), "after\n");
     }
 }
