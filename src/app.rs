@@ -55,10 +55,34 @@ enum WindowAction {
     Drag,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SidebarView {
-    Files,
-    Agent,
+const AGENT_RAIL_WIDTH: f32 = 36.0;
+
+fn split_workspace(
+    content: egui::Rect,
+    explorer_open: bool,
+    explorer_width: f32,
+    agent_open: bool,
+    agent_width: f32,
+) -> (Option<egui::Rect>, egui::Rect, egui::Rect) {
+    let right_width = if agent_open {
+        agent_width.max(240.0).min(content.width() * 0.45)
+    } else {
+        AGENT_RAIL_WIDTH
+    };
+    let explorer_width = explorer_width
+        .max(120.0)
+        .min((content.width() - right_width - 160.0).max(120.0));
+    let explorer = explorer_open
+        .then(|| content.with_max_x((content.left() + explorer_width).min(content.right())));
+    let agent = content.with_min_x((content.right() - right_width).max(content.left()));
+    let editor = egui::Rect::from_min_max(
+        egui::pos2(
+            explorer.map_or(content.left(), |rect| rect.right() + 1.0),
+            content.top(),
+        ),
+        egui::pos2((agent.left() - 1.0).max(content.left()), content.bottom()),
+    );
+    (explorer, editor, agent)
 }
 
 struct TreeState {
@@ -208,7 +232,9 @@ pub struct EditorApp {
     sidebar: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
-    sidebar_view: SidebarView,
+    agent_sidebar: bool,
+    agent_sidebar_width: f32,
+    agent_sidebar_dragging: bool,
     agent: AgentState,
     agent_controller: Option<AgentController>,
     pending_agent_prompt: bool,
@@ -261,9 +287,11 @@ impl EditorApp {
             scroll_to_find_match: false,
             bracket_pair: None,
             sidebar: true,
-            sidebar_width: 220.0,
+            sidebar_width: 248.0,
             sidebar_dragging: false,
-            sidebar_view: SidebarView::Files,
+            agent_sidebar: false,
+            agent_sidebar_width: 360.0,
+            agent_sidebar_dragging: false,
             agent: AgentState::default(),
             agent_controller: None,
             pending_agent_prompt: false,
@@ -387,26 +415,32 @@ impl EditorApp {
         content.max.y = status.top();
         self.draw_statusbar(root, status);
 
-        let mut sidebar_divider = None;
-        if self.sidebar {
-            self.sidebar_width = self.sidebar_width.clamp(140.0, content.width().min(500.0));
-            let sidebar = content.with_max_x(content.left() + self.sidebar_width);
-            let divider = egui::Rect::from_center_size(
-                egui::pos2(sidebar.right(), sidebar.center().y),
-                egui::vec2(5.0, sidebar.height()),
-            );
+        let (sidebar, editor, agent) = split_workspace(
+            content,
+            self.sidebar,
+            self.sidebar_width,
+            self.agent_sidebar,
+            self.agent_sidebar_width,
+        );
+        if let Some(sidebar) = sidebar {
             root.scope_builder(
                 UiBuilder::new().id_salt("sidebar").max_rect(sidebar),
                 |ui| self.draw_sidebar(ui),
             );
-            sidebar_divider = Some((divider, content.left(), content.width().min(500.0)));
-            content.min.x = sidebar.right() + 1.0;
         }
         root.scope_builder(
-            UiBuilder::new().id_salt("editor_surface").max_rect(content),
+            UiBuilder::new().id_salt("editor_surface").max_rect(editor),
             |ui| self.draw_editor(ui),
         );
-        if let Some((divider, left, maximum)) = sidebar_divider {
+        root.scope_builder(
+            UiBuilder::new().id_salt("agent_sidebar").max_rect(agent),
+            |ui| self.draw_agent_sidebar(ui),
+        );
+        if let Some(sidebar) = sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(sidebar.right(), sidebar.center().y),
+                egui::vec2(5.0, sidebar.height()),
+            );
             let pointer = ctx.pointer_hover_pos();
             let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
             if hovered && ctx.input(|input| input.pointer.primary_pressed()) {
@@ -418,7 +452,7 @@ impl EditorApp {
             if self.sidebar_dragging
                 && let Some(pointer) = pointer
             {
-                self.sidebar_width = (pointer.x - left).clamp(140.0, maximum);
+                self.sidebar_width = (pointer.x - content.left()).clamp(120.0, 500.0);
                 ctx.request_repaint();
             }
             if hovered || self.sidebar_dragging {
@@ -429,6 +463,47 @@ impl EditorApp {
                 root.painter(),
                 divider,
                 0x8000_0000_0000_0000,
+                u64::from(divider.center().x.to_bits()) ^ ((active as u64) << 63),
+            );
+            root.painter().line_segment(
+                [divider.center_top(), divider.center_bottom()],
+                egui::Stroke::new(
+                    if active { 2.0 } else { 1.0 },
+                    if active {
+                        Color32::from_rgb(86, 207, 225)
+                    } else {
+                        Color32::from_rgb(53, 55, 64)
+                    },
+                ),
+            );
+        }
+        if self.agent_sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(agent.left(), agent.center().y),
+                egui::vec2(5.0, agent.height()),
+            );
+            let pointer = ctx.pointer_hover_pos();
+            let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
+            if hovered && ctx.input(|input| input.pointer.primary_pressed()) {
+                self.agent_sidebar_dragging = true;
+            }
+            if !ctx.input(|input| input.pointer.primary_down()) {
+                self.agent_sidebar_dragging = false;
+            }
+            if self.agent_sidebar_dragging
+                && let Some(pointer) = pointer
+            {
+                self.agent_sidebar_width = (content.right() - pointer.x).clamp(240.0, 560.0);
+                ctx.request_repaint();
+            }
+            if hovered || self.agent_sidebar_dragging {
+                ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            let active = hovered || self.agent_sidebar_dragging;
+            crate::renderer::mark_retained(
+                root.painter(),
+                divider,
+                0x9000_0000_0000_0000,
                 u64::from(divider.center().x.to_bits()) ^ ((active as u64) << 63),
             );
             root.painter().line_segment(
@@ -676,44 +751,135 @@ impl EditorApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        let mut selected = self.sidebar_view;
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(20, 22, 27));
         egui::Frame::new()
-            .fill(Color32::from_rgb(26, 27, 31))
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .fill(Color32::from_rgb(23, 25, 30))
+            .inner_margin(egui::Margin::symmetric(11, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(selected == SidebarView::Files, "Files")
-                        .clicked()
-                    {
-                        selected = SidebarView::Files;
-                    }
-                    let agent_label = if self.agent.waiting_permission() {
-                        "Agent •"
-                    } else {
-                        "Agent"
-                    };
-                    if ui
-                        .selectable_label(selected == SidebarView::Agent, agent_label)
-                        .clicked()
-                    {
-                        selected = SidebarView::Agent;
-                    }
+                    ui.label(
+                        RichText::new("EXPLORER")
+                            .size(10.5)
+                            .strong()
+                            .color(Color32::from_rgb(134, 143, 159)),
+                    );
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(self.tree.visible.len().to_string())
+                                .monospace()
+                                .size(10.0)
+                                .color(Color32::from_rgb(89, 98, 113)),
+                        );
+                    });
+                });
+                let project = self
+                    .tree
+                    .root
+                    .file_name()
+                    .unwrap_or(self.tree.root.as_os_str())
+                    .to_string_lossy();
+                ui.add(
+                    Label::new(
+                        RichText::new(project)
+                            .monospace()
+                            .size(12.5)
+                            .color(Color32::from_rgb(218, 222, 230)),
+                    )
+                    .truncate(),
+                );
+            });
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, Color32::from_rgb(42, 45, 53)),
+        );
+        if self.find_open {
+            self.draw_find(ui);
+        }
+        self.draw_tree(ui);
+    }
+
+    fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 27));
+        if !self.agent_sidebar {
+            let response = ui
+                .put(
+                    egui::Rect::from_min_size(
+                        rect.min + egui::vec2(5.0, 7.0),
+                        egui::vec2(26.0, 30.0),
+                    ),
+                    egui::Button::new(
+                        RichText::new("A")
+                            .monospace()
+                            .strong()
+                            .color(Color32::from_rgb(137, 221, 231)),
+                    )
+                    .frame(false),
+                )
+                .on_hover_text("Open Cursor Agent");
+            if self.agent.waiting_permission() {
+                ui.painter().circle_filled(
+                    egui::pos2(rect.right() - 7.0, rect.top() + 9.0),
+                    3.0,
+                    Color32::from_rgb(245, 184, 77),
+                );
+            }
+            if response.clicked() {
+                self.agent_sidebar = true;
+                self.open_agent(ui.ctx());
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
+
+        let mut collapse = false;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(23, 25, 30))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.painter().circle_filled(
+                        egui::pos2(ui.cursor().left() + 4.0, ui.cursor().top() + 9.0),
+                        3.5,
+                        if self.agent.waiting_permission() {
+                            Color32::from_rgb(245, 184, 77)
+                        } else if self.agent.session_ready {
+                            Color32::from_rgb(91, 214, 156)
+                        } else {
+                            Color32::from_rgb(86, 207, 225)
+                        },
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("CURSOR AGENT")
+                            .size(10.5)
+                            .strong()
+                            .color(Color32::from_rgb(176, 184, 198)),
+                    );
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        collapse = ui
+                            .add(egui::Button::new(RichText::new(">").monospace()).frame(false))
+                            .on_hover_text("Collapse Agent")
+                            .clicked();
+                    });
                 });
             });
-        if selected != self.sidebar_view {
-            self.sidebar_view = selected;
-            if selected == SidebarView::Agent {
-                self.open_agent(ui.ctx());
-            }
-        }
-        if self.sidebar_view == SidebarView::Agent {
-            self.draw_agent(ui);
+        ui.painter().hline(
+            rect.x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, Color32::from_rgb(42, 45, 53)),
+        );
+        if collapse {
+            self.agent_sidebar = false;
+            self.agent_sidebar_dragging = false;
+            ui.ctx().request_repaint();
         } else {
-            if self.find_open {
-                self.draw_find(ui);
-            }
-            self.draw_tree(ui);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| self.draw_agent(ui));
         }
     }
 
@@ -863,41 +1029,46 @@ impl EditorApp {
         egui::Frame::new()
             .fill(Color32::from_rgb(27, 28, 33))
             .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| match &status {
-                ConnectionState::Provisioning { downloaded, total } => {
-                    let total =
-                        total.map_or_else(|| "?".into(), |value| (value / 1_048_576).to_string());
-                    ui.label(format!(
-                        "Installing Cursor Agent… {} / {total} MiB",
-                        downloaded / 1_048_576
-                    ));
-                }
-                ConnectionState::Starting => {
-                    ui.label("Starting Cursor Agent…");
-                }
-                ConnectionState::Ready => {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Cursor Agent ready").color(Color32::LIGHT_GREEN));
-                        if ui.small_button("New Session").clicked() {
-                            new_session = true;
-                        }
-                    });
-                }
-                ConnectionState::AuthenticationRequired(methods) => {
-                    ui.label("Sign in to Cursor to continue.");
-                    for method in methods {
-                        if ui.button(&method.name).clicked() {
-                            authenticate = Some(method.id.clone());
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match &status {
+                    ConnectionState::Provisioning { downloaded, total } => {
+                        let total = total
+                            .map_or_else(|| "?".into(), |value| (value / 1_048_576).to_string());
+                        ui.label(format!(
+                            "Installing Cursor Agent… {} / {total} MiB",
+                            downloaded / 1_048_576
+                        ));
+                    }
+                    ConnectionState::Starting => {
+                        ui.label("Starting Cursor Agent…");
+                    }
+                    ConnectionState::Ready => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Cursor Agent ready").color(Color32::LIGHT_GREEN),
+                            );
+                            if ui.small_button("New Session").clicked() {
+                                new_session = true;
+                            }
+                        });
+                    }
+                    ConnectionState::AuthenticationRequired(methods) => {
+                        ui.label("Sign in to Cursor to continue.");
+                        for method in methods {
+                            if ui.button(&method.name).clicked() {
+                                authenticate = Some(method.id.clone());
+                            }
                         }
                     }
-                }
-                ConnectionState::Failed(error) => {
-                    ui.colored_label(Color32::LIGHT_RED, error);
-                    reconnect = ui.button("Retry").clicked();
-                }
-                ConnectionState::Disconnected => {
-                    ui.label("Cursor Agent is disconnected.");
-                    reconnect = ui.button("Connect").clicked();
+                    ConnectionState::Failed(error) => {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                        reconnect = ui.button("Retry").clicked();
+                    }
+                    ConnectionState::Disconnected => {
+                        ui.label("Cursor Agent is disconnected.");
+                        reconnect = ui.button("Connect").clicked();
+                    }
                 }
             });
 
@@ -1862,6 +2033,18 @@ struct Shell {
     first_frame_logged: bool,
 }
 
+fn repaint_deadline(delay: Duration, now: Instant) -> Option<Instant> {
+    (delay != Duration::MAX).then(|| now + delay)
+}
+
+fn repaint_delay_after_texture_update(delay: Duration, textures_updated: bool) -> Duration {
+    if textures_updated {
+        Duration::ZERO
+    } else {
+        delay
+    }
+}
+
 fn system_clipboard(
     clipboard: &mut Option<arboard::Clipboard>,
 ) -> Result<&mut arboard::Clipboard, String> {
@@ -1931,6 +2114,7 @@ impl Shell {
         }
         state.handle_platform_output_with_event_loop(window, event_loop, output.platform_output);
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        let textures_updated = !output.textures_delta.set.is_empty();
         #[cfg(target_os = "linux")]
         window.pre_present_notify();
         if let Err(error) =
@@ -1957,15 +2141,18 @@ impl Shell {
             .viewport_output
             .get(&ViewportId::ROOT)
             .map_or(Duration::MAX, |output| output.repaint_delay);
-        if delay.is_zero() {
-            window.request_redraw();
-        } else if delay == Duration::MAX {
+        let delay = repaint_delay_after_texture_update(delay, textures_updated);
+        let now = Instant::now();
+        if let Some(repaint_at) = repaint_deadline(delay, now) {
+            self.repaint_at = Some(repaint_at);
+            if delay.is_zero() {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(repaint_at));
+            }
+        } else {
             self.repaint_at = None;
             event_loop.set_control_flow(ControlFlow::Wait);
-        } else {
-            let repaint_at = Instant::now() + delay;
-            self.repaint_at = Some(repaint_at);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(repaint_at));
         }
     }
 }
@@ -2588,19 +2775,49 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::{
         EditorApp, TreeState, find_highlighted_job, launch_in_current_process, match_bracket_pair,
-        match_spans, next_find_match, plain_text_job, presentation_job,
-        search_selection_after_navigation,
+        match_spans, next_find_match, plain_text_job, presentation_job, repaint_deadline,
+        repaint_delay_after_texture_update, search_selection_after_navigation, split_workspace,
     };
     use crate::{buffer::Buffer, file_io::OpenTarget};
     use egui::{
         Color32, CursorIcon, Event, Id, Key, Modifiers, PointerButton, RawInput, Rect, Vec2,
-        epaint::Shape, pos2,
+        ViewportId, epaint::Shape, pos2,
     };
-    use std::fs;
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn graphical_launch_runs_in_the_current_process() {
         assert!(launch_in_current_process(false, false, false, false));
+    }
+
+    #[test]
+    fn agent_opens_on_the_right_without_replacing_the_explorer() {
+        let content = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (explorer, editor, agent) = split_workspace(content, true, 240.0, true, 340.0);
+
+        let explorer = explorer.expect("explorer remains visible");
+        assert_eq!(explorer.left(), content.left());
+        assert_eq!(agent.right(), content.right());
+        assert!(explorer.right() < editor.left());
+        assert!(editor.right() < agent.left());
+    }
+
+    #[test]
+    fn immediate_repaint_gets_a_followup_event_loop_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(repaint_deadline(Duration::ZERO, now), Some(now));
+    }
+
+    #[test]
+    fn texture_upload_forces_a_followup_repaint() {
+        assert_eq!(
+            repaint_delay_after_texture_update(Duration::MAX, true),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -2666,7 +2883,7 @@ mod tests {
     }
 
     #[test]
-    fn project_search_palette_is_opaque_on_its_first_visible_frame() {
+    fn project_search_sizing_pass_requests_an_opaque_followup_frame() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -2674,20 +2891,15 @@ mod tests {
             create: false,
         })
         .unwrap();
-        app.search_open = true;
         let context = egui::Context::default();
-        let input = || RawInput {
+        let input = |time| RawInput {
             screen_rect: Some(Rect::from_min_size(
                 pos2(0.0, 0.0),
                 Vec2::new(1000.0, 700.0),
             )),
-            time: Some(0.0),
+            time: Some(time),
             ..RawInput::default()
         };
-        for _ in 0..3 {
-            let _ = context.run_ui(input(), |root| app.ui(root));
-        }
-        let output = context.run_ui(input(), |root| app.ui(root));
         fn contains_opaque_palette(shape: &Shape) -> bool {
             match shape {
                 Shape::Rect(rect) => {
@@ -2700,6 +2912,21 @@ mod tests {
             }
         }
 
+        let _ = context.run_ui(input(0.0), |root| app.ui(root));
+        app.search_open = true;
+        let sizing = context.run_ui(input(1.0), |root| app.ui(root));
+        assert!(
+            !sizing
+                .shapes
+                .iter()
+                .any(|shape| contains_opaque_palette(&shape.shape))
+        );
+        assert_eq!(
+            sizing.viewport_output[&ViewportId::ROOT].repaint_delay,
+            Duration::ZERO
+        );
+
+        let output = context.run_ui(input(1.016), |root| app.ui(root));
         assert!(
             output
                 .shapes
@@ -2733,7 +2960,7 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|shape| match &shape.shape {
-                Shape::Rect(rect) if rect.fill == Color32::from_rgb(26, 27, 31) => Some(rect),
+                Shape::Rect(rect) if rect.fill == Color32::from_rgb(20, 22, 27) => Some(rect),
                 _ => None,
             })
             .max_by(|left, right| left.rect.height().total_cmp(&right.rect.height()))
@@ -2806,7 +3033,7 @@ mod tests {
                     pos2(0.0, 0.0),
                     Vec2::new(1000.0, 700.0),
                 )),
-                events: vec![Event::PointerMoved(pos2(220.0, 100.0))],
+                events: vec![Event::PointerMoved(pos2(248.0, 100.0))],
                 ..RawInput::default()
             },
             |root| app.ui(root),
@@ -2843,9 +3070,9 @@ mod tests {
         };
         draw(Vec::new());
         draw(vec![
-            Event::PointerMoved(pos2(221.0, 100.0)),
+            Event::PointerMoved(pos2(249.0, 100.0)),
             Event::PointerButton {
-                pos: pos2(221.0, 100.0),
+                pos: pos2(249.0, 100.0),
                 button: PointerButton::Primary,
                 pressed: true,
                 modifiers: Modifiers::NONE,

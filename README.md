@@ -74,7 +74,7 @@ Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F
 
 ## Cursor Agent sidebar
 
-Choose **Agent** in the sidebar to start the managed Cursor Agent for the current project. Nothing agent-related is launched, inspected, or downloaded during normal editor startup. The Agent view supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
+Open the **A** rail on the right to expand the independent Cursor Agent sidebar for the current project; the Files explorer remains visible on the left. Nothing agent-related is launched, inspected, or downloaded until that rail is opened. The Agent sidebar supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
 Official release builds embed a tested per-platform Cursor manifest. Plain local source builds intentionally omit it unless `EDITUR_AGENT_MANIFEST` points to a generated manifest, and the Agent view reports that clearly instead of resolving a mutable package at runtime.
 

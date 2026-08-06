@@ -198,6 +198,12 @@ impl Renderer {
         primitives: &[ClippedPrimitive],
         textures_delta: &TexturesDelta,
     ) -> Result<(), String> {
+        for frame in &mut self.frames {
+            super::invalidate_retained_uploads_on_texture_replace(
+                &mut frame.retained,
+                textures_delta,
+            );
+        }
         for (id, delta) in &textures_delta.set {
             self.update_texture(*id, delta)?;
         }

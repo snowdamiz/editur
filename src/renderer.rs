@@ -1,4 +1,4 @@
-use egui::{PaintCallback, Painter, Rect, epaint::Primitive};
+use egui::{PaintCallback, Painter, Rect, TexturesDelta, epaint::Primitive};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -49,6 +49,15 @@ pub(crate) fn retain_active_uploads(
     retained.retain(|key, _| active.contains(key));
 }
 
+pub(crate) fn invalidate_retained_uploads_on_texture_replace(
+    retained: &mut HashMap<u64, RetainedUpload>,
+    textures: &TexturesDelta,
+) {
+    if textures.set.iter().any(|(_, delta)| delta.pos.is_none()) {
+        retained.clear();
+    }
+}
+
 fn choose_adapter(adapters: &[(&str, bool, bool)], requested: Option<&str>) -> Option<usize> {
     if let Some(requested) = requested {
         let requested = requested.to_ascii_lowercase();
@@ -92,8 +101,10 @@ compile_error!("editur supports macOS, Windows, and Linux");
 #[cfg(test)]
 mod tests {
     use super::{
-        RetainedUpload, buffer_capacity, choose_adapter, retain_active_uploads, upload_required,
+        RetainedUpload, buffer_capacity, choose_adapter,
+        invalidate_retained_uploads_on_texture_replace, retain_active_uploads, upload_required,
     };
+    use egui::{Color32, ColorImage, TextureId, TextureOptions, TexturesDelta, epaint::ImageDelta};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -151,5 +162,31 @@ mod tests {
 
         assert!(!retained.contains_key(&1));
         assert!(upload_required(retained.get(&1), upload));
+    }
+
+    #[test]
+    fn replacing_a_texture_invalidates_retained_meshes() {
+        let upload = RetainedUpload {
+            revision: 7,
+            vertex_offset: 16,
+            vertex_bytes: 32,
+            index_offset: 8,
+            index_bytes: 12,
+        };
+        let mut retained = HashMap::from([(1, upload)]);
+        let textures = TexturesDelta {
+            set: vec![(
+                TextureId::default(),
+                ImageDelta::full(
+                    ColorImage::filled([2, 2], Color32::WHITE),
+                    TextureOptions::LINEAR,
+                ),
+            )],
+            free: Vec::new(),
+        };
+
+        invalidate_retained_uploads_on_texture_replace(&mut retained, &textures);
+
+        assert!(retained.is_empty());
     }
 }

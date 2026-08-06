@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 use crate::renderer::mark_retained;
 use crate::tree::TreeEntry;
 
-const ROW_HEIGHT: f32 = 22.0;
+const ROW_HEIGHT: f32 = 26.0;
 
 #[derive(Clone)]
 pub struct TreeRow {
@@ -65,18 +65,18 @@ impl TreeSurface {
             0x4000_0000_0000_0000,
             u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
         );
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(26, 27, 31));
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 27));
         for index in self.visible_rows(rows.len(), rect.height()) {
             let row = &rows[index];
             let top = rect.top() + index as f32 * ROW_HEIGHT - self.scroll_y;
             let row_rect = Rect::from_min_size(
-                egui::pos2(rect.left(), top),
-                egui::vec2(content.width(), ROW_HEIGHT),
+                egui::pos2(rect.left() + 4.0, top + 1.0),
+                egui::vec2((content.width() - 8.0).max(0.0), ROW_HEIGHT - 2.0),
             );
             let fill = if selected == Some(index) {
-                Color32::from_rgb(17, 103, 139)
+                Color32::from_rgb(30, 57, 66)
             } else if self.hovered == Some(index) {
-                Color32::from_rgb(38, 40, 46)
+                Color32::from_rgb(29, 32, 39)
             } else {
                 Color32::TRANSPARENT
             };
@@ -91,13 +91,31 @@ impl TreeSurface {
                 0x5000_0000_0000_0000 | index as u64,
                 revision,
             );
-            painter.rect_filled(row_rect, 3.0, fill);
+            painter.rect_filled(row_rect, 4.0, fill);
+            if selected == Some(index) {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(rect.left(), row_rect.top() + 3.0),
+                        egui::vec2(2.0, row_rect.height() - 6.0),
+                    ),
+                    1.0,
+                    Color32::from_rgb(86, 207, 225),
+                );
+            }
+            for depth in 0..row.depth {
+                let x = rect.left() + 13.0 + depth as f32 * 16.0;
+                painter.vline(
+                    x,
+                    row_rect.y_range(),
+                    Stroke::new(1.0, Color32::from_rgb(35, 39, 47)),
+                );
+            }
             let marker_center = egui::pos2(
-                rect.left() + 11.0 + row.depth as f32 * 14.0,
+                rect.left() + 13.0 + row.depth as f32 * 16.0,
                 row_rect.center().y,
             );
             if row.directory {
-                let stroke = Stroke::new(1.2, Color32::from_rgb(160, 165, 177));
+                let stroke = Stroke::new(1.2, Color32::from_rgb(128, 139, 155));
                 if row.expanded {
                     painter.line_segment(
                         [
@@ -130,22 +148,70 @@ impl TreeSurface {
                     );
                 }
             }
+            let icon_left = marker_center.x + 8.0;
+            let icon_color = if row.directory {
+                Color32::from_rgb(103, 196, 208)
+            } else {
+                Color32::from_rgb(105, 114, 130)
+            };
+            if row.directory {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(icon_left, marker_center.y - 4.0),
+                        egui::vec2(11.0, 8.0),
+                    ),
+                    1.5,
+                    icon_color,
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(icon_left + 1.0, marker_center.y - 6.0),
+                        egui::vec2(5.0, 3.0),
+                    ),
+                    1.0,
+                    icon_color,
+                );
+            } else {
+                let left = icon_left + 1.0;
+                let right = icon_left + 9.0;
+                let top = marker_center.y - 6.0;
+                let bottom = marker_center.y + 6.0;
+                let stroke = Stroke::new(1.0, icon_color);
+                painter.line_segment(
+                    [egui::pos2(left, top), egui::pos2(right - 2.5, top)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(right - 2.5, top), egui::pos2(right, top + 2.5)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(right, top + 2.5), egui::pos2(right, bottom)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(right, bottom), egui::pos2(left, bottom)],
+                    stroke,
+                );
+                painter.line_segment([egui::pos2(left, bottom), egui::pos2(left, top)], stroke);
+            }
             let label = self.labels.entry(row.revision).or_insert_with(|| {
                 ui.fonts_mut(|fonts| {
                     fonts.layout_no_wrap(
                         row.label.clone(),
-                        FontId::proportional(14.0),
-                        Color32::from_rgb(190, 193, 202),
+                        FontId::proportional(if row.directory { 13.5 } else { 13.0 }),
+                        if row.directory {
+                            Color32::from_rgb(213, 218, 227)
+                        } else {
+                            Color32::from_rgb(174, 181, 194)
+                        },
                     )
                 })
             });
             painter.galley(
-                egui::pos2(
-                    marker_center.x + 9.0,
-                    row_rect.center().y - label.size().y * 0.5,
-                ),
+                egui::pos2(icon_left + 15.0, row_rect.center().y - label.size().y * 0.5),
                 Arc::clone(label),
-                Color32::from_rgb(190, 193, 202),
+                Color32::WHITE,
             );
         }
         if crate::scrollbar::show(
