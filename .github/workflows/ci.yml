@@ -57,7 +57,7 @@ jobs:
         run: rustup update stable --no-self-update
       - name: Validate Unix bootstrap installer
         if: runner.os != 'Windows'
-        run: sh -n install.sh
+        run: sh -n install.sh dev.sh
       - name: Validate Windows bootstrap installer
         if: runner.os == 'Windows'
         shell: pwsh

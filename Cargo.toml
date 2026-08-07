@@ -59,3 +59,9 @@ codegen-units = 1
 lto = "thin"
 panic = "abort"
 strip = true
+
+[profile.dev]
+opt-level = 2
+
+[patch.crates-io]
+block = { path = "vendor/block" }

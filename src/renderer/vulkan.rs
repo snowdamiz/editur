@@ -487,7 +487,7 @@ impl Renderer {
         let command = frame.command;
         let clear = [vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.055, 0.063, 0.082, 1.0],
+                float32: [0.078, 0.078, 0.086, 1.0],
             },
         }];
         let pass_info = vk::RenderPassBeginInfo::default()

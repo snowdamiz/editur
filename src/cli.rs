@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum Command {
     Open(Option<PathBuf>),
     Resident(PathBuf),
+    QuitRunning,
     AgentProcess(PathBuf),
     AgentProvision,
     Syntax(SyntaxCommand),
@@ -54,6 +55,13 @@ where
             return Err("too many internal provision arguments".into());
         }
         return Ok(Command::AgentProvision);
+    }
+
+    if first == "--quit-running" {
+        if args.next().is_some() {
+            return Err("too many internal quit arguments".into());
+        }
+        return Ok(Command::QuitRunning);
     }
 
     #[cfg(windows)]
@@ -162,6 +170,7 @@ mod tests {
             Ok(Command::Resident(PathBuf::from("/tmp/project")))
         );
         assert!(parse(&["--resident"]).is_err());
+        assert_eq!(parse(&["--quit-running"]), Ok(Command::QuitRunning));
     }
 
     #[test]

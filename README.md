@@ -76,7 +76,7 @@ Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F
 
 Use the sidebar icon at the right of the titlebar to toggle the independent Cursor Agent sidebar for the current project; the Files explorer remains visible on the left and the collapsed Agent sidebar consumes no workspace. Nothing agent-related is launched, inspected, or downloaded until the sidebar is first opened. The Agent sidebar supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
-Official release builds embed a tested per-platform Cursor manifest. Plain local source builds intentionally omit it unless `EDITUR_AGENT_MANIFEST` points to a generated manifest, and the Agent view reports that clearly instead of resolving a mutable package at runtime.
+Official release builds embed a tested per-platform Cursor manifest. To run the same pinned Cursor Agent flow from a local source checkout, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`, then launches Editur with it embedded. A plain `cargo run` intentionally omits the manifest.
 
 Cursor authentication is handled by Cursor Agent. Choose its advertised login method in the sidebar to open the browser flow; Editur does not ask for, print, or store Cursor credentials. A Cursor account is required. Agent use consumes the limits or usage-based billing of that account and selected model; check [Cursor's current pricing](https://cursor.com/pricing) before use.
 

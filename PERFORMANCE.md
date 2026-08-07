@@ -27,7 +27,7 @@ Measured 2026-08-06 on the same Apple M4 reference machine. The comparison used 
 | First editable frame, 5-run median | 60.95 ms | 61.12 ms | +0.17 ms / ≤5 ms |
 | Idle CPU, Agent unopened | 0.1% baseline | 0.0% point sample | No measurable regression |
 | Resident memory, Agent unopened | — | 45.2–47.3 MiB (5 samples) | Recorded |
-| Stripped arm64 binary | 8,393,056 bytes | 9,675,504 bytes | +1.22 MiB / <30 MiB |
+| Stripped arm64 binary | 8,393,056 bytes | 9,926,704 bytes | +1.46 MiB / <30 MiB |
 | Installed, signed-out Cursor process to ACP initialize | — | 291 ms | Recorded |
 
 Normal startup constructs only the Agent titlebar toggle: it performs no sidecar lookup, ACP initialization, network request, child-process launch, or agent repaint polling. Agent events wake egui immediately and are drained 64 at a time; while a turn is active, open-file reconciliation requests a frame at 500 ms intervals. A native input-to-present trace during authenticated streaming remains part of the release smoke test.

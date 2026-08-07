@@ -577,7 +577,7 @@ impl Renderer {
                 .OMSetRenderTargets(1, Some(&rtv), false, None);
             frame
                 .commands
-                .ClearRenderTargetView(rtv, &[0.055, 0.063, 0.082, 1.0], None);
+                .ClearRenderTargetView(rtv, &[0.078, 0.078, 0.086, 1.0], None);
             frame.commands.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: self.size.width as f32,
                 Height: self.size.height as f32,

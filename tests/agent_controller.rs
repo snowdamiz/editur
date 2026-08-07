@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use editur::agent::controller::{AgentController, Command, ConfigValue, Event};
+use editur::agent::controller::{
+    AgentController, Command, ConfigValue, Event, InteractionResponse, QuestionAnswer,
+};
 
 fn receive_until(
     controller: &AgentController,
@@ -19,6 +21,123 @@ fn receive_until(
         }
     }
     panic!("timed out waiting for controller event: {events:?}");
+}
+
+#[test]
+fn authentication_required_is_a_status_not_a_transcript_error() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--auth-required".into()],
+    );
+    let mut events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::ConnectionChanged(
+                editur::agent::controller::ConnectionState::AuthenticationRequired(_)
+            )
+        )
+    });
+
+    controller
+        .send(Command::Authenticate("cursor_login".into()))
+        .unwrap();
+    events.extend(receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::SessionReady { .. }),
+    ));
+
+    assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+}
+
+#[test]
+fn reconnecting_restores_the_newest_project_session() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+    );
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionLoaded { .. })
+    });
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::SessionsUpdated(sessions)
+            if sessions.len() == 2 && sessions[0].title.as_deref() == Some("Newest task")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::UserMessage(text) if text == "restored prompt"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::AssistantDelta(text) if text == "restored reply"
+    )));
+
+    controller
+        .send(Command::LoadSession("older-session".into()))
+        .unwrap();
+    let older = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionLoaded { .. })
+    });
+    assert!(older.iter().any(|event| matches!(
+        event,
+        Event::AssistantDelta(text) if text == "older reply"
+    )));
+
+    controller
+        .send(Command::Prompt("follow up".into()))
+        .unwrap();
+    let follow_up = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(follow_up.iter().any(|event| matches!(
+        event,
+        Event::AssistantDelta(text) if text == "first "
+    )));
+}
+
+#[test]
+fn removed_sessions_stay_out_of_history_after_reconnecting() {
+    let project = tempfile::tempdir().unwrap();
+    let start = || {
+        AgentController::start_process(
+            project.path().to_path_buf(),
+            env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+            vec!["--sessions".into()],
+        )
+    };
+    let controller = start();
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionLoaded { .. })
+    });
+
+    controller
+        .send(Command::RemoveSession("older-session".into()))
+        .unwrap();
+    let removed = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionsUpdated(_))
+    });
+    assert!(removed.iter().any(|event| matches!(
+        event,
+        Event::SessionsUpdated(sessions)
+            if sessions.iter().all(|session| session.id != "older-session")
+    )));
+    drop(controller);
+
+    let reopened = start();
+    let restored = receive_until(&reopened, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionLoaded { .. })
+    });
+    assert!(restored.iter().any(|event| matches!(
+        event,
+        Event::SessionsUpdated(sessions)
+            if sessions.len() == 1 && sessions[0].id == "newest-session"
+    )));
 }
 
 #[test]
@@ -74,6 +193,9 @@ fn advertised_session_controls_round_trip_exact_values() {
         Event::SessionReady { current_mode: Some(mode), modes, config_options }
             if mode == "ask" && modes.iter().any(|mode| mode.id == "agent")
                 && config_options.iter().any(|option| option.id == "model")
+                && config_options.iter().any(|option| {
+                    option.id == "thoughts" && option.value == ConfigValue::Boolean(false)
+                })
     )));
 
     controller.send(Command::SetMode("agent".into())).unwrap();
@@ -172,8 +294,12 @@ fn split_tool_updates_render_supplied_details_and_unknown_notifications_are_igno
     assert!(
         tools[1]
             .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("after"))
+            .as_ref()
+            .is_some_and(|detail| detail.content.iter().any(|content| matches!(
+                content,
+                editur::agent::controller::ToolOutput::Diff { new_text, .. }
+                    if new_text.contains("after")
+            )))
     );
 
     controller.send(Command::Prompt("unknown".into())).unwrap();
@@ -212,6 +338,7 @@ fn permission_request_waits_for_each_exact_supplied_choice() {
             _ => None,
         })
         .unwrap();
+        assert_eq!(request.action, "Run a sensitive command");
         assert_eq!(
             request
                 .options
@@ -236,6 +363,155 @@ fn permission_request_waits_for_each_exact_supplied_choice() {
         );
     }
     controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn run_everything_changes_without_starting_an_agent_turn() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller.send(Command::SetRunEverything(true)).unwrap();
+    controller.send(Command::Prompt("first".into())).unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::UserMessage(text) if text == "first"))
+    );
+    let reply = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AssistantDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(reply, "first reply");
+    assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+    controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn run_everything_auto_approves_acp_permissions_with_allow_always() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller.send(Command::SetRunEverything(true)).unwrap();
+    controller
+        .send(Command::Prompt("permission-always".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::PermissionRequested(_) | Event::TurnFinished { .. }
+        )
+    });
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::PermissionRequested(_))),
+        "Yolo mode leaked a permission request to the UI: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "allow_always"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TurnFinished { .. }))
+    );
+    controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn cursor_question_extension_round_trips_rich_answers() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("cursor-question".into()))
+        .unwrap();
+    let request = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::InteractionRequested(_))
+    })
+    .into_iter()
+    .find_map(|event| match event {
+        Event::InteractionRequested(request) => Some(request),
+        _ => None,
+    })
+    .unwrap();
+    controller
+        .send(Command::RespondInteraction {
+            request_id: request.request_id,
+            response: InteractionResponse::Answers(vec![QuestionAnswer {
+                question_id: "q".into(),
+                selected_option_ids: vec!["a".into(), "b".into()],
+            }]),
+        })
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "answered"))
+    );
+}
+
+#[test]
+fn cursor_extension_notifications_reach_structured_tool_cards() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("cursor-notification".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ToolCallUpdated(tool)
+            if tool.id == "todos-1" && tool.detail.as_ref().is_some_and(|detail| matches!(
+                detail.content.as_slice(),
+                [editur::agent::controller::ToolOutput::Todo { content, .. }]
+                    if content == "Ship it"
+            ))
+    )));
 }
 
 #[test]
@@ -332,6 +608,16 @@ fn unexpected_agent_exit_preserves_bounded_stderr_diagnostics() {
         event,
         Event::ProcessExited { diagnostics, .. } if diagnostics.contains("fake diagnostic")
     )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::ProcessExited { error, .. }
+                if error.contains("Process exited")
+                    && !error.contains("spawned_at")
+                    && !error.contains("fake diagnostic")
+        )),
+        "process exit should be concise and omit SDK internals: {events:?}"
+    );
 }
 
 #[test]

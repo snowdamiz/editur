@@ -4,13 +4,14 @@ use egui::{
     epaint::text::{Galley, LayoutJob},
     text::{ByteIndex, CCursor, CCursorRange, LayoutSection},
 };
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use crate::renderer::mark_retained;
 
 const LINE_HEIGHT: f32 = 18.0;
 const TEXT_LEFT_PADDING: f32 = 8.0;
-pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 25, 30);
+const CARET_BLINK_INTERVAL: f64 = 0.7;
+pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 24, 26);
 
 struct RetainedLine {
     job: LayoutJob,
@@ -43,6 +44,8 @@ pub struct EditorSurface {
     offsets: Vec<f32>,
     visual_revision: Option<u64>,
     wrap_width: u32,
+    caret_blink_started: f64,
+    caret_was_focused: bool,
 }
 
 pub struct EditorOutput {
@@ -140,6 +143,7 @@ impl EditorSurface {
         let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
         self.sync_lines(highlighted, visual_revision, wrap_width);
         self.clamp_selection(text);
+        let cursor_before_input = self.cursor;
 
         if request_focus {
             response.request_focus();
@@ -161,7 +165,6 @@ impl EditorSurface {
         if let Some(character) = scroll_to_character {
             self.scroll_character_into_view(character, content.height());
             self.layout_visible_lines(ui, content);
-            ensure_cursor_visible = true;
         }
 
         if response.clicked() || response.drag_started() {
@@ -215,8 +218,29 @@ impl EditorSurface {
         if ensure_cursor_visible {
             self.scroll_character_into_view(self.cursor, content.height());
         }
-        self.paint(ui, rect, content, response.has_focus());
-        if response.has_focus() {
+        let focused = response.has_focus();
+        let time = ui.input(|input| input.time);
+        if focused
+            && (!self.caret_was_focused
+                || changed
+                || self.cursor != cursor_before_input
+                || response.clicked()
+                || response.dragged())
+        {
+            self.caret_blink_started = time;
+        }
+        self.caret_was_focused = focused;
+        let caret_visible = focused
+            && (((time - self.caret_blink_started).max(0.0) / CARET_BLINK_INTERVAL) as u64)
+                .is_multiple_of(2);
+        if focused {
+            let elapsed = (time - self.caret_blink_started).max(0.0);
+            let until_next = CARET_BLINK_INTERVAL - elapsed.rem_euclid(CARET_BLINK_INTERVAL);
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(until_next));
+        }
+        self.paint(ui, rect, content, focused, caret_visible);
+        if focused {
             self.update_ime(ui, rect, content);
         }
         if crate::scrollbar::show(
@@ -354,7 +378,7 @@ impl EditorSurface {
         }
     }
 
-    fn paint(&self, ui: &Ui, rect: Rect, content: Rect, focused: bool) {
+    fn paint(&self, ui: &Ui, rect: Rect, content: Rect, focused: bool, caret_visible: bool) {
         let painter = ui.painter_at(rect);
         mark_retained(
             &painter,
@@ -365,7 +389,7 @@ impl EditorSurface {
         painter.rect_filled(rect, 0.0, EDITOR_BACKGROUND);
         painter.line_segment(
             [content.left_top(), content.left_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(53, 55, 64)),
+            Stroke::new(1.0, Color32::from_rgb(53, 53, 59)),
         );
         let selection = self.selection();
         let cursor_line = self.line_for_character(self.cursor);
@@ -428,7 +452,7 @@ impl EditorSurface {
                 Color32::LIGHT_GRAY,
             );
         }
-        if focused {
+        if caret_visible {
             mark_retained(
                 &painter,
                 rect,
@@ -667,10 +691,14 @@ impl EditorSurface {
         let galley = line.galley.as_ref()?;
         let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
         let local = galley.pos_from_cursor(relative);
-        Some(local.translate(egui::vec2(
+        let translated = local.translate(egui::vec2(
             content.left() + TEXT_LEFT_PADDING,
             content.top() + self.offsets[line_index] - self.scroll_y,
-        )))
+        ));
+        Some(Rect::from_min_size(
+            translated.min,
+            egui::vec2(translated.width(), translated.height().max(LINE_HEIGHT)),
+        ))
     }
 
     fn scroll_character_into_view(&mut self, character: usize, viewport_height: f32) {
@@ -718,23 +746,26 @@ struct LineSpec {
 }
 
 fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for (index, byte) in highlighted.text.bytes().enumerate() {
-        if byte == b'\n' {
-            ranges.push(start..index);
-            start = index + 1;
-        }
-    }
-    ranges.push(start..highlighted.text.len());
-
     let mut char_start = 0;
-    ranges
-        .into_iter()
-        .map(|range| {
-            let text = highlighted.text[range.clone()].to_owned();
+    let mut range_start = 0;
+    let mut section_start = 0;
+    highlighted
+        .text
+        .split('\n')
+        .map(|text| {
+            let range = range_start..range_start + text.len();
+            while highlighted
+                .sections
+                .get(section_start)
+                .is_some_and(|section| section.byte_range.end.0 <= range.start)
+            {
+                section_start += 1;
+            }
             let mut sections = Vec::new();
-            for section in &highlighted.sections {
+            for section in &highlighted.sections[section_start..] {
+                if section.byte_range.start.0 >= range.end {
+                    break;
+                }
                 let start = section.byte_range.start.0.max(range.start);
                 let end = section.byte_range.end.0.min(range.end);
                 if start < end {
@@ -758,9 +789,10 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
             }
             let line_start = char_start;
             char_start += text.chars().count() + 1;
+            range_start = range.end.saturating_add(1);
             LineSpec {
                 job: LayoutJob {
-                    text,
+                    text: text.to_owned(),
                     sections,
                     wrap: egui::text::TextWrapping {
                         max_width: wrap_width,
@@ -841,8 +873,24 @@ fn byte_index(text: &str, character: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorSurface, gutter_width, selection_drag_scroll_delta};
-    use egui::{Color32, CursorIcon, Event, Id, Key, Modifiers, RawInput, Rect, Vec2, pos2};
+    use super::{EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job};
+    use egui::{
+        Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2,
+        pos2, text::LayoutJob,
+    };
+    use std::time::{Duration, Instant};
+
+    fn painted_caret(primitives: &[egui::ClippedPrimitive]) -> bool {
+        primitives
+            .iter()
+            .any(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh
+                    .vertices
+                    .iter()
+                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
+                egui::epaint::Primitive::Callback(_) => false,
+            })
+    }
 
     #[test]
     fn retained_editor_replaces_selections_and_replays_delta_history() {
@@ -864,9 +912,60 @@ mod tests {
     }
 
     #[test]
+    fn highlighted_large_file_splits_into_lines_without_quadratic_delay() {
+        let mut job = LayoutJob::default();
+        for _ in 0..3_000 {
+            for (index, token) in ["pub ", "value", " = ", "1;\n"].into_iter().enumerate() {
+                job.append(
+                    token,
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::monospace(14.0),
+                        color: Color32::from_gray(180 + index as u8),
+                        ..TextFormat::default()
+                    },
+                );
+            }
+        }
+
+        let started = Instant::now();
+        let lines = split_layout_job(&job, 800.0);
+
+        assert_eq!(lines.len(), 3_001);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "retained-line split took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn line_number_gutter_stays_compact_and_grows_with_digit_count() {
         assert_eq!(gutter_width(9), 22.0);
         assert_eq!(gutter_width(999), 32.0);
+    }
+
+    #[test]
+    fn requested_character_stays_in_view_when_the_caret_is_elsewhere() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = (0..40)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let target = text.chars().count() - 2;
+        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 180.0);
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(200.0, 90.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, Some(target));
+            },
+        );
+
+        assert!(editor.scroll_y > 0.0);
     }
 
     #[test]
@@ -895,6 +994,32 @@ mod tests {
     }
 
     #[test]
+    fn caret_on_an_empty_line_has_visible_height() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text\n".to_owned();
+        editor.set_selection(text.chars().count(), text.chars().count());
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, true, None);
+            },
+        );
+        let content = Rect::from_min_max(pos2(22.0, 0.0), pos2(200.0, 200.0));
+
+        assert!(editor.cursor_rect(content).unwrap().height() >= 18.0);
+    }
+
+    #[test]
     fn focused_caret_is_painted_during_the_former_hidden_blink_phase() {
         let context = egui::Context::default();
         let mut editor = EditorSurface::default();
@@ -917,15 +1042,45 @@ mod tests {
         );
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
 
-        assert!(primitives.iter().any(|primitive| {
-            match &primitive.primitive {
-                egui::epaint::Primitive::Mesh(mesh) => mesh
-                    .vertices
-                    .iter()
-                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
-                egui::epaint::Primitive::Callback(_) => false,
-            }
-        }));
+        assert!(painted_caret(&primitives));
+    }
+
+    #[test]
+    fn focused_caret_blinks_on_a_slow_cadence() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(14.0),
+            egui::Color32::WHITE,
+            200.0,
+        );
+        let input = |time| RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+            time: Some(time),
+            ..RawInput::default()
+        };
+        let first = context.run_ui(input(0.0), |ui| {
+            editor.show(ui, &mut text, &job, 1, true, None);
+        });
+        let hidden = context.run_ui(input(0.8), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        let visible_again = context.run_ui(input(1.5), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+
+        assert!(painted_caret(
+            &context.tessellate(first.shapes, first.pixels_per_point)
+        ));
+        assert!(!painted_caret(
+            &context.tessellate(hidden.shapes, hidden.pixels_per_point)
+        ));
+        assert!(painted_caret(&context.tessellate(
+            visible_again.shapes,
+            visible_again.pixels_per_point,
+        )));
     }
 
     #[test]
@@ -968,15 +1123,7 @@ mod tests {
         let primitives = context.tessellate(output.shapes, output.pixels_per_point);
 
         assert_eq!(editor.cursor(), 1);
-        assert!(primitives.iter().any(|primitive| {
-            match &primitive.primitive {
-                egui::epaint::Primitive::Mesh(mesh) => mesh
-                    .vertices
-                    .iter()
-                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
-                egui::epaint::Primitive::Callback(_) => false,
-            }
-        }));
+        assert!(painted_caret(&primitives));
         assert!(context.memory(|memory| memory.has_focus(Id::new("editor"))));
     }
 

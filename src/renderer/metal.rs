@@ -187,6 +187,7 @@ impl Renderer {
 
     pub fn resize(&mut self, window: &Window, size: PhysicalSize<u32>) -> Result<(), String> {
         self.size = size;
+        self.layer.set_contents_scale(window.scale_factor());
         self.layer
             .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
         round_window(window)
@@ -228,7 +229,7 @@ impl Renderer {
             .ok_or_else(|| "Metal: color attachment 0 is unavailable".to_owned())?;
         attachment.set_texture(Some(drawable.texture()));
         attachment.set_load_action(MTLLoadAction::Clear);
-        attachment.set_clear_color(MTLClearColor::new(0.055, 0.063, 0.082, 1.0));
+        attachment.set_clear_color(MTLClearColor::new(0.078, 0.078, 0.086, 1.0));
         attachment.set_store_action(MTLStoreAction::Store);
 
         let command_buffer = self.command_queue.new_command_buffer();

@@ -67,10 +67,10 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
                     );
                     append(&mut job, &marker, &style, false);
                 }
-                Tag::TableRow => table_cell = 0,
+                Tag::TableHead | Tag::TableRow => table_cell = 0,
                 Tag::TableCell => {
                     if table_cell > 0 {
-                        append(&mut job, "  │  ", &style, false);
+                        append(&mut job, "  |  ", &style, false);
                     }
                     table_cell += 1;
                 }
@@ -100,7 +100,7 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
                     lists.pop();
                     ensure_newlines(&mut job, if lists.is_empty() { 2 } else { 1 });
                 }
-                TagEnd::Item | TagEnd::TableRow => ensure_newlines(&mut job, 1),
+                TagEnd::Item | TagEnd::TableHead | TagEnd::TableRow => ensure_newlines(&mut job, 1),
                 TagEnd::Table => ensure_newlines(&mut job, 2),
                 TagEnd::Emphasis => style.emphasis = style.emphasis.saturating_sub(1),
                 TagEnd::Strong => style.strong = style.strong.saturating_sub(1),
@@ -140,6 +140,18 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
     job
 }
 
+pub(crate) fn compact_layout(source: &str, wrap_width: f32) -> LayoutJob {
+    let mut job = layout(source, wrap_width);
+    for section in &mut job.sections {
+        section.format.font_id.size = (section.format.font_id.size * 0.85).min(18.0);
+        section.format.line_height = section
+            .format
+            .line_height
+            .map(|height| (height * 0.82).min(23.0));
+    }
+    job
+}
+
 fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
     let heading_size = style.heading.map_or(15.0, |level| match level {
         HeadingLevel::H1 => 28.0,
@@ -166,11 +178,11 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
             font_id: if code {
                 FontId::monospace(14.0)
             } else {
-                FontId::proportional(heading_size)
+                FontId::monospace(heading_size)
             },
             color,
             background: if code {
-                Color32::from_rgb(38, 40, 47)
+                Color32::from_rgb(38, 38, 42)
             } else {
                 Color32::TRANSPARENT
             },
@@ -223,6 +235,27 @@ mod tests {
             section.format.font_id == FontId::monospace(14.0)
                 && section.format.background != Color32::TRANSPARENT
         }));
+    }
+
+    #[test]
+    fn renders_table_headers_and_rows_on_separate_lines() {
+        let job = layout(
+            "| Metric | Result |\n| --- | --- |\n| Startup | Pass |",
+            600.0,
+        );
+
+        assert_eq!(job.text, "Metric  |  Result\nStartup  |  Pass\n");
+    }
+
+    #[test]
+    fn preview_uses_the_editors_readable_monospace_font() {
+        let job = layout("# Title\n\nBody text with `code`.", 600.0);
+
+        assert!(
+            job.sections
+                .iter()
+                .all(|section| { section.format.font_id.family == egui::FontFamily::Monospace })
+        );
     }
 
     #[test]

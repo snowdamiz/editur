@@ -22,6 +22,8 @@ enum Request {
 pub enum InstanceEvent {
     Open(OpenTarget, Sender<bool>),
     Quit(Sender<bool>),
+    Wake,
+    Exit,
 }
 
 pub enum Claim {
@@ -84,6 +86,10 @@ pub fn spawn_listener(
                         let accepted = proxy.send_event(InstanceEvent::Quit(reply)).is_ok()
                             && response.recv_timeout(Duration::from_secs(2)) == Ok(true);
                         let _ = send_response(&mut stream, accepted);
+                        if accepted {
+                            let _ = proxy.send_event(InstanceEvent::Exit);
+                            break;
+                        }
                     }
                     Err(_) => {}
                 }

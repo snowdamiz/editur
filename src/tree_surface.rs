@@ -66,7 +66,7 @@ impl TreeSurface {
             0x4000_0000_0000_0000,
             u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
         );
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 27));
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 22));
         for index in self.visible_rows(rows.len(), rect.height()) {
             let row = &rows[index];
             let top = rect.top() + index as f32 * ROW_HEIGHT - self.scroll_y;
@@ -77,7 +77,7 @@ impl TreeSurface {
             let fill = if selected == Some(index) {
                 Color32::from_rgb(30, 57, 66)
             } else if self.hovered == Some(index) {
-                Color32::from_rgb(29, 32, 39)
+                Color32::from_rgb(29, 29, 32)
             } else {
                 Color32::TRANSPARENT
             };
@@ -108,7 +108,7 @@ impl TreeSurface {
                 painter.vline(
                     x,
                     row_rect.y_range(),
-                    Stroke::new(1.0, Color32::from_rgb(35, 39, 47)),
+                    Stroke::new(1.0, Color32::from_rgb(35, 35, 39)),
                 );
             }
             let marker_center = egui::pos2(

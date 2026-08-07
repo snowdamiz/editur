@@ -173,9 +173,9 @@ pub(crate) fn show(
         layout.thumb,
         3.0,
         if active {
-            Color32::from_rgb(112, 116, 128)
+            Color32::from_rgb(116, 116, 122)
         } else {
-            Color32::from_rgb(78, 82, 94)
+            Color32::from_rgb(82, 82, 88)
         }
         .gamma_multiply(opacity),
     );

@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Cursor, Read, Write},
     path::{Component, Path},
+    time::UNIX_EPOCH,
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use ureq::ResponseExt;
 const MAX_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 2_048;
+const VERIFICATION_RECEIPT: &str = ".editur-verified.json";
 const EMBEDDED_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent-sidecar.json"));
 
 #[derive(Debug, Deserialize)]
@@ -369,12 +371,31 @@ pub struct DownloadProgress {
     pub total: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationReceipt {
+    version: String,
+    archive_sha256: String,
+    files: Vec<VerifiedFile>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedFile {
+    path: String,
+    modified_seconds: u64,
+    modified_nanoseconds: u32,
+}
+
 pub fn installed(manifest: &SidecarManifest, data_dir: &Path) -> Result<InstalledSidecar, String> {
     validate_version(&manifest.version)?;
     let destination = data_dir
         .join("agents/cursor/versions")
         .join(&manifest.version);
-    verify_installed(manifest, &destination)?;
+    if !verification_receipt_matches(manifest, &destination) {
+        verify_installed(manifest, &destination)?;
+        let _ = write_verification_receipt(manifest, &destination);
+    }
     Ok(installed_sidecar(manifest, &destination))
 }
 
@@ -384,9 +405,8 @@ pub fn ensure(
     data_dir: &Path,
     mut progress: impl FnMut(DownloadProgress),
 ) -> Result<InstalledSidecar, String> {
-    if installed(manifest, data_dir).is_ok() {
+    if let Ok(installed) = installed(manifest, data_dir) {
         return with_provision_lock(data_dir, || {
-            let installed = installed(manifest, data_dir)?;
             let agent_dir = data_dir.join("agents/cursor");
             let previous = activate(&agent_dir, &manifest.version)?;
             cleanup_obsolete_versions(
@@ -523,6 +543,7 @@ fn provision_from_bytes_locked(
         .map_err(|error| format!("cannot create {}: {error}", versions.display()))?;
     let destination = versions.join(&manifest.version);
     if destination.exists() && verify_installed(manifest, &destination).is_ok() {
+        let _ = write_verification_receipt(manifest, &destination);
         let previous = activate(&agent_dir, &manifest.version)?;
         cleanup_obsolete_versions(&versions, &manifest.version, previous.as_deref());
         return Ok(installed_sidecar(manifest, &destination));
@@ -554,6 +575,7 @@ fn provision_from_bytes_locked(
         staged_entrypoint.as_deref(),
         &manifest.version,
     )?;
+    let _ = write_verification_receipt(manifest, staging.path());
     let staged = staging.keep();
     let _replaced = if destination.exists() {
         let replaced = tempfile::Builder::new()
@@ -622,6 +644,9 @@ fn installed_sidecar(manifest: &SidecarManifest, version_dir: &Path) -> Installe
 
 fn activate(agent_dir: &Path, version: &str) -> Result<Option<String>, String> {
     let active = read_version_marker(&agent_dir.join("active"));
+    if active.as_deref() == Some(version) {
+        return Ok(read_version_marker(&agent_dir.join("previous")));
+    }
     let previous = if active.as_deref().is_some_and(|active| active != version) {
         active
     } else {
@@ -680,27 +705,14 @@ fn cleanup_obsolete_versions(versions: &Path, current: &str, previous: Option<&s
 
 fn verify_installed(manifest: &SidecarManifest, version_dir: &Path) -> Result<(), String> {
     for entry in &manifest.entries {
-        validate_relative_path(&entry.path)?;
         let path = version_dir.join(&entry.path);
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("managed Cursor Agent file is missing: {error}"))?;
-        if metadata.file_type().is_symlink()
-            || (entry.kind == EntryKind::File && !metadata.is_file())
-            || (entry.kind == EntryKind::Directory && !metadata.is_dir())
-            || (entry.kind == EntryKind::File && metadata.len() != entry.size)
-        {
-            return Err(format!(
-                "managed Cursor Agent file has changed: {}",
-                entry.path
-            ));
-        }
+        verify_metadata(entry, &path)?;
         if entry.kind == EntryKind::File {
             let checksum = file_checksum(&path)?;
             if entry
                 .sha256
                 .as_ref()
                 .is_none_or(|expected| !checksum.eq_ignore_ascii_case(expected))
-                || !executable_matches(&metadata, entry.executable)
             {
                 return Err(format!(
                     "managed Cursor Agent file has changed: {}",
@@ -710,6 +722,92 @@ fn verify_installed(manifest: &SidecarManifest, version_dir: &Path) -> Result<()
         }
     }
     Ok(())
+}
+
+fn verification_receipt_matches(manifest: &SidecarManifest, version_dir: &Path) -> bool {
+    let Ok(bytes) = fs::read(version_dir.join(VERIFICATION_RECEIPT)) else {
+        return false;
+    };
+    let Ok(receipt) = serde_json::from_slice::<VerificationReceipt>(&bytes) else {
+        return false;
+    };
+    receipt.version == manifest.version
+        && receipt
+            .archive_sha256
+            .eq_ignore_ascii_case(&manifest.archive_sha256)
+        && verification_receipt(manifest, version_dir).as_ref() == Ok(&receipt)
+}
+
+fn write_verification_receipt(
+    manifest: &SidecarManifest,
+    version_dir: &Path,
+) -> Result<(), String> {
+    let receipt = verification_receipt(manifest, version_dir)?;
+    let bytes = serde_json::to_vec(&receipt)
+        .map_err(|error| format!("cannot encode Cursor Agent verification receipt: {error}"))?;
+    let mut staged = tempfile::NamedTempFile::new_in(version_dir)
+        .map_err(|error| format!("cannot stage Cursor Agent verification receipt: {error}"))?;
+    staged
+        .write_all(&bytes)
+        .and_then(|()| staged.flush())
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|error| format!("cannot write Cursor Agent verification receipt: {error}"))?;
+    staged
+        .persist(version_dir.join(VERIFICATION_RECEIPT))
+        .map_err(|error| {
+            format!(
+                "cannot save Cursor Agent verification receipt: {}",
+                error.error
+            )
+        })?;
+    Ok(())
+}
+
+fn verification_receipt(
+    manifest: &SidecarManifest,
+    version_dir: &Path,
+) -> Result<VerificationReceipt, String> {
+    let mut files = Vec::new();
+    for entry in &manifest.entries {
+        let path = version_dir.join(&entry.path);
+        let metadata = verify_metadata(entry, &path)?;
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        files.push(VerifiedFile {
+            path: entry.path.clone(),
+            modified_seconds: modified.as_secs(),
+            modified_nanoseconds: modified.subsec_nanos(),
+        });
+    }
+    Ok(VerificationReceipt {
+        version: manifest.version.clone(),
+        archive_sha256: manifest.archive_sha256.clone(),
+        files,
+    })
+}
+
+fn verify_metadata(entry: &ManagedEntry, path: &Path) -> Result<fs::Metadata, String> {
+    validate_relative_path(&entry.path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("managed Cursor Agent file is missing: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || (entry.kind == EntryKind::File && !metadata.is_file())
+        || (entry.kind == EntryKind::Directory && !metadata.is_dir())
+        || (entry.kind == EntryKind::File && metadata.len() != entry.size)
+        || (entry.kind == EntryKind::File && !executable_matches(&metadata, entry.executable))
+    {
+        return Err(format!(
+            "managed Cursor Agent file has changed: {}",
+            entry.path
+        ));
+    }
+    Ok(metadata)
 }
 
 fn file_checksum(path: &Path) -> Result<String, String> {
@@ -1111,7 +1209,7 @@ mod tests {
     use super::valid_cursor_archive_uri;
     use super::{
         ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, ReleaseSpec, SidecarManifest,
-        cleanup_obsolete_versions, embedded_manifest, ensure, extract_archive,
+        cleanup_obsolete_versions, embedded_manifest, ensure, extract_archive, installed,
         provision_from_bytes_with, verify_archive, verify_installed,
     };
 
@@ -1692,6 +1790,57 @@ mod tests {
     }
 
     #[test]
+    fn provisioning_records_a_fast_launch_verification_receipt() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "dist-package/agent",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"agent").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let manifest = zip_manifest(&bytes);
+        let temp = tempfile::tempdir().unwrap();
+
+        provision_from_bytes_with(&manifest, temp.path(), &bytes, |_, _, _| Ok(())).unwrap();
+
+        assert!(
+            temp.path()
+                .join("agents/cursor/versions")
+                .join(&manifest.version)
+                .join(".editur-verified.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn launch_receipt_does_not_hide_a_changed_managed_file() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "dist-package/agent",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"agent").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let manifest = zip_manifest(&bytes);
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar =
+            provision_from_bytes_with(&manifest, temp.path(), &bytes, |_, _, _| Ok(())).unwrap();
+        std::fs::write(&sidecar.command, b"evil!").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar.command)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        assert!(installed(&manifest, temp.path()).is_err());
+    }
+
+    #[test]
     fn concurrent_provisioning_is_serialized() {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive
@@ -1777,10 +1926,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let installed =
             provision_from_bytes_with(&manifest, temp.path(), &bytes, |_, _, _| Ok(())).unwrap();
+        let active = temp.path().join("agents/cursor/active");
+        let unchanged = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&active)
+            .unwrap()
+            .set_modified(unchanged)
+            .unwrap();
 
         let ensured = ensure(&manifest, temp.path(), |_| {}).unwrap();
 
         assert_eq!(ensured, installed);
+        assert_eq!(
+            std::fs::metadata(active).unwrap().modified().unwrap(),
+            unchanged
+        );
     }
 
     #[test]

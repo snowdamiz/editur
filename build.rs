@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EDITUR_REQUIRE_PRECOMPILED_METAL");
     println!("cargo:rerun-if-env-changed=EDITUR_AGENT_MANIFEST");
     println!("cargo:rustc-check-cfg=cfg(editur_precompiled_metal)");
+    println!("cargo:rustc-check-cfg=cfg(feature, values(\"cargo-clippy\"))");
     let mut builder = SyntaxSetBuilder::new();
     if let Err(error) = builder.add_from_folder("assets/syntaxes", true) {
         panic!("failed to compile built-in syntaxes: {error}");
@@ -121,5 +122,4 @@ fn metal_fallback(message: &str) {
     if env::var("EDITUR_REQUIRE_PRECOMPILED_METAL").as_deref() == Ok("1") {
         panic!("{message}");
     }
-    println!("cargo:warning={message}; using runtime shader fallback");
 }
