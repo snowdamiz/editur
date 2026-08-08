@@ -923,6 +923,62 @@ fn agent_toggle_rect(header: egui::Rect) -> egui::Rect {
     )
 }
 
+fn file_tree_toggle_rect(titlebar: egui::Rect, _editor_header: egui::Rect) -> egui::Rect {
+    #[cfg(target_os = "macos")]
+    let controls_right = titlebar.left() + 72.0;
+    #[cfg(not(target_os = "macos"))]
+    let controls_right = _editor_header.left();
+    egui::Rect::from_center_size(
+        egui::pos2(controls_right + 17.0, titlebar.center().y),
+        egui::vec2(34.0, titlebar.height()),
+    )
+}
+
+fn draw_sidebar_toggle_icon(
+    ui: &mut egui::Ui,
+    button: egui::Rect,
+    response: &egui::Response,
+    open: bool,
+    panel_on_right: bool,
+) -> egui::Pos2 {
+    let icon_center = button.center();
+    let icon = egui::Rect::from_center_size(icon_center, egui::vec2(16.0, 13.0));
+    let icon_color = if response.hovered() || open {
+        Color32::from_rgb(218, 224, 235)
+    } else {
+        Color32::from_rgb(155, 163, 177)
+    };
+    ui.painter().rect_stroke(
+        icon,
+        2.0,
+        egui::Stroke::new(1.2, icon_color),
+        egui::StrokeKind::Inside,
+    );
+    let divider_x = if panel_on_right {
+        icon.right() - 4.5
+    } else {
+        icon.left() + 4.5
+    };
+    ui.painter().vline(
+        divider_x,
+        icon.y_range(),
+        egui::Stroke::new(1.2, icon_color),
+    );
+    if open {
+        let selected = if panel_on_right {
+            egui::Rect::from_min_max(egui::pos2(divider_x, icon.top()), icon.right_bottom())
+        } else {
+            egui::Rect::from_min_max(icon.left_top(), egui::pos2(divider_x, icon.bottom()))
+        };
+        ui.painter().rect_filled(
+            selected,
+            1.0,
+            Color32::from_rgba_unmultiplied(218, 224, 235, 55),
+        );
+    }
+    icon_center
+}
+
 fn agent_new_session_rect(header: egui::Rect) -> egui::Rect {
     let toggle = agent_toggle_rect(header);
     egui::Rect::from_center_size(
@@ -1637,6 +1693,7 @@ impl EditorApp {
             editor_header.bottom() - 0.5,
             egui::Stroke::new(1.0, Color32::from_rgb(42, 42, 47)),
         );
+        let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         #[cfg(target_os = "macos")]
         let controls_left = editor_header.right();
         #[cfg(not(target_os = "macos"))]
@@ -1702,13 +1759,13 @@ impl EditorApp {
             |button| button.left(),
         );
         #[cfg(target_os = "macos")]
-        let tabs_left = if editor_header.left() == rect.left() {
-            editor_header.left() + 72.0
-        } else {
+        let tabs_left = if self.sidebar {
             editor_header.left()
+        } else {
+            file_tree_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let tabs_left = editor_header.left();
+        let tabs_left = file_tree_button.right() + 4.0;
         let tabs_right = (controls_start - 8.0).max(tabs_left);
         let tabs_used_right = (tabs_left + self.tabs.len() as f32 * TAB_WIDTH).min(tabs_right);
         if tabs_used_right > tabs_left {
@@ -1725,7 +1782,7 @@ impl EditorApp {
             egui::pos2(controls_start, editor_header.bottom()),
         );
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = rect.left() + 72.0;
+        let sidebar_drag_left = file_tree_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
         let sidebar_drag_right = (editor_header.left() - 3.0).max(sidebar_drag_left);
@@ -1760,6 +1817,11 @@ impl EditorApp {
             self.agent_sidebar = true;
             self.agent_sidebar_dragging = false;
             self.open_agent(ui.ctx());
+            ui.ctx().request_repaint();
+        }
+        if self.draw_file_tree_toggle(ui, file_tree_button) {
+            self.sidebar = !self.sidebar;
+            self.sidebar_dragging = false;
             ui.ctx().request_repaint();
         }
 
@@ -1963,43 +2025,7 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        let icon_center = button.center()
-            + if self.agent_sidebar {
-                egui::vec2(-3.0, 0.0)
-            } else {
-                egui::Vec2::ZERO
-            };
-        let icon = egui::Rect::from_center_size(icon_center, egui::vec2(16.0, 13.0));
-        let icon_color = if response.hovered() && self.agent_sidebar {
-            Color32::from_rgb(151, 232, 242)
-        } else if response.hovered() {
-            Color32::from_rgb(218, 224, 235)
-        } else if self.agent_sidebar {
-            Color32::from_rgb(112, 215, 228)
-        } else {
-            Color32::from_rgb(155, 163, 177)
-        };
-        ui.painter().rect_stroke(
-            icon,
-            2.0,
-            egui::Stroke::new(1.2, icon_color),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().vline(
-            icon.right() - 4.5,
-            icon.y_range(),
-            egui::Stroke::new(1.2, icon_color),
-        );
-        if self.agent_sidebar {
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(icon.right() - 4.5, icon.top()),
-                    icon.right_bottom(),
-                ),
-                1.0,
-                Color32::from_rgba_unmultiplied(86, 207, 225, 55),
-            );
-        }
+        let icon_center = draw_sidebar_toggle_icon(ui, button, &response, self.agent_sidebar, true);
         if self.agent.waiting_permission() {
             ui.painter().circle_filled(
                 icon_center + egui::vec2(8.0, -7.0),
@@ -2007,6 +2033,22 @@ impl EditorApp {
                 Color32::from_rgb(245, 184, 77),
             );
         }
+        response.clicked()
+    }
+
+    fn draw_file_tree_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
+        let label = if self.sidebar {
+            "Hide File Tree"
+        } else {
+            "Show File Tree"
+        };
+        let response = ui
+            .interact(button, Id::new("file_tree_toggle"), Sense::click())
+            .on_hover_text(label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        draw_sidebar_toggle_icon(ui, button, &response, self.sidebar, false);
         response.clicked()
     }
 
@@ -5959,12 +6001,12 @@ mod tests {
         agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
         agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agent_transcript_fade_mesh, build_agent_diff, cached_agent_diff,
-        disable_transient_egui_debug_overlays, find_highlighted_job, install_repaint_wake,
-        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
-        next_find_match, plain_text_job, presentation_job, queue_resize, repaint_deadline,
-        repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
-        search_selection_after_navigation, slash_command_query, split_agent_sidebar,
-        split_editor_column, split_workspace,
+        disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
+        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
+        model_display_name, next_find_match, plain_text_job, presentation_job, queue_resize,
+        repaint_deadline, repaint_delay_after_texture_update, run_everything_state,
+        search_needs_polling, search_selection_after_navigation, slash_command_query,
+        split_agent_sidebar, split_editor_column, split_workspace,
     };
     use crate::{
         agent::controller::{
@@ -5996,6 +6038,49 @@ mod tests {
     #[test]
     fn graphical_launch_runs_in_the_current_process() {
         assert!(launch_in_current_process(false, false, false, false));
+    }
+
+    #[test]
+    fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
+        let button = Rect::from_center_size(pos2(50.0, 17.0), Vec2::new(34.0, 34.0));
+        let draw = |open, panel_on_right| {
+            let context = egui::Context::default();
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(100.0, 34.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    let response = ui.interact(
+                        button,
+                        Id::new(("sidebar_toggle_icon", open, panel_on_right)),
+                        egui::Sense::click(),
+                    );
+                    draw_sidebar_toggle_icon(ui, button, &response, open, panel_on_right);
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Rect(rect) if rect.rect.size() == Vec2::new(16.0, 13.0) => {
+                        Some((rect.rect.center(), rect.stroke.color))
+                    }
+                    _ => None,
+                })
+                .expect("sidebar toggle icon")
+        };
+        let inactive = [draw(false, false), draw(false, true)];
+        let active = [draw(true, false), draw(true, true)];
+
+        assert_eq!(
+            active.map(|icon| icon.0 - button.center()),
+            inactive.map(|icon| icon.0 - button.center())
+        );
+        assert_eq!(
+            active.map(|icon| icon.1),
+            [Color32::from_rgb(218, 224, 235); 2]
+        );
     }
 
     #[test]
@@ -6250,7 +6335,7 @@ mod tests {
             .iter()
             .find_map(|clipped| match &clipped.shape {
                 Shape::Rect(rect)
-                    if rect.stroke.color == Color32::from_rgb(112, 215, 228)
+                    if rect.stroke.color == Color32::from_rgb(218, 224, 235)
                         && rect.rect.size() == Vec2::new(16.0, 13.0) =>
                 {
                     Some(rect.rect.center())
@@ -6261,7 +6346,7 @@ mod tests {
         let plus_center = plus_center.expect("new-session icon");
         let toggle_center = toggle_center.expect("sidebar icon");
         assert!(plus_center.x - history_center.x <= 30.5);
-        assert!(toggle_center.x - plus_center.x <= 30.5);
+        assert!(toggle_center.x - plus_center.x <= 33.5);
     }
 
     #[test]
@@ -8165,8 +8250,8 @@ mod tests {
     }
 
     #[test]
-    fn every_titlebar_region_starts_a_window_drag() {
-        for start in [pos2(100.0, 17.0), pos2(400.0, 17.0), pos2(600.0, 17.0)] {
+    fn unoccupied_titlebar_regions_start_a_window_drag() {
+        for start in [pos2(120.0, 17.0), pos2(400.0, 17.0), pos2(600.0, 17.0)] {
             let temp = tempfile::tempdir().unwrap();
             let mut app = EditorApp::new(OpenTarget {
                 root: temp.path().canonicalize().unwrap(),
@@ -8513,6 +8598,77 @@ mod tests {
         );
 
         assert_eq!(app.buffer().unwrap().path, second);
+    }
+
+    #[test]
+    fn file_tree_toggle_collapses_the_tree_without_overlapping_tabs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("current.rs");
+        fs::write(&file, "text\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(file.clone()),
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let draw = |app: &mut EditorApp, events| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+
+        draw(&mut app, Vec::new());
+        let open_button = context
+            .read_response(Id::new("file_tree_toggle"))
+            .expect("file tree toggle")
+            .rect;
+        draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(open_button.center()),
+                Event::PointerButton {
+                    pos: open_button.center(),
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: open_button.center(),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, Vec::new());
+        let closed_button = context
+            .read_response(Id::new("file_tree_toggle"))
+            .expect("file tree toggle")
+            .rect;
+        let tab = context
+            .read_response(Id::new(("file_tab", file.display().to_string())))
+            .expect("file tab")
+            .rect;
+
+        assert!(!app.sidebar);
+        #[cfg(target_os = "macos")]
+        assert_eq!(closed_button, open_button);
+        #[cfg(not(target_os = "macos"))]
+        assert!(closed_button.left() < open_button.left());
+        assert!(tab.left() >= closed_button.right());
     }
 
     #[test]

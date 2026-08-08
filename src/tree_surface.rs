@@ -83,6 +83,7 @@ impl TreeSurface {
             };
             let revision = row.revision
                 ^ u64::from(top.to_bits())
+                ^ u64::from(rect.width().to_bits()).rotate_left(32)
                 ^ (row.expanded as u64) << 33
                 ^ (selected == Some(index)) as u64
                 ^ ((self.hovered == Some(index)) as u64) << 1;
@@ -266,7 +267,7 @@ impl TreeSurface {
 #[cfg(test)]
 mod tests {
     use super::{TreeRow, TreeSurface};
-    use crate::tree::TreeEntry;
+    use crate::{renderer::retained_paint, tree::TreeEntry};
     use egui::{Color32, Event, RawInput, Rect, Shape, Vec2, pos2};
     use std::{ffi::OsString, path::PathBuf};
 
@@ -278,6 +279,49 @@ mod tests {
         let visible = surface.visible_rows(100, 220.0);
         assert!(visible.contains(&50));
         assert!(visible.len() <= 13);
+    }
+
+    #[test]
+    fn selected_row_retention_changes_during_sidebar_resize() {
+        let context = egui::Context::default();
+        let mut surface = TreeSurface::default();
+        let rows = [TreeRow {
+            entry: TreeEntry {
+                name: OsString::from("main.rs"),
+                path: PathBuf::from("main.rs"),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: "main.rs".into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        }];
+        let draw = |surface: &mut TreeSurface, width| {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(width, 80.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    surface.show(ui, &rows, Some(0), false);
+                },
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .find_map(|primitive| {
+                    retained_paint(&primitive.primitive)
+                        .ok()
+                        .flatten()
+                        .filter(|paint| paint.key == 0x5000_0000_0000_0000)
+                })
+                .expect("retained selected row")
+                .revision
+        };
+
+        assert_ne!(draw(&mut surface, 200.0), draw(&mut surface, 320.0));
     }
 
     #[test]
