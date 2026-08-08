@@ -33,7 +33,7 @@ use winit::{
 
 use super::{buffer_capacity, choose_adapter};
 
-const FRAMES_IN_FLIGHT: usize = 2;
+const FRAMES_IN_FLIGHT: usize = 3;
 
 #[cfg(editur_precompiled_metal)]
 const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.metallib"));
@@ -98,6 +98,7 @@ pub struct Renderer {
     frames: Vec<FrameBuffers>,
     next_frame: usize,
     size: PhysicalSize<u32>,
+    scale_factor: f64,
     adapter_name: String,
 }
 
@@ -158,6 +159,7 @@ impl Renderer {
         layer.set_presents_with_transaction(false);
         attach_layer(window, &mut layer)?;
         let size = window.inner_size();
+        let scale_factor = window.scale_factor();
         layer.set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
 
         let command_queue = device.new_command_queue();
@@ -173,6 +175,7 @@ impl Renderer {
             frames,
             next_frame: 0,
             size,
+            scale_factor,
             adapter_name,
         })
     }
@@ -186,11 +189,17 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, window: &Window, size: PhysicalSize<u32>) -> Result<(), String> {
-        self.size = size;
-        self.layer.set_contents_scale(window.scale_factor());
-        self.layer
-            .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
-        round_window(window)
+        let scale_factor = window.scale_factor();
+        if self.scale_factor != scale_factor {
+            self.scale_factor = scale_factor;
+            self.layer.set_contents_scale(scale_factor);
+        }
+        if self.size != size {
+            self.size = size;
+            self.layer
+                .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
+        }
+        Ok(())
     }
 
     pub fn render(
@@ -484,17 +493,6 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
     Ok(())
 }
 
-fn round_window(window: &Window) -> Result<(), String> {
-    let handle = window
-        .window_handle()
-        .map_err(|error| format!("Metal: cannot obtain the AppKit window handle: {error}"))?;
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return Err("Metal: winit did not provide an AppKit window handle".to_owned());
-    };
-    let view = unsafe { &*handle.ns_view.as_ptr().cast::<Object>() };
-    unsafe { round_view_layers(view) }
-}
-
 unsafe fn round_view_layers(view: &Object) -> Result<(), String> {
     let layer = unsafe {
         view.send_message::<_, *mut Object>(Sel::register("layer"), ())
@@ -545,7 +543,7 @@ mod tests {
     };
 
     #[test]
-    fn macos_layer_rounding_sets_radius_and_clips_during_resize() {
+    fn macos_layer_rounding_sets_radius_and_clips() {
         unsafe {
             let class = Class::get("CALayer").unwrap();
             let layer = class

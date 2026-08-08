@@ -156,9 +156,10 @@ impl TreeSurface {
                 Color32::from_rgb(105, 114, 130)
             };
             if row.directory {
+                let center_y = marker_center.y + 1.0;
                 painter.rect_filled(
                     Rect::from_min_size(
-                        egui::pos2(icon_left, marker_center.y - 4.0),
+                        egui::pos2(icon_left, center_y - 4.0),
                         egui::vec2(11.0, 8.0),
                     ),
                     1.5,
@@ -166,7 +167,7 @@ impl TreeSurface {
                 );
                 painter.rect_filled(
                     Rect::from_min_size(
-                        egui::pos2(icon_left + 1.0, marker_center.y - 6.0),
+                        egui::pos2(icon_left + 1.0, center_y - 6.0),
                         egui::vec2(5.0, 3.0),
                     ),
                     1.0,
@@ -266,7 +267,7 @@ impl TreeSurface {
 mod tests {
     use super::{TreeRow, TreeSurface};
     use crate::tree::TreeEntry;
-    use egui::{Event, RawInput, Rect, Vec2, pos2};
+    use egui::{Color32, Event, RawInput, Rect, Shape, Vec2, pos2};
     use std::{ffi::OsString, path::PathBuf};
 
     #[test]
@@ -308,5 +309,60 @@ mod tests {
         );
 
         assert_eq!(surface.hovered, Some(0));
+    }
+
+    #[test]
+    fn directory_row_glyphs_and_label_share_one_vertical_center() {
+        let context = egui::Context::default();
+        let mut surface = TreeSurface::default();
+        let rows = [TreeRow {
+            entry: TreeEntry {
+                name: OsString::from("src"),
+                path: PathBuf::from("src"),
+                is_dir: true,
+                is_symlink: false,
+            },
+            label: "src".into(),
+            depth: 0,
+            directory: true,
+            expanded: false,
+            revision: 1,
+        }];
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(200.0, 80.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                surface.show(ui, &rows, None, false);
+            },
+        );
+        let folder_color = Color32::from_rgb(103, 196, 208);
+        let chevron_color = Color32::from_rgb(128, 139, 155);
+        let mut folder_top = f32::INFINITY;
+        let mut folder_bottom = f32::NEG_INFINITY;
+        let mut chevron_top = f32::INFINITY;
+        let mut chevron_bottom = f32::NEG_INFINITY;
+        let mut label_center = None;
+        for clipped in output.shapes {
+            match clipped.shape {
+                Shape::Rect(rect) if rect.fill == folder_color => {
+                    folder_top = folder_top.min(rect.rect.top());
+                    folder_bottom = folder_bottom.max(rect.rect.bottom());
+                }
+                Shape::LineSegment { points, stroke } if stroke.color == chevron_color => {
+                    chevron_top = chevron_top.min(points[0].y.min(points[1].y));
+                    chevron_bottom = chevron_bottom.max(points[0].y.max(points[1].y));
+                }
+                Shape::Text(text) if text.galley.text() == "src" => {
+                    label_center = Some(text.pos.y + text.galley.size().y * 0.5);
+                }
+                _ => {}
+            }
+        }
+        let label_center = label_center.expect("tree label");
+
+        assert!(((folder_top + folder_bottom) * 0.5 - label_center).abs() < 0.01);
+        assert!(((chevron_top + chevron_bottom) * 0.5 - label_center).abs() < 0.01);
     }
 }

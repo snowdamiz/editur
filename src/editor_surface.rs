@@ -10,6 +10,7 @@ use crate::renderer::mark_retained;
 
 const LINE_HEIGHT: f32 = 18.0;
 const TEXT_LEFT_PADDING: f32 = 8.0;
+const TEXT_TOP_PADDING: f32 = 6.0;
 const CARET_BLINK_INTERVAL: f64 = 0.7;
 pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 24, 26);
 
@@ -52,6 +53,12 @@ pub struct EditorOutput {
     pub response: Response,
     pub cursor: usize,
     pub changed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DocumentMetrics {
+    pub revision: u64,
+    pub line_count: usize,
 }
 
 impl EditorSurface {
@@ -123,6 +130,29 @@ impl EditorSurface {
         request_focus: bool,
         scroll_to_character: Option<usize>,
     ) -> EditorOutput {
+        let document = DocumentMetrics {
+            revision: visual_revision,
+            line_count: line_count(text),
+        };
+        self.show_document(
+            ui,
+            text,
+            highlighted,
+            document,
+            request_focus,
+            scroll_to_character,
+        )
+    }
+
+    pub(crate) fn show_document(
+        &mut self,
+        ui: &mut Ui,
+        text: &mut String,
+        highlighted: &LayoutJob,
+        document: DocumentMetrics,
+        request_focus: bool,
+        scroll_to_character: Option<usize>,
+    ) -> EditorOutput {
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
         let editor_rect = rect;
@@ -135,13 +165,16 @@ impl EditorSurface {
         }) {
             ui.output_mut(|output| output.cursor_icon = CursorIcon::Text);
         }
-        let gutter_width = gutter_width(self.lines.len().max(line_count(text)));
+        let gutter_width = gutter_width(document.line_count);
         let content = Rect::from_min_max(
-            egui::pos2(rect.left() + gutter_width, rect.top()),
+            egui::pos2(
+                rect.left() + gutter_width,
+                (rect.top() + TEXT_TOP_PADDING).min(rect.bottom()),
+            ),
             editor_rect.right_bottom(),
         );
         let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
-        self.sync_lines(highlighted, visual_revision, wrap_width);
+        self.sync_lines(highlighted, document.revision, wrap_width);
         self.clamp_selection(text);
         let cursor_before_input = self.cursor;
 
@@ -388,7 +421,10 @@ impl EditorSurface {
         );
         painter.rect_filled(rect, 0.0, EDITOR_BACKGROUND);
         painter.line_segment(
-            [content.left_top(), content.left_bottom()],
+            [
+                egui::pos2(content.left(), rect.top()),
+                egui::pos2(content.left(), rect.bottom()),
+            ],
             Stroke::new(1.0, Color32::from_rgb(53, 53, 59)),
         );
         let selection = self.selection();
@@ -966,6 +1002,37 @@ mod tests {
         );
 
         assert!(editor.scroll_y > 0.0);
+    }
+
+    #[test]
+    fn first_code_line_is_inset_from_the_editor_top() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 200.0);
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            },
+        );
+        fn code_y(shape: &egui::epaint::Shape) -> Option<f32> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "text" => Some(text.pos.y),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(code_y),
+                _ => None,
+            }
+        }
+        let y = output
+            .shapes
+            .iter()
+            .find_map(|shape| code_y(&shape.shape))
+            .expect("painted code line");
+
+        assert_eq!(y, 6.0);
     }
 
     #[test]

@@ -143,23 +143,23 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
 pub(crate) fn compact_layout(source: &str, wrap_width: f32) -> LayoutJob {
     let mut job = layout(source, wrap_width);
     for section in &mut job.sections {
-        section.format.font_id.size = (section.format.font_id.size * 0.85).min(18.0);
+        section.format.font_id.size = (section.format.font_id.size * 0.93).min(18.5);
         section.format.line_height = section
             .format
             .line_height
-            .map(|height| (height * 0.82).min(23.0));
+            .map(|height| (height * 0.89).min(22.5));
     }
     job
 }
 
 fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
-    let heading_size = style.heading.map_or(15.0, |level| match level {
-        HeadingLevel::H1 => 28.0,
-        HeadingLevel::H2 => 24.0,
-        HeadingLevel::H3 => 21.0,
-        HeadingLevel::H4 => 18.0,
-        HeadingLevel::H5 => 16.0,
-        HeadingLevel::H6 => 15.0,
+    let heading_size = style.heading.map_or(14.0, |level| match level {
+        HeadingLevel::H1 => 24.0,
+        HeadingLevel::H2 => 21.0,
+        HeadingLevel::H3 => 18.0,
+        HeadingLevel::H4 => 16.0,
+        HeadingLevel::H5 => 15.0,
+        HeadingLevel::H6 => 14.0,
     });
     let code = inline_code || style.code_block > 0;
     let color = if style.link > 0 {
@@ -176,9 +176,9 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
         0.0,
         TextFormat {
             font_id: if code {
-                FontId::monospace(14.0)
+                FontId::monospace(13.5)
             } else {
-                FontId::monospace(heading_size)
+                FontId::proportional(heading_size)
             },
             color,
             background: if code {
@@ -198,9 +198,9 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
                 Stroke::NONE
             },
             line_height: Some(if style.heading.is_some() {
-                heading_size + 8.0
+                heading_size + 6.0
             } else {
-                23.0
+                21.0
             }),
             ..TextFormat::default()
         },
@@ -232,7 +232,7 @@ mod tests {
         let title = job.sections.first().expect("title formatting");
         assert!(title.format.font_id.size > 20.0);
         assert!(job.sections.iter().any(|section| {
-            section.format.font_id == FontId::monospace(14.0)
+            section.format.font_id == FontId::monospace(13.5)
                 && section.format.background != Color32::TRANSPARENT
         }));
     }
@@ -248,14 +248,37 @@ mod tests {
     }
 
     #[test]
-    fn preview_uses_the_editors_readable_monospace_font() {
+    fn preview_uses_proportional_text_and_monospace_code_at_a_compact_scale() {
         let job = layout("# Title\n\nBody text with `code`.", 600.0);
 
-        assert!(
-            job.sections
+        let font_at = |needle: &str| {
+            let offset = job.text.find(needle).unwrap();
+            &job.sections
                 .iter()
-                .all(|section| { section.format.font_id.family == egui::FontFamily::Monospace })
-        );
+                .find(|section| {
+                    section.byte_range.start.0 <= offset && offset < section.byte_range.end.0
+                })
+                .unwrap()
+                .format
+                .font_id
+        };
+        let title = font_at("Title");
+        let body = font_at("Body");
+        let code = font_at("code");
+        assert_eq!(title.family, egui::FontFamily::Proportional);
+        assert_eq!(body.family, egui::FontFamily::Proportional);
+        assert_eq!(code.family, egui::FontFamily::Monospace);
+        assert!(title.size <= 24.0);
+        assert!(body.size <= 14.0);
+        assert!(code.size <= 13.5);
+    }
+
+    #[test]
+    fn compact_agent_markdown_keeps_body_copy_comfortably_readable() {
+        let job = compact_layout("Body copy", 320.0);
+        let body_size = job.sections[0].format.font_id.size;
+
+        assert!(body_size > 12.8, "compact body text was {body_size}px");
     }
 
     #[test]

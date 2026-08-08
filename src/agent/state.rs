@@ -360,17 +360,21 @@ impl AgentState {
         if removed {
             self.transcript.pop_front();
         }
-        while self.transcript.len() > MAX_TRANSCRIPT_ITEMS
-            || self.transcript.iter().map(item_size).sum::<usize>() > MAX_TRANSCRIPT_BYTES
-        {
+        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
+        while self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES {
             if let Some(tool) = self.transcript.iter_mut().find_map(|item| match item {
                 TranscriptItem::Tool(tool) if tool.detail.is_some() => Some(tool),
                 _ => None,
             }) {
+                let before = tool_size(tool);
                 tool.detail = None;
+                bytes = bytes.saturating_sub(before - tool_size(tool));
                 continue;
             }
-            removed |= self.transcript.pop_front().is_some();
+            if let Some(item) = self.transcript.pop_front() {
+                bytes = bytes.saturating_sub(item_size(&item));
+                removed = true;
+            }
         }
         if removed {
             self.transcript.push_front(TranscriptItem::Truncated);
@@ -625,17 +629,7 @@ fn item_size(item: &TranscriptItem) -> usize {
             .iter()
             .map(|item| item.content.len() + item.status.len())
             .sum(),
-        TranscriptItem::Tool(tool) => {
-            tool.id.len()
-                + tool.status.as_ref().map_or(0, String::len)
-                + tool.detail.as_ref().map_or(0, tool_detail_size)
-                + tool.title.as_ref().map_or(0, String::len)
-                + tool
-                    .paths
-                    .iter()
-                    .map(|path| path.as_os_str().as_encoded_bytes().len())
-                    .sum::<usize>()
-        }
+        TranscriptItem::Tool(tool) => tool_size(tool),
         TranscriptItem::Permission(card) => {
             card.action.len()
                 + card.tool_call_id.len()
@@ -648,6 +642,18 @@ fn item_size(item: &TranscriptItem) -> usize {
         TranscriptItem::Interaction(card) => interaction_size(&card.request),
         TranscriptItem::Truncated => 0,
     }
+}
+
+fn tool_size(tool: &ToolActivity) -> usize {
+    tool.id.len()
+        + tool.status.as_ref().map_or(0, String::len)
+        + tool.detail.as_ref().map_or(0, tool_detail_size)
+        + tool.title.as_ref().map_or(0, String::len)
+        + tool
+            .paths
+            .iter()
+            .map(|path| path.as_os_str().as_encoded_bytes().len())
+            .sum::<usize>()
 }
 
 fn interaction_size(request: &InteractionRequest) -> usize {
