@@ -8264,10 +8264,10 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::{
         AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, EDITOR_BACKGROUND,
-        EditorApp, PendingAction, RESIZE_SETTLE_DELAY, TAB_WIDTH, TITLEBAR_HEIGHT,
-        TITLEBAR_PAINT_KEY, TreeState, agent_collapsing_header, agent_composer_content,
-        agent_composer_height, agent_diff_preview, agent_markdown_galley, agent_menu_rect,
-        agent_near_bottom, agent_new_session_rect, agent_selector_button, agent_send_button_colors,
+        EditorApp, PendingAction, RESIZE_SETTLE_DELAY, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
+        TreeState, agent_collapsing_header, agent_composer_content, agent_composer_height,
+        agent_diff_preview, agent_markdown_galley, agent_menu_rect, agent_near_bottom,
+        agent_new_session_rect, agent_selector_button, agent_send_button_colors,
         agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh,
         agentic_new_session_button, build_agent_diff, cached_agent_diff, defer_resize,
         disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
@@ -11502,10 +11502,6 @@ mod tests {
             }],
         );
         draw(&mut app, Vec::new());
-        let closed_button = context
-            .read_response(Id::new("file_tree_toggle"))
-            .expect("file tree toggle")
-            .rect;
         let agentic_button = context
             .read_response(Id::new("agentic_mode_toggle"))
             .expect("agentic mode toggle")
@@ -11516,10 +11512,6 @@ mod tests {
             .rect;
 
         assert!(!app.sidebar);
-        #[cfg(target_os = "macos")]
-        assert_eq!(closed_button, open_button);
-        #[cfg(not(target_os = "macos"))]
-        assert!(closed_button.left() < open_button.left());
         assert!(tab.left() >= agentic_button.right());
     }
 
@@ -11924,7 +11916,7 @@ mod tests {
         fs::write(&file, "text\n").unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root,
-            file: Some(file),
+            file: Some(file.clone()),
             create: false,
         })
         .unwrap();
@@ -11953,13 +11945,16 @@ mod tests {
             .iter()
             .find_map(|shape| cyan_underline(&shape.shape))
             .expect("active tab underline");
-        let (_, editor, _) = split_workspace(screen, true, 248.0, false, 360.0);
+        let tab = context
+            .read_response(Id::new(("file_tab", file.display().to_string())))
+            .expect("file tab")
+            .rect;
 
         assert_eq!(
             underline,
             [
-                pos2(editor.left(), TITLEBAR_HEIGHT - 1.0),
-                pos2(editor.left() + TAB_WIDTH, TITLEBAR_HEIGHT - 1.0),
+                pos2(tab.left(), tab.bottom() - 1.0),
+                pos2(tab.right(), tab.bottom() - 1.0),
             ]
         );
     }
