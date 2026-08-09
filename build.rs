@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use syntect::parsing::SyntaxSetBuilder;
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/syntaxes");
@@ -14,7 +13,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EDITUR_PROVIDER_BUNDLE");
     println!("cargo:rustc-check-cfg=cfg(editur_precompiled_metal)");
     println!("cargo:rustc-check-cfg=cfg(feature, values(\"cargo-clippy\"))");
-    let mut builder = SyntaxSetBuilder::new();
+    let mut builder = syntect::parsing::SyntaxSet::load_defaults_newlines().into_builder();
     if let Err(error) = builder.add_from_folder("assets/syntaxes", true) {
         panic!("failed to compile built-in syntaxes: {error}");
     }

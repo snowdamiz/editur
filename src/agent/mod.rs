@@ -98,7 +98,7 @@ pub fn run_managed_process(
             project_root.display()
         ));
     }
-    let data_dir = crate::syntax::data_dir()?;
+    let data_dir = crate::data_dir()?;
     let bundle = provision::embedded_bundle()?;
     let installed = provision::installed(bundle.manifest(provider)?, &data_dir)?;
     let prepared = provider::prepare_installed(provider, installed, &data_dir);
@@ -112,6 +112,9 @@ pub fn run_managed_process(
         .args(&prepared.args)
         .current_dir(&project_root)
         .envs(prepared.env.iter().map(|(name, value)| (name, value)));
+    for name in prepared.remove_env {
+        process.env_remove(name);
+    }
     #[cfg(windows)]
     process.env_remove(WINDOWS_JOB_ENV);
 

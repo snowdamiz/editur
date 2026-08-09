@@ -20,6 +20,13 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Result, Stdio};
+use serde::Deserialize;
+
+#[derive(Clone, Deserialize)]
+struct CodexFixture {
+    initialize: InitializeResponse,
+    new_session: NewSessionResponse,
+}
 
 #[derive(Clone, Debug)]
 struct CursorRequest {
@@ -53,28 +60,58 @@ impl agent_client_protocol::JsonRpcRequest for CursorRequest {
 }
 
 fn main() {
+    if run_descendant_child() {
+        return;
+    }
     #[cfg(windows)]
     if run_windows_job_fixture() {
         return;
     }
     let mut authentication_required = false;
     let mut terminal_auth = false;
+    let mut codex_auth = false;
     let mut sessions_supported = false;
     let mut stale_session = false;
     let mut address_file = None;
-    for argument in std::env::args_os().skip(1) {
+    let mut descendant_file = None;
+    let mut codex_fixture = None;
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--auth-required") => authentication_required = true,
             Some("--terminal-auth") => {
                 authentication_required = true;
                 terminal_auth = true;
             }
+            Some("--codex-auth") => {
+                authentication_required = true;
+                codex_auth = true;
+            }
             Some("--sessions") => sessions_supported = true,
             Some("--stale-session") => stale_session = true,
+            Some("--codex-fixture") => {
+                let path = arguments.next().expect("Codex fixture path");
+                codex_fixture = Some(
+                    serde_json::from_slice(
+                        &std::fs::read(path).expect("read Codex compatibility fixture"),
+                    )
+                    .expect("parse Codex compatibility fixture"),
+                );
+            }
+            Some("--descendant") => {
+                descendant_file = Some(arguments.next().expect("descendant marker path"));
+            }
             _ if address_file.is_none() => address_file = Some(argument),
             _ => {}
         }
     }
+    let _descendant = descendant_file.map(|address_file| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--descendant-child")
+            .arg(address_file)
+            .spawn()
+            .expect("spawn fake descendant")
+    });
     let listener = address_file.map(|address_file| {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake marker");
         std::fs::write(address_file, listener.local_addr().unwrap().to_string())
@@ -84,13 +121,29 @@ fn main() {
     let result = async_io::block_on(run(
         authentication_required,
         terminal_auth,
+        codex_auth,
         sessions_supported,
         stale_session,
+        codex_fixture,
     ));
     drop(listener);
     if let Err(error) = result {
         eprintln!("fake ACP agent: {error}");
         std::process::exit(1);
+    }
+}
+
+fn run_descendant_child() -> bool {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--descendant-child")) {
+        return false;
+    }
+    let address_file = arguments.next().expect("descendant marker path");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind descendant marker");
+    std::fs::write(address_file, listener.local_addr().unwrap().to_string())
+        .expect("write descendant marker");
+    loop {
+        std::thread::park();
     }
 }
 
@@ -131,9 +184,13 @@ fn run_windows_job_fixture() -> bool {
 async fn run(
     authentication_required: bool,
     terminal_auth: bool,
+    codex_auth: bool,
     sessions_supported: bool,
     stale_session: bool,
+    codex_fixture: Option<CodexFixture>,
 ) -> Result<()> {
+    let codex_fixture = codex_fixture.map(Arc::new);
+    let sessions_supported = sessions_supported || codex_fixture.is_some();
     let prompts = Arc::new(AtomicUsize::new(0));
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
     let boolean_config_options = Arc::new(AtomicBool::new(false));
@@ -144,6 +201,7 @@ async fn run(
         .on_receive_request(
             {
                 let boolean_config_options = Arc::clone(&boolean_config_options);
+                let codex_fixture = codex_fixture.clone();
                 async move |request: InitializeRequest, responder, _connection| {
                     boolean_config_options.store(
                         request
@@ -155,6 +213,9 @@ async fn run(
                             .is_some(),
                         Ordering::Release,
                     );
+                    if let Some(fixture) = &codex_fixture {
+                        return responder.respond(fixture.initialize.clone());
+                    }
                     let mut capabilities = AgentCapabilities::new().prompt_capabilities(
                         PromptCapabilities::new()
                             .image(true)
@@ -168,17 +229,36 @@ async fn run(
                         );
                     }
                     if authentication_required {
-                        response = response.auth_methods(vec![if terminal_auth {
-                            AuthMethod::Terminal(
-                                AuthMethodTerminal::new("terminal_login", "Terminal Login")
-                                    .args(vec!["login".into()]),
-                            )
+                        response = response.auth_methods(if codex_auth {
+                            let mut meta = serde_json::Map::new();
+                            meta.insert(
+                                "api-key".into(),
+                                serde_json::json!({"provider": "openai"}),
+                            );
+                            vec![
+                                AuthMethod::Agent(
+                                    AuthMethodAgent::new("api-key", "API Key")
+                                        .description("Use an API key to authenticate")
+                                        .meta(meta),
+                                ),
+                                AuthMethod::Agent(
+                                    AuthMethodAgent::new("chat-gpt", "ChatGPT")
+                                        .description("Use ChatGPT to authenticate"),
+                                ),
+                            ]
                         } else {
-                            AuthMethod::Agent(AuthMethodAgent::new(
-                                "cursor_login",
-                                "Cursor Login",
-                            ))
-                        }]);
+                            vec![if terminal_auth {
+                                AuthMethod::Terminal(
+                                    AuthMethodTerminal::new("terminal_login", "Terminal Login")
+                                        .args(vec!["login".into()]),
+                                )
+                            } else {
+                                AuthMethod::Agent(AuthMethodAgent::new(
+                                    "cursor_login",
+                                    "Cursor Login",
+                                ))
+                            }]
+                        });
                     }
                     response = response.agent_capabilities(capabilities);
                     responder.respond(response)
@@ -190,7 +270,7 @@ async fn run(
             {
                 let authenticated = Arc::clone(&authenticated);
                 async move |request: AuthenticateRequest, responder, _connection| {
-                    if request.method_id.0.as_ref() != "cursor_login" {
+                    if !matches!(request.method_id.0.as_ref(), "cursor_login" | "api-key" | "chat-gpt") {
                         return responder.respond_with_result(Err(
                             agent_client_protocol::Error::invalid_params(),
                         ));
@@ -205,6 +285,7 @@ async fn run(
             {
                 let authenticated = Arc::clone(&authenticated);
                 let boolean_config_options = Arc::clone(&boolean_config_options);
+                let codex_fixture = codex_fixture.clone();
                 async move |request: NewSessionRequest, responder, _connection| {
                     if !authenticated.load(Ordering::Acquire) {
                         return responder.respond_with_result(Err(
@@ -214,6 +295,9 @@ async fn run(
                 if !request.cwd.is_absolute() {
                     return responder
                         .respond_with_result(Err(agent_client_protocol::Error::invalid_params()));
+                }
+                if let Some(fixture) = &codex_fixture {
+                    return responder.respond(fixture.new_session.clone());
                 }
                 responder.respond(
                     NewSessionResponse::new("fake-session")
@@ -235,11 +319,16 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            {
+            let has_codex_fixture = codex_fixture.is_some();
             async move |request: ListSessionsRequest, responder, _connection| {
                 assert!(
                     sessions_supported
                         && request.cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
                 );
+                if has_codex_fixture {
+                    return responder.respond(ListSessionsResponse::new(Vec::new()));
+                }
                 let cwd = request.cwd.expect("validated cwd");
                 let mut sessions = vec![
                     SessionInfo::new("older-session", cwd.clone())
@@ -257,6 +346,7 @@ async fn run(
                     );
                 }
                 responder.respond(ListSessionsResponse::new(sessions))
+            }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -386,6 +476,10 @@ async fn run(
                         }
                         if prompt_text(&request) == "exit" {
                             eprintln!("fake diagnostic before exit");
+                            std::process::exit(23);
+                        }
+                        if prompt_text(&request) == "exit-secret" {
+                            eprintln!("CODEX_API_KEY=super-secret-test-value");
                             std::process::exit(23);
                         }
                         if prompt_text(&request) == "error" {

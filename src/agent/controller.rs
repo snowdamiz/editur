@@ -175,6 +175,7 @@ pub struct AuthChoice {
     pub description: Option<String>,
     pub kind: AuthKind,
     pub setup: Option<String>,
+    pub can_authenticate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -680,17 +681,17 @@ fn run_thread(
             Event::ConnectionChanged(ConnectionState::Disconnected),
         );
     } else if let Err(error) = result {
-        let diagnostics = diagnostics
+        let raw_diagnostics = diagnostics
             .lock()
             .map(|text| text.clone())
             .unwrap_or_default();
-        send_event(
-            &events,
-            Event::ProcessExited {
-                error: connection_error(&error, &diagnostics),
-                diagnostics,
-            },
-        );
+        let error = connection_error(&error, &raw_diagnostics);
+        let diagnostics = if provider == ProviderId::Codex && !raw_diagnostics.is_empty() {
+            "Codex stderr suppressed to protect authentication and protocol data.".into()
+        } else {
+            raw_diagnostics
+        };
+        send_event(&events, Event::ProcessExited { error, diagnostics });
     }
 }
 
@@ -725,7 +726,7 @@ fn managed_config(
     project_root: &std::path::Path,
     events: &EventSender,
 ) -> Result<(AcpAgentConfig, ManagedTree), String> {
-    let data_dir = crate::syntax::data_dir()?;
+    let data_dir = crate::data_dir()?;
     super::provider::prepare(provider, &data_dir, |progress| {
         send_event(
             events,
@@ -988,8 +989,21 @@ async fn run_connection(
                     .iter()
                     .take(MAX_CHOICES)
                     .map(|method| {
-                        let (kind, setup) = match method {
-                            AuthMethod::Agent(_) => (AuthKind::Agent, None),
+                        let codex_api_key = provider == ProviderId::Codex
+                            && method.id().0.as_ref() == "api-key";
+                        let (kind, setup, can_authenticate) = match method {
+                            AuthMethod::Agent(_) if codex_api_key => {
+                                let names = ["CODEX_API_KEY", "OPENAI_API_KEY"];
+                                (
+                                    AuthKind::Environment,
+                                    Some(format!("variables: {}", names.join(", "))),
+                                    names.iter().any(|name| {
+                                        std::env::var_os(name)
+                                            .is_some_and(|value| !value.is_empty())
+                                    }),
+                                )
+                            }
+                            AuthMethod::Agent(_) => (AuthKind::Agent, None, true),
                             AuthMethod::Terminal(terminal) => {
                                 let mut details = Vec::new();
                                 if !terminal.args.is_empty() {
@@ -1000,7 +1014,11 @@ async fn run_connection(
                                     names.sort();
                                     details.push(format!("environment: {}", names.join(", ")));
                                 }
-                                (AuthKind::Terminal, (!details.is_empty()).then(|| details.join("; ")))
+                                (
+                                    AuthKind::Terminal,
+                                    (!details.is_empty()).then(|| details.join("; ")),
+                                    false,
+                                )
                             }
                             AuthMethod::EnvVar(environment) => {
                                 let names = environment
@@ -1012,9 +1030,10 @@ async fn run_connection(
                                 (
                                     AuthKind::Environment,
                                     (!names.is_empty()).then(|| format!("variables: {names}")),
+                                    false,
                                 )
                             }
-                            _ => (AuthKind::Unsupported, None),
+                            _ => (AuthKind::Unsupported, None, false),
                         };
                         AuthChoice {
                             id: method.id().0.to_string(),
@@ -1022,6 +1041,7 @@ async fn run_connection(
                             description: method.description().map(str::to_owned),
                             kind,
                             setup,
+                            can_authenticate,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1071,7 +1091,7 @@ async fn run_connection(
                                 );
                                 continue;
                             };
-                            if method.kind != AuthKind::Agent {
+                            if !method.can_authenticate {
                                 send_event(
                                     &events,
                                     Event::Error(format!(
@@ -1683,7 +1703,7 @@ impl HiddenSessions {
 }
 
 fn session_history_path(provider: ProviderId, project_root: &std::path::Path) -> Option<PathBuf> {
-    crate::syntax::data_dir()
+    crate::data_dir()
         .ok()
         .map(|directory| session_history_path_in(&directory, provider, project_root))
 }

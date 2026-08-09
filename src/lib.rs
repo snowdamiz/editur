@@ -14,3 +14,9 @@ pub mod syntax;
 pub mod tree;
 pub mod tree_surface;
 pub mod update;
+
+pub fn data_dir() -> Result<std::path::PathBuf, String> {
+    directories::ProjectDirs::from("io", "editur", "Editur")
+        .map(|directories| directories.data_dir().to_path_buf())
+        .ok_or_else(|| "cannot determine the application data directory".to_owned())
+}

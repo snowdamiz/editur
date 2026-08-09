@@ -100,7 +100,7 @@ pub fn spawn_listener(
 }
 
 fn instance_address() -> Result<SocketAddr, String> {
-    let data_dir = crate::syntax::data_dir()?;
+    let data_dir = crate::data_dir()?;
     Ok(SocketAddr::from(([127, 0, 0, 1], instance_port(&data_dir))))
 }
 

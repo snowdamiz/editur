@@ -7,7 +7,7 @@ fn help_version_and_invalid_arguments_have_stable_exit_behavior() {
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(help.status.success());
     let help = String::from_utf8_lossy(&help.stdout);
-    assert!(help.contains("editur syntax install"));
+    assert!(!help.contains("syntax install"));
     assert!(help.contains("editur update"));
 
     let version = Command::new(binary).arg("--version").output().unwrap();
@@ -17,10 +17,7 @@ fn help_version_and_invalid_arguments_have_stable_exit_behavior() {
         concat!("editur ", env!("CARGO_PKG_VERSION"))
     );
 
-    let invalid = Command::new(binary)
-        .args(["syntax", "remove", "Not Valid"])
-        .output()
-        .unwrap();
+    let invalid = Command::new(binary).args(["one", "two"]).output().unwrap();
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).starts_with("editur: "));
 }

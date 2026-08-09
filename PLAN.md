@@ -8,7 +8,7 @@ Editur is a small native code editor launched from a terminal for quick, focused
 editur src/main.rs
 ```
 
-It opens one lightweight desktop window with a navigable file tree and one editor buffer. The first release is written in Rust, ships Rust syntax highlighting only, and lets users install other language grammars with a command instead of editing configuration files.
+It opens one lightweight desktop window with a navigable file tree and one editor buffer. The first release is written in Rust and ships broad syntax highlighting without project configuration or separate installs.
 
 ### Audience and outcome
 
@@ -29,8 +29,7 @@ The first release must:
 - Search the current file from `Cmd/Ctrl+F`, highlighting matches while the user types.
 - Search project filenames and UTF-8 file contents from a floating `Cmd/Ctrl+Shift+F` palette, updating results while the user types.
 - Support selection, copy/paste, undo/redo, wrapped lines, vertical scrolling, and standard text input without horizontal scrollbars.
-- Highlight Rust by default and use plain text for unknown file types.
-- Install another language with `editur syntax install <language>`.
+- Highlight supported source and data files automatically and use plain text for unknown file types.
 - Update a release installation from the terminal with `editur update`.
 - Save safely without silently overwriting a file changed by another process.
 - Warn before discarding unsaved work.
@@ -54,9 +53,6 @@ Those features belong only after the quick single-file workflow is proven.
 
 ```text
 editur [PATH]
-editur syntax list
-editur syntax install <LANGUAGE>
-editur syntax remove <LANGUAGE>
 editur update
 editur --help
 editur --version
@@ -115,13 +111,11 @@ The tree reads a directory only when the user expands it, sorts directories befo
 | Transient UI | `egui` | Keep its input/accessibility integration and use widgets only for infrequent search palettes, prompts, and error dialogs. |
 | Renderer | Direct Metal, Direct3D 12, and Vulkan modules | Each release contains only its platform API. A small in-repo egui mesh/texture renderer avoids `wgpu`, translation layers, and a second rendering abstraction. |
 | Highlighting | `syntect` with its `fancy-regex` backend | Mature Sublime-compatible grammar support, a pure-Rust regex path, and precompiled syntax dumps for fast startup. |
-| Syntax manifests | `serde` and JSON | A small, versioned package format with broad tooling support. |
-| Syntax downloads | `ureq` with Rustls | A small blocking, pure-Rust HTTP client fits a short-lived CLI operation; no async runtime is needed. |
-| Package extraction and checksums | `zip` and `sha2` | Standard package transport plus bounded extraction and SHA-256 verification. |
+| Updates and agent packages | `ureq`, `zip`, and `sha2` | Bounded HTTPS transport, extraction, and SHA-256 verification. |
 | User data location | `directories` | Correct per-platform application data paths without custom OS branches. |
 | Safe temporary files | `tempfile` | Same-directory temporary writes before replacement. |
 
-Keep dependency features narrow. In particular, do not enable image loaders, web support, persistence, alternate graphics APIs, or every bundled `syntect` syntax. Use `egui` with default fonts and `egui-winit` with accessibility for transient UI and input plumbing, a text-only clipboard backend, and target-gated graphics bindings so macOS never compiles Vulkan or D3D12, Windows never compiles Metal or Vulkan, and Linux never compiles Metal or D3D12. Disable `syntect` default features and select the `regex-fancy`, parsing, YAML-load, dump-load, and dump-create features explicitly; otherwise Cargo can pull in the native Oniguruma library and violate the Rust-only requirement.
+Keep dependency features narrow. In particular, do not enable image loaders, web support, persistence, or alternate graphics APIs. Use `egui` with default fonts and `egui-winit` with accessibility for transient UI and input plumbing, a text-only clipboard backend, and target-gated graphics bindings so macOS never compiles Vulkan or D3D12, Windows never compiles Metal or Vulkan, and Linux never compiles Metal or D3D12. Disable `syntect` default features in the application and select its pure-Rust `fancy-regex` backend; the build dependency compiles the default and Editur-provided grammars into one embedded dump.
 
 ### Renderer configuration
 
@@ -183,66 +177,11 @@ Opening a file records its size, modification time, and content hash. Saving fol
 
 Reject binary and invalid UTF-8 input with a clear message. Do not perform lossy decoding because a quick editor must not corrupt a file it does not understand.
 
-## 7. Syntax highlighting and extensions
+## 7. Syntax highlighting
 
 ### Default behavior
 
-Embed only two syntax definitions in the base binary:
-
-- Rust, selected for `.rs` files.
-- Plain Text, used as the safe fallback.
-
-Compile them into a `syntect` syntax dump during the release build and load the dump directly at startup. Do not parse a catalog of YAML grammars every time the editor opens.
-
-### User workflow
-
-```text
-$ editur syntax list
-Installed:
-  rust (built in)
-
-Available:
-  javascript
-  markdown
-  python
-
-$ editur syntax install python
-Installed python 1.0.0
-
-$ editur notes.py
-```
-
-The next editor launch discovers `.py` automatically. No config file, restart command, or language mapping is required.
-
-Also allow `editur syntax install ./python.editur-syntax` for package authors and offline use. This is an installation command, not a folder the user must maintain.
-
-### Package format
-
-An `.editur-syntax` package is a ZIP-formatted, data-only archive:
-
-```text
-manifest.json
-syntaxes/*.sublime-syntax
-LICENSES/*
-```
-
-The manifest contains only:
-
-- Format version.
-- Stable language ID and display name.
-- Package version and minimum compatible Editur version.
-- Filename extensions and exact filenames.
-- Included grammar files and any syntax-package dependencies.
-
-It contains no executable hooks. The installer rejects absolute paths, `..` traversal, symlinks, duplicate language IDs, unknown manifest versions, downloads above 2 MiB, unpacked content above 8 MiB or 128 entries, invalid checksums, and grammars that fail to compile.
-
-### Official catalog
-
-Host a static versioned index and package files with the project’s release artifacts. `syntax install <language>` performs a blocking HTTPS download, validates the advertised SHA-256 checksum, installs into the platform application-data directory, and rebuilds one combined syntax dump atomically.
-
-The GUI only reads that combined dump. Network access, package extraction, YAML parsing, and grammar linking happen in the explicit install command, never on the editor startup path.
-
-The initial registry needs only a few common languages. Adding a generic plugin API is intentionally out of scope; syntax data solves the stated extension need with a much smaller security and maintenance surface.
+Compile Syntect's full default syntax set and Editur's additional grammars into one dump during the build. Load that immutable dump once at startup; never parse YAML or access the network on the editor path. Detect exact filenames before extensions and fall back to plain text for unknown files.
 
 ## 8. Performance contract
 
@@ -269,7 +208,7 @@ Incremental highlighting caches parser state per line and reparses from the firs
 - Terminal subcommands print one contextual error and exit nonzero.
 - GUI failures become a visible non-blocking error banner or modal, depending on whether user action is required.
 - Development builds can log startup phase timings when `EDITUR_LOG=debug` is set.
-- Release builds contain no telemetry and make no network request except an explicit syntax catalog/install or update command.
+- Release builds contain no telemetry and make no network request except an explicit update or agent provisioning command.
 
 Use standard error types first. Add a small derived error enum only when repeated manual conversions become noisy; do not introduce an error hierarchy for six modules.
 
@@ -307,9 +246,9 @@ Exit condition: opening, editing, saving, and creating a file cannot silently di
 
 Exit condition: a user can open a directory, navigate or search to a file without a mouse, edit it, save it, and switch files safely.
 
-### Milestone 3: Rust highlighting
+### Milestone 3: syntax highlighting
 
-- Embed the precompiled Rust and Plain Text syntax set.
+- Embed the precompiled default and Editur-provided syntax set.
 - Detect syntax from the selected file.
 - Cache parser state and per-line layout so idle frames never re-highlight or re-layout unchanged text.
 - Mark retained editor/tree/chrome paint regions and verify Metal, D3D12, and Vulkan skip unchanged upload-buffer segments.
@@ -317,17 +256,7 @@ Exit condition: a user can open a directory, navigate or search to a file withou
 
 Exit condition: Rust highlighting is correct enough for comments, strings, raw strings, macros, keywords, and types while meeting the measured interaction budget.
 
-### Milestone 4: syntax packages
-
-- Define and validate the versioned package manifest.
-- Implement list, local install, remove, and combined-cache rebuild.
-- Add official catalog resolution, HTTPS download, size limits, and checksum validation.
-- Publish Python and Markdown as end-to-end sample packages.
-- Test corrupt archives, traversal attempts, invalid manifests, failed grammar compilation, and interrupted cache replacement.
-
-Exit condition: a clean install can run `editur syntax install python` and immediately receive Python highlighting without editing configuration.
-
-### Milestone 5: release hardening
+### Milestone 4: release hardening
 
 - Run formatting, Clippy with warnings denied, unit tests, and CLI integration tests.
 - Exercise accessibility labels and keyboard-only operation.
@@ -342,10 +271,10 @@ Exit condition: every product requirement and performance gate has reproducible 
 
 ## 11. Minimal test strategy
 
-Prefer small tests around behavior that can lose data or break the extension boundary:
+Prefer small tests around behavior that can lose data or break a public boundary:
 
-- Unit tests for argument parsing, path-root selection, syntax detection, manifest validation, line-ending handling, and disk fingerprint comparison.
-- Temporary-directory integration tests for create, save, conflict, permissions, syntax install/remove, and atomic cache replacement.
+- Unit tests for argument parsing, path-root selection, syntax detection, line-ending handling, and disk fingerprint comparison.
+- Temporary-directory integration tests for create, save, conflict, and permissions.
 - One GUI smoke test per supported OS for launch, search, type, save, and close; do not build a large screenshot suite.
 - One benchmark fixture set: small Rust, 10,000-line Rust, 1 MiB Rust, and a file above the 5 MiB ceiling.
 
@@ -367,7 +296,7 @@ Editur v1 is done when a new user can:
 3. Navigate the surrounding project from the sidebar.
 4. Search the current file from `Cmd/Ctrl+F` and surrounding project files and contents from `Cmd/Ctrl+Shift+F` with live results.
 5. Save without line-ending damage or silent external-change overwrite.
-6. Install Python highlighting with one command and have it selected automatically for `.py` files.
+6. Open a Python file and have its built-in highlighting selected automatically.
 7. Use the core workflow entirely by keyboard.
 8. Observe the documented startup, latency, idle, memory, and binary-size results on the reference systems.
 9. Run `editur update` to install the latest successful build from the `release` branch without opening the UI.

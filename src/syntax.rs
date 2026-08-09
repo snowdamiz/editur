@@ -1,9 +1,8 @@
-use crate::syntax::package::{Manifest, PackageManager};
 use egui::{
     Color32, FontId, TextFormat,
     text::{LayoutJob, LayoutSection},
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
@@ -13,69 +12,36 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
-pub mod package;
-
 const BUILTIN_DUMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/default_syntaxes.packdump"));
 
 pub struct SyntaxManager {
     set: SyntaxSet,
-    installed: Vec<Manifest>,
 }
 
 impl SyntaxManager {
     pub fn built_in() -> Result<Self, String> {
         syntect::dumps::from_reader::<SyntaxSet, _>(BUILTIN_DUMP)
-            .map(|set| Self {
-                set,
-                installed: Vec::new(),
-            })
+            .map(|set| Self { set })
             .map_err(|error| format!("cannot load built-in syntaxes: {error}"))
-    }
-
-    pub fn load(data_dir: &Path) -> Result<Self, String> {
-        let packages = PackageManager::new(data_dir.to_path_buf());
-        let installed = packages.installed()?;
-        let cache = packages.cache_path();
-        let set = if cache.is_file() {
-            syntect::dumps::from_dump_file(&cache)
-                .map_err(|error| format!("cannot load {}: {error}", cache.display()))?
-        } else if installed.is_empty() {
-            syntect::dumps::from_reader::<SyntaxSet, _>(BUILTIN_DUMP)
-                .map_err(|error| format!("cannot load built-in syntaxes: {error}"))?
-        } else {
-            return Err("installed syntax cache is missing; reinstall a syntax package".into());
-        };
-        Ok(Self { set, installed })
     }
 
     pub fn detect(&self, path: &Path, force_plain_text: bool) -> &SyntaxReference {
         if force_plain_text {
             return self.plain_text();
         }
-        let filename = path.file_name().and_then(|name| name.to_str());
-        let extension = path.extension().and_then(|extension| extension.to_str());
-        if let Some(manifest) = self.installed.iter().find(|manifest| {
-            filename
-                .is_some_and(|filename| manifest.filenames.iter().any(|mapped| mapped == filename))
-                || extension.is_some_and(|extension| {
-                    manifest
-                        .extensions
-                        .iter()
-                        .any(|mapped| mapped.eq_ignore_ascii_case(extension))
+        path.file_name()
+            .and_then(|filename| filename.to_str())
+            .and_then(|filename| {
+                self.set.find_syntax_by_extension(filename).or_else(|| {
+                    self.set
+                        .find_syntax_by_extension(filename.trim_start_matches('.'))
                 })
-        }) {
-            if let Some(syntax) =
-                extension.and_then(|extension| self.set.find_syntax_by_extension(extension))
-            {
-                return syntax;
-            }
-            if let Some(syntax) = self.set.find_syntax_by_name(&manifest.display_name) {
-                return syntax;
-            }
-        }
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| self.set.find_syntax_by_extension(extension))
+            })
+            .or_else(|| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(|extension| self.set.find_syntax_by_extension(extension))
+            })
             .unwrap_or_else(|| self.plain_text())
     }
 
@@ -88,12 +54,6 @@ impl SyntaxManager {
     pub fn set(&self) -> &SyntaxSet {
         &self.set
     }
-}
-
-pub fn data_dir() -> Result<PathBuf, String> {
-    directories::ProjectDirs::from("io", "editur", "Editur")
-        .map(|directories| directories.data_dir().to_path_buf())
-        .ok_or_else(|| "cannot determine the application data directory".to_owned())
 }
 
 pub struct Highlighter {
@@ -348,19 +308,44 @@ const fn color(r: u8, g: u8, b: u8) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::package::{Manifest, PackageManager};
-    use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
 
     #[test]
-    fn detects_only_built_in_rust_and_plain_text() {
+    fn detects_previously_optional_syntaxes_without_installing_packages() {
         let syntaxes = SyntaxManager::built_in().unwrap();
-        assert_eq!(syntaxes.set.syntaxes().len(), 2);
-        assert_eq!(syntaxes.detect(Path::new("main.rs"), false).name, "Rust");
-        assert_eq!(
-            syntaxes.detect(Path::new("notes.py"), false).name,
-            "Plain Text"
-        );
+        for path in [
+            "main.c",
+            "main.cpp",
+            "main.cs",
+            "style.css",
+            "Dockerfile",
+            ".env",
+            "main.go",
+            "schema.graphql",
+            "index.html",
+            "Main.java",
+            "main.js",
+            "data.json",
+            "Main.kt",
+            "main.lua",
+            "Makefile",
+            "README.md",
+            "index.php",
+            "script.py",
+            "Gemfile",
+            "script.sh",
+            "schema.sql",
+            "main.swift",
+            "Cargo.toml",
+            "main.ts",
+            "document.xml",
+            "config.yaml",
+        ] {
+            assert_ne!(
+                syntaxes.detect(Path::new(path), false).name,
+                "Plain Text",
+                "missing built-in syntax for {path}"
+            );
+        }
         assert_eq!(
             syntaxes.detect(Path::new("main.rs"), true).name,
             "Plain Text"
@@ -368,95 +353,45 @@ mod tests {
     }
 
     #[test]
-    fn loads_installed_extension_and_exact_filename_mappings() {
-        let temp = tempfile::tempdir().unwrap();
-        let data_dir = temp.path().join("data");
-        let manifest = Manifest {
-            format_version: 1,
-            id: "python".into(),
-            display_name: "Python".into(),
-            version: "1.0.0".into(),
-            minimum_editur_version: "0.1.0".into(),
-            extensions: vec!["py".into()],
-            filenames: vec!["SConstruct".into()],
-            grammars: vec!["syntaxes/Python.sublime-syntax".into()],
-            dependencies: vec![],
-        };
-        let grammar = br#"%YAML 1.2
----
-name: Python
-file_extensions: [py]
-scope: source.python
-contexts: { main: [] }
-"#;
-        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        zip.start_file("manifest.json", SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
-            .unwrap();
-        zip.start_file(
-            "syntaxes/Python.sublime-syntax",
-            SimpleFileOptions::default(),
-        )
-        .unwrap();
-        zip.write_all(grammar).unwrap();
-        let bytes = zip.finish().unwrap().into_inner();
-        PackageManager::new(data_dir.clone())
-            .install_bytes(&bytes)
-            .unwrap();
-
-        let syntaxes = SyntaxManager::load(&data_dir).unwrap();
-        assert_eq!(
-            syntaxes.detect(Path::new("script.py"), false).name,
-            "Python"
-        );
-        assert_eq!(
-            syntaxes.detect(Path::new("SConstruct"), false).name,
-            "Python"
-        );
-    }
-
-    #[test]
-    fn installed_package_uses_the_matching_grammar_for_each_extension() {
-        let temp = tempfile::tempdir().unwrap();
-        let data_dir = temp.path().join("data");
-        let manifest = Manifest {
-            format_version: 1,
-            id: "c-cpp".into(),
-            display_name: "C++".into(),
-            version: "1.0.0".into(),
-            minimum_editur_version: "0.1.0".into(),
-            extensions: vec!["c".into(), "cpp".into()],
-            filenames: vec![],
-            grammars: vec![
-                "syntaxes/C.sublime-syntax".into(),
-                "syntaxes/C++.sublime-syntax".into(),
-            ],
-            dependencies: vec![],
-        };
-        let grammar = |name: &str, extension: &str| {
-            format!(
-                "%YAML 1.2\n---\nname: {name}\nfile_extensions: [{extension}]\nscope: source.{extension}\ncontexts: {{ main: [] }}\n"
-            )
-        };
-        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        zip.start_file("manifest.json", SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
-            .unwrap();
-        for (path, name, extension) in [
-            ("syntaxes/C.sublime-syntax", "C", "c"),
-            ("syntaxes/C++.sublime-syntax", "C++", "cpp"),
+    fn detects_previously_manifest_only_filenames() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        for path in [
+            "Dockerfile.dev",
+            "Dockerfile.test",
+            "Dockerfile.production",
+            "Containerfile",
+            "Containerfile.dev",
+            ".env.local",
+            ".env.example",
+            ".env.sample",
+            ".env.development",
+            ".env.development.local",
+            ".env.test",
+            ".env.test.local",
+            ".env.staging",
+            ".env.production",
+            ".env.production.local",
+            "makefile",
+            "GNUmakefile",
+            "README",
+            "CHANGELOG",
+            "SConstruct",
+            "SConscript",
+            "Rakefile",
+            "Guardfile",
+            "Vagrantfile",
+            ".bashrc",
+            ".zshrc",
+            ".profile",
+            "bashrc",
+            "zshrc",
         ] {
-            zip.start_file(path, SimpleFileOptions::default()).unwrap();
-            zip.write_all(grammar(name, extension).as_bytes()).unwrap();
+            assert_ne!(
+                syntaxes.detect(Path::new(path), false).name,
+                "Plain Text",
+                "missing built-in syntax for {path}"
+            );
         }
-        PackageManager::new(data_dir.clone())
-            .install_bytes(&zip.finish().unwrap().into_inner())
-            .unwrap();
-
-        let syntaxes = SyntaxManager::load(&data_dir).unwrap();
-        assert_eq!(syntaxes.detect(Path::new("main.c"), false).name, "C");
     }
 
     #[test]
@@ -488,16 +423,12 @@ contexts: { main: [] }
 
     #[test]
     fn highlights_representative_markdown_constructs() {
-        let mut builder = syntect::parsing::SyntaxSetBuilder::new();
-        builder
-            .add_from_folder("syntax-packages/markdown/syntaxes", true)
-            .unwrap();
-        let syntaxes = builder.build();
-        let syntax = syntaxes.find_syntax_by_name("Markdown").unwrap();
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let syntax = syntaxes.detect(Path::new("README.md"), false);
         let source = "# Heading\n\nUse `cargo test` and **bold**.\n";
         let job = Highlighter::new()
             .unwrap()
-            .highlight_job(source, syntax, &syntaxes, 800.0)
+            .highlight_job(source, syntax, syntaxes.set(), 800.0)
             .unwrap();
         let color = |token: &str| {
             let offset = source.find(token).unwrap();

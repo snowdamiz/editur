@@ -19,6 +19,13 @@ const EMBEDDED_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent
 
 use super::provider::{ProviderId, catalog, descriptor};
 
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseSpec {
@@ -39,7 +46,18 @@ pub struct Distribution {
     pub entrypoint: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub version_probes: Vec<VersionProbe>,
     pub archive_format: ArchiveFormat,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionProbe {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub expected: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,6 +86,8 @@ pub struct SidecarManifest {
     #[serde(default)]
     pub entrypoint: Option<String>,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub version_probes: Vec<VersionProbe>,
     pub entries: Vec<ManagedEntry>,
     pub license_url: String,
     pub terms_url: String,
@@ -154,6 +174,7 @@ impl SidecarManifest {
         }) {
             return Err("ACP provider manifest entrypoint is not a declared file".into());
         }
+        validate_version_probes(&self.version_probes, &self.entries)?;
         validate_provider_policy(self, provider)?;
         Ok(())
     }
@@ -194,6 +215,7 @@ impl SidecarManifest {
                 distribution.command
             ));
         }
+        validate_version_probes(&distribution.version_probes, &entries)?;
         Ok(Self {
             format_version: 1,
             agent: provider.as_str().into(),
@@ -201,7 +223,7 @@ impl SidecarManifest {
             os: distribution.os.clone(),
             architecture: distribution.architecture.clone(),
             archive_url: distribution.archive_url.clone(),
-            archive_sha256: crate::syntax::package::sha256_hex(bytes),
+            archive_sha256: crate::agent::provision::sha256_hex(bytes),
             archive_format: distribution.archive_format,
             archive_size_bytes: bytes.len() as u64,
             max_compressed_bytes: MAX_COMPRESSED_BYTES,
@@ -210,11 +232,47 @@ impl SidecarManifest {
             command: distribution.command.clone(),
             entrypoint: distribution.entrypoint.clone(),
             args: distribution.args.clone(),
+            version_probes: distribution.version_probes.clone(),
             entries,
             license_url: descriptor(provider).license_url.into(),
             terms_url: descriptor(provider).terms_url.into(),
         })
     }
+}
+
+fn validate_version_probes(
+    probes: &[VersionProbe],
+    entries: &[ManagedEntry],
+) -> Result<(), String> {
+    for probe in probes {
+        validate_relative_path(&probe.command)?;
+        if !entries
+            .iter()
+            .any(|entry| entry.path == probe.command && entry.kind == EntryKind::File)
+        {
+            return Err("ACP provider version probe command is not a declared file".into());
+        }
+        if probe.expected.is_empty()
+            || probe.expected.len() > 256
+            || probe.expected.chars().any(char::is_control)
+        {
+            return Err("ACP provider version probe has an invalid expected response".into());
+        }
+        for argument in probe
+            .args
+            .iter()
+            .filter(|argument| !argument.starts_with('-'))
+        {
+            validate_relative_path(argument)?;
+            if !entries
+                .iter()
+                .any(|entry| entry.path == *argument && entry.kind == EntryKind::File)
+            {
+                return Err("ACP provider version probe argument is not a declared file".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -302,6 +360,11 @@ fn validate_provider_policy(
     } else {
         "runtime/bin/node"
     };
+    if provider == ProviderId::Codex
+        && manifest.version_probes != codex_version_probes(expected_node)
+    {
+        return Err("Codex manifest has unexpected or missing pinned version probes".into());
+    }
     validate_provider_host(manifest, provider)?;
     let valid = match provider {
         ProviderId::Cursor => {
@@ -329,6 +392,24 @@ fn validate_provider_policy(
             metadata.display_name
         )
     })
+}
+
+fn codex_version_probes(node: &str) -> Vec<VersionProbe> {
+    vec![
+        VersionProbe {
+            command: node.into(),
+            args: vec!["package/dist/index.js".into(), "--version".into()],
+            expected: "@agentclientprotocol/codex-acp 1.1.14".into(),
+        },
+        VersionProbe {
+            command: node.into(),
+            args: vec![
+                "package/node_modules/@openai/codex/bin/codex.js".into(),
+                "--version".into(),
+            ],
+            expected: "codex-cli 0.147.0".into(),
+        },
+    ]
 }
 
 fn validate_provider_host(manifest: &SidecarManifest, provider: ProviderId) -> Result<(), String> {
@@ -577,6 +658,12 @@ pub fn ensure(
             Ok(installed)
         });
     }
+    #[cfg(debug_assertions)]
+    if provider == ProviderId::Codex
+        && let Some(path) = std::env::var_os("EDITUR_CODEX_ARCHIVE")
+    {
+        return provision_from_development_archive(manifest, data_dir, Path::new(&path));
+    }
     fs::create_dir_all(data_dir)
         .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
     let download = tempfile::tempdir_in(data_dir)
@@ -638,6 +725,28 @@ pub fn ensure(
     provision_from_bytes(manifest, data_dir, &bytes)
 }
 
+#[cfg(debug_assertions)]
+fn provision_from_development_archive(
+    manifest: &SidecarManifest,
+    data_dir: &Path,
+    path: &Path,
+) -> Result<InstalledSidecar, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect development Codex archive: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("development Codex archive is not a regular file".into());
+    }
+    let limit = manifest
+        .max_compressed_bytes
+        .min(MAX_COMPRESSED_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit).read_to_end(&mut bytes))
+        .map_err(|error| format!("cannot read development Codex archive: {error}"))?;
+    provision_from_bytes(manifest, data_dir, &bytes)
+}
+
 #[cfg(not(feature = "network"))]
 pub fn ensure(
     manifest: &SidecarManifest,
@@ -654,6 +763,44 @@ pub fn provision_from_bytes(
     bytes: &[u8],
 ) -> Result<InstalledSidecar, String> {
     provision_from_bytes_with(manifest, data_dir, bytes, |command, entrypoint, version| {
+        if !manifest.version_probes.is_empty() {
+            let root = command
+                .ancestors()
+                .nth(Path::new(&manifest.command).components().count())
+                .ok_or_else(|| "cannot locate staged ACP provider root".to_owned())?;
+            for probe in &manifest.version_probes {
+                let mut process = std::process::Command::new(root.join(&probe.command));
+                process.args(probe.args.iter().map(|argument| {
+                    if argument.starts_with('-') {
+                        Path::new(argument).to_path_buf()
+                    } else {
+                        root.join(argument)
+                    }
+                }));
+                if manifest.provider()? == ProviderId::Codex {
+                    for name in ["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"] {
+                        process.env_remove(name);
+                    }
+                }
+                let output = process.current_dir(root).output().map_err(|error| {
+                    format!("cannot validate ACP provider version probe: {error}")
+                })?;
+                let reported = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success()
+                    || !reported.lines().any(|line| line.trim() == probe.expected)
+                {
+                    return Err(format!(
+                        "ACP provider version probe did not report `{}`",
+                        probe.expected
+                    ));
+                }
+            }
+            return Ok(());
+        }
         let mut process = std::process::Command::new(command);
         if let Some(entrypoint) = entrypoint {
             process.arg(entrypoint);
@@ -1015,7 +1162,7 @@ fn verify_archive(manifest: &SidecarManifest, bytes: &[u8]) -> Result<(), String
     if size > manifest.max_compressed_bytes || size != manifest.archive_size_bytes {
         return Err("ACP provider archive exceeds its compressed-size limit".into());
     }
-    let checksum = crate::syntax::package::sha256_hex(bytes);
+    let checksum = crate::agent::provision::sha256_hex(bytes);
     if !checksum.eq_ignore_ascii_case(&manifest.archive_sha256) {
         return Err("ACP provider archive failed SHA-256 verification".into());
     }
@@ -1443,6 +1590,7 @@ fn validate_release_distribution(
                 && distribution.command == expected_node
                 && distribution.entrypoint.as_deref() == Some("package/dist/index.js")
                 && distribution.args.is_empty()
+                && distribution.version_probes == codex_version_probes(expected_node)
         }
         ProviderId::Claude => false,
     };
@@ -1462,8 +1610,9 @@ mod tests {
     use super::provision_from_bytes;
     use super::{
         ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, ProviderId, ReleaseSpec,
-        SidecarManifest, cleanup_obsolete_versions, embedded_manifest, ensure, extract_archive,
-        installed, provision_from_bytes_with, verify_archive, verify_installed,
+        SidecarManifest, VersionProbe, cleanup_obsolete_versions, embedded_manifest, ensure,
+        extract_archive, installed, provision_from_bytes_with, provision_from_development_archive,
+        verify_archive, verify_installed,
     };
     #[cfg(feature = "network")]
     use super::{valid_archive_uri, valid_cursor_archive_uri};
@@ -1486,6 +1635,7 @@ mod tests {
             command: "dist-package/agent".into(),
             entrypoint: None,
             args: vec!["acp".into()],
+            version_probes: Vec::new(),
             entries: Vec::new(),
             license_url: "https://cursor.com/terms-of-service".into(),
             terms_url: "https://cursor.com/terms-of-service".into(),
@@ -1499,12 +1649,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         manifest
@@ -1719,7 +1869,7 @@ mod tests {
             "path": "dist-package/agent",
             "kind": "file",
             "size": 5,
-            "sha256": crate::syntax::package::sha256_hex(b"agent"),
+            "sha256": crate::agent::provision::sha256_hex(b"agent"),
             "executable": true
         });
         json["entries"] = serde_json::json!([entry.clone(), entry]);
@@ -1755,7 +1905,7 @@ mod tests {
         manifest.archive_format = ArchiveFormat::Zip;
         manifest.archive_size_bytes = bytes.len() as u64;
         manifest.max_compressed_bytes = bytes.len() as u64;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         let temp = tempfile::tempdir().unwrap();
 
         let error = extract_archive(&manifest, &bytes, temp.path()).unwrap_err();
@@ -1782,12 +1932,12 @@ mod tests {
         manifest.archive_size_bytes = bytes.len() as u64;
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 8;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 9,
-            sha256: Some(crate::syntax::package::sha256_hex(b"123456789")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"123456789")),
             executable: false,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -1814,12 +1964,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -1848,12 +1998,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -1883,12 +2033,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -1973,14 +2123,14 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 4;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.command = "dist-package/node.exe".into();
         manifest.entrypoint = Some("dist-package/index.js".into());
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/node.exe".into(),
             kind: EntryKind::File,
             size: 4,
-            sha256: Some(crate::syntax::package::sha256_hex(b"node")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"node")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -2010,12 +2160,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = script.len() as u64;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: script.len() as u64,
-            sha256: Some(crate::syntax::package::sha256_hex(script)),
+            sha256: Some(crate::agent::provision::sha256_hex(script)),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -2023,6 +2173,69 @@ mod tests {
         let error = provision_from_bytes(&manifest, temp.path(), &bytes).unwrap_err();
 
         assert!(error.contains("reported an unexpected version"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioner_requires_every_declared_version_probe() {
+        let script = b"#!/bin/sh\ncase \"$1\" in\n  --version) echo 2026.07.23-e383d2b;;\n  --adapter) echo adapter-1;;\n  --dependency) echo wrong;;\nesac\n";
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "dist-package/agent",
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        archive.write_all(script).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let mut manifest = manifest();
+        manifest.archive_format = ArchiveFormat::Zip;
+        manifest.archive_size_bytes = bytes.len() as u64;
+        manifest.max_compressed_bytes = bytes.len() as u64;
+        manifest.max_extracted_bytes = script.len() as u64;
+        manifest.max_entries = 1;
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
+        manifest.version_probes = vec![
+            VersionProbe {
+                command: "dist-package/agent".into(),
+                args: vec!["--adapter".into()],
+                expected: "adapter-1".into(),
+            },
+            VersionProbe {
+                command: "dist-package/agent".into(),
+                args: vec!["--dependency".into()],
+                expected: "dependency-2".into(),
+            },
+        ];
+        manifest.entries = vec![ManagedEntry {
+            path: "dist-package/agent".into(),
+            kind: EntryKind::File,
+            size: script.len() as u64,
+            sha256: Some(crate::agent::provision::sha256_hex(script)),
+            executable: true,
+        }];
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = provision_from_bytes(&manifest, temp.path(), &bytes).unwrap_err();
+
+        assert!(error.contains("dependency-2"), "{error}");
+        assert!(!temp.path().join("agents/cursor/active").exists());
+    }
+
+    #[test]
+    fn development_archive_never_bypasses_manifest_verification() {
+        let data = tempfile::tempdir().unwrap();
+        let archive = data.path().join("codex.zip");
+        std::fs::write(&archive, b"tampered").unwrap();
+        let mut manifest = manifest();
+        manifest.archive_size_bytes = 8;
+        manifest.max_compressed_bytes = 8;
+
+        let error =
+            provision_from_development_archive(&manifest, data.path(), &archive).unwrap_err();
+
+        assert!(error.contains("SHA-256"), "{error}");
+        assert!(!data.path().join("agents/cursor/active").exists());
     }
 
     #[test]
@@ -2042,12 +2255,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -2188,12 +2401,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -2254,14 +2467,14 @@ mod tests {
         cursor.max_compressed_bytes = cursor_bytes.len() as u64;
         cursor.max_extracted_bytes = 11;
         cursor.max_entries = cursor_entries.len();
-        cursor.archive_sha256 = crate::syntax::package::sha256_hex(&cursor_bytes);
+        cursor.archive_sha256 = crate::agent::provision::sha256_hex(&cursor_bytes);
         cursor.entries = cursor_entries
             .iter()
             .map(|(path, bytes, executable)| ManagedEntry {
                 path: (*path).into(),
                 kind: EntryKind::File,
                 size: bytes.len() as u64,
-                sha256: Some(crate::syntax::package::sha256_hex(bytes)),
+                sha256: Some(crate::agent::provision::sha256_hex(bytes)),
                 executable: *executable,
             })
             .collect();
@@ -2288,14 +2501,14 @@ mod tests {
         codex.max_compressed_bytes = codex_bytes.len() as u64;
         codex.max_extracted_bytes = 11;
         codex.max_entries = codex_entries.len();
-        codex.archive_sha256 = crate::syntax::package::sha256_hex(&codex_bytes);
+        codex.archive_sha256 = crate::agent::provision::sha256_hex(&codex_bytes);
         codex.entries = codex_entries
             .iter()
             .map(|(path, bytes, executable)| ManagedEntry {
                 path: (*path).into(),
                 kind: EntryKind::File,
                 size: bytes.len() as u64,
-                sha256: Some(crate::syntax::package::sha256_hex(bytes)),
+                sha256: Some(crate::agent::provision::sha256_hex(bytes)),
                 executable: *executable,
             })
             .collect();
@@ -2360,12 +2573,12 @@ mod tests {
         manifest.max_compressed_bytes = bytes.len() as u64;
         manifest.max_extracted_bytes = 5;
         manifest.max_entries = 1;
-        manifest.archive_sha256 = crate::syntax::package::sha256_hex(&bytes);
+        manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
         manifest.entries = vec![ManagedEntry {
             path: "dist-package/agent".into(),
             kind: EntryKind::File,
             size: 5,
-            sha256: Some(crate::syntax::package::sha256_hex(b"agent")),
+            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
             executable: true,
         }];
         let temp = tempfile::tempdir().unwrap();
@@ -2416,7 +2629,7 @@ mod tests {
             SidecarManifest::generate(&spec, spec.select("macos", "aarch64").unwrap(), &bytes)
                 .unwrap();
 
-        let expected_file_checksum = crate::syntax::package::sha256_hex(b"agent");
+        let expected_file_checksum = crate::agent::provision::sha256_hex(b"agent");
         assert_eq!(
             (
                 generated.archive_sha256,
@@ -2424,7 +2637,7 @@ mod tests {
                 generated.entries[0].sha256.as_deref(),
             ),
             (
-                crate::syntax::package::sha256_hex(&bytes),
+                crate::agent::provision::sha256_hex(&bytes),
                 "dist-package/cursor-agent",
                 Some(expected_file_checksum.as_str()),
             )
@@ -2450,6 +2663,18 @@ mod tests {
                         "command": "{command}",
                         "entrypoint": "package/dist/index.js",
                         "args": [],
+                        "version_probes": [
+                            {{
+                                "command": "{command}",
+                                "args": ["package/dist/index.js", "--version"],
+                                "expected": "@agentclientprotocol/codex-acp 1.1.14"
+                            }},
+                            {{
+                                "command": "{command}",
+                                "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+                                "expected": "codex-cli 0.147.0"
+                            }}
+                        ],
                         "archive_format": "zip"
                     }}]
                 }}"#,
@@ -2474,6 +2699,13 @@ mod tests {
             )
             .unwrap();
         archive.write_all(b"adapter").unwrap();
+        archive
+            .start_file(
+                "package/node_modules/@openai/codex/bin/codex.js",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"codex").unwrap();
         let bytes = archive.finish().unwrap().into_inner();
 
         let manifest = SidecarManifest::generate(

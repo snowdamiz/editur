@@ -34,7 +34,7 @@ pub fn run() -> Result<(), String> {
         .map_err(|error| format!("cannot read {}: {error}", executable.display()))?;
     let checksum = download(&checksum_url, MAX_CHECKSUM_SIZE)?;
     let advertised = advertised_checksum(&checksum)?;
-    if crate::syntax::package::sha256_hex(&current).eq_ignore_ascii_case(advertised) {
+    if crate::agent::provision::sha256_hex(&current).eq_ignore_ascii_case(advertised) {
         println!("Editur is already up to date.");
         return Ok(());
     }
@@ -98,17 +98,17 @@ fn provision_sidecar(url: &str) -> Result<(), String> {
     let bytes = download(url, MAX_AGENT_MANIFEST_SIZE)?;
     let bundle = crate::agent::provision::ProviderBundle::parse(&bytes)?;
     let manifest = bundle.manifest(crate::agent::provider::ProviderId::Cursor)?;
-    crate::agent::provision::ensure(manifest, &crate::syntax::data_dir()?, |_| {})?;
+    crate::agent::provision::ensure(manifest, &crate::data_dir()?, |_| {})?;
     Ok(())
 }
 
 fn verify_update(current: &[u8], downloaded: &[u8], checksum: &[u8]) -> Result<bool, String> {
     let advertised = advertised_checksum(checksum)?;
-    let downloaded_checksum = crate::syntax::package::sha256_hex(downloaded);
+    let downloaded_checksum = crate::agent::provision::sha256_hex(downloaded);
     if !downloaded_checksum.eq_ignore_ascii_case(advertised) {
         return Err("downloaded update does not match its SHA-256 checksum".into());
     }
-    Ok(!crate::syntax::package::sha256_hex(current).eq_ignore_ascii_case(advertised))
+    Ok(!crate::agent::provision::sha256_hex(current).eq_ignore_ascii_case(advertised))
 }
 
 fn advertised_checksum(checksum: &[u8]) -> Result<&str, String> {
@@ -293,7 +293,7 @@ fn migrate_macos_install(base: &str, executable: &std::path::Path) -> Result<(),
     let archive = download(&archive_url, MAX_APP_ARCHIVE_SIZE)?;
     let checksum = download(&checksum_url, MAX_CHECKSUM_SIZE)?;
     let advertised = advertised_checksum(&checksum)?;
-    if !crate::syntax::package::sha256_hex(&archive).eq_ignore_ascii_case(advertised) {
+    if !crate::agent::provision::sha256_hex(&archive).eq_ignore_ascii_case(advertised) {
         return Err("downloaded update does not match its SHA-256 checksum".into());
     }
     if !crate::instance::quit_running()? {

@@ -37,13 +37,14 @@ use crate::{
         state::{AgentState, TranscriptItem},
     },
     buffer::Buffer,
+    data_dir,
     editor_surface::{DocumentMetrics, EDITOR_BACKGROUND, EditorSurface},
     file_io::{OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, safe_save},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     markdown,
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
-    syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager, data_dir},
+    syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
     tree::{TreeEntry, read_directory},
     tree_surface::{TreeRow, TreeSurface},
 };
@@ -559,23 +560,50 @@ fn draw_provider_selector_identity(
     provider: ProviderId,
     enabled: bool,
 ) -> egui::Response {
+    let provider = provider_descriptor(provider);
     let response = ui
         .add_enabled_ui(enabled, |ui| {
-            let inner = ui.horizontal(|ui| {
-                draw_provider_identity(ui, provider);
-                ui.label(RichText::new("⌄").weak());
-            });
-            ui.interact(
-                inner.response.rect,
-                Id::new(("agent_provider_selector", ui.id())),
-                Sense::click(),
-            )
+            let text_color = if ui.is_enabled() {
+                Color32::from_rgb(238, 240, 246)
+            } else {
+                Color32::from_rgb(122, 126, 136)
+            };
+            let galley = ui.painter().layout_no_wrap(
+                provider.display_name.to_owned(),
+                FontId::proportional(13.0),
+                text_color,
+            );
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(32.0 + galley.size().x, 20.0), Sense::click());
+            if response.hovered() || response.is_pointer_button_down_on() {
+                ui.painter().rect_filled(
+                    rect.expand2(egui::vec2(4.0, 2.0)),
+                    5.0,
+                    if response.is_pointer_button_down_on() {
+                        Color32::from_rgb(37, 44, 49)
+                    } else {
+                        Color32::from_rgb(31, 36, 40)
+                    },
+                );
+            }
+            let icon = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 7.5, rect.center().y),
+                egui::vec2(15.0, 18.0),
+            );
+            paint_provider_icon(ui.painter(), icon, provider.icon, text_color);
+            let text_pos = egui::pos2(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5);
+            let text_right = text_pos.x + galley.size().x;
+            ui.painter().galley(text_pos, galley, text_color);
+            let tip = egui::pos2(text_right + 7.0, rect.center().y + 1.5);
+            let stroke = egui::Stroke::new(1.3, text_color);
+            ui.painter()
+                .line_segment([tip + egui::vec2(-3.0, -2.5), tip], stroke);
+            ui.painter()
+                .line_segment([tip, tip + egui::vec2(3.0, -2.5)], stroke);
+            response
         })
         .inner;
-    let label = format!(
-        "Select ACP provider: {}",
-        provider_descriptor(provider).display_name
-    );
+    let label = format!("Select ACP provider: {}", provider.display_name);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label.clone())
     });
@@ -1126,6 +1154,24 @@ fn agent_session_menu_rect(
     let left = (anchor.right() - width).clamp(
         transcript.left() + 6.0,
         (transcript.right() - width - 6.0).max(transcript.left() + 6.0),
+    );
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
+}
+
+fn agent_provider_menu_rect(
+    bounds: egui::Rect,
+    anchor: egui::Rect,
+    item_count: usize,
+    row_height: f32,
+) -> egui::Rect {
+    let width = AGENT_PROVIDER_MENU_WIDTH.min((bounds.width() - 16.0).max(1.0));
+    let top = anchor.bottom() + 6.0;
+    let height = (16.0 + item_count as f32 * row_height)
+        .min(280.0)
+        .min((bounds.bottom() - top - 8.0).max(1.0));
+    let left = anchor.left().clamp(
+        bounds.left() + 8.0,
+        (bounds.right() - width - 8.0).max(bounds.left() + 8.0),
     );
     egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
 }
@@ -1768,9 +1814,7 @@ impl EditorApp {
         let selected = buffer.as_ref().map(|buffer| buffer.path.clone());
         let tabs = buffer.into_iter().map(FileTab::new).collect::<Vec<_>>();
         let active_tab = (!tabs.is_empty()).then_some(0);
-        let syntaxes = data_dir()
-            .and_then(|directory| SyntaxManager::load(&directory))
-            .or_else(|_| SyntaxManager::built_in())?;
+        let syntaxes = SyntaxManager::built_in()?;
         let search = SearchController::new(target.root.clone())?;
         Ok(Self {
             tabs,
@@ -2532,7 +2576,11 @@ impl EditorApp {
             let agent_header =
                 egui::Rect::from_min_max(editor_header.right_top(), rect.right_bottom());
             egui::Rect::from_min_max(
-                egui::pos2(agent_header.left() + 3.0, agent_header.top()),
+                egui::pos2(
+                    self.provider_menu_anchor
+                        .map_or(agent_header.left() + 3.0, |anchor| anchor.right() + 4.0),
+                    agent_header.top(),
+                ),
                 egui::pos2(
                     agent_sessions_rect(agent_header).left(),
                     agent_header.bottom(),
@@ -3069,6 +3117,24 @@ impl EditorApp {
 
     fn open_agent(&mut self, ctx: &egui::Context) {
         self.ensure_provider_catalog();
+        if provider_descriptor(self.selected_provider).install_policy == InstallPolicy::Lazy {
+            match data_dir() {
+                Ok(directory)
+                    if !crate::agent::provider::terms_accepted(
+                        &directory,
+                        self.selected_provider,
+                    ) =>
+                {
+                    self.pending_provider_terms = Some(self.selected_provider);
+                    return;
+                }
+                Err(error) => {
+                    self.show_error(error);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let wake = ctx.clone();
         self.start_agent(move || wake.request_repaint());
     }
@@ -3769,9 +3835,13 @@ impl EditorApp {
                             );
                             ui.add_space(10.0);
                             for method in methods {
-                                if method.kind == AuthKind::Agent {
+                                if method.can_authenticate {
                                     let button = egui::Button::new(
-                                        RichText::new(&method.name)
+                                        RichText::new(if method.kind == AuthKind::Environment {
+                                            "Use environment API key"
+                                        } else {
+                                            &method.name
+                                        })
                                             .strong()
                                             .color(Color32::from_rgb(10, 27, 31)),
                                     )
@@ -3832,8 +3902,16 @@ impl EditorApp {
                                     .color(Color32::from_rgb(237, 191, 194)),
                             );
                             ui.add(Label::new(RichText::new(error).weak()).wrap());
+                            if let Some(diagnostics) = &self.agent.diagnostics {
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(diagnostics).small().monospace().weak(),
+                                    )
+                                    .wrap(),
+                                );
+                            }
                             ui.add_space(8.0);
-                            reconnect = ui.button("Try again").clicked();
+                            reconnect = ui.button("Retry").clicked();
                         });
                 }
                 ConnectionState::Disconnected => {
@@ -5131,15 +5209,21 @@ impl EditorApp {
                     AgentMenu::Sessions => AGENT_SESSION_ROW_HEIGHT,
                     _ => AGENT_MENU_ROW_HEIGHT,
                 };
-                let popup = if matches!(menu, AgentMenu::Sessions | AgentMenu::Providers) {
-                    let width = if matches!(menu, AgentMenu::Providers) {
-                        AGENT_PROVIDER_MENU_WIDTH
-                    } else {
-                        AGENT_MENU_WIDTH
-                    };
-                    agent_session_menu_rect(transcript, anchor, item_count, row_height, width)
-                } else {
-                    agent_menu_rect(transcript, anchor, item_count, row_height)
+                let popup = match menu {
+                    AgentMenu::Providers => agent_provider_menu_rect(
+                        ui.ctx().content_rect(),
+                        anchor,
+                        item_count,
+                        row_height,
+                    ),
+                    AgentMenu::Sessions => agent_session_menu_rect(
+                        transcript,
+                        anchor,
+                        item_count,
+                        row_height,
+                        AGENT_MENU_WIDTH,
+                    ),
+                    _ => agent_menu_rect(transcript, anchor, item_count, row_height),
                 };
                 menu_popup = Some(popup);
                 let max_scroll =
@@ -5166,20 +5250,20 @@ impl EditorApp {
                         .max_rect(popup)
                         .layout(Layout::top_down(Align::LEFT)),
                     |ui| {
+                        ui.set_clip_rect(ui.ctx().content_rect());
                         ui.painter().add(egui::Shadow {
-                            offset: [0, 4],
-                            blur: 16,
+                            offset: [0, 6],
+                            blur: 18,
                             spread: 0,
-                            color: Color32::from_black_alpha(120),
+                            color: Color32::from_black_alpha(110),
                         }
-                        .as_shape(popup, 9));
-                        ui.set_clip_rect(popup);
+                        .as_shape(popup, 11));
                         ui.painter()
-                            .rect_filled(popup, 9.0, Color32::from_rgb(26, 27, 31));
+                            .rect_filled(popup, 11.0, Color32::from_rgb(26, 27, 31));
                         ui.painter().rect_stroke(
                             popup,
-                            9.0,
-                            egui::Stroke::new(1.0, Color32::from_rgb(57, 61, 70)),
+                            11.0,
+                            egui::Stroke::new(1.0, Color32::from_rgb(52, 55, 62)),
                             egui::StrokeKind::Inside,
                         );
                         ui.scope_builder(
@@ -5411,10 +5495,9 @@ impl EditorApp {
                     || (!menu_toggled
                         && ui.input(|input| {
                             input.pointer.any_click()
-                                && input
-                                    .pointer
-                                    .interact_pos()
-                                    .is_some_and(|position| !popup.contains(position))
+                                && input.pointer.interact_pos().is_some_and(|position| {
+                                    !popup.contains(position) && !anchor.contains(position)
+                                })
                         }));
                 if close {
                     open_menu = None;
@@ -7573,9 +7656,9 @@ fn provider_menu_option(
         )
     });
     let fill = if selected {
-        Color32::from_rgb(38, 55, 62)
+        Color32::from_rgb(31, 42, 47)
     } else if response.hovered() {
-        Color32::from_rgb(39, 40, 46)
+        Color32::from_rgb(34, 35, 40)
     } else {
         Color32::TRANSPARENT
     };
@@ -7583,7 +7666,7 @@ fn provider_menu_option(
         ui.painter().rect_filled(rect, 5.0, fill);
     }
     let name_color = if !ui.is_enabled() {
-        Color32::from_rgb(105, 111, 123)
+        Color32::from_rgb(132, 138, 149)
     } else if selected || response.hovered() {
         Color32::from_rgb(230, 233, 240)
     } else {
@@ -7592,7 +7675,7 @@ fn provider_menu_option(
     let detail_color = if ui.is_enabled() {
         Color32::from_rgb(145, 153, 168)
     } else {
-        Color32::from_rgb(88, 94, 106)
+        Color32::from_rgb(103, 109, 120)
     };
     let icon_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 9.0, rect.top() + 5.0),
@@ -7607,7 +7690,7 @@ fn provider_menu_option(
         name_color,
     );
     ui.painter().text(
-        egui::pos2(rect.left() + 9.0, rect.top() + 32.0),
+        egui::pos2(rect.left() + 31.0, rect.top() + 32.0),
         Align2::LEFT_CENTER,
         provider.description,
         FontId::proportional(11.0),
@@ -7615,12 +7698,12 @@ fn provider_menu_option(
     );
     if let Some(status) = status {
         ui.painter().text(
-            egui::pos2(rect.left() + 9.0, rect.top() + 48.0),
+            egui::pos2(rect.left() + 31.0, rect.top() + 48.0),
             Align2::LEFT_CENTER,
             status,
             FontId::proportional(10.5),
             if unavailable.is_some() {
-                Color32::from_rgb(184, 121, 126)
+                Color32::from_rgb(171, 112, 118)
             } else {
                 Color32::from_rgb(109, 174, 186)
             },
@@ -8266,13 +8349,14 @@ mod tests {
         agent_new_session_rect, agent_selector_button, agent_send_button_colors,
         agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh,
         agentic_new_session_button, build_agent_diff, cached_agent_diff, defer_resize,
-        disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
-        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, plain_text_job, presentation_job,
-        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
-        run_everything_state, search_needs_polling, search_selection_after_navigation,
-        shutdown_agent_in_background, skip_transition_render, slash_command_query,
-        split_agent_sidebar, split_agentic_workspace, split_editor_column, split_workspace,
+        disable_transient_egui_debug_overlays, draw_provider_selector_identity,
+        draw_sidebar_toggle_icon, find_highlighted_job, install_repaint_wake,
+        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
+        next_find_match, plain_text_job, presentation_job, provider_selector_visible,
+        repaint_deadline, repaint_delay_after_texture_update, run_everything_state,
+        search_needs_polling, search_selection_after_navigation, shutdown_agent_in_background,
+        skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_workspace,
+        split_editor_column, split_workspace,
     };
     use crate::{
         agent::controller::{
@@ -8293,6 +8377,96 @@ mod tests {
             ProviderId::Cursor,
             ProviderId::Codex,
         ]));
+    }
+
+    #[test]
+    fn provider_selector_uses_a_drawn_chevron() {
+        let mut selector = Rect::NOTHING;
+        let output = egui::Context::default().run_ui(RawInput::default(), |ui| {
+            selector = draw_provider_selector_identity(ui, ProviderId::Cursor, true).rect;
+        });
+        let glyph = output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Text(text) => text.galley.text() == "⌄",
+            _ => false,
+        });
+        let strokes = output
+            .shapes
+            .iter()
+            .filter(|shape| match &shape.shape {
+                Shape::LineSegment { points, .. } => {
+                    points.iter().all(|point| selector.contains(*point))
+                }
+                _ => false,
+            })
+            .count();
+
+        assert!(!glyph);
+        assert_eq!(strokes, 2);
+    }
+
+    #[test]
+    fn provider_selector_stays_open_in_ide_and_agentic_layouts() {
+        for agentic_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agentic_mode = agentic_mode;
+            app.agent_sidebar = !agentic_mode;
+            app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+            app.agent.connection = ConnectionState::Ready;
+            app.agent.session_ready = true;
+            let context = egui::Context::default();
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+            let draw = |app: &mut EditorApp, events| {
+                let _ = context.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..RawInput::default()
+                    },
+                    |root| app.ui(root),
+                );
+            };
+
+            draw(&mut app, Vec::new());
+            let anchor = app.provider_menu_anchor.expect("provider selector");
+            let selector = anchor.center();
+            draw(
+                &mut app,
+                vec![
+                    Event::PointerMoved(selector),
+                    Event::PointerButton {
+                        pos: selector,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+            draw(
+                &mut app,
+                vec![Event::PointerButton {
+                    pos: selector,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+            draw(&mut app, Vec::new());
+
+            assert_eq!(
+                app.agent_menu,
+                Some(super::AgentMenu::Providers),
+                "provider menu closed in agentic_mode={agentic_mode}"
+            );
+            let popup = app.agent_menu_popup.expect("provider menu");
+            assert_eq!(popup.left(), anchor.left());
+            assert_eq!(popup.top(), anchor.bottom() + 6.0);
+        }
     }
 
     #[test]
@@ -8430,6 +8604,34 @@ mod tests {
                 .iter()
                 .any(|shape| has_text(&shape.shape, "Cursor"))
         );
+
+        app.agent.connection = ConnectionState::Failed("adapter stopped".into());
+        app.agent.diagnostics = Some("Codex diagnostics were suppressed.".into());
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        for expected in [
+            "Codex Agent unavailable",
+            "adapter stopped",
+            "Codex diagnostics were suppressed.",
+            "Retry",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| has_text(&shape.shape, expected)),
+                "missing failure-state text: {expected}"
+            );
+        }
+        assert_eq!(app.selected_provider, ProviderId::Codex);
     }
 
     #[test]

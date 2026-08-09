@@ -8,6 +8,18 @@
       "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-macos-aarch64.zip",
       "command": "runtime/bin/node",
       "entrypoint": "package/dist/index.js",
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "@agentclientprotocol/codex-acp 1.1.14"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+          "expected": "codex-cli 0.147.0"
+        }
+      ],
       "archive_format": "zip"
     },
     {
@@ -16,6 +28,18 @@
       "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-macos-x86_64.zip",
       "command": "runtime/bin/node",
       "entrypoint": "package/dist/index.js",
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "@agentclientprotocol/codex-acp 1.1.14"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+          "expected": "codex-cli 0.147.0"
+        }
+      ],
       "archive_format": "zip"
     },
     {
@@ -24,6 +48,18 @@
       "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-linux-x86_64.zip",
       "command": "runtime/bin/node",
       "entrypoint": "package/dist/index.js",
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "@agentclientprotocol/codex-acp 1.1.14"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+          "expected": "codex-cli 0.147.0"
+        }
+      ],
       "archive_format": "zip"
     },
     {
@@ -32,6 +68,18 @@
       "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-windows-x86_64.zip",
       "command": "runtime/node.exe",
       "entrypoint": "package/dist/index.js",
+      "version_probes": [
+        {
+          "command": "runtime/node.exe",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "@agentclientprotocol/codex-acp 1.1.14"
+        },
+        {
+          "command": "runtime/node.exe",
+          "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+          "expected": "codex-cli 0.147.0"
+        }
+      ],
       "archive_format": "zip"
     }
   ]

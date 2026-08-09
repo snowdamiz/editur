@@ -152,6 +152,74 @@ fn terminal_authentication_kind_is_preserved_without_collecting_credentials() {
 }
 
 #[test]
+fn codex_api_key_auth_is_environment_owned_and_chatgpt_stays_agent_owned() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--codex-auth".into()],
+    );
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::ConnectionChanged(ConnectionState::AuthenticationRequired(_))
+        )
+    });
+    let methods = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ConnectionChanged(ConnectionState::AuthenticationRequired(methods)) => {
+                Some(methods)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let api_key = methods
+        .iter()
+        .find(|method| method.id == "api-key")
+        .unwrap();
+    let chatgpt = methods
+        .iter()
+        .find(|method| method.id == "chat-gpt")
+        .unwrap();
+
+    assert_eq!(api_key.kind, AuthKind::Environment);
+    assert_eq!(
+        api_key.setup.as_deref(),
+        Some("variables: CODEX_API_KEY, OPENAI_API_KEY")
+    );
+    assert_eq!(
+        api_key.can_authenticate,
+        ["CODEX_API_KEY", "OPENAI_API_KEY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    );
+    assert_eq!(chatgpt.kind, AuthKind::Agent);
+    assert!(chatgpt.can_authenticate);
+    assert_eq!(
+        methods
+            .iter()
+            .map(|method| method.id.as_str())
+            .collect::<Vec<_>>(),
+        ["api-key", "chat-gpt"]
+    );
+
+    controller
+        .send(Command::Authenticate("chat-gpt".into()))
+        .unwrap();
+    let authenticated = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    assert!(
+        !authenticated
+            .iter()
+            .any(|event| matches!(event, Event::Error(_)))
+    );
+}
+
+#[test]
 fn history_and_cursor_only_controls_are_capability_events() {
     for (provider, args, expected_history, expected_allow_all) in [
         (ProviderId::Cursor, vec!["--sessions".into()], true, true),
@@ -176,6 +244,44 @@ fn history_and_cursor_only_controls_are_capability_events() {
                 if (*history, *allow_run_everything) == (expected_history, expected_allow_all)
         )));
     }
+}
+
+#[test]
+fn pinned_codex_fixture_drives_history_and_standard_session_controls() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-acp-1.1.14.json");
+    let fixture_text = std::fs::read_to_string(&fixture).unwrap();
+    for forbidden in ["/Users/", "/home/", "accountId", "apiKey", "sk-"] {
+        assert!(!fixture_text.contains(forbidden));
+    }
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--codex-fixture".into(),
+            fixture.to_string_lossy().into_owned(),
+        ],
+    );
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Capabilities {
+            history: true,
+            allow_run_everything: false
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::SessionReady { config_options, .. }
+            if config_options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>()
+                == ["mode", "collaboration_mode", "model", "reasoning_effort", "fast-mode"]
+    )));
 }
 
 #[test]
@@ -856,6 +962,38 @@ fn unexpected_agent_exit_preserves_bounded_stderr_diagnostics() {
 }
 
 #[test]
+fn codex_stderr_never_copies_provider_payloads_into_events() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("exit-secret".into()))
+        .unwrap();
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::ProcessExited { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .all(|event| { !format!("{event:?}").contains("super-secret-test-value") })
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProcessExited { diagnostics, .. }
+            if diagnostics == "Codex stderr suppressed to protect authentication and protocol data."
+    )));
+}
+
+#[test]
 fn malformed_agent_stdout_becomes_a_connection_error() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(
@@ -912,6 +1050,50 @@ fn clean_shutdown_waits_for_the_fake_process_to_exit() {
         assert!(
             Instant::now() < deadline,
             "fake process still owns its marker socket"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_shutdown_terminates_the_descendant_tree() {
+    let project = tempfile::tempdir().unwrap();
+    let address_file = project.path().join("descendant-address");
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--descendant".into(),
+            address_file.to_string_lossy().into_owned(),
+        ],
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !address_file.is_file() {
+        assert!(Instant::now() < deadline, "fake descendant did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let address = std::fs::read_to_string(&address_file).unwrap();
+
+    controller.send(Command::Shutdown).unwrap();
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::ConnectionChanged(editur::agent::controller::ConnectionState::Disconnected)
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::net::TcpListener::bind(&address).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake descendant survived Unix process-group shutdown"
         );
         std::thread::sleep(Duration::from_millis(10));
     }

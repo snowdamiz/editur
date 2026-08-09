@@ -1,5 +1,5 @@
 use editur::agent::provider::{
-    InstallPolicy, ProviderExtensions, ProviderId, accept_terms, catalog, load_selected,
+    InstallPolicy, ProviderExtensions, ProviderId, accept_terms, catalog, load_selected, prepare,
     prepare_installed, save_selected, terms_accepted,
 };
 use editur::agent::provision::{InstalledSidecar, ProviderBundle, provider_root};
@@ -84,6 +84,16 @@ fn optional_provider_terms_are_accepted_per_provider() {
     assert!(!terms_accepted(data.path(), ProviderId::Claude));
 }
 
+#[test]
+fn optional_provider_terms_gate_precedes_package_preparation() {
+    let data = tempfile::tempdir().unwrap();
+
+    let error = prepare(ProviderId::Codex, data.path(), |_| {}).unwrap_err();
+
+    assert!(error.contains("terms"), "{error}");
+    assert!(!provider_root(data.path(), ProviderId::Codex).exists());
+}
+
 fn manifest(provider: &str) -> serde_json::Value {
     let (command, entrypoint, args, archive_url) = if provider == "cursor" {
         if cfg!(windows) {
@@ -129,6 +139,31 @@ fn manifest(provider: &str) -> serde_json::Value {
             "executable": false
         }));
     }
+    if provider == "codex" {
+        entries.push(serde_json::json!({
+            "path": "package/node_modules/@openai/codex/bin/codex.js",
+            "kind": "file",
+            "size": 1,
+            "sha256": "33".repeat(32),
+            "executable": false
+        }));
+    }
+    let version_probes = if provider == "codex" {
+        serde_json::json!([
+            {
+                "command": command,
+                "args": ["package/dist/index.js", "--version"],
+                "expected": "@agentclientprotocol/codex-acp 1.1.14"
+            },
+            {
+                "command": command,
+                "args": ["package/node_modules/@openai/codex/bin/codex.js", "--version"],
+                "expected": "codex-cli 0.147.0"
+            }
+        ])
+    } else {
+        serde_json::json!([])
+    };
     serde_json::json!({
         "format_version": 1,
         "agent": provider,
@@ -140,11 +175,12 @@ fn manifest(provider: &str) -> serde_json::Value {
         "archive_format": "zip",
         "archive_size_bytes": 2,
         "max_compressed_bytes": 2,
-        "max_extracted_bytes": 2,
+        "max_extracted_bytes": entries.len(),
         "max_entries": entries.len(),
         "command": command,
         "entrypoint": entrypoint,
         "args": args,
+        "version_probes": version_probes,
         "entries": entries,
         "license_url": if provider == "cursor" { "https://cursor.com/terms-of-service" } else { "https://github.com/agentclientprotocol/codex-acp/blob/v1.1.14/LICENSE" },
         "terms_url": if provider == "cursor" { "https://cursor.com/terms-of-service" } else { "https://openai.com/policies/terms-of-use/" }
@@ -221,6 +257,30 @@ fn provider_policy_rejects_host_command_and_blocked_claude_distribution() {
 }
 
 #[test]
+fn codex_manifest_pins_both_managed_version_probes() {
+    let mut codex = manifest("codex");
+    let probes = codex
+        .as_object_mut()
+        .unwrap()
+        .remove("version_probes")
+        .unwrap();
+    let error =
+        editur::agent::provision::SidecarManifest::parse(&serde_json::to_vec(&codex).unwrap())
+            .unwrap_err();
+    assert!(error.contains("version probes"), "{error}");
+
+    codex["version_probes"] = probes;
+
+    editur::agent::provision::SidecarManifest::parse(&serde_json::to_vec(&codex).unwrap()).unwrap();
+    codex["version_probes"][1]["expected"] = "codex-cli latest".into();
+    assert!(
+        editur::agent::provision::SidecarManifest::parse(&serde_json::to_vec(&codex).unwrap())
+            .unwrap_err()
+            .contains("version probes")
+    );
+}
+
+#[test]
 fn managed_provider_namespaces_cannot_collide() {
     let data = std::path::Path::new("/application-data");
     assert_eq!(
@@ -265,6 +325,14 @@ fn installed_package_becomes_an_exact_provider_owned_launch() {
             data.join("agents/codex/cache").into_os_string()
         )]
     );
+    assert_eq!(
+        prepared.remove_env,
+        ["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"]
+    );
+    assert!(prepared.command.is_absolute());
+    assert!(prepared.args.iter().all(|argument| {
+        argument.starts_with('-') || std::path::Path::new(argument).is_absolute()
+    }));
     assert_eq!(prepared.extensions, ProviderExtensions::None);
 }
 

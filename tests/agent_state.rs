@@ -277,6 +277,17 @@ fn provider_switch_clears_bound_state_and_preserves_the_unsent_draft() {
         size: 2,
         cost: None,
     });
+    state.apply(Event::ProcessExited {
+        error: "Codex stopped".into(),
+        diagnostics: "provider-only diagnostic".into(),
+    });
+    assert_eq!(
+        state.diagnostics.as_deref(),
+        Some("provider-only diagnostic")
+    );
+    assert!(!state.transcript.iter().any(|item| {
+        matches!(item, TranscriptItem::Error(text) if text.contains("provider-only diagnostic"))
+    }));
 
     state.reset_for_provider_switch();
 
@@ -292,6 +303,7 @@ fn provider_switch_clears_bound_state_and_preserves_the_unsent_draft() {
     assert!(state.current_mode.is_none());
     assert!(state.config_options.is_empty());
     assert!(state.usage.is_none());
+    assert!(state.diagnostics.is_none());
 }
 
 #[test]

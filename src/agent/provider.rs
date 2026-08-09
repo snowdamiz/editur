@@ -134,6 +134,7 @@ pub struct PreparedAgent {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, OsString)>,
+    pub remove_env: Vec<&'static str>,
     pub version: String,
     pub extensions: ProviderExtensions,
 }
@@ -143,6 +144,14 @@ pub fn prepare(
     data_dir: &Path,
     progress: impl FnMut(super::provision::DownloadProgress),
 ) -> Result<PreparedAgent, String> {
+    if descriptor(provider).install_policy == InstallPolicy::Lazy
+        && !terms_accepted(data_dir, provider)
+    {
+        return Err(format!(
+            "accept the {} terms before installation",
+            descriptor(provider).display_name
+        ));
+    }
     let bundle = super::provision::embedded_bundle()?;
     let installed = super::provision::ensure(bundle.manifest(provider)?, data_dir, progress)?;
     Ok(prepare_installed(provider, installed, data_dir))
@@ -170,6 +179,11 @@ pub fn prepare_installed(
         command: installed.command,
         args: installed.args,
         env,
+        remove_env: if provider == ProviderId::Codex {
+            vec!["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"]
+        } else {
+            Vec::new()
+        },
         version: installed.version,
         extensions: metadata.extensions,
     }

@@ -58,10 +58,6 @@ Release builds publish a launchable `.app` bundle for macOS, a native executable
 ```text
 editur [PATH]
 editur update
-editur syntax list
-editur syntax install typescript
-editur syntax install ./language.editur-syntax
-editur syntax remove typescript
 ```
 
 `PATH` may be an existing file, a directory, or a new filename whose parent exists. While Editur is open, later `editur PATH` commands forward the target to that process and return immediately. Closing the window exits the editor completely after the normal unsaved-change check.
@@ -96,28 +92,12 @@ Push the commit to the dedicated delivery branch:
 git push origin HEAD:release
 ```
 
-The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. It builds the pinned Codex adapter from its locked upstream commit, packages the exact private runtime deterministically, verifies its version probe, and attests both package and provider bundle. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, provider packages, build attestations, and syntax catalog. Version tags matching `v*` still publish versioned application releases.
+The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. It builds the pinned Codex adapter from its locked upstream commit, packages the exact private runtime deterministically, verifies its version probe, and attests both package and provider bundle. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, provider packages, and build attestations. Version tags matching `v*` still publish versioned application releases.
 
-## Syntax packages
+## Syntax highlighting
 
-Rust and Plain Text are the only embedded syntaxes. Additional highlighting stays out of the editor binary and is installed only when requested:
+Syntax highlighting is fully built in and selected automatically from the file name or extension; unknown formats fall back to Plain Text. Editur embeds Syntect's full default syntax set plus C/C++, C#, CSS, Dockerfile, dotenv, Go, GraphQL, HTML, Java, JavaScript, JSON, Kotlin, Lua, Makefile, Markdown, PHP, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript, XML, and YAML grammars. No syntax package download, configuration, or separate CLI command is required.
 
-```sh
-editur syntax list
-editur syntax install typescript
-editur syntax remove typescript
-```
-
-Bare names such as `dockerfile` always refer to catalog packages, even when the current project contains a `Dockerfile`. Prefix local archives with a path, such as `./language.editur-syntax`.
-
-The published catalog currently includes C/C++, C#, CSS, Dockerfile, dotenv, Go, GraphQL, HTML, Java, JavaScript, JSON, Kotlin, Lua, Makefile, Markdown, PHP, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript, XML, and YAML. CI builds deterministic data-only archives from `syntax-packages/` and publishes them to the `syntax-v1` release.
-
-Build that catalog locally with:
-
-```sh
-cargo run --release --locked --example build_syntax_catalog -- dist/syntax BASE_URL
-```
-
-Set `EDITUR_SYNTAX_CATALOG` to test another HTTPS catalog. `EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
+`EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, and [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan.

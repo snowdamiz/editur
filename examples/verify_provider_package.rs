@@ -1,5 +1,10 @@
 use std::{env, fs, path::PathBuf};
 
+use agent_client_protocol::schema::{
+    ProtocolVersion,
+    v1::{ClientCapabilities, Implementation, InitializeRequest},
+};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 use editur::agent::provision::{SidecarManifest, provision_from_bytes};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,29 +23,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = SidecarManifest::parse(&fs::read(manifest)?)?;
     let data = tempfile::tempdir()?;
     let installed = provision_from_bytes(&manifest, data.path(), &fs::read(archive)?)?;
-    if manifest.agent == "codex" {
-        let entrypoint = PathBuf::from(&installed.args[0]);
-        let version_root = entrypoint
-            .parent()
-            .and_then(|path| path.parent())
-            .ok_or("Codex entrypoint has no package root")?
-            .parent()
-            .ok_or("Codex package has no version root")?;
-        let output = std::process::Command::new(&installed.command)
-            .arg(version_root.join("package/node_modules/@openai/codex/bin/codex.js"))
-            .arg("--version")
-            .output()?;
-        let reported = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if !output.status.success() || !reported.contains("0.147.0") {
-            return Err(
-                format!("Codex dependency reported an unexpected version: {reported}").into(),
-            );
-        }
-    }
+    let agent = AcpAgent::new(AcpAgentConfig::new(&installed.command).args(installed.args));
+    async_io::block_on(Client.builder().name("editur-package-probe").connect_with(
+        agent,
+        |connection: ConnectionTo<Agent>| async move {
+            let initialized = connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new())
+                        .client_info(Implementation::new(
+                            "editur-package-probe",
+                            env!("CARGO_PKG_VERSION"),
+                        )),
+                )
+                .block_task()
+                .await?;
+            if initialized.protocol_version != ProtocolVersion::V1 {
+                return Err(agent_client_protocol::Error::invalid_request()
+                    .data("packaged provider does not support stable ACP v1"));
+            }
+            Ok(())
+        },
+    ))?;
     println!(
         "Verified {} {} at {}",
         manifest.agent,

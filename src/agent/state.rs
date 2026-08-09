@@ -79,6 +79,7 @@ pub struct AgentState {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub usage: Option<UsageState>,
+    pub diagnostics: Option<String>,
     session_load_backup: Option<SessionLoadBackup>,
 }
 
@@ -101,6 +102,7 @@ impl Default for AgentState {
             session_id: None,
             title: None,
             usage: None,
+            diagnostics: None,
             session_load_backup: None,
         }
     }
@@ -195,6 +197,7 @@ impl AgentState {
                     .collect();
                 self.config_options = bounded_configs(config_options);
                 self.usage = None;
+                self.diagnostics = None;
             }
             Event::SessionsUpdated(sessions) => {
                 self.sessions = Some(sessions.into_iter().take(MAX_CHOICES).collect());
@@ -406,11 +409,8 @@ impl AgentState {
                 self.active = false;
                 self.session_ready = false;
                 self.connection = ConnectionState::Failed(error.clone());
-                self.push(TranscriptItem::Error(bounded(if diagnostics.is_empty() {
-                    error
-                } else {
-                    format!("{error}\n{diagnostics}")
-                })));
+                self.diagnostics = (!diagnostics.is_empty()).then(|| bounded(diagnostics));
+                self.push(TranscriptItem::Error(bounded(error)));
             }
         }
         self.trim();
