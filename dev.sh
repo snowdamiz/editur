@@ -26,6 +26,13 @@ fi
 EDITUR_AGENT_MANIFEST="$manifest" cargo build --locked --bin editur
 target/debug/editur --quit-running
 sleep 0.1
+if [ "$agent_os" = macos ]; then
+  app="target/editur-dev/Editur.app"
+  binary="$app/Contents/MacOS/editur"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  cp assets/macos/Info.plist "$app/Contents/Info.plist"
+  cp assets/icons/editur.icns "$app/Contents/Resources/Editur.icns"
+fi
 mkdir -p "$(dirname -- "$binary")"
 cp target/debug/editur "$binary.new"
 mv "$binary.new" "$binary"

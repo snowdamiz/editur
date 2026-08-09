@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/syntaxes");
     println!("cargo:rerun-if-changed=assets/shaders/egui.wgsl");
     println!("cargo:rerun-if-changed=assets/shaders/egui.metal");
+    println!("cargo:rerun-if-changed=assets/icons/editur.ico");
     println!("cargo:rerun-if-env-changed=EDITUR_REQUIRE_PRECOMPILED_METAL");
     println!("cargo:rerun-if-env-changed=EDITUR_AGENT_MANIFEST");
     println!("cargo:rustc-check-cfg=cfg(editur_precompiled_metal)");
@@ -70,6 +71,14 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         compile_metal_library(&output_dir);
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set_icon("assets/icons/editur.ico")
+            .compile()
+            .unwrap_or_else(|error| {
+                panic!("failed to embed the Windows application icon: {error}")
+            });
     }
 }
 

@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use editur::agent::controller::{
-    AgentController, Command, ConfigValue, Event, InteractionResponse, QuestionAnswer,
+    AgentController, Command, ConfigValue, ConnectionState, Event, InteractionResponse,
+    PromptAttachment, QuestionAnswer,
 };
 
 fn receive_until(
@@ -21,6 +22,71 @@ fn receive_until(
         }
     }
     panic!("timed out waiting for controller event: {events:?}");
+}
+
+#[test]
+fn image_prompt_reaches_the_agent_as_an_acp_image_block() {
+    let project = tempfile::tempdir().unwrap();
+    let image_path = project.path().join("reference.png");
+    std::fs::write(&image_path, [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]).unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::PromptWithAttachments {
+            text: "image".into(),
+            attachments: vec![PromptAttachment::from_path(&image_path).unwrap()],
+        })
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "image/png:16"))
+    );
+}
+
+#[test]
+fn audio_and_text_files_use_their_advertised_acp_content_blocks() {
+    let project = tempfile::tempdir().unwrap();
+    let audio = project.path().join("sample.mp3");
+    let notes = project.path().join("notes.md");
+    std::fs::write(&audio, b"ID3sample audio").unwrap();
+    std::fs::write(&notes, b"project notes").unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::PromptWithAttachments {
+            text: "attachments".into(),
+            attachments: vec![
+                PromptAttachment::from_path(audio).unwrap(),
+                PromptAttachment::from_path(notes).unwrap(),
+            ],
+        })
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(events.iter().any(
+        |event| matches!(event, Event::AssistantDelta(text) if text == "audio:audio/mpeg,text:text/plain")
+    ));
 }
 
 #[test]
@@ -142,6 +208,37 @@ fn removed_sessions_stay_out_of_history_after_reconnecting() {
         Event::SessionsUpdated(sessions)
             if sessions.len() == 1 && sessions[0].id == "newest-session"
     )));
+}
+
+#[test]
+fn stale_listed_session_is_removed_without_a_transcript_error() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into(), "--stale-session".into()],
+    );
+    receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
+
+    controller
+        .send(Command::LoadSession("stale-session".into()))
+        .unwrap();
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::SessionsUpdated(sessions) if sessions.iter().all(|session| session.id != "stale-session")),
+    );
+
+    assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::ConnectionChanged(ConnectionState::Ready)))
+    );
 }
 
 #[test]

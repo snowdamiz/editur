@@ -55,6 +55,13 @@ pub struct UsageState {
     pub cost: Option<String>,
 }
 
+struct SessionLoadBackup {
+    transcript: VecDeque<TranscriptItem>,
+    changed_paths: HashSet<PathBuf>,
+    title: Option<String>,
+    usage: Option<UsageState>,
+}
+
 pub struct AgentState {
     pub connection: ConnectionState,
     pub session_ready: bool,
@@ -70,6 +77,7 @@ pub struct AgentState {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub usage: Option<UsageState>,
+    session_load_backup: Option<SessionLoadBackup>,
 }
 
 impl Default for AgentState {
@@ -89,6 +97,7 @@ impl Default for AgentState {
             session_id: None,
             title: None,
             usage: None,
+            session_load_backup: None,
         }
     }
 }
@@ -147,6 +156,7 @@ impl AgentState {
                 modes,
                 config_options,
             } => {
+                self.session_load_backup = None;
                 self.session_ready = true;
                 self.active = false;
                 self.transcript.clear();
@@ -166,19 +176,33 @@ impl AgentState {
                 self.sessions = Some(sessions.into_iter().take(MAX_CHOICES).collect());
             }
             Event::SessionLoading { title } => {
+                self.session_load_backup = Some(SessionLoadBackup {
+                    transcript: std::mem::take(&mut self.transcript),
+                    changed_paths: std::mem::take(&mut self.changed_paths),
+                    title: self.title.take(),
+                    usage: self.usage.take(),
+                });
                 self.session_ready = false;
                 self.active = false;
                 self.connection = ConnectionState::Starting;
-                self.transcript.clear();
-                self.changed_paths.clear();
                 self.title = title.map(bounded);
-                self.usage = None;
+            }
+            Event::SessionLoadFailed => {
+                if let Some(backup) = self.session_load_backup.take() {
+                    self.transcript = backup.transcript;
+                    self.changed_paths = backup.changed_paths;
+                    self.title = backup.title;
+                    self.usage = backup.usage;
+                }
+                self.session_ready = true;
+                self.active = false;
             }
             Event::SessionLoaded {
                 current_mode,
                 modes,
                 config_options,
             } => {
+                self.session_load_backup = None;
                 self.session_ready = true;
                 self.active = false;
                 self.current_mode = current_mode.map(bounded);
@@ -219,7 +243,9 @@ impl AgentState {
             Event::UserMessage(text) => {
                 self.active = true;
                 self.prompt.clear();
-                self.push(TranscriptItem::User(bounded(text)));
+                if !text.is_empty() {
+                    self.push(TranscriptItem::User(bounded(text)));
+                }
             }
             Event::AssistantDelta(text) => {
                 let text = bounded(text);

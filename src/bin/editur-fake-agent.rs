@@ -8,15 +8,15 @@ use std::{
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, Diff, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionConfigOption, SessionConfigSelectOption, SessionInfo, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields,
+    CancelNotification, ContentBlock, ContentChunk, Diff, EmbeddedResourceResource,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
+    SessionConfigSelectOption, SessionInfo, SessionListCapabilities, SessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Result, Stdio};
 
@@ -58,11 +58,13 @@ fn main() {
     }
     let mut authentication_required = false;
     let mut sessions_supported = false;
+    let mut stale_session = false;
     let mut address_file = None;
     for argument in std::env::args_os().skip(1) {
         match argument.to_str() {
             Some("--auth-required") => authentication_required = true,
             Some("--sessions") => sessions_supported = true,
+            Some("--stale-session") => stale_session = true,
             _ if address_file.is_none() => address_file = Some(argument),
             _ => {}
         }
@@ -73,7 +75,11 @@ fn main() {
             .expect("write fake marker");
         listener
     });
-    let result = async_io::block_on(run(authentication_required, sessions_supported));
+    let result = async_io::block_on(run(
+        authentication_required,
+        sessions_supported,
+        stale_session,
+    ));
     drop(listener);
     if let Err(error) = result {
         eprintln!("fake ACP agent: {error}");
@@ -115,7 +121,11 @@ fn run_windows_job_fixture() -> bool {
     }
 }
 
-async fn run(authentication_required: bool, sessions_supported: bool) -> Result<()> {
+async fn run(
+    authentication_required: bool,
+    sessions_supported: bool,
+    stale_session: bool,
+) -> Result<()> {
     let prompts = Arc::new(AtomicUsize::new(0));
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
     let boolean_config_options = Arc::new(AtomicBool::new(false));
@@ -137,15 +147,16 @@ async fn run(authentication_required: bool, sessions_supported: bool) -> Result<
                             .is_some(),
                         Ordering::Release,
                     );
+                    let mut capabilities = AgentCapabilities::new().prompt_capabilities(
+                        PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    );
                     let mut response = InitializeResponse::new(request.protocol_version);
                     if sessions_supported {
-                        response = response.agent_capabilities(
-                            AgentCapabilities::new()
-                                .load_session(true)
-                                .session_capabilities(
-                                    SessionCapabilities::new()
-                                        .list(SessionListCapabilities::new()),
-                                ),
+                        capabilities = capabilities.load_session(true).session_capabilities(
+                            SessionCapabilities::new().list(SessionListCapabilities::new()),
                         );
                     }
                     if authentication_required {
@@ -153,6 +164,7 @@ async fn run(authentication_required: bool, sessions_supported: bool) -> Result<
                             AuthMethodAgent::new("cursor_login", "Cursor Login"),
                         )]);
                     }
+                    response = response.agent_capabilities(capabilities);
                     responder.respond(response)
                 }
             },
@@ -213,14 +225,22 @@ async fn run(authentication_required: bool, sessions_supported: bool) -> Result<
                         && request.cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
                 );
                 let cwd = request.cwd.expect("validated cwd");
-                responder.respond(ListSessionsResponse::new(vec![
+                let mut sessions = vec![
                     SessionInfo::new("older-session", cwd.clone())
                         .title("Older task")
                         .updated_at("2026-08-06T12:00:00Z"),
-                    SessionInfo::new("newest-session", cwd)
+                    SessionInfo::new("newest-session", cwd.clone())
                         .title("Newest task")
                         .updated_at("2026-08-07T12:00:00Z"),
-                ]))
+                ];
+                if stale_session {
+                    sessions.push(
+                        SessionInfo::new("stale-session", cwd)
+                            .title("Missing task")
+                            .updated_at("2026-08-05T12:00:00Z"),
+                    );
+                }
+                responder.respond(ListSessionsResponse::new(sessions))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -230,6 +250,15 @@ async fn run(authentication_required: bool, sessions_supported: bool) -> Result<
                 async move |request: LoadSessionRequest,
                             responder,
                             connection: ConnectionTo<agent_client_protocol::Client>| {
+                        if stale_session && request.session_id.0.as_ref() == "stale-session" {
+                            return responder.respond_with_result(Err(
+                                agent_client_protocol::Error::invalid_params().data(
+                                    serde_json::json!({
+                                        "message": "Session stale-session not found"
+                                    }),
+                                ),
+                            ));
+                        }
                         if !sessions_supported
                             || !matches!(
                                 request.session_id.0.as_ref(),
@@ -359,6 +388,50 @@ async fn run(authentication_required: bool, sessions_supported: bool) -> Result<
                                 })?;
                             }
                             std::future::pending::<()>().await;
+                        }
+                        if prompt_text(&request) == "image" {
+                            let summary = request
+                                .prompt
+                                .iter()
+                                .find_map(|content| match content {
+                                    ContentBlock::Image(image) => {
+                                        Some(format!("{}:{}", image.mime_type, image.data.len()))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| "missing image".into());
+                            stream_text(&task_connection, &request, &summary)?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "attachments" {
+                            let summary = request
+                                .prompt
+                                .iter()
+                                .filter_map(|content| match content {
+                                    ContentBlock::Audio(audio) => {
+                                        Some(format!("audio:{}", audio.mime_type))
+                                    }
+                                    ContentBlock::Resource(resource) => match &resource.resource {
+                                        EmbeddedResourceResource::TextResourceContents(text) => {
+                                            Some(format!(
+                                                "text:{}",
+                                                text.mime_type.as_deref().unwrap_or("unknown")
+                                            ))
+                                        }
+                                        EmbeddedResourceResource::BlobResourceContents(blob) => {
+                                            Some(format!(
+                                                "blob:{}",
+                                                blob.mime_type.as_deref().unwrap_or("unknown")
+                                            ))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            stream_text(&task_connection, &request, &summary)?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                         if prompt_text(&request) == "unknown" {
                             {

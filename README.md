@@ -30,7 +30,7 @@ Update that installed binary at any time from the terminal:
 editur update
 ```
 
-Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle plus a CLI symlink; Linux and Windows install the native executable. Set `EDITUR_INSTALL_DIR` to override the default install directory.
+Both installers download from the [continuous release](https://github.com/snowdamiz/editur/releases/tag/release) and verify its SHA-256 checksum before installation. macOS installs the native `Editur.app` bundle to `~/Applications` plus a CLI symlink; Windows installs the icon-bearing native executable and adds Editur to the Start menu; Linux installs the native executable. Set `EDITUR_INSTALL_DIR` to override the CLI directory, `EDITUR_APP_DIR` to override the macOS application directory, or `EDITUR_START_MENU_DIR` to override the Windows shortcut directory.
 
 The installers also download the pinned proprietary Cursor Agent package directly from Cursor. Editur verifies the archive and every installed file, keeps it private to Editur, disables Cursor's own auto-updater, and never adds Cursor Agent to `PATH` or changes a global Cursor installation. Cursor Agent is subject to [Cursor's terms](https://cursor.com/terms-of-service).
 
@@ -51,7 +51,7 @@ On Ubuntu/Debian, install the native window headers and Vulkan loader first:
 sudo apt-get install libwayland-dev libxkbcommon-dev libvulkan1
 ```
 
-Release builds publish a `.zip` app bundle for macOS, a `.tar.gz` archive for Linux, and a `.zip` archive for Windows. Every archive includes the native platform icon. macOS release builds require a precompiled Metal shader library, while local builds fall back to runtime compilation when the optional Apple Metal toolchain is absent. Release assets carry GitHub artifact attestations.
+Release builds publish a launchable `.app` bundle for macOS, a native executable archive for Linux, and an icon-bearing `.exe` archive for Windows. CI validates the application structure before uploading each artifact. On macOS, `./dev.sh .` also launches from `target/editur-dev/Editur.app`, so local development uses the real Dock icon without any runtime icon decoding or LaunchServices delay. macOS release builds require a precompiled Metal shader library, while local builds fall back to runtime compilation when the optional Apple Metal toolchain is absent. Release assets carry GitHub artifact attestations.
 
 ## Use
 
@@ -74,7 +74,7 @@ Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F
 
 ## Cursor Agent sidebar
 
-Use the sidebar icon at the right of the titlebar to toggle the independent Cursor Agent sidebar for the current project; the Files explorer remains visible on the left and the collapsed Agent sidebar consumes no workspace. Nothing agent-related is launched, inspected, or downloaded until the sidebar is first opened. The Agent sidebar supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
+Use the sidebar icon at the right of the titlebar to toggle the independent Cursor Agent sidebar for the current project; the Files explorer remains visible on the left and the collapsed Agent sidebar consumes no workspace. Nothing agent-related is launched, inspected, or downloaded until the sidebar is first opened. The Agent sidebar supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, ACP image, audio, and resource attachments from the + button or drag and drop, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
 Official release builds embed a tested per-platform Cursor manifest. To run the same pinned Cursor Agent flow from a local source checkout, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`, then launches Editur with it embedded. A plain `cargo run` intentionally omits the manifest.
 

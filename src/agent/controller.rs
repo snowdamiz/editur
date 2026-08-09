@@ -2,8 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
-    io::Write as _,
-    path::PathBuf,
+    io::{Read as _, Write as _},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,6 +14,7 @@ use std::{
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
+use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -25,6 +26,134 @@ const MAX_CHOICES: usize = 128;
 const MAX_PLAN_ITEMS: usize = 1_024;
 const MAX_TOOL_PATHS: usize = 256;
 const MAX_HIDDEN_SESSIONS: usize = 4_096;
+pub const MAX_PROMPT_ATTACHMENTS: usize = 8;
+pub const MAX_PROMPT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_PROMPT_ATTACHMENT_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptAttachmentKind {
+    Image(&'static str),
+    Audio(&'static str),
+    File,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptAttachment {
+    path: PathBuf,
+    kind: PromptAttachmentKind,
+    byte_len: u64,
+}
+
+impl PromptAttachment {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let source = path.as_ref();
+        let path = source
+            .canonicalize()
+            .map_err(|error| format!("cannot attach {}: {error}", source.display()))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a file", path.display()));
+        }
+        if metadata.len() == 0 || metadata.len() > MAX_PROMPT_ATTACHMENT_BYTES {
+            return Err(format!(
+                "{} must be a non-empty file no larger than {} MiB",
+                path.display(),
+                MAX_PROMPT_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
+        let mut header = Vec::with_capacity(12);
+        fs::File::open(&path)
+            .and_then(|file| file.take(12).read_to_end(&mut header))
+            .map_err(|error| format!("cannot read attached file {}: {error}", path.display()))?;
+        Ok(Self {
+            path,
+            kind: attachment_kind(&header),
+            byte_len: metadata.len(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub const fn is_image(&self) -> bool {
+        matches!(self.kind, PromptAttachmentKind::Image(_))
+    }
+
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    fn read(&self) -> Result<Vec<u8>, String> {
+        let bytes = read_bounded_attachment(&self.path)?;
+        if attachment_kind(&bytes) != self.kind {
+            return Err(format!("{} changed file type", self.path.display()));
+        }
+        Ok(bytes)
+    }
+}
+
+fn read_bounded_attachment(path: &Path) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("cannot read attached file {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROMPT_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read attached file {}: {error}", path.display()))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROMPT_ATTACHMENT_BYTES {
+        return Err(format!(
+            "{} must be a non-empty file no larger than {} MiB",
+            path.display(),
+            MAX_PROMPT_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(bytes)
+}
+
+fn audio_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+    {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else {
+        None
+    }
+}
+
+fn attachment_kind(bytes: &[u8]) -> PromptAttachmentKind {
+    image_mime_type(bytes)
+        .map(PromptAttachmentKind::Image)
+        .or_else(|| audio_mime_type(bytes).map(PromptAttachmentKind::Audio))
+        .unwrap_or(PromptAttachmentKind::File)
+}
+
+#[derive(Clone, Copy)]
+struct AttachmentSupport {
+    image: bool,
+    audio: bool,
+    embedded_context: bool,
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
@@ -136,6 +265,7 @@ pub enum Event {
     SessionLoading {
         title: Option<String>,
     },
+    SessionLoadFailed,
     SessionLoaded {
         current_mode: Option<String>,
         modes: Vec<ModeChoice>,
@@ -314,6 +444,10 @@ pub enum Command {
     },
     SetRunEverything(bool),
     Prompt(String),
+    PromptWithAttachments {
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    },
     DecidePermission {
         request_id: u64,
         option_id: String,
@@ -778,6 +912,14 @@ async fn run_connection(
                     return Err(agent_client_protocol::Error::invalid_request()
                         .data("Cursor Agent does not support stable ACP v1"));
                 }
+                let attachment_support = AttachmentSupport {
+                    image: initialized.agent_capabilities.prompt_capabilities.image,
+                    audio: initialized.agent_capabilities.prompt_capabilities.audio,
+                    embedded_context: initialized
+                        .agent_capabilities
+                        .prompt_capabilities
+                        .embedded_context,
+                };
                 let auth = initialized
                     .auth_methods
                     .iter()
@@ -942,10 +1084,22 @@ async fn run_connection(
                             match load_session(&connection, &project_root, session, &events).await {
                                 Ok(loaded) => session_id = Some(loaded),
                                 Err(error) => {
-                                    send_event(
-                                        &events,
-                                        Event::Error(format!("cannot load session: {error}")),
-                                    );
+                                    send_event(&events, Event::SessionLoadFailed);
+                                    if session_not_found(&error) {
+                                        if let Err(error) = hidden_sessions.hide(id.clone()) {
+                                            send_event(&events, Event::Error(error));
+                                        }
+                                        sessions.retain(|session| session.id != id);
+                                        send_event(
+                                            &events,
+                                            Event::SessionsUpdated(sessions.clone()),
+                                        );
+                                    } else {
+                                        send_event(
+                                            &events,
+                                            Event::Error(format!("cannot load session: {error}")),
+                                        );
+                                    }
                                     send_event(
                                         &events,
                                         Event::ConnectionChanged(ConnectionState::Ready),
@@ -1006,50 +1160,26 @@ async fn run_connection(
                             auto_approve_permissions.store(enabled, Ordering::Release);
                         }
                         Command::Prompt(text) => {
-                            let Some(session) = session_id.clone() else {
-                                send_event(
-                                    &events,
-                                    Event::Error("authenticate before sending a prompt".into()),
-                                );
-                                continue;
-                            };
-                            if text.trim().is_empty() || active.swap(true, Ordering::AcqRel) {
-                                send_event(
-                                    &events,
-                                    Event::Error(
-                                        "only one non-empty prompt can run at a time".into(),
-                                    ),
-                                );
-                                continue;
-                            }
-                            send_event(&events, Event::UserMessage(text.clone()));
-                            let events_for_result = events.clone();
-                            let active_for_result = Arc::clone(&active);
-                            connection
-                                .send_request(PromptRequest::new(
-                                    session,
-                                    vec![ContentBlock::Text(TextContent::new(text))],
-                                ))
-                                .on_receiving_result(async move |result| {
-                                    active_for_result.store(false, Ordering::Release);
-                                    let cancelled = match result {
-                                        Ok(response) => {
-                                            response.stop_reason == StopReason::Cancelled
-                                        }
-                                        Err(error) => {
-                                            send_event(
-                                                &events_for_result,
-                                                Event::Error(format!("agent turn failed: {error}")),
-                                            );
-                                            false
-                                        }
-                                    };
-                                    send_event(
-                                        &events_for_result,
-                                        Event::TurnFinished { cancelled },
-                                    );
-                                    Ok(())
-                                })?;
+                            send_prompt(
+                                &connection,
+                                &events,
+                                &active,
+                                session_id.clone(),
+                                text,
+                                Vec::new(),
+                                attachment_support,
+                            )?;
+                        }
+                        Command::PromptWithAttachments { text, attachments } => {
+                            send_prompt(
+                                &connection,
+                                &events,
+                                &active,
+                                session_id.clone(),
+                                text,
+                                attachments,
+                                attachment_support,
+                            )?;
                         }
                         Command::DecidePermission {
                             request_id,
@@ -1116,6 +1246,182 @@ async fn run_connection(
         .await
 }
 
+fn send_prompt(
+    connection: &ConnectionTo<Agent>,
+    events: &EventSender,
+    active: &Arc<AtomicBool>,
+    session: Option<SessionId>,
+    text: String,
+    attachments: Vec<PromptAttachment>,
+    attachment_support: AttachmentSupport,
+) -> agent_client_protocol::Result<()> {
+    let Some(session) = session else {
+        send_event(
+            events,
+            Event::Error("authenticate before sending a prompt".into()),
+        );
+        return Ok(());
+    };
+    if (text.trim().is_empty() && attachments.is_empty()) || active.swap(true, Ordering::AcqRel) {
+        send_event(
+            events,
+            Event::Error("only one non-empty prompt can run at a time".into()),
+        );
+        return Ok(());
+    }
+    let (content, displays) = match prompt_content(&text, &attachments, attachment_support) {
+        Ok(content) => content,
+        Err(error) => {
+            active.store(false, Ordering::Release);
+            send_event(events, Event::Error(error));
+            send_event(events, Event::TurnFinished { cancelled: false });
+            return Ok(());
+        }
+    };
+    send_event(events, Event::UserMessage(text));
+    for content in displays {
+        send_event(
+            events,
+            Event::ContentReceived {
+                role: ContentRole::User,
+                content,
+            },
+        );
+    }
+    let events_for_result = events.clone();
+    let active_for_result = Arc::clone(active);
+    connection
+        .send_request(PromptRequest::new(session, content))
+        .on_receiving_result(async move |result| {
+            active_for_result.store(false, Ordering::Release);
+            let cancelled = match result {
+                Ok(response) => response.stop_reason == StopReason::Cancelled,
+                Err(error) => {
+                    send_event(
+                        &events_for_result,
+                        Event::Error(format!("agent turn failed: {error}")),
+                    );
+                    false
+                }
+            };
+            send_event(&events_for_result, Event::TurnFinished { cancelled });
+            Ok(())
+        })
+}
+
+fn prompt_content(
+    text: &str,
+    attachments: &[PromptAttachment],
+    support: AttachmentSupport,
+) -> Result<(Vec<ContentBlock>, Vec<DisplayContent>), String> {
+    if attachments.len() > MAX_PROMPT_ATTACHMENTS {
+        return Err(format!("attach at most {MAX_PROMPT_ATTACHMENTS} files"));
+    }
+    let mut content = Vec::with_capacity(attachments.len() + usize::from(!text.trim().is_empty()));
+    if !text.trim().is_empty() {
+        content.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    let mut displays = Vec::with_capacity(attachments.len());
+    let mut total = 0_u64;
+    for attachment in attachments {
+        let bytes = attachment.read()?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_PROMPT_ATTACHMENT_TOTAL_BYTES {
+            return Err(format!(
+                "attached files must total no more than {} MiB",
+                MAX_PROMPT_ATTACHMENT_TOTAL_BYTES / 1024 / 1024
+            ));
+        }
+        let byte_len = i64::try_from(bytes.len()).ok();
+        let uri = attachment_uri(&attachment.path);
+        let name = attachment
+            .path
+            .file_name()
+            .unwrap_or(attachment.path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        match attachment.kind {
+            PromptAttachmentKind::Image(mime_type) if support.image => {
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                displays.push(DisplayContent::Image {
+                    mime_type: mime_type.into(),
+                    uri: Some(uri.clone()),
+                    encoded_bytes: data.len(),
+                });
+                content.push(ContentBlock::Image(
+                    ImageContent::new(data, mime_type).uri(uri),
+                ));
+            }
+            PromptAttachmentKind::Audio(mime_type) if support.audio => {
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                displays.push(DisplayContent::Audio {
+                    mime_type: mime_type.into(),
+                    encoded_bytes: data.len(),
+                });
+                content.push(ContentBlock::Audio(AudioContent::new(data, mime_type)));
+            }
+            PromptAttachmentKind::File if support.embedded_context => {
+                let resource = if let Ok(text) = std::str::from_utf8(&bytes) {
+                    EmbeddedResourceResource::TextResourceContents(
+                        TextResourceContents::new(text, uri.clone()).mime_type("text/plain"),
+                    )
+                } else {
+                    EmbeddedResourceResource::BlobResourceContents(
+                        BlobResourceContents::new(
+                            base64::engine::general_purpose::STANDARD.encode(bytes),
+                            uri.clone(),
+                        )
+                        .mime_type("application/octet-stream"),
+                    )
+                };
+                content.push(ContentBlock::Resource(EmbeddedResource::new(resource)));
+                displays.push(DisplayContent::ResourceLink {
+                    name,
+                    title: None,
+                    uri,
+                    description: None,
+                    mime_type: None,
+                    size: byte_len,
+                });
+            }
+            kind => {
+                let mime_type = match kind {
+                    PromptAttachmentKind::Image(mime_type)
+                    | PromptAttachmentKind::Audio(mime_type) => Some(mime_type),
+                    PromptAttachmentKind::File => None,
+                };
+                let mut link = ResourceLink::new(name.clone(), uri.clone()).size(byte_len);
+                if let Some(mime_type) = mime_type {
+                    link = link.mime_type(mime_type);
+                }
+                content.push(ContentBlock::ResourceLink(link));
+                displays.push(DisplayContent::ResourceLink {
+                    name,
+                    title: None,
+                    uri,
+                    description: None,
+                    mime_type: mime_type.map(str::to_owned),
+                    size: byte_len,
+                });
+            }
+        }
+    }
+    Ok((content, displays))
+}
+
+fn attachment_uri(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file://" });
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            write!(uri, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    uri
+}
+
 async fn new_session(
     connection: &ConnectionTo<Agent>,
     project_root: &std::path::Path,
@@ -1176,6 +1482,17 @@ fn untitled_session(session_id: &SessionId) -> SessionChoice {
         title: None,
         updated_at: None,
     }
+}
+
+fn session_not_found(error: &agent_client_protocol::Error) -> bool {
+    error.code == ErrorCode::ResourceNotFound
+        || (error.code == ErrorCode::InvalidParams
+            && error.data.as_ref().is_some_and(|data| {
+                data.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| data.as_str())
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("not found"))
+            }))
 }
 
 async fn list_sessions(
@@ -2170,6 +2487,20 @@ mod tests {
                     encoded_bytes: 4,
                 },
             }
+        );
+    }
+
+    #[test]
+    fn attachment_file_uri_encodes_reserved_path_characters() {
+        #[cfg(windows)]
+        assert_eq!(
+            attachment_uri(Path::new(r"C:\Project files\notes #1.md")),
+            "file:///C:/Project%20files/notes%20%231.md"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            attachment_uri(Path::new("/tmp/Project files/notes #1.md")),
+            "file:///tmp/Project%20files/notes%20%231.md"
         );
     }
 

@@ -27,6 +27,7 @@ use crate::{
         controller::{
             AgentController, Command as AgentCommand, ConfigValue, ConnectionState, ContentRole,
             DisplayContent, Event as AgentEvent, InteractionKind, InteractionResponse,
+            MAX_PROMPT_ATTACHMENT_TOTAL_BYTES, MAX_PROMPT_ATTACHMENTS, PromptAttachment,
             QuestionAnswer, SessionChoice, ToolOutput,
         },
         state::{AgentState, TranscriptItem},
@@ -65,6 +66,7 @@ const FIND_BAR_HEIGHT: f32 = 38.0;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
+const AGENT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
 const AGENT_MENU_WIDTH: f32 = 240.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
@@ -1223,6 +1225,378 @@ struct FileTab {
     highlight_cache: HighlightCache,
 }
 
+struct AgentComposerAttachment {
+    file: PromptAttachment,
+    thumbnail: Option<egui::TextureHandle>,
+}
+
+struct AgentFilePicker {
+    directory: PathBuf,
+    entries: Vec<TreeEntry>,
+    selected: HashSet<PathBuf>,
+    query: String,
+    focus_search: bool,
+    error: Option<String>,
+}
+
+impl AgentFilePicker {
+    fn open(directory: PathBuf) -> Result<Self, String> {
+        let entries = read_directory(&directory)?;
+        Ok(Self::with_entries(directory, entries))
+    }
+
+    fn with_entries(directory: PathBuf, entries: Vec<TreeEntry>) -> Self {
+        Self {
+            directory,
+            entries,
+            selected: HashSet::new(),
+            query: String::new(),
+            focus_search: true,
+            error: None,
+        }
+    }
+
+    fn navigate(&mut self, directory: PathBuf) -> Result<(), String> {
+        let entries = match read_directory(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        self.directory = directory;
+        self.entries = entries;
+        self.query.clear();
+        self.focus_search = true;
+        self.error = None;
+        Ok(())
+    }
+
+    fn toggle(&mut self, path: PathBuf) {
+        if !self.selected.remove(&path) {
+            self.selected.insert(path);
+        }
+    }
+
+    fn visible_entries(&self) -> Vec<TreeEntry> {
+        let query = self.query.trim().to_lowercase();
+        self.entries
+            .iter()
+            .filter(|entry| {
+                query.is_empty() || entry.name.to_string_lossy().to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn load_agent_thumbnail(
+    ctx: &egui::Context,
+    attachment: &PromptAttachment,
+) -> Option<egui::TextureHandle> {
+    if !attachment.is_image() {
+        return None;
+    }
+    let mut reader = image::ImageReader::open(attachment.path())
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let pixels = reader
+        .decode()
+        .ok()?
+        .resize_to_fill(96, 96, image::imageops::FilterType::Triangle)
+        .into_rgba8();
+    Some(ctx.load_texture(
+        attachment.path().display().to_string(),
+        egui::ColorImage::from_rgba_unmultiplied([96, 96], pixels.as_raw()),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn agent_attachment_tile(
+    ui: &mut egui::Ui,
+    attachment: &AgentComposerAttachment,
+) -> egui::Response {
+    let size = egui::vec2(48.0, 48.0);
+    let response = if let Some(thumbnail) = &attachment.thumbnail {
+        ui.add(
+            egui::Image::from_texture((thumbnail.id(), size))
+                .fit_to_exact_size(size)
+                .corner_radius(7)
+                .sense(Sense::click()),
+        )
+    } else {
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        ui.painter()
+            .rect_filled(rect, 7.0, Color32::from_rgb(37, 43, 49));
+        let extension = attachment
+            .file
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| !extension.is_empty())
+            .map_or_else(|| "FILE".into(), |extension| extension.to_uppercase());
+        ui.painter().text(
+            rect.center() + egui::vec2(0.0, 1.0),
+            Align2::CENTER_CENTER,
+            extension.chars().take(5).collect::<String>(),
+            FontId::proportional(9.5),
+            Color32::from_rgb(132, 205, 220),
+        );
+        response
+    };
+    ui.painter().rect_stroke(
+        response.rect,
+        7.0,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(28)),
+        egui::StrokeKind::Inside,
+    );
+    let close = response.rect.right_top() + egui::vec2(-8.0, 8.0);
+    ui.painter()
+        .circle_filled(close, 6.5, Color32::from_black_alpha(185));
+    let stroke = egui::Stroke::new(1.2, Color32::from_rgb(225, 230, 237));
+    ui.painter().line_segment(
+        [close + egui::vec2(-2.0, -2.0), close + egui::vec2(2.0, 2.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [close + egui::vec2(-2.0, 2.0), close + egui::vec2(2.0, -2.0)],
+        stroke,
+    );
+    response.on_hover_text(format!("Remove {}", attachment.file.path().display()))
+}
+
+fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -> egui::Response {
+    let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 36.0));
+    let response = ui.interact(rect, id.with(&entry.path), Sense::click());
+    let fill = if selected {
+        Color32::from_rgb(30, 57, 66)
+    } else if response.hovered() {
+        Color32::from_rgb(29, 31, 35)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top() + 5.0),
+                egui::vec2(2.0, rect.height() - 10.0),
+            ),
+            1.0,
+            Color32::from_rgb(86, 207, 225),
+        );
+    }
+    let icon_left = rect.left() + 12.0;
+    let icon_color = if entry.is_dir {
+        Color32::from_rgb(103, 196, 208)
+    } else {
+        Color32::from_rgb(105, 114, 130)
+    };
+    if entry.is_dir {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(icon_left, rect.center().y - 4.0),
+                egui::vec2(13.0, 9.0),
+            ),
+            1.5,
+            icon_color,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(icon_left + 1.0, rect.center().y - 6.0),
+                egui::vec2(6.0, 3.0),
+            ),
+            1.0,
+            icon_color,
+        );
+    } else {
+        ui.painter().rect_stroke(
+            egui::Rect::from_center_size(
+                egui::pos2(icon_left + 6.0, rect.center().y),
+                egui::vec2(10.0, 14.0),
+            ),
+            1.0,
+            egui::Stroke::new(1.0, icon_color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let metadata = if entry.is_dir {
+        "Folder".to_owned()
+    } else {
+        entry
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| !extension.is_empty())
+            .map_or_else(|| "File".to_owned(), |extension| extension.to_uppercase())
+    };
+    let trailing = if selected && !entry.is_dir {
+        112.0
+    } else {
+        86.0
+    };
+    ui.painter()
+        .with_clip_rect(rect.with_max_x(rect.right() - trailing))
+        .text(
+            egui::pos2(icon_left + 20.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            entry.name.to_string_lossy(),
+            FontId::proportional(13.0),
+            Color32::from_rgb(211, 216, 226),
+        );
+    let metadata_right = rect.right() - if entry.is_dir || selected { 36.0 } else { 12.0 };
+    ui.painter().text(
+        egui::pos2(metadata_right, rect.center().y),
+        Align2::RIGHT_CENTER,
+        metadata,
+        FontId::proportional(10.5),
+        Color32::from_rgb(111, 121, 137),
+    );
+    if entry.is_dir {
+        let center = egui::pos2(rect.right() - 14.0, rect.center().y);
+        let stroke = egui::Stroke::new(1.1, Color32::from_rgb(128, 139, 155));
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-2.0, -3.5),
+                center + egui::vec2(1.5, 0.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(1.5, 0.0),
+                center + egui::vec2(-2.0, 3.5),
+            ],
+            stroke,
+        );
+    } else if selected {
+        let center = egui::pos2(rect.right() - 16.0, rect.center().y);
+        ui.painter()
+            .circle_filled(center, 8.0, Color32::from_rgb(86, 207, 225));
+        let stroke = egui::Stroke::new(1.4, Color32::from_rgb(15, 43, 49));
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-3.5, 0.0),
+                center + egui::vec2(-1.0, 2.5),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-1.0, 2.5),
+                center + egui::vec2(4.0, -3.0),
+            ],
+            stroke,
+        );
+    }
+    response.on_hover_text(entry.path.display().to_string())
+}
+
+fn agent_file_picker_location_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            5.0,
+            if selected {
+                Color32::from_rgb(29, 53, 61)
+            } else {
+                Color32::from_rgb(29, 30, 34)
+            },
+        );
+    }
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top() + 8.0),
+                egui::vec2(2.0, rect.height() - 16.0),
+            ),
+            1.0,
+            Color32::from_rgb(86, 207, 225),
+        );
+    }
+    let folder = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 12.0, rect.center().y - 4.0),
+        egui::vec2(13.0, 9.0),
+    );
+    let icon_color = if selected {
+        Color32::from_rgb(103, 211, 226)
+    } else {
+        Color32::from_rgb(117, 128, 144)
+    };
+    ui.painter().rect_stroke(
+        folder,
+        1.5,
+        egui::Stroke::new(1.2, icon_color),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(folder.left() + 1.5, folder.top()),
+            egui::pos2(folder.left() + 4.5, folder.top() - 2.5),
+        ],
+        egui::Stroke::new(1.2, icon_color),
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.5),
+        if selected {
+            Color32::from_rgb(224, 231, 237)
+        } else {
+            Color32::from_rgb(174, 181, 194)
+        },
+    );
+    response
+}
+
+fn agent_file_picker_icon_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 5.0, Color32::from_white_alpha(12));
+    }
+    paint(
+        ui.painter(),
+        rect,
+        if !ui.is_enabled() {
+            Color32::from_rgb(77, 84, 96)
+        } else if response.hovered() {
+            Color32::from_rgb(220, 225, 234)
+        } else {
+            Color32::from_rgb(146, 155, 171)
+        },
+    );
+    response.on_hover_text(label)
+}
+
 impl FileTab {
     fn new(buffer: Buffer) -> Self {
         Self {
@@ -1270,6 +1644,9 @@ pub struct EditorApp {
     agent_follow_transcript: bool,
     agent_prompt_history_index: Option<usize>,
     agent_prompt_history_draft: String,
+    agent_attachments: Vec<AgentComposerAttachment>,
+    agent_drop_hovered: bool,
+    agent_file_picker: Option<AgentFilePicker>,
     agent_run_everything: Option<bool>,
     scrollbar_activity: crate::scrollbar::Activity,
     agent: AgentState,
@@ -1339,6 +1716,9 @@ impl EditorApp {
             agent_follow_transcript: true,
             agent_prompt_history_index: None,
             agent_prompt_history_draft: String::new(),
+            agent_attachments: Vec::new(),
+            agent_drop_hovered: false,
+            agent_file_picker: None,
             agent_run_everything: None,
             scrollbar_activity: crate::scrollbar::Activity::default(),
             agent: AgentState::default(),
@@ -2321,6 +2701,7 @@ impl EditorApp {
         self.agentic_mode = enabled;
         self.agent_menu = None;
         self.agent_menu_popup = None;
+        self.agent_file_picker = None;
         if enabled {
             if let Some(controller) = &self.agent_controller {
                 let _ = controller.send(AgentCommand::RefreshSessions);
@@ -2600,11 +2981,16 @@ impl EditorApp {
         for event in events {
             if matches!(
                 event,
-                AgentEvent::SessionReady { .. } | AgentEvent::SessionLoading { .. }
+                AgentEvent::SessionReady { .. } | AgentEvent::SessionLoaded { .. }
             ) {
                 self.agent_follow_transcript = true;
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
+                self.agent_attachments.clear();
+                self.agent_file_picker = None;
+            }
+            if matches!(event, AgentEvent::UserMessage(_)) {
+                self.agent_attachments.clear();
             }
             if let AgentEvent::CommandsUpdated(commands) = &event
                 && let Some(enabled) = run_everything_state(commands)
@@ -2725,11 +3111,21 @@ impl EditorApp {
             return;
         };
         let prompt = self.agent.prompt.trim().to_owned();
-        if prompt.is_empty() || self.agent.active || !self.agent.session_ready {
+        if (prompt.is_empty() && self.agent_attachments.is_empty())
+            || self.agent.active
+            || !self.agent.session_ready
+        {
             return;
         }
         self.agent.active = true;
-        match controller.send(AgentCommand::Prompt(prompt)) {
+        match controller.send(AgentCommand::PromptWithAttachments {
+            text: prompt,
+            attachments: self
+                .agent_attachments
+                .iter()
+                .map(|attachment| attachment.file.clone())
+                .collect(),
+        }) {
             Ok(()) => {
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
@@ -2738,6 +3134,67 @@ impl EditorApp {
                 self.agent.active = false;
                 self.show_error(error);
             }
+        }
+    }
+
+    fn attach_agent_files(
+        &mut self,
+        ctx: &egui::Context,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) {
+        for path in paths {
+            if self.agent_attachments.len() >= MAX_PROMPT_ATTACHMENTS {
+                self.show_error(format!("attach at most {MAX_PROMPT_ATTACHMENTS} files"));
+                break;
+            }
+            let attachment = match PromptAttachment::from_path(path) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    self.show_error(error);
+                    continue;
+                }
+            };
+            if self
+                .agent_attachments
+                .iter()
+                .any(|attached| attached.file.path() == attachment.path())
+            {
+                continue;
+            }
+            let total = self
+                .agent_attachments
+                .iter()
+                .map(|attached| attached.file.byte_len())
+                .sum::<u64>()
+                .saturating_add(attachment.byte_len());
+            if total > MAX_PROMPT_ATTACHMENT_TOTAL_BYTES {
+                self.show_error(format!(
+                    "attached files must total no more than {} MiB",
+                    MAX_PROMPT_ATTACHMENT_TOTAL_BYTES / 1024 / 1024
+                ));
+                break;
+            }
+            let thumbnail = load_agent_thumbnail(ctx, &attachment);
+            self.agent_attachments.push(AgentComposerAttachment {
+                file: attachment,
+                thumbnail,
+            });
+        }
+    }
+
+    fn open_agent_file_picker(&mut self) {
+        let directory = self.tree.root.clone();
+        let picker = self
+            .tree
+            .children
+            .get(&directory)
+            .cloned()
+            .map(|entries| AgentFilePicker::with_entries(directory.clone(), entries))
+            .map(Ok)
+            .unwrap_or_else(|| AgentFilePicker::open(directory));
+        match picker {
+            Ok(picker) => self.agent_file_picker = Some(picker),
+            Err(error) => self.show_error(error),
         }
     }
 
@@ -2813,9 +3270,16 @@ impl EditorApp {
                 .y;
             (text_height, row_height)
         });
-        let composer_height = agent_composer_height(text_height, row_height, rect.height());
+        let attachment_height = if self.agent_attachments.is_empty() {
+            0.0
+        } else {
+            AGENT_ATTACHMENT_ROW_HEIGHT
+        };
+        let composer_height = (agent_composer_height(text_height, row_height, rect.height())
+            + attachment_height)
+            .min(AGENT_COMPOSER_MAX_HEIGHT + attachment_height);
         let composer_height = if self.agentic_mode {
-            (composer_height + 20.0).min(AGENT_COMPOSER_MAX_HEIGHT)
+            (composer_height + 20.0).min(AGENT_COMPOSER_MAX_HEIGHT + attachment_height)
         } else {
             composer_height
         };
@@ -2875,6 +3339,7 @@ impl EditorApp {
             self.agent_sidebar = false;
             self.agent_sidebar_dragging = false;
             self.agent_menu = None;
+            self.agent_file_picker = None;
             ui.ctx().request_repaint();
         }
         if !self.agentic_mode && self.agent.session_ready {
@@ -3830,6 +4295,7 @@ impl EditorApp {
 
         let mut send = false;
         let mut cancel = false;
+        let mut open_file_picker = false;
         let mut submit_shortcut = false;
         let mut prompt_changed = false;
         let mut history_navigated = false;
@@ -3881,6 +4347,33 @@ impl EditorApp {
             composer
         };
         let composer_content = agent_composer_content(composer_panel);
+        let (hovered_files, dropped_files, pointer) = ui.input(|input| {
+            (
+                !input.raw.hovered_files.is_empty(),
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+                input.pointer.hover_pos(),
+            )
+        });
+        let pointer_over_composer = pointer.is_some_and(|pointer| composer_panel.contains(pointer));
+        if hovered_files {
+            self.agent_drop_hovered = composer_enabled && pointer_over_composer;
+        }
+        if !dropped_files.is_empty() {
+            let dropped_over_composer =
+                composer_enabled && (pointer_over_composer || self.agent_drop_hovered);
+            self.agent_drop_hovered = false;
+            if dropped_over_composer {
+                self.attach_agent_files(ui.ctx(), dropped_files);
+                ui.ctx().request_repaint();
+            }
+        } else if !hovered_files {
+            self.agent_drop_hovered = false;
+        }
         let activity_height = if self.agent.active { 22.0 } else { 0.0 };
         if self.agent.active {
             let activity = composer_content.with_max_y(composer_content.top() + activity_height);
@@ -3904,6 +4397,50 @@ impl EditorApp {
                 },
             );
         }
+        let attachment_height = if self.agent_attachments.is_empty() {
+            0.0
+        } else {
+            AGENT_ATTACHMENT_ROW_HEIGHT
+        };
+        if attachment_height > 0.0 {
+            let attachments = egui::Rect::from_min_max(
+                egui::pos2(
+                    composer_content.left(),
+                    composer_content.top() + activity_height,
+                ),
+                egui::pos2(
+                    composer_content.right(),
+                    composer_content.top() + activity_height + attachment_height,
+                ),
+            );
+            let mut remove = None;
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("agent_attachments")
+                    .max_rect(attachments)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ScrollArea::horizontal()
+                        .id_salt("agent_attachment_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (index, attachment) in self.agent_attachments.iter().enumerate()
+                                {
+                                    if agent_attachment_tile(ui, attachment).clicked() {
+                                        remove = Some(index);
+                                    }
+                                }
+                            });
+                        });
+                },
+            );
+            if let Some(index) = remove {
+                self.agent_attachments.remove(index);
+                ui.ctx().request_repaint();
+            }
+        }
         let footer = egui::Rect::from_min_max(
             egui::pos2(composer_content.left(), composer_content.bottom() - 30.0),
             composer_content.right_bottom(),
@@ -3911,7 +4448,7 @@ impl EditorApp {
         let input_rect = egui::Rect::from_min_max(
             egui::pos2(
                 composer_content.left(),
-                composer_content.top() + activity_height,
+                composer_content.top() + activity_height + attachment_height,
             ),
             egui::pos2(composer_content.right(), footer.top() - 4.0),
         );
@@ -4023,7 +4560,22 @@ impl EditorApp {
                 .max_rect(footer)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let attach = ui
+                    .add_enabled(
+                        composer_enabled,
+                        egui::Button::new(
+                            RichText::new("+")
+                                .size(20.0)
+                                .color(Color32::from_rgb(166, 178, 194)),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(6)
+                        .min_size(egui::vec2(40.0, 30.0)),
+                    )
+                    .on_hover_text("Attach files");
+                open_file_picker = attach.clicked();
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     let run_everything = self
                         .agent_run_everything
@@ -4143,8 +4695,9 @@ impl EditorApp {
                         );
                         cancel = response.clicked();
                     } else {
-                        let ready =
-                            self.agent.session_ready && !self.agent.prompt.trim().is_empty();
+                        let ready = self.agent.session_ready
+                            && (!self.agent.prompt.trim().is_empty()
+                                || !self.agent_attachments.is_empty());
                         let (fill, color) = agent_send_button_colors(ready);
                         let response = ui
                             .add_enabled(
@@ -4183,6 +4736,27 @@ impl EditorApp {
                 });
             },
         );
+        if self.agent_drop_hovered {
+            let radius = if self.agentic_mode { 14.0 } else { 0.0 };
+            ui.painter().rect_filled(
+                composer_panel,
+                radius,
+                Color32::from_rgba_unmultiplied(32, 74, 84, 236),
+            );
+            ui.painter().rect_stroke(
+                composer_panel.shrink(1.0),
+                radius,
+                egui::Stroke::new(1.5, Color32::from_rgb(91, 196, 216)),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                composer_panel.center(),
+                Align2::CENTER_CENTER,
+                "Drop files to attach",
+                FontId::proportional(14.0),
+                Color32::from_rgb(226, 241, 244),
+            );
+        }
 
         let mut menu_popup = None;
         if let (Some(menu), Some(anchor)) = (open_menu.as_ref(), menu_anchor) {
@@ -4481,6 +5055,11 @@ impl EditorApp {
         }
         self.agent_menu_popup = menu_popup;
         self.agent_menu = open_menu;
+
+        if open_file_picker {
+            self.open_agent_file_picker();
+            ui.ctx().request_repaint();
+        }
 
         for (request_id, option_id) in permission_decisions {
             if self.agent.decide_permission(request_id, &option_id)
@@ -5102,7 +5681,438 @@ impl EditorApp {
         }
     }
 
+    fn draw_agent_file_picker(&mut self, ctx: &egui::Context) {
+        let Some(picker) = self.agent_file_picker.as_mut() else {
+            return;
+        };
+        let project_root = self.tree.root.clone();
+        let home =
+            directories::UserDirs::new().map(|directories| directories.home_dir().to_path_buf());
+        let attached_count = self.agent_attachments.len();
+        let screen = ctx.content_rect();
+        let size = egui::vec2(
+            (screen.width() - 32.0).clamp(460.0, 640.0),
+            (screen.height() - 32.0).clamp(288.0, 480.0),
+        );
+        let position = screen.center() - size * 0.5;
+        let mut close = ctx.input(|input| input.key_pressed(Key::Escape));
+        let mut attach =
+            ctx.input(|input| input.key_pressed(Key::Enter)) && !picker.selected.is_empty();
+        let mut navigate = None;
+        let mut refresh = false;
+        let remaining = MAX_PROMPT_ATTACHMENTS
+            .saturating_sub(attached_count.saturating_add(picker.selected.len()));
+        let frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
+            .fill(Color32::from_rgb(24, 25, 29))
+            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(24)))
+            .inner_margin(0)
+            .corner_radius(12)
+            .shadow(egui::Shadow {
+                offset: [0, 10],
+                blur: 32,
+                spread: 2,
+                color: Color32::from_black_alpha(170),
+            });
+        egui::Window::new("Add context")
+            .id(Id::new("agent_file_picker"))
+            .fixed_pos(position)
+            .title_bar(false)
+            .fade_in(false)
+            .fixed_size(size)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_min_size(ui.available_size());
+                let full = ui.available_rect_before_wrap();
+                let header = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), 56.0));
+                let footer = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), full.bottom() - 56.0),
+                    full.right_bottom(),
+                );
+                let body = egui::Rect::from_min_max(header.left_bottom(), footer.right_top());
+                let rail_width = 128.0_f32.min(body.width() * 0.3);
+                let rail =
+                    egui::Rect::from_min_size(body.min, egui::vec2(rail_width, body.height()));
+                let content = egui::Rect::from_min_max(rail.right_top(), body.right_bottom());
+                let divider = egui::Stroke::new(1.0, Color32::from_white_alpha(18));
+
+                ui.painter()
+                    .rect_filled(rail, 0.0, Color32::from_rgb(21, 22, 25));
+                ui.painter()
+                    .rect_filled(footer, 0.0, Color32::from_rgb(22, 23, 27));
+                ui.painter()
+                    .hline(header.x_range(), header.bottom(), divider);
+                ui.painter().vline(rail.right(), rail.y_range(), divider);
+                ui.painter().hline(footer.x_range(), footer.top(), divider);
+
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(header.shrink2(egui::vec2(16.0, 8.0)))
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.label(
+                            RichText::new("Add context")
+                                .size(15.5)
+                                .strong()
+                                .color(Color32::from_rgb(231, 234, 240)),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            close |= agent_file_picker_icon_button(
+                                ui,
+                                "Close (Esc)",
+                                |painter, rect, color| {
+                                    let stroke = egui::Stroke::new(1.4, color);
+                                    painter.line_segment(
+                                        [
+                                            rect.center() + egui::vec2(-3.5, -3.5),
+                                            rect.center() + egui::vec2(3.5, 3.5),
+                                        ],
+                                        stroke,
+                                    );
+                                    painter.line_segment(
+                                        [
+                                            rect.center() + egui::vec2(-3.5, 3.5),
+                                            rect.center() + egui::vec2(3.5, -3.5),
+                                        ],
+                                        stroke,
+                                    );
+                                },
+                            )
+                            .clicked();
+                        });
+                    },
+                );
+
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(rail.shrink2(egui::vec2(12.0, 12.0)))
+                        .layout(Layout::top_down(Align::LEFT)),
+                    |ui| {
+                        ui.label(
+                            RichText::new("LOCATIONS")
+                                .size(9.5)
+                                .strong()
+                                .color(Color32::from_rgb(102, 111, 126)),
+                        );
+                        ui.add_space(8.0);
+                        if agent_file_picker_location_row(
+                            ui,
+                            "Project",
+                            picker.directory.starts_with(&project_root),
+                        )
+                        .clicked()
+                        {
+                            navigate = Some(project_root.clone());
+                        }
+                        if let Some(home) = &home
+                            && agent_file_picker_location_row(
+                                ui,
+                                "Home",
+                                picker.directory.starts_with(home)
+                                    && !picker.directory.starts_with(&project_root),
+                            )
+                            .clicked()
+                        {
+                            navigate = Some(home.clone());
+                        }
+                    },
+                );
+
+                let toolbar =
+                    egui::Rect::from_min_size(content.min, egui::vec2(content.width(), 52.0));
+                let columns = egui::Rect::from_min_size(
+                    toolbar.left_bottom(),
+                    egui::vec2(content.width(), 26.0),
+                );
+                let list_rect =
+                    egui::Rect::from_min_max(columns.left_bottom(), content.right_bottom());
+                ui.painter()
+                    .hline(toolbar.x_range(), toolbar.bottom(), divider);
+                ui.painter()
+                    .rect_filled(columns, 0.0, Color32::from_rgb(22, 23, 27));
+                ui.painter()
+                    .hline(columns.x_range(), columns.bottom(), divider);
+
+                let up_rect = egui::Rect::from_min_size(
+                    toolbar.min + egui::vec2(6.0, 6.0),
+                    egui::vec2(40.0, 40.0),
+                );
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(up_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add_enabled_ui(picker.directory.parent().is_some(), |ui| {
+                            if agent_file_picker_icon_button(
+                                ui,
+                                "Parent folder",
+                                |painter, rect, color| {
+                                    let center = rect.center();
+                                    let stroke = egui::Stroke::new(1.4, color);
+                                    painter.line_segment(
+                                        [
+                                            center + egui::vec2(-4.0, 1.5),
+                                            center + egui::vec2(0.0, -2.5),
+                                        ],
+                                        stroke,
+                                    );
+                                    painter.line_segment(
+                                        [
+                                            center + egui::vec2(0.0, -2.5),
+                                            center + egui::vec2(4.0, 1.5),
+                                        ],
+                                        stroke,
+                                    );
+                                    painter.vline(
+                                        center.x,
+                                        (center.y - 2.0)..=(center.y + 5.0),
+                                        stroke,
+                                    );
+                                },
+                            )
+                            .clicked()
+                            {
+                                navigate = picker.directory.parent().map(Path::to_path_buf);
+                            }
+                        });
+                    },
+                );
+
+                let refresh_rect = egui::Rect::from_min_size(
+                    egui::pos2(toolbar.right() - 46.0, toolbar.top() + 6.0),
+                    egui::vec2(40.0, 40.0),
+                );
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(refresh_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        refresh |= agent_file_picker_icon_button(
+                            ui,
+                            "Refresh folder",
+                            |painter, rect, color| {
+                                let center = rect.center();
+                                let stroke = egui::Stroke::new(1.3, color);
+                                painter.circle_stroke(center, 6.0, stroke);
+                                painter.line_segment(
+                                    [
+                                        center + egui::vec2(3.0, -6.0),
+                                        center + egui::vec2(6.5, -6.0),
+                                    ],
+                                    stroke,
+                                );
+                                painter.line_segment(
+                                    [
+                                        center + egui::vec2(6.5, -6.0),
+                                        center + egui::vec2(6.5, -2.5),
+                                    ],
+                                    stroke,
+                                );
+                            },
+                        )
+                        .clicked();
+                    },
+                );
+
+                let search_width = (content.width() * 0.36).clamp(120.0, 190.0);
+                let search_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        refresh_rect.left() - search_width - 6.0,
+                        toolbar.top() + 10.0,
+                    ),
+                    egui::pos2(refresh_rect.left() - 6.0, toolbar.bottom() - 10.0),
+                );
+                ui.painter()
+                    .rect_filled(search_rect, 5.0, Color32::from_rgb(19, 20, 23));
+                let search_response = ui
+                    .scope_builder(
+                        UiBuilder::new()
+                            .max_rect(search_rect.shrink2(egui::vec2(9.0, 4.0)))
+                            .layout(Layout::left_to_right(Align::Center)),
+                        |ui| {
+                            ui.add_sized(
+                                ui.available_size(),
+                                TextEdit::singleline(&mut picker.query)
+                                    .id(Id::new("agent_file_picker_search"))
+                                    .hint_text("Filter files")
+                                    .font(FontId::proportional(12.0))
+                                    .frame(egui::Frame::NONE),
+                            )
+                        },
+                    )
+                    .inner;
+                ui.painter().rect_stroke(
+                    search_rect,
+                    5.0,
+                    egui::Stroke::new(
+                        1.0,
+                        if search_response.has_focus() {
+                            Color32::from_rgb(83, 164, 178)
+                        } else {
+                            Color32::from_white_alpha(18)
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                if picker.focus_search {
+                    search_response.request_focus();
+                    picker.focus_search = false;
+                }
+
+                let folder_rect = egui::Rect::from_min_max(
+                    egui::pos2(up_rect.right() + 8.0, toolbar.top()),
+                    egui::pos2(search_rect.left() - 8.0, toolbar.bottom()),
+                );
+                let folder_name = picker
+                    .directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map_or_else(|| picker.directory.display().to_string(), str::to_owned);
+                ui.painter().with_clip_rect(folder_rect).text(
+                    folder_rect.left_center(),
+                    Align2::LEFT_CENTER,
+                    folder_name,
+                    FontId::proportional(12.5),
+                    Color32::from_rgb(201, 207, 218),
+                );
+
+                ui.painter().text(
+                    egui::pos2(columns.left() + 14.0, columns.center().y),
+                    Align2::LEFT_CENTER,
+                    "NAME",
+                    FontId::proportional(9.5),
+                    Color32::from_rgb(102, 111, 126),
+                );
+                ui.painter().text(
+                    egui::pos2(columns.right() - 14.0, columns.center().y),
+                    Align2::RIGHT_CENTER,
+                    "TYPE",
+                    FontId::proportional(9.5),
+                    Color32::from_rgb(102, 111, 126),
+                );
+
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(list_rect)
+                        .layout(Layout::top_down(Align::LEFT)),
+                    |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("agent_file_picker_entries")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let entries = picker.visible_entries();
+                                if entries.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            RichText::new(if picker.query.trim().is_empty() {
+                                                "This folder is empty"
+                                            } else {
+                                                "No matching files"
+                                            })
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(117, 126, 141)),
+                                        );
+                                    });
+                                }
+                                for entry in entries {
+                                    let selected = picker.selected.contains(&entry.path);
+                                    if agent_file_picker_row(ui, &entry, selected).clicked() {
+                                        if entry.is_dir {
+                                            navigate = Some(entry.path);
+                                        } else if selected
+                                            || picker.selected.len() + attached_count
+                                                < MAX_PROMPT_ATTACHMENTS
+                                        {
+                                            picker.toggle(entry.path);
+                                        } else {
+                                            picker.error = Some(format!(
+                                                "Attach at most {MAX_PROMPT_ATTACHMENTS} files"
+                                            ));
+                                        }
+                                    }
+                                }
+                            });
+                    },
+                );
+
+                let status = picker.error.clone().unwrap_or_else(|| {
+                    format!(
+                        "{} selected  ·  {remaining} available",
+                        picker.selected.len()
+                    )
+                });
+                ui.painter().text(
+                    egui::pos2(footer.left() + 16.0, footer.center().y),
+                    Align2::LEFT_CENTER,
+                    status,
+                    FontId::proportional(11.5),
+                    if picker.error.is_some() {
+                        Color32::from_rgb(244, 139, 145)
+                    } else {
+                        Color32::from_rgb(125, 134, 149)
+                    },
+                );
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .max_rect(footer.shrink2(egui::vec2(12.0, 8.0)))
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        let label = match picker.selected.len() {
+                            1 => "Add 1 file".to_owned(),
+                            count => format!("Add {count} files"),
+                        };
+                        attach |= ui
+                            .add_enabled(
+                                !picker.selected.is_empty(),
+                                egui::Button::new(
+                                    RichText::new(label)
+                                        .strong()
+                                        .color(Color32::from_rgb(9, 28, 32)),
+                                )
+                                .fill(Color32::from_rgb(94, 210, 224))
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(6)
+                                .min_size(egui::vec2(104.0, 40.0)),
+                            )
+                            .clicked();
+                        close |= ui
+                            .add(
+                                egui::Button::new("Cancel")
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(6)
+                                    .min_size(egui::vec2(70.0, 40.0)),
+                            )
+                            .clicked();
+                    },
+                );
+            });
+
+        if let Some(directory) = navigate {
+            let _ = picker.navigate(directory);
+        } else if refresh {
+            let _ = picker.navigate(picker.directory.clone());
+        }
+        let paths = attach.then(|| {
+            let mut paths = picker.selected.iter().cloned().collect::<Vec<_>>();
+            paths.sort();
+            paths
+        });
+        if close || paths.is_some() {
+            self.agent_file_picker = None;
+        }
+        if let Some(paths) = paths {
+            self.attach_agent_files(ctx, paths);
+            ctx.request_repaint();
+        }
+    }
+
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        self.draw_agent_file_picker(ctx);
         if self.pending_agent_prompt {
             let mut save_and_run = false;
             let mut cancel = false;
@@ -6670,16 +7680,16 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, EDITOR_BACKGROUND, EditorApp, PendingAction,
-        RESIZE_SETTLE_DELAY, TAB_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TreeState,
-        agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
-        agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
-        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
-        agent_transcript_fade_mesh, agentic_new_session_button, build_agent_diff,
-        cached_agent_diff, defer_resize, disable_transient_egui_debug_overlays,
-        draw_sidebar_toggle_icon, find_highlighted_job, install_repaint_wake,
-        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
-        next_find_match, plain_text_job, presentation_job, repaint_deadline,
+        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, EDITOR_BACKGROUND,
+        EditorApp, PendingAction, RESIZE_SETTLE_DELAY, TAB_WIDTH, TITLEBAR_HEIGHT,
+        TITLEBAR_PAINT_KEY, TreeState, agent_collapsing_header, agent_composer_content,
+        agent_composer_height, agent_diff_preview, agent_markdown_galley, agent_menu_rect,
+        agent_near_bottom, agent_new_session_rect, agent_selector_button, agent_send_button_colors,
+        agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh,
+        agentic_new_session_button, build_agent_diff, cached_agent_diff, defer_resize,
+        disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
+        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
+        model_display_name, next_find_match, plain_text_job, presentation_job, repaint_deadline,
         repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
         search_selection_after_navigation, skip_transition_render, slash_command_query,
         split_agent_sidebar, split_agentic_workspace, split_editor_column, split_workspace,
@@ -6694,8 +7704,8 @@ mod tests {
         file_io::OpenTarget,
     };
     use egui::{
-        Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput,
-        Rect, TouchPhase, Vec2, epaint::Shape, pos2,
+        Color32, CursorIcon, DroppedFile, Event, HoveredFile, Id, Key, Modifiers, MouseWheelUnit,
+        PointerButton, RawInput, Rect, TouchPhase, Vec2, epaint::Shape, pos2,
     };
     use std::{
         fs,
@@ -7896,6 +8906,271 @@ mod tests {
         assert_eq!(agent_composer_height(28.0, 14.0, 700.0), 108.0);
         assert_eq!(agent_composer_height(84.0, 14.0, 700.0), 150.0);
         assert_eq!(agent_composer_height(1_400.0, 14.0, 700.0), 240.0);
+    }
+
+    #[test]
+    fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("reference.png");
+        fs::write(&image, include_bytes!("../assets/icons/editur.png")).unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let pointer = pos2(800.0, 650.0);
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(pointer)],
+                hovered_files: vec![HoveredFile {
+                    path: Some(image.clone()),
+                    ..HoveredFile::default()
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(pointer)],
+                dropped_files: vec![DroppedFile {
+                    path: Some(image),
+                    ..DroppedFile::default()
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn contains_filename(shape: &Shape) -> bool {
+            match shape {
+                Shape::Text(text) => {
+                    text.galley.text().contains("reference.png")
+                        && text.pos.x > 560.0
+                        && text.pos.y > 520.0
+                }
+                Shape::Vec(shapes) => shapes.iter().any(contains_filename),
+                _ => false,
+            }
+        }
+        fn contains_thumbnail(shape: &Shape) -> bool {
+            fn is_thumbnail(bounds: Rect) -> bool {
+                bounds.left() > 560.0
+                    && bounds.top() > 520.0
+                    && (40.0..=56.0).contains(&bounds.width())
+                    && (40.0..=56.0).contains(&bounds.height())
+            }
+            match shape {
+                Shape::Rect(rect) if rect.brush.is_some() => is_thumbnail(rect.rect),
+                Shape::Mesh(mesh) if !mesh.vertices.is_empty() => {
+                    let bounds = mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                        bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                    });
+                    is_thumbnail(bounds)
+                }
+                Shape::Vec(shapes) => shapes.iter().any(contains_thumbnail),
+                _ => false,
+            }
+        }
+
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| contains_filename(&shape.shape)),
+            "image attachments should not render a filename badge"
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_thumbnail(&shape.shape)),
+            "the dropped image should render as a small thumbnail"
+        );
+    }
+
+    #[test]
+    fn image_picker_button_is_visible_in_both_agent_composers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent_sidebar = true;
+        let context = egui::Context::default();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        };
+        let sidebar = context.run_ui(input(), |root| app.ui(root));
+        app.agent_sidebar = false;
+        app.agentic_mode = true;
+        let agentic = context.run_ui(input(), |root| app.ui(root));
+        fn has_plus(shape: &Shape) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == "+",
+                Shape::Vec(shapes) => shapes.iter().any(has_plus),
+                _ => false,
+            }
+        }
+
+        assert!(
+            [sidebar, agentic]
+                .iter()
+                .all(|output| output.shapes.iter().any(|shape| has_plus(&shape.shape)))
+        );
+    }
+
+    #[test]
+    fn custom_file_picker_loads_one_directory_at_a_time_and_preserves_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let child = root.join("child");
+        fs::create_dir(&child).unwrap();
+        let root_file = root.join("root.txt");
+        let nested_file = child.join("nested.txt");
+        fs::write(&root_file, "root").unwrap();
+        fs::write(&nested_file, "nested").unwrap();
+
+        let mut picker = AgentFilePicker::open(root.clone()).unwrap();
+        assert_eq!(
+            picker
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            [child.clone(), root_file.clone()]
+        );
+        picker.toggle(root_file.clone());
+        picker.navigate(child).unwrap();
+
+        assert_eq!(picker.entries[0].path, nested_file);
+        assert!(picker.selected.contains(&root_file));
+    }
+
+    #[test]
+    fn custom_file_picker_filters_the_current_folder_case_insensitively() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join("Reference.PNG"), "image").unwrap();
+        fs::write(root.join("notes.txt"), "notes").unwrap();
+        let mut picker = AgentFilePicker::open(root).unwrap();
+
+        picker.query = "png".into();
+
+        assert_eq!(
+            picker
+                .visible_entries()
+                .iter()
+                .map(|entry| entry.name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["Reference.PNG"]
+        );
+    }
+
+    #[test]
+    fn custom_file_picker_renders_project_files_without_a_native_dialog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("reference.png"), "image").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.open_agent_file_picker();
+        let context = egui::Context::default();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        assert!(
+            context
+                .read_response(Id::new("agent_file_picker"))
+                .is_some()
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "reference.png"))
+        );
+    }
+
+    #[test]
+    fn custom_file_picker_stays_fixed_while_the_pointer_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+        fs::write(root.join("reference.png"), "image").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.open_agent_file_picker();
+        let context = egui::Context::default();
+        let mut positions = Vec::new();
+
+        for pointer in [pos2(500.0, 350.0), pos2(650.0, 300.0), pos2(400.0, 240.0)] {
+            let mut input = RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            };
+            input.events.push(Event::PointerMoved(pointer));
+            let _ = context.run_ui(input, |root| app.ui(root));
+            positions.push(
+                context
+                    .read_response(Id::new("agent_file_picker"))
+                    .unwrap()
+                    .rect,
+            );
+        }
+
+        assert!(
+            positions.windows(2).all(|pair| pair[0] == pair[1]),
+            "picker moved between pointer repaints: {positions:?}"
+        );
+        assert_eq!(
+            positions[0],
+            Rect::from_min_size(pos2(180.0, 110.0), Vec2::new(640.0, 480.0))
+        );
     }
 
     #[test]

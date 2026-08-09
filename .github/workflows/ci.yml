@@ -128,6 +128,33 @@ jobs:
           if ((Get-Content -LiteralPath "dist/${{ matrix.update_asset }}.sha256" -Raw) -ne $hash) {
             throw "Windows updater checksum was not written correctly"
           }
+      - name: Verify native application package
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            test -x dist/package/Editur.app/Contents/MacOS/editur
+            test -s dist/package/Editur.app/Contents/Resources/Editur.icns
+            plutil -lint dist/package/Editur.app/Contents/Info.plist
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' dist/package/Editur.app/Contents/Info.plist)" = editur
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' dist/package/Editur.app/Contents/Info.plist)" = Editur
+          else
+            test -x dist/package/editur
+            test -s dist/package/editur.png
+          fi
+      - name: Verify Windows application package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath dist/package/editur.exe -PathType Leaf)) {
+            throw 'Windows package is missing editur.exe'
+          }
+          if (-not (Test-Path -LiteralPath dist/package/editur.ico -PathType Leaf)) {
+            throw 'Windows package is missing the Editur icon'
+          }
+          $signature = [IO.File]::ReadAllBytes((Resolve-Path dist/package/editur.exe))[0..1]
+          if ($signature[0] -ne 0x4d -or $signature[1] -ne 0x5a) {
+            throw 'editur.exe is not a Windows PE executable'
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
@@ -294,14 +321,16 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           install_dir="$RUNNER_TEMP/editur/bin"
-          EDITUR_INSTALL_DIR="$install_dir" sh install.sh
+          app_dir="$RUNNER_TEMP/editur/apps"
+          EDITUR_INSTALL_DIR="$install_dir" EDITUR_APP_DIR="$app_dir" sh install.sh
           "$install_dir/editur" --version
           "$install_dir/editur" --help
           "$install_dir/editur" update
           if [ "$RUNNER_OS" = "macOS" ]; then
             bare_dir="$RUNNER_TEMP/editur/bare-bin"
             mkdir -p "$bare_dir"
-            cp "$install_dir/Editur.app/Contents/MacOS/editur" "$bare_dir/editur"
+            test -f "$app_dir/Editur.app/Contents/Resources/Editur.icns"
+            cp "$app_dir/Editur.app/Contents/MacOS/editur" "$bare_dir/editur"
             "$bare_dir/editur" update
             test -L "$bare_dir/editur"
             test -f "$bare_dir/Editur.app/Contents/Resources/Editur.icns"
@@ -319,7 +348,11 @@ jobs:
         shell: pwsh
         run: |
           $installDir = Join-Path $env:RUNNER_TEMP 'editur\bin'
-          .\install.ps1 -InstallDir $installDir
+          $startMenuDir = Join-Path $env:RUNNER_TEMP 'editur\start-menu'
+          .\install.ps1 -InstallDir $installDir -StartMenuDir $startMenuDir
+          if (-not (Test-Path -LiteralPath (Join-Path $startMenuDir 'Editur.lnk') -PathType Leaf)) {
+            throw 'Windows installer did not create the Editur Start menu shortcut'
+          }
           $editur = Join-Path $installDir 'editur.exe'
           & $editur --version
           & $editur --help

@@ -3,6 +3,7 @@ set -eu
 
 release_base=https://github.com/snowdamiz/editur/releases/download/release
 install_dir=${EDITUR_INSTALL_DIR:-"$HOME/.local/bin"}
+app_dir=${EDITUR_APP_DIR:-"$HOME/Applications"}
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) asset=editur-macos-aarch64.zip; package=app ;;
@@ -61,14 +62,15 @@ if [ "$package" = app ]; then
   mkdir "$download_dir/package"
   /usr/bin/ditto -x -k "$download_dir/$asset" "$download_dir/package"
   app_source="$download_dir/package/Editur.app"
-  app_destination="$install_dir/Editur.app"
+  app_destination="$app_dir/Editur.app"
   executable="$app_source/Contents/MacOS/editur"
   if [ ! -d "$app_source" ] || [ -L "$app_source" ] || [ ! -f "$executable" ] || [ -L "$executable" ]; then
     printf 'editur: release archive does not contain a valid Editur.app\n' >&2
     exit 1
   fi
   "$executable" --provision-agent
-  staged_app="$install_dir/.Editur.app.new.$$"
+  mkdir -p "$app_dir"
+  staged_app="$app_dir/.Editur.app.new.$$"
   if [ -e "$staged_app" ] || [ -L "$staged_app" ]; then
     printf 'editur: staging path already exists: %s\n' "$staged_app" >&2
     exit 1
@@ -79,7 +81,7 @@ if [ "$package" = app ]; then
       printf 'editur: refusing to replace non-directory %s\n' "$app_destination" >&2
       exit 1
     fi
-    backup_app="$install_dir/.Editur.app.old.$$"
+    backup_app="$app_dir/.Editur.app.old.$$"
     if [ -e "$backup_app" ] || [ -L "$backup_app" ]; then
       printf 'editur: backup path already exists: %s\n' "$backup_app" >&2
       exit 1
@@ -96,6 +98,7 @@ if [ "$package" = app ]; then
   staged_app=
   rm -f -- "$install_dir/editur"
   ln -s "$app_destination/Contents/MacOS/editur" "$install_dir/editur"
+  printf 'Installed Editur.app to %s\n' "$app_destination"
 else
   chmod 0755 "$download_dir/$asset"
   "$download_dir/$asset" --provision-agent

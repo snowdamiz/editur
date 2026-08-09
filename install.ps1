@@ -1,4 +1,7 @@
-param([string] $InstallDir)
+param(
+    [string] $InstallDir,
+    [string] $StartMenuDir
+)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -56,8 +59,32 @@ try {
         }
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
     }
+
+    if ([string]::IsNullOrWhiteSpace($StartMenuDir)) {
+        $StartMenuDir = if ($env:EDITUR_START_MENU_DIR) {
+            $env:EDITUR_START_MENU_DIR
+        } else {
+            Join-Path ([Environment]::GetFolderPath('Programs')) 'Editur'
+        }
+    }
+    [IO.Directory]::CreateDirectory($StartMenuDir) | Out-Null
+    $shortcutPath = Join-Path $StartMenuDir 'Editur.lnk'
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $destination
+        $shortcut.WorkingDirectory = [Environment]::GetFolderPath('MyDocuments')
+        $shortcut.IconLocation = "$destination,0"
+        $shortcut.Save()
+    } finally {
+        if ($shortcut) {
+            [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        }
+        [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
     Write-Host "Installed Editur to $destination"
-    Write-Host 'Open a new terminal, then run: editur .'
+    Write-Host "Added Editur to the Start menu at $shortcutPath"
+    Write-Host 'Open Editur from the Start menu, or open a new terminal and run: editur .'
 } finally {
     if ([IO.Directory]::Exists($temporary)) {
         Remove-Item -LiteralPath $temporary -Recurse -Force

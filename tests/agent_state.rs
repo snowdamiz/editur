@@ -71,11 +71,30 @@ fn loading_a_session_keeps_the_replayed_transcript() {
 }
 
 #[test]
+fn failed_session_load_restores_the_active_transcript() {
+    let mut state = AgentState::default();
+    state.apply(Event::ConnectionChanged(ConnectionState::Ready));
+    state.apply(Event::SessionTitleUpdated(Some("Current task".into())));
+    state.apply(Event::UserMessage("keep this".into()));
+    state.apply(Event::AssistantDelta("still here".into()));
+    state.apply(Event::TurnFinished { cancelled: false });
+    let transcript = state.transcript.clone();
+
+    state.apply(Event::SessionLoading {
+        title: Some("Missing task".into()),
+    });
+    state.apply(Event::SessionLoadFailed);
+    state.apply(Event::ConnectionChanged(ConnectionState::Ready));
+
+    assert_eq!(state.transcript, transcript);
+    assert_eq!(state.title.as_deref(), Some("Current task"));
+    assert!(state.session_ready);
+}
+
+#[test]
 fn state_enforces_one_turn_orders_streams_and_answers_permission_once() {
-    let mut state = AgentState {
-        prompt: "ship it".into(),
-        ..AgentState::default()
-    };
+    let mut state = AgentState::default();
+    state.prompt = "ship it".into();
     state.apply(Event::ConnectionChanged(ConnectionState::Ready));
     state.apply(Event::SessionReady {
         current_mode: None,
