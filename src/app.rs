@@ -2818,7 +2818,7 @@ impl EditorApp {
             Color32::from_rgb(174, 181, 194)
         };
         ui.painter().text(
-            button.center(),
+            button.center() - egui::vec2(5.0, 0.0),
             Align2::CENTER_CENTER,
             label,
             FontId::proportional(12.0),
@@ -3594,7 +3594,7 @@ impl EditorApp {
             self.provider_menu_anchor = None;
         }
         painter.text(
-            egui::pos2(title_x, header.center().y - 0.5),
+            egui::pos2(title_x, header.center().y),
             Align2::LEFT_CENTER,
             title,
             FontId::proportional(13.0),
@@ -8600,11 +8600,12 @@ mod tests {
                 |root| app.ui(root),
             )
         };
-        fn text(shape: &Shape, expected: &str) -> Option<(f32, f32)> {
+        fn text(shape: &Shape, expected: &str) -> Option<(Rect, f32)> {
             match shape {
-                Shape::Text(text) if text.galley.text() == expected => {
-                    Some((text.pos.y, text.galley.job.sections[0].format.font_id.size))
-                }
+                Shape::Text(text) if text.galley.text() == expected => Some((
+                    Rect::from_min_size(text.pos, text.galley.size()),
+                    text.galley.job.sections[0].format.font_id.size,
+                )),
                 Shape::Vec(shapes) => shapes.iter().find_map(|shape| text(shape, expected)),
                 _ => None,
             }
@@ -8617,13 +8618,58 @@ mod tests {
         };
 
         let idle = draw(&mut app);
-        assert_eq!(find(&idle, "Landing Page Builder").unwrap().1, 13.0);
+        let title = find(&idle, "Landing Page Builder").unwrap();
+        assert_eq!(title.1, 13.0);
+        assert_eq!(title.0.center().y, TITLEBAR_HEIGHT * 0.5);
         assert!(find(&idle, "Ready").is_none());
         assert!(find(&idle, "Working").is_none());
 
         app.agent.active = true;
         let active = draw(&mut app);
-        assert!(find(&active, "Working").unwrap().0 >= 592.0);
+        assert!(find(&active, "Working").unwrap().0.top() >= 592.0);
+    }
+
+    #[test]
+    fn agentic_toggle_text_keeps_sidebar_edge_padding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let button = context
+            .read_response(Id::new("agentic_mode_toggle"))
+            .expect("agentic mode toggle")
+            .rect;
+        fn label_rect(shape: &Shape) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == "Agent" => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(label_rect),
+                _ => None,
+            }
+        }
+        let label = output
+            .shapes
+            .iter()
+            .find_map(|shape| label_rect(&shape.shape))
+            .expect("Agent toggle label");
+
+        let right_padding = button.right() - label.right();
+        assert!(right_padding >= 12.0, "right padding was {right_padding}");
     }
 
     #[test]
