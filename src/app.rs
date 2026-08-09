@@ -4895,7 +4895,7 @@ impl EditorApp {
                 .max_rect(footer)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
                 let attach = ui
                     .add_enabled(
                         composer_enabled,
@@ -4907,7 +4907,7 @@ impl EditorApp {
                         .fill(Color32::TRANSPARENT)
                         .stroke(egui::Stroke::NONE)
                         .corner_radius(6)
-                        .min_size(egui::vec2(40.0, 30.0)),
+                        .min_size(egui::vec2(32.0, 30.0)),
                     )
                     .on_hover_text("Attach files");
                 open_file_picker = attach.clicked();
@@ -7456,7 +7456,6 @@ fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui:
             .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), idle_color);
     let width = (idle_galley.size().x + 20.0).max(40.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 30.0), Sense::click());
-    let visual_rect = rect.translate(egui::vec2(0.0, 4.0));
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -7472,14 +7471,11 @@ fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui:
         idle_galley
     };
     ui.painter().galley(
-        egui::pos2(
-            visual_rect.left(),
-            visual_rect.center().y - galley.size().y * 0.5,
-        ),
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
         galley,
         text_color,
     );
-    let tip = egui::pos2(visual_rect.right() - 5.5, visual_rect.center().y + 2.0);
+    let tip = egui::pos2(rect.right() - 5.5, rect.center().y + 2.0);
     let arrow_color = if response.hovered() {
         Color32::from_rgb(230, 235, 243)
     } else {
@@ -8730,10 +8726,7 @@ mod tests {
 
         assert_eq!(text(&idle.0).0, Color32::from_rgb(166, 175, 190));
         assert_eq!(text(&hovered.0).0, Color32::from_rgb(218, 224, 235));
-        assert_eq!(
-            text(&idle.0).1 + text(&idle.0).2 * 0.5,
-            idle.1.center().y + 4.0
-        );
+        assert_eq!(text(&idle.0).1 + text(&idle.0).2 * 0.5, idle.1.center().y);
         assert!(
             !hovered
                 .0
@@ -10478,11 +10471,13 @@ mod tests {
                 |root| app.ui(root),
             )
         };
-        fn has_text(shape: &Shape, label: &str) -> bool {
+        fn text_rect(shape: &Shape, label: &str) -> Option<Rect> {
             match shape {
-                Shape::Text(text) => text.galley.text() == label,
-                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, label)),
-                _ => false,
+                Shape::Text(text) if text.galley.text() == label => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, label)),
+                _ => None,
             }
         }
 
@@ -10492,17 +10487,28 @@ mod tests {
                 output
                     .shapes
                     .iter()
-                    .any(|shape| has_text(&shape.shape, label)),
+                    .any(|shape| text_rect(&shape.shape, label).is_some()),
                 "missing {label} selector"
             );
         }
+        let find = |label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| text_rect(&shape.shape, label))
+                .unwrap()
+        };
+        let attach = find("+");
+        let permissions = find("Ask");
+        assert_eq!(attach.center().y, permissions.center().y);
+        assert!(permissions.left() - attach.right() <= 16.0);
 
         app.agent_menu = Some(super::AgentMenu::Permissions);
         assert!(
             draw(&mut app)
                 .shapes
                 .iter()
-                .any(|shape| has_text(&shape.shape, "Allow all"))
+                .any(|shape| text_rect(&shape.shape, "Allow all").is_some())
         );
     }
 
