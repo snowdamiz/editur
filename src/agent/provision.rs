@@ -17,9 +17,13 @@ const MAX_ARCHIVE_ENTRIES: usize = 2_048;
 const VERIFICATION_RECEIPT: &str = ".editur-verified.json";
 const EMBEDDED_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent-sidecar.json"));
 
+use super::provider::{ProviderId, catalog, descriptor};
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseSpec {
+    #[serde(default)]
+    pub provider: Option<ProviderId>,
     pub version: String,
     pub distributions: Vec<Distribution>,
 }
@@ -45,7 +49,7 @@ pub enum ArchiveFormat {
     Zip,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidecarManifest {
     pub format_version: u32,
@@ -72,43 +76,49 @@ pub struct SidecarManifest {
 impl SidecarManifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let manifest: Self = serde_json::from_slice(bytes)
-            .map_err(|error| format!("invalid Cursor sidecar manifest: {error}"))?;
-        if manifest.format_version != 1 || manifest.agent != "cursor" {
-            return Err("unsupported Cursor sidecar manifest format version".into());
+            .map_err(|error| format!("invalid ACP provider manifest: {error}"))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn provider(&self) -> Result<ProviderId, String> {
+        self.agent.parse()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let provider = self.provider()?;
+        if self.format_version != 1 {
+            return Err("unsupported ACP provider manifest format version".into());
         }
-        validate_version(&manifest.version)?;
-        if !manifest
-            .archive_url
-            .starts_with("https://downloads.cursor.com/")
-        {
-            return Err("Cursor archive URL must use https://downloads.cursor.com".into());
-        }
-        if manifest.os != std::env::consts::OS || manifest.architecture != std::env::consts::ARCH {
+        validate_version(&self.version)?;
+        validate_provider_host(self, provider)?;
+        if self.os != std::env::consts::OS || self.architecture != std::env::consts::ARCH {
             return Err(format!(
-                "Cursor sidecar manifest is not for the current platform ({}/{})",
+                "{} manifest is not for the current platform ({}/{})",
+                descriptor(provider).display_name,
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ));
         }
-        let extracted_size = manifest
+        let extracted_size = self
             .entries
             .iter()
             .try_fold(0_u64, |total, entry| total.checked_add(entry.size));
-        if manifest.archive_size_bytes == 0
-            || manifest.archive_size_bytes > manifest.max_compressed_bytes
-            || manifest.max_compressed_bytes == 0
-            || manifest.max_compressed_bytes > MAX_COMPRESSED_BYTES
-            || manifest.max_extracted_bytes == 0
-            || manifest.max_extracted_bytes > MAX_EXTRACTED_BYTES
-            || manifest.max_entries == 0
-            || manifest.max_entries > MAX_ARCHIVE_ENTRIES
-            || manifest.entries.len() > manifest.max_entries
-            || extracted_size.is_none_or(|size| size > manifest.max_extracted_bytes)
+        if self.archive_size_bytes == 0
+            || self.archive_size_bytes > self.max_compressed_bytes
+            || self.max_compressed_bytes == 0
+            || self.max_compressed_bytes > MAX_COMPRESSED_BYTES
+            || self.max_extracted_bytes == 0
+            || self.max_extracted_bytes > MAX_EXTRACTED_BYTES
+            || self.max_entries == 0
+            || self.max_entries > MAX_ARCHIVE_ENTRIES
+            || self.entries.len() > self.max_entries
+            || extracted_size.is_none_or(|size| size > self.max_extracted_bytes)
         {
-            return Err("Cursor sidecar manifest has unsafe extraction limits".into());
+            return Err("ACP provider manifest has unsafe extraction limits".into());
         }
-        if !valid_sha256(&manifest.archive_sha256)
-            || manifest.entries.iter().any(|entry| {
+        if !valid_sha256(&self.archive_sha256)
+            || self.entries.iter().any(|entry| {
                 entry.kind == EntryKind::File
                     && entry
                         .sha256
@@ -116,35 +126,36 @@ impl SidecarManifest {
                         .is_none_or(|hash| !valid_sha256(hash))
             })
         {
-            return Err("Cursor sidecar manifest has an invalid SHA-256 value".into());
+            return Err("ACP provider manifest has an invalid SHA-256 value".into());
         }
-        validate_relative_path(&manifest.command)?;
-        if let Some(entrypoint) = &manifest.entrypoint {
+        validate_relative_path(&self.command)?;
+        if let Some(entrypoint) = &self.entrypoint {
             validate_relative_path(entrypoint)?;
         }
-        let mut paths = HashSet::with_capacity(manifest.entries.len());
-        for entry in &manifest.entries {
+        let mut paths = HashSet::with_capacity(self.entries.len());
+        for entry in &self.entries {
             validate_relative_path(&entry.path)?;
             if !paths.insert(entry.path.as_str()) {
                 return Err(format!("duplicate manifest path `{}`", entry.path));
             }
         }
-        if !manifest
+        if !self
             .entries
             .iter()
-            .any(|entry| entry.path == manifest.command && entry.kind == EntryKind::File)
+            .any(|entry| entry.path == self.command && entry.kind == EntryKind::File)
         {
-            return Err("Cursor sidecar manifest command is not a declared file".into());
+            return Err("ACP provider manifest command is not a declared file".into());
         }
-        if manifest.entrypoint.as_ref().is_some_and(|entrypoint| {
-            !manifest
+        if self.entrypoint.as_ref().is_some_and(|entrypoint| {
+            !self
                 .entries
                 .iter()
                 .any(|entry| entry.path == *entrypoint && entry.kind == EntryKind::File)
         }) {
-            return Err("Cursor sidecar manifest entrypoint is not a declared file".into());
+            return Err("ACP provider manifest entrypoint is not a declared file".into());
         }
-        Ok(manifest)
+        validate_provider_policy(self, provider)?;
+        Ok(())
     }
 
     pub fn generate(
@@ -152,8 +163,10 @@ impl SidecarManifest {
         distribution: &Distribution,
         bytes: &[u8],
     ) -> Result<Self, String> {
+        let provider = release.provider();
+        validate_release_distribution(provider, &release.version, distribution)?;
         if bytes.len() as u64 > MAX_COMPRESSED_BYTES {
-            return Err("Cursor Agent archive exceeds the release compressed-size limit".into());
+            return Err("ACP provider archive exceeds the release compressed-size limit".into());
         }
         let entries = match distribution.archive_format {
             ArchiveFormat::TarGz => inspect_tar_gz(bytes)?,
@@ -165,7 +178,7 @@ impl SidecarManifest {
                 .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
                 .is_none_or(|total| total > MAX_EXTRACTED_BYTES)
         {
-            return Err("Cursor Agent archive exceeds the release extraction limits".into());
+            return Err("ACP provider archive exceeds the release extraction limits".into());
         }
         if !entries
             .iter()
@@ -177,13 +190,13 @@ impl SidecarManifest {
             })
         {
             return Err(format!(
-                "Cursor Agent archive is missing declared command `{}`",
+                "ACP provider archive is missing declared command `{}`",
                 distribution.command
             ));
         }
         Ok(Self {
             format_version: 1,
-            agent: "cursor".into(),
+            agent: provider.as_str().into(),
             version: release.version.clone(),
             os: distribution.os.clone(),
             architecture: distribution.architecture.clone(),
@@ -198,20 +211,166 @@ impl SidecarManifest {
             entrypoint: distribution.entrypoint.clone(),
             args: distribution.args.clone(),
             entries,
-            license_url: "https://cursor.com/terms-of-service".into(),
-            terms_url: "https://cursor.com/terms-of-service".into(),
+            license_url: descriptor(provider).license_url.into(),
+            terms_url: descriptor(provider).terms_url.into(),
         })
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBundle {
+    pub format_version: u32,
+    pub providers: Vec<SidecarManifest>,
+}
+
+impl ProviderBundle {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid ACP provider bundle: {error}"))?;
+        match value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(1) => Ok(Self {
+                format_version: 2,
+                providers: vec![SidecarManifest::parse(bytes)?],
+            }),
+            Some(2) => {
+                let bundle: Self = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid ACP provider bundle: {error}"))?;
+                if bundle.providers.is_empty() {
+                    return Err("ACP provider bundle is empty".into());
+                }
+                let mut ids = HashSet::with_capacity(bundle.providers.len());
+                for manifest in &bundle.providers {
+                    manifest.validate()?;
+                    if !ids.insert(manifest.provider()?) {
+                        return Err(format!("duplicate provider `{}`", manifest.agent));
+                    }
+                }
+                if !ids.contains(&ProviderId::Cursor) {
+                    return Err("ACP provider bundle does not include required Cursor".into());
+                }
+                Ok(bundle)
+            }
+            _ => Err("unsupported ACP provider bundle format version".into()),
+        }
+    }
+
+    pub fn manifest(&self, provider: ProviderId) -> Result<&SidecarManifest, String> {
+        self.providers
+            .iter()
+            .find(|manifest| manifest.provider() == Ok(provider))
+            .ok_or_else(|| {
+                format!(
+                    "{} is unavailable in this Editur build",
+                    descriptor(provider).display_name
+                )
+            })
+    }
+
+    pub fn available(&self) -> Vec<ProviderId> {
+        catalog()
+            .iter()
+            .filter(|provider| provider.unavailable_reason.is_none())
+            .filter(|provider| self.manifest(provider.id).is_ok())
+            .map(|provider| provider.id)
+            .collect()
+    }
+}
+
+fn validate_provider_policy(
+    manifest: &SidecarManifest,
+    provider: ProviderId,
+) -> Result<(), String> {
+    let metadata = descriptor(provider);
+    if let Some(reason) = metadata.unavailable_reason {
+        return Err(format!(
+            "{} is unavailable: {reason}",
+            metadata.display_name
+        ));
+    }
+    if manifest.license_url != metadata.license_url || manifest.terms_url != metadata.terms_url {
+        return Err(format!(
+            "{} manifest has unapproved license or terms links",
+            metadata.display_name
+        ));
+    }
+    let expected_node = if cfg!(windows) {
+        "runtime/node.exe"
+    } else {
+        "runtime/bin/node"
+    };
+    validate_provider_host(manifest, provider)?;
+    let valid = match provider {
+        ProviderId::Cursor => {
+            manifest.version == "2026.07.23-e383d2b"
+                && manifest.args == ["--disable-auto-update", "acp"]
+                && if cfg!(windows) {
+                    manifest.command == "dist-package/node.exe"
+                        && manifest.entrypoint.as_deref() == Some("dist-package/index.js")
+                } else {
+                    manifest.command == "dist-package/cursor-agent" && manifest.entrypoint.is_none()
+                }
+        }
+        ProviderId::Codex => {
+            manifest.version == "1.1.14"
+                && manifest.archive_format == ArchiveFormat::Zip
+                && manifest.command == expected_node
+                && manifest.entrypoint.as_deref() == Some("package/dist/index.js")
+                && manifest.args.is_empty()
+        }
+        ProviderId::Claude => false,
+    };
+    valid.then_some(()).ok_or_else(|| {
+        format!(
+            "{} manifest violates its compiled release policy",
+            metadata.display_name
+        )
+    })
+}
+
+fn validate_provider_host(manifest: &SidecarManifest, provider: ProviderId) -> Result<(), String> {
+    match provider {
+        ProviderId::Cursor
+            if !manifest
+                .archive_url
+                .starts_with("https://downloads.cursor.com/") =>
+        {
+            return Err("Cursor archive URL must use https://downloads.cursor.com".into());
+        }
+        ProviderId::Codex
+            if !manifest.archive_url.starts_with(
+                "https://github.com/snowdamiz/editur/releases/download/provider-v1/",
+            ) =>
+        {
+            return Err("Codex archive URL must use Editur's pinned provider release".into());
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn embedded_manifest() -> Result<SidecarManifest, String> {
     if EMBEDDED_MANIFEST.is_empty() {
         return Err("this Editur build does not include a Cursor Agent manifest".into());
     }
-    SidecarManifest::parse(EMBEDDED_MANIFEST)
+    Ok(embedded_bundle()?.manifest(ProviderId::Cursor)?.clone())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+pub fn embedded_bundle() -> Result<ProviderBundle, String> {
+    if EMBEDDED_MANIFEST.is_empty() {
+        return Err("this Editur build does not include an ACP provider bundle".into());
+    }
+    ProviderBundle::parse(EMBEDDED_MANIFEST)
+}
+
+pub fn provider_root(data_dir: &Path, provider: ProviderId) -> std::path::PathBuf {
+    data_dir.join("agents").join(provider.as_str())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedEntry {
     pub path: String,
@@ -231,16 +390,16 @@ pub enum EntryKind {
 
 fn inspect_zip(bytes: &[u8]) -> Result<Vec<ManagedEntry>, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| format!("invalid Cursor Agent ZIP archive: {error}"))?;
+        .map_err(|error| format!("invalid ACP provider ZIP archive: {error}"))?;
     if archive.len() > MAX_ARCHIVE_ENTRIES {
-        return Err("Cursor Agent archive exceeds the release entry-count limit".into());
+        return Err("ACP provider archive exceeds the release entry-count limit".into());
     }
     let mut entries = Vec::with_capacity(archive.len());
     let mut seen = HashSet::with_capacity(archive.len());
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
-            .map_err(|error| format!("cannot inspect Cursor Agent archive: {error}"))?;
+            .map_err(|error| format!("cannot inspect ACP provider archive: {error}"))?;
         let path = entry.name().to_owned();
         validate_relative_path(&path)?;
         if !seen.insert(path.clone()) {
@@ -281,18 +440,18 @@ fn inspect_tar_gz(bytes: &[u8]) -> Result<Vec<ManagedEntry>, String> {
     let mut seen = HashSet::new();
     for entry in archive
         .entries()
-        .map_err(|error| format!("invalid Cursor Agent tar.gz archive: {error}"))?
+        .map_err(|error| format!("invalid ACP provider tar.gz archive: {error}"))?
     {
         let mut entry =
-            entry.map_err(|error| format!("cannot inspect Cursor Agent archive: {error}"))?;
+            entry.map_err(|error| format!("cannot inspect ACP provider archive: {error}"))?;
         if entries.len() >= MAX_ARCHIVE_ENTRIES {
-            return Err("Cursor Agent archive exceeds the release entry-count limit".into());
+            return Err("ACP provider archive exceeds the release entry-count limit".into());
         }
         let path = entry
             .path()
-            .map_err(|error| format!("invalid Cursor Agent archive path: {error}"))?
+            .map_err(|error| format!("invalid ACP provider archive path: {error}"))?
             .to_str()
-            .ok_or_else(|| "Cursor Agent archive path is not valid UTF-8".to_owned())?
+            .ok_or_else(|| "ACP provider archive path is not valid UTF-8".to_owned())?
             .to_owned();
         validate_relative_path(&path)?;
         if !seen.insert(path.clone()) {
@@ -336,20 +495,20 @@ fn checksum_reader(reader: &mut impl Read, expected_size: u64) -> Result<String,
     loop {
         let count = reader
             .read(&mut buffer)
-            .map_err(|error| format!("cannot hash Cursor Agent archive entry: {error}"))?;
+            .map_err(|error| format!("cannot hash ACP provider archive entry: {error}"))?;
         if count == 0 {
             break;
         }
         size = size
             .checked_add(count as u64)
-            .ok_or_else(|| "Cursor Agent archive entry size overflowed".to_owned())?;
+            .ok_or_else(|| "ACP provider archive entry size overflowed".to_owned())?;
         if size > expected_size || size > MAX_EXTRACTED_BYTES {
-            return Err("Cursor Agent archive entry exceeds its declared size".into());
+            return Err("ACP provider archive entry exceeds its declared size".into());
         }
         hasher.update(&buffer[..count]);
     }
     if size != expected_size {
-        return Err("Cursor Agent archive entry size does not match its header".into());
+        return Err("ACP provider archive entry size does not match its header".into());
     }
     Ok(hasher
         .finalize()
@@ -389,8 +548,8 @@ struct VerifiedFile {
 
 pub fn installed(manifest: &SidecarManifest, data_dir: &Path) -> Result<InstalledSidecar, String> {
     validate_version(&manifest.version)?;
-    let destination = data_dir
-        .join("agents/cursor/versions")
+    let destination = provider_root(data_dir, manifest.provider()?)
+        .join("versions")
         .join(&manifest.version);
     if !verification_receipt_matches(manifest, &destination) {
         verify_installed(manifest, &destination)?;
@@ -405,9 +564,10 @@ pub fn ensure(
     data_dir: &Path,
     mut progress: impl FnMut(DownloadProgress),
 ) -> Result<InstalledSidecar, String> {
+    let provider = manifest.provider()?;
     if let Ok(installed) = installed(manifest, data_dir) {
-        return with_provision_lock(data_dir, || {
-            let agent_dir = data_dir.join("agents/cursor");
+        return with_provision_lock(data_dir, provider, || {
+            let agent_dir = provider_root(data_dir, provider);
             let previous = activate(&agent_dir, &manifest.version)?;
             cleanup_obsolete_versions(
                 &agent_dir.join("versions"),
@@ -420,12 +580,15 @@ pub fn ensure(
     fs::create_dir_all(data_dir)
         .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
     let download = tempfile::tempdir_in(data_dir)
-        .map_err(|error| format!("cannot stage Cursor Agent download: {error}"))?;
+        .map_err(|error| format!("cannot stage ACP provider download: {error}"))?;
     let mut response = ureq::get(&manifest.archive_url)
         .call()
         .map_err(|error| format!("cannot download {}: {error}", manifest.archive_url))?;
-    if !valid_cursor_archive_uri(response.get_uri()) {
-        return Err("Cursor archive redirect left https://downloads.cursor.com".into());
+    if !valid_archive_uri(provider, response.get_uri()) {
+        return Err(format!(
+            "{} archive redirect left its approved distribution host",
+            descriptor(provider).display_name
+        ));
     }
     let total = response
         .headers()
@@ -433,7 +596,7 @@ pub fn ensure(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     if total.is_some_and(|size| size > manifest.max_compressed_bytes) {
-        return Err("Cursor Agent archive exceeds its compressed-size limit".into());
+        return Err("ACP provider archive exceeds its compressed-size limit".into());
     }
     progress(DownloadProgress {
         downloaded: 0,
@@ -457,9 +620,9 @@ pub fn ensure(
         }
         downloaded = downloaded
             .checked_add(count as u64)
-            .ok_or_else(|| "Cursor Agent archive size overflowed".to_owned())?;
+            .ok_or_else(|| "ACP provider archive size overflowed".to_owned())?;
         if downloaded > manifest.max_compressed_bytes {
-            return Err("Cursor Agent archive exceeds its compressed-size limit".into());
+            return Err("ACP provider archive exceeds its compressed-size limit".into());
         }
         archive
             .write_all(&buffer[..count])
@@ -482,7 +645,7 @@ pub fn ensure(
     _progress: impl FnMut(DownloadProgress),
 ) -> Result<InstalledSidecar, String> {
     installed(manifest, data_dir)
-        .map_err(|_| "this Editur build cannot download Cursor Agent".into())
+        .map_err(|_| "this Editur build cannot download ACP providers".into())
 }
 
 pub fn provision_from_bytes(
@@ -499,7 +662,7 @@ pub fn provision_from_bytes(
             .arg("--version")
             .current_dir(command.parent().unwrap_or(data_dir))
             .output()
-            .map_err(|error| format!("cannot validate Cursor Agent: {error}"))?;
+            .map_err(|error| format!("cannot validate ACP provider: {error}"))?;
         let reported = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -507,7 +670,7 @@ pub fn provision_from_bytes(
         );
         if !output.status.success() || !reported.contains(version) {
             return Err(format!(
-                "Cursor Agent reported an unexpected version: {}",
+                "ACP provider reported an unexpected version: {}",
                 reported.trim()
             ));
         }
@@ -521,7 +684,7 @@ fn provision_from_bytes_with(
     bytes: &[u8],
     validate: impl FnOnce(&Path, Option<&Path>, &str) -> Result<(), String>,
 ) -> Result<InstalledSidecar, String> {
-    with_provision_lock(data_dir, || {
+    with_provision_lock(data_dir, manifest.provider()?, || {
         provision_from_bytes_locked(manifest, data_dir, bytes, validate)
     })
 }
@@ -537,7 +700,9 @@ fn provision_from_bytes_locked(
     if let Some(entrypoint) = &manifest.entrypoint {
         validate_relative_path(entrypoint)?;
     }
-    let agent_dir = data_dir.join("agents/cursor");
+    let provider = manifest.provider()?;
+    let display_name = descriptor(provider).display_name;
+    let agent_dir = provider_root(data_dir, provider);
     let versions = agent_dir.join("versions");
     fs::create_dir_all(&versions)
         .map_err(|error| format!("cannot create {}: {error}", versions.display()))?;
@@ -551,12 +716,12 @@ fn provision_from_bytes_locked(
     let staging = tempfile::Builder::new()
         .prefix(".install-")
         .tempdir_in(&versions)
-        .map_err(|error| format!("cannot stage Cursor Agent: {error}"))?;
+        .map_err(|error| format!("cannot stage {display_name}: {error}"))?;
     extract_archive(manifest, bytes, staging.path())?;
     let staged_command = staging.path().join(&manifest.command);
     if !staged_command.is_file() {
         return Err(format!(
-            "Cursor Agent command is missing: {}",
+            "{display_name} command is missing: {}",
             manifest.command
         ));
     }
@@ -568,7 +733,7 @@ fn provision_from_bytes_locked(
         .as_ref()
         .is_some_and(|path| !path.is_file())
     {
-        return Err("Cursor Agent entrypoint is missing".into());
+        return Err(format!("{display_name} entrypoint is missing"));
     }
     validate(
         &staged_command,
@@ -581,17 +746,17 @@ fn provision_from_bytes_locked(
         let replaced = tempfile::Builder::new()
             .prefix(".replace-")
             .tempdir_in(&versions)
-            .map_err(|error| format!("cannot stage Cursor Agent repair: {error}"))?;
+            .map_err(|error| format!("cannot stage {display_name} repair: {error}"))?;
         let previous = replaced.path().join("previous");
         fs::rename(&destination, &previous)
-            .map_err(|error| format!("cannot stage corrupt Cursor Agent for repair: {error}"))?;
+            .map_err(|error| format!("cannot stage corrupt {display_name} for repair: {error}"))?;
         if let Err(error) = fs::rename(&staged, &destination) {
             let rollback = fs::rename(&previous, &destination);
             let _ = fs::remove_dir_all(&staged);
             return Err(match rollback {
-                Ok(()) => format!("cannot activate repaired Cursor Agent: {error}"),
+                Ok(()) => format!("cannot activate repaired {display_name}: {error}"),
                 Err(rollback) => format!(
-                    "cannot activate repaired Cursor Agent: {error}; rollback failed: {rollback}"
+                    "cannot activate repaired {display_name}: {error}; rollback failed: {rollback}"
                 ),
             });
         }
@@ -599,7 +764,7 @@ fn provision_from_bytes_locked(
     } else {
         if let Err(error) = fs::rename(&staged, &destination) {
             let _ = fs::remove_dir_all(&staged);
-            return Err(format!("cannot activate Cursor Agent: {error}"));
+            return Err(format!("cannot activate {display_name}: {error}"));
         }
         None
     };
@@ -610,9 +775,11 @@ fn provision_from_bytes_locked(
 
 fn with_provision_lock<T>(
     data_dir: &Path,
+    provider: ProviderId,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let agent_dir = data_dir.join("agents/cursor");
+    let agent_dir = provider_root(data_dir, provider);
+    let display_name = descriptor(provider).display_name;
     fs::create_dir_all(&agent_dir)
         .map_err(|error| format!("cannot create {}: {error}", agent_dir.display()))?;
     let lock = fs::OpenOptions::new()
@@ -621,9 +788,9 @@ fn with_provision_lock<T>(
         .create(true)
         .truncate(false)
         .open(agent_dir.join(".provision.lock"))
-        .map_err(|error| format!("cannot open Cursor Agent provision lock: {error}"))?;
+        .map_err(|error| format!("cannot open {display_name} provision lock: {error}"))?;
     lock.lock()
-        .map_err(|error| format!("cannot lock Cursor Agent provisioning: {error}"))?;
+        .map_err(|error| format!("cannot lock {display_name} provisioning: {error}"))?;
     run()
 }
 
@@ -671,15 +838,15 @@ fn read_version_marker(path: &Path) -> Option<String> {
 
 fn write_version_marker(agent_dir: &Path, name: &str, version: &str) -> Result<(), String> {
     let mut marker = tempfile::NamedTempFile::new_in(agent_dir)
-        .map_err(|error| format!("cannot stage Cursor Agent {name} marker: {error}"))?;
+        .map_err(|error| format!("cannot stage ACP provider {name} marker: {error}"))?;
     marker
         .write_all(version.as_bytes())
         .and_then(|()| marker.flush())
         .and_then(|()| marker.as_file().sync_all())
-        .map_err(|error| format!("cannot write Cursor Agent {name} marker: {error}"))?;
+        .map_err(|error| format!("cannot write ACP provider {name} marker: {error}"))?;
     marker
         .persist(agent_dir.join(name))
-        .map_err(|error| format!("cannot activate Cursor Agent: {}", error.error))?;
+        .map_err(|error| format!("cannot activate ACP provider: {}", error.error))?;
     Ok(())
 }
 
@@ -715,7 +882,7 @@ fn verify_installed(manifest: &SidecarManifest, version_dir: &Path) -> Result<()
                 .is_none_or(|expected| !checksum.eq_ignore_ascii_case(expected))
             {
                 return Err(format!(
-                    "managed Cursor Agent file has changed: {}",
+                    "managed ACP provider file has changed: {}",
                     entry.path
                 ));
             }
@@ -744,19 +911,19 @@ fn write_verification_receipt(
 ) -> Result<(), String> {
     let receipt = verification_receipt(manifest, version_dir)?;
     let bytes = serde_json::to_vec(&receipt)
-        .map_err(|error| format!("cannot encode Cursor Agent verification receipt: {error}"))?;
+        .map_err(|error| format!("cannot encode ACP provider verification receipt: {error}"))?;
     let mut staged = tempfile::NamedTempFile::new_in(version_dir)
-        .map_err(|error| format!("cannot stage Cursor Agent verification receipt: {error}"))?;
+        .map_err(|error| format!("cannot stage ACP provider verification receipt: {error}"))?;
     staged
         .write_all(&bytes)
         .and_then(|()| staged.flush())
         .and_then(|()| staged.as_file().sync_all())
-        .map_err(|error| format!("cannot write Cursor Agent verification receipt: {error}"))?;
+        .map_err(|error| format!("cannot write ACP provider verification receipt: {error}"))?;
     staged
         .persist(version_dir.join(VERIFICATION_RECEIPT))
         .map_err(|error| {
             format!(
-                "cannot save Cursor Agent verification receipt: {}",
+                "cannot save ACP provider verification receipt: {}",
                 error.error
             )
         })?;
@@ -795,7 +962,7 @@ fn verification_receipt(
 fn verify_metadata(entry: &ManagedEntry, path: &Path) -> Result<fs::Metadata, String> {
     validate_relative_path(&entry.path)?;
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("managed Cursor Agent file is missing: {error}"))?;
+        .map_err(|error| format!("managed ACP provider file is missing: {error}"))?;
     if metadata.file_type().is_symlink()
         || (entry.kind == EntryKind::File && !metadata.is_file())
         || (entry.kind == EntryKind::Directory && !metadata.is_dir())
@@ -803,7 +970,7 @@ fn verify_metadata(entry: &ManagedEntry, path: &Path) -> Result<fs::Metadata, St
         || (entry.kind == EntryKind::File && !executable_matches(&metadata, entry.executable))
     {
         return Err(format!(
-            "managed Cursor Agent file has changed: {}",
+            "managed ACP provider file has changed: {}",
             entry.path
         ));
     }
@@ -844,13 +1011,13 @@ fn executable_matches(_metadata: &fs::Metadata, _executable: bool) -> bool {
 }
 
 fn verify_archive(manifest: &SidecarManifest, bytes: &[u8]) -> Result<(), String> {
-    let size = u64::try_from(bytes.len()).map_err(|_| "Cursor Agent archive is too large")?;
+    let size = u64::try_from(bytes.len()).map_err(|_| "ACP provider archive is too large")?;
     if size > manifest.max_compressed_bytes || size != manifest.archive_size_bytes {
-        return Err("Cursor Agent archive exceeds its compressed-size limit".into());
+        return Err("ACP provider archive exceeds its compressed-size limit".into());
     }
     let checksum = crate::syntax::package::sha256_hex(bytes);
     if !checksum.eq_ignore_ascii_case(&manifest.archive_sha256) {
-        return Err("Cursor Agent archive failed SHA-256 verification".into());
+        return Err("ACP provider archive failed SHA-256 verification".into());
     }
     Ok(())
 }
@@ -872,16 +1039,16 @@ fn extract_archive(
         }
     }
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| format!("invalid Cursor Agent ZIP archive: {error}"))?;
+        .map_err(|error| format!("invalid ACP provider ZIP archive: {error}"))?;
     if archive.len() > manifest.max_entries {
-        return Err("Cursor Agent archive exceeds its entry-count limit".into());
+        return Err("ACP provider archive exceeds its entry-count limit".into());
     }
     let mut extracted_bytes = 0_u64;
     let mut seen = HashSet::with_capacity(archive.len());
     for index in 0..archive.len() {
         let entry = archive
             .by_index(index)
-            .map_err(|error| format!("cannot inspect Cursor Agent archive: {error}"))?;
+            .map_err(|error| format!("cannot inspect ACP provider archive: {error}"))?;
         let name = entry.name();
         validate_relative_path(name)?;
         if !seen.insert(name.to_owned()) {
@@ -906,20 +1073,20 @@ fn extract_archive(
         }
         extracted_bytes = extracted_bytes
             .checked_add(entry.size())
-            .ok_or_else(|| "Cursor Agent archive extracted size overflowed".to_owned())?;
+            .ok_or_else(|| "ACP provider archive extracted size overflowed".to_owned())?;
         if extracted_bytes > manifest.max_extracted_bytes {
-            return Err("Cursor Agent archive exceeds its extracted-size limit".into());
+            return Err("ACP provider archive exceeds its extracted-size limit".into());
         }
     }
     if seen.len() != manifest.entries.len() {
-        return Err("Cursor Agent archive does not match its pinned entry count".into());
+        return Err("ACP provider archive does not match its pinned entry count".into());
     }
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| format!("invalid Cursor Agent ZIP archive: {error}"))?;
+        .map_err(|error| format!("invalid ACP provider ZIP archive: {error}"))?;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
-            .map_err(|error| format!("cannot read Cursor Agent archive: {error}"))?;
+            .map_err(|error| format!("cannot read ACP provider archive: {error}"))?;
         let expected = expected
             .get(entry.name())
             .ok_or_else(|| format!("unexpected archive path `{}`", entry.name()))?;
@@ -950,7 +1117,7 @@ fn extract_archive(
             }
             written = written
                 .checked_add(count as u64)
-                .ok_or_else(|| "Cursor Agent archive extracted size overflowed".to_owned())?;
+                .ok_or_else(|| "ACP provider archive extracted size overflowed".to_owned())?;
             if written > expected.size {
                 return Err(format!(
                     "archive entry `{}` exceeds its pinned size",
@@ -998,23 +1165,23 @@ fn extract_tar_gz(
     let mut archive = tar::Archive::new(decoder);
     let entries = archive
         .entries()
-        .map_err(|error| format!("invalid Cursor Agent tar.gz archive: {error}"))?;
+        .map_err(|error| format!("invalid ACP provider tar.gz archive: {error}"))?;
     let mut count = 0_usize;
     let mut extracted_bytes = 0_u64;
     let mut seen = HashSet::with_capacity(manifest.entries.len());
     for entry in entries {
         let entry =
-            entry.map_err(|error| format!("cannot inspect Cursor Agent archive: {error}"))?;
+            entry.map_err(|error| format!("cannot inspect ACP provider archive: {error}"))?;
         count += 1;
         if count > manifest.max_entries {
-            return Err("Cursor Agent archive exceeds its entry-count limit".into());
+            return Err("ACP provider archive exceeds its entry-count limit".into());
         }
         let path = entry
             .path()
-            .map_err(|error| format!("invalid Cursor Agent archive path: {error}"))?;
+            .map_err(|error| format!("invalid ACP provider archive path: {error}"))?;
         let name = path
             .to_str()
-            .ok_or_else(|| "Cursor Agent archive path is not valid UTF-8".to_owned())?;
+            .ok_or_else(|| "ACP provider archive path is not valid UTF-8".to_owned())?;
         validate_relative_path(name)?;
         if !seen.insert(name.to_owned()) {
             return Err(format!("duplicate archive path `{name}`"));
@@ -1036,29 +1203,29 @@ fn extract_tar_gz(
         }
         extracted_bytes = extracted_bytes
             .checked_add(size)
-            .ok_or_else(|| "Cursor Agent archive extracted size overflowed".to_owned())?;
+            .ok_or_else(|| "ACP provider archive extracted size overflowed".to_owned())?;
         if extracted_bytes > manifest.max_extracted_bytes {
-            return Err("Cursor Agent archive exceeds its extracted-size limit".into());
+            return Err("ACP provider archive exceeds its extracted-size limit".into());
         }
     }
     if count != manifest.entries.len() {
-        return Err("Cursor Agent archive entry count does not match its manifest".into());
+        return Err("ACP provider archive entry count does not match its manifest".into());
     }
 
     let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     for entry in archive
         .entries()
-        .map_err(|error| format!("invalid Cursor Agent tar.gz archive: {error}"))?
+        .map_err(|error| format!("invalid ACP provider tar.gz archive: {error}"))?
     {
         let mut entry =
-            entry.map_err(|error| format!("cannot read Cursor Agent archive: {error}"))?;
+            entry.map_err(|error| format!("cannot read ACP provider archive: {error}"))?;
         let path = entry
             .path()
-            .map_err(|error| format!("invalid Cursor Agent archive path: {error}"))?;
+            .map_err(|error| format!("invalid ACP provider archive path: {error}"))?;
         let name = path
             .to_str()
-            .ok_or_else(|| "Cursor Agent archive path is not valid UTF-8".to_owned())?;
+            .ok_or_else(|| "ACP provider archive path is not valid UTF-8".to_owned())?;
         let expected = expected
             .get(name)
             .ok_or_else(|| format!("unexpected archive path `{name}`"))?;
@@ -1089,7 +1256,7 @@ fn extract_tar_gz(
             }
             written = written
                 .checked_add(read as u64)
-                .ok_or_else(|| "Cursor Agent archive extracted size overflowed".to_owned())?;
+                .ok_or_else(|| "ACP provider archive extracted size overflowed".to_owned())?;
             if written > expected.size {
                 return Err(format!(
                     "archive entry `{}` exceeds its pinned size",
@@ -1143,18 +1310,32 @@ fn validate_version(version: &str) -> Result<(), String> {
             Some(Component::Normal(_))
         )
     {
-        return Err("invalid Cursor Agent version in sidecar manifest".into());
+        return Err("invalid ACP provider version in sidecar manifest".into());
     }
     Ok(())
 }
 
 #[cfg(feature = "network")]
+fn valid_archive_uri(provider: ProviderId, uri: &ureq::http::Uri) -> bool {
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    uri.authority().is_some_and(|authority| {
+        let host = authority.host();
+        authority.port_u16().is_none_or(|port| port == 443)
+            && match provider {
+                ProviderId::Cursor => host == "downloads.cursor.com",
+                ProviderId::Codex => {
+                    host == "github.com" || host == "release-assets.githubusercontent.com"
+                }
+                ProviderId::Claude => false,
+            }
+    })
+}
+
+#[cfg(all(test, feature = "network"))]
 fn valid_cursor_archive_uri(uri: &ureq::http::Uri) -> bool {
-    uri.scheme_str() == Some("https")
-        && uri.authority().is_some_and(|authority| {
-            authority.host() == "downloads.cursor.com"
-                && authority.port_u16().is_none_or(|port| port == 443)
-        })
+    valid_archive_uri(ProviderId::Cursor, uri)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -1180,23 +1361,97 @@ fn set_executable(_path: &Path, _executable: bool) -> Result<(), String> {
 impl ReleaseSpec {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let spec: Self = serde_json::from_slice(bytes)
-            .map_err(|error| format!("invalid Cursor release spec: {error}"))?;
-        if spec.distributions.iter().any(|distribution| {
-            !distribution
-                .archive_url
-                .starts_with("https://downloads.cursor.com/")
-        }) {
-            return Err("Cursor archive URL must use https://downloads.cursor.com".into());
+            .map_err(|error| format!("invalid ACP provider release spec: {error}"))?;
+        let provider = spec.provider();
+        if let Some(reason) = descriptor(provider).unavailable_reason {
+            return Err(format!(
+                "{} is unavailable: {reason}",
+                descriptor(provider).display_name
+            ));
+        }
+        validate_version(&spec.version)?;
+        for distribution in &spec.distributions {
+            validate_release_distribution(provider, &spec.version, distribution)?;
         }
         Ok(spec)
+    }
+
+    pub fn provider(&self) -> ProviderId {
+        self.provider.unwrap_or(ProviderId::Cursor)
     }
 
     pub fn select(&self, os: &str, architecture: &str) -> Result<&Distribution, String> {
         self.distributions
             .iter()
             .find(|distribution| distribution.os == os && distribution.architecture == architecture)
-            .ok_or_else(|| format!("Cursor Agent is unavailable for {os}/{architecture}"))
+            .ok_or_else(|| {
+                format!(
+                    "{} is unavailable for {os}/{architecture}",
+                    descriptor(self.provider()).display_name
+                )
+            })
     }
+
+    #[cfg(feature = "network")]
+    pub fn valid_archive_uri(&self, uri: &ureq::http::Uri) -> bool {
+        valid_archive_uri(self.provider(), uri)
+    }
+}
+
+fn validate_release_distribution(
+    provider: ProviderId,
+    version: &str,
+    distribution: &Distribution,
+) -> Result<(), String> {
+    match provider {
+        ProviderId::Cursor
+            if !distribution
+                .archive_url
+                .starts_with("https://downloads.cursor.com/") =>
+        {
+            return Err("Cursor archive URL must use https://downloads.cursor.com".into());
+        }
+        ProviderId::Codex
+            if !distribution.archive_url.starts_with(
+                "https://github.com/snowdamiz/editur/releases/download/provider-v1/",
+            ) =>
+        {
+            return Err("Codex archive URL must use Editur's pinned provider release".into());
+        }
+        _ => {}
+    }
+    let expected_node = if distribution.os == "windows" {
+        "runtime/node.exe"
+    } else {
+        "runtime/bin/node"
+    };
+    let valid = match provider {
+        ProviderId::Cursor => {
+            version == "2026.07.23-e383d2b"
+                && distribution.args == ["--disable-auto-update", "acp"]
+                && if distribution.os == "windows" {
+                    distribution.command == "dist-package/node.exe"
+                        && distribution.entrypoint.as_deref() == Some("dist-package/index.js")
+                } else {
+                    distribution.command == "dist-package/cursor-agent"
+                        && distribution.entrypoint.is_none()
+                }
+        }
+        ProviderId::Codex => {
+            version == "1.1.14"
+                && distribution.archive_format == ArchiveFormat::Zip
+                && distribution.command == expected_node
+                && distribution.entrypoint.as_deref() == Some("package/dist/index.js")
+                && distribution.args.is_empty()
+        }
+        ProviderId::Claude => false,
+    };
+    valid.then_some(()).ok_or_else(|| {
+        format!(
+            "{} release violates its compiled distribution policy",
+            descriptor(provider).display_name
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1205,13 +1460,13 @@ mod tests {
 
     #[cfg(unix)]
     use super::provision_from_bytes;
-    #[cfg(feature = "network")]
-    use super::valid_cursor_archive_uri;
     use super::{
-        ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, ReleaseSpec, SidecarManifest,
-        cleanup_obsolete_versions, embedded_manifest, ensure, extract_archive, installed,
-        provision_from_bytes_with, verify_archive, verify_installed,
+        ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, ProviderId, ReleaseSpec,
+        SidecarManifest, cleanup_obsolete_versions, embedded_manifest, ensure, extract_archive,
+        installed, provision_from_bytes_with, verify_archive, verify_installed,
     };
+    #[cfg(feature = "network")]
+    use super::{valid_archive_uri, valid_cursor_archive_uri};
 
     fn manifest() -> SidecarManifest {
         SidecarManifest {
@@ -1265,7 +1520,7 @@ mod tests {
                     "architecture": "aarch64",
                     "archive_url": "https://downloads.cursor.com/lab/pinned/agent.tar.gz",
                     "command": "dist-package/cursor-agent",
-                    "args": ["acp"],
+                    "args": ["--disable-auto-update", "acp"],
                     "archive_format": "tar_gz"
                 }]
             }"#,
@@ -1322,6 +1577,24 @@ mod tests {
         assert!(!valid_cursor_archive_uri(
             &"http://downloads.cursor.com/agent.tar.gz".parse().unwrap()
         ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn codex_redirects_accept_only_the_pinned_release_hosts() {
+        for url in [
+            "https://github.com/snowdamiz/editur/releases/download/provider-v1/codex.zip",
+            "https://release-assets.githubusercontent.com/private/codex.zip",
+        ] {
+            assert!(valid_archive_uri(ProviderId::Codex, &url.parse().unwrap()));
+        }
+        for url in [
+            "https://downloads.cursor.com/codex.zip",
+            "https://github.com.evil.example/codex.zip",
+            "http://github.com/snowdamiz/editur/codex.zip",
+        ] {
+            assert!(!valid_archive_uri(ProviderId::Codex, &url.parse().unwrap()));
+        }
     }
 
     #[test]
@@ -1945,6 +2218,132 @@ mod tests {
     }
 
     #[test]
+    fn managed_files_and_receipts_are_isolated_by_provider() {
+        fn package(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (path, bytes, executable) in entries {
+                let mode = if *executable { 0o755 } else { 0o644 };
+                archive
+                    .start_file(
+                        *path,
+                        zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                    )
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap().into_inner()
+        }
+
+        let cursor_command = if cfg!(windows) {
+            "dist-package/node.exe"
+        } else {
+            "dist-package/cursor-agent"
+        };
+        let cursor_entrypoint = cfg!(windows).then_some("dist-package/index.js");
+        let mut cursor_entries = vec![(cursor_command, b"cursor".as_slice(), true)];
+        if let Some(entrypoint) = cursor_entrypoint {
+            cursor_entries.push((entrypoint, b"entry".as_slice(), false));
+        }
+        let cursor_bytes = package(&cursor_entries);
+        let mut cursor = manifest();
+        cursor.command = cursor_command.into();
+        cursor.entrypoint = cursor_entrypoint.map(str::to_owned);
+        cursor.args = vec!["--disable-auto-update".into(), "acp".into()];
+        cursor.archive_format = ArchiveFormat::Zip;
+        cursor.archive_size_bytes = cursor_bytes.len() as u64;
+        cursor.max_compressed_bytes = cursor_bytes.len() as u64;
+        cursor.max_extracted_bytes = 11;
+        cursor.max_entries = cursor_entries.len();
+        cursor.archive_sha256 = crate::syntax::package::sha256_hex(&cursor_bytes);
+        cursor.entries = cursor_entries
+            .iter()
+            .map(|(path, bytes, executable)| ManagedEntry {
+                path: (*path).into(),
+                kind: EntryKind::File,
+                size: bytes.len() as u64,
+                sha256: Some(crate::syntax::package::sha256_hex(bytes)),
+                executable: *executable,
+            })
+            .collect();
+
+        let codex_command = if cfg!(windows) {
+            "runtime/node.exe"
+        } else {
+            "runtime/bin/node"
+        };
+        let codex_entries = [
+            (codex_command, b"node".as_slice(), true),
+            ("package/dist/index.js", b"adapter".as_slice(), false),
+        ];
+        let codex_bytes = package(&codex_entries);
+        let mut codex = cursor.clone();
+        codex.agent = "codex".into();
+        codex.version = "1.1.14".into();
+        codex.archive_url =
+            "https://github.com/snowdamiz/editur/releases/download/provider-v1/codex.zip".into();
+        codex.command = codex_command.into();
+        codex.entrypoint = Some("package/dist/index.js".into());
+        codex.args.clear();
+        codex.archive_size_bytes = codex_bytes.len() as u64;
+        codex.max_compressed_bytes = codex_bytes.len() as u64;
+        codex.max_extracted_bytes = 11;
+        codex.max_entries = codex_entries.len();
+        codex.archive_sha256 = crate::syntax::package::sha256_hex(&codex_bytes);
+        codex.entries = codex_entries
+            .iter()
+            .map(|(path, bytes, executable)| ManagedEntry {
+                path: (*path).into(),
+                kind: EntryKind::File,
+                size: bytes.len() as u64,
+                sha256: Some(crate::syntax::package::sha256_hex(bytes)),
+                executable: *executable,
+            })
+            .collect();
+        codex.license_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Codex)
+                .license_url
+                .into();
+        codex.terms_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Codex)
+                .terms_url
+                .into();
+
+        let temp = tempfile::tempdir().unwrap();
+        let installed_cursor =
+            provision_from_bytes_with(&cursor, temp.path(), &cursor_bytes, |_, _, _| Ok(()))
+                .unwrap();
+        let installed_codex =
+            provision_from_bytes_with(&codex, temp.path(), &codex_bytes, |_, _, _| Ok(())).unwrap();
+
+        assert!(
+            installed_cursor
+                .command
+                .starts_with(temp.path().join("agents/cursor"))
+        );
+        assert!(
+            installed_codex
+                .command
+                .starts_with(temp.path().join("agents/codex"))
+        );
+        assert!(
+            installed_cursor
+                .command
+                .parent()
+                .unwrap()
+                .ancestors()
+                .any(|path| path.join(".editur-verified.json").is_file())
+        );
+        assert!(
+            installed_codex
+                .command
+                .parent()
+                .unwrap()
+                .ancestors()
+                .any(|path| path.join(".editur-verified.json").is_file())
+        );
+    }
+
+    #[test]
     fn a_corrupt_managed_version_is_repaired_from_the_pinned_archive() {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive
@@ -1996,8 +2395,8 @@ mod tests {
                     "os": "macos",
                     "architecture": "aarch64",
                     "archive_url": "https://downloads.cursor.com/lab/pinned/agent.zip",
-                    "command": "dist-package/agent",
-                    "args": ["acp"],
+                    "command": "dist-package/cursor-agent",
+                    "args": ["--disable-auto-update", "acp"],
                     "archive_format": "zip"
                 }]
             }"#,
@@ -2006,7 +2405,7 @@ mod tests {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive
             .start_file(
-                "dist-package/agent",
+                "dist-package/cursor-agent",
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
@@ -2026,9 +2425,68 @@ mod tests {
             ),
             (
                 crate::syntax::package::sha256_hex(&bytes),
-                "dist-package/agent",
+                "dist-package/cursor-agent",
                 Some(expected_file_checksum.as_str()),
             )
         );
+    }
+
+    #[test]
+    fn codex_release_spec_generates_a_policy_checked_lazy_provider_manifest() {
+        let command = if cfg!(windows) {
+            "runtime/node.exe"
+        } else {
+            "runtime/bin/node"
+        };
+        let spec = ReleaseSpec::parse(
+            format!(
+                r#"{{
+                    "provider": "codex",
+                    "version": "1.1.14",
+                    "distributions": [{{
+                        "os": "{}",
+                        "architecture": "{}",
+                        "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/codex.zip",
+                        "command": "{command}",
+                        "entrypoint": "package/dist/index.js",
+                        "args": [],
+                        "archive_format": "zip"
+                    }}]
+                }}"#,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                command,
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        archive.write_all(b"node").unwrap();
+        archive
+            .start_file(
+                "package/dist/index.js",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"adapter").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+
+        let manifest = SidecarManifest::generate(
+            &spec,
+            spec.select(std::env::consts::OS, std::env::consts::ARCH)
+                .unwrap(),
+            &bytes,
+        )
+        .unwrap();
+        let parsed = SidecarManifest::parse(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert_eq!(parsed.agent, "codex");
+        assert_eq!(parsed.command, command);
+        assert_eq!(parsed.entrypoint.as_deref(), Some("package/dist/index.js"));
     }
 }

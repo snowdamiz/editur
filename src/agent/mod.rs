@@ -1,4 +1,5 @@
 pub mod controller;
+pub mod provider;
 pub mod provision;
 pub mod state;
 
@@ -35,7 +36,7 @@ pub fn new_windows_job() -> Result<(String, WindowsJob), String> {
     let handle = unsafe {
         Owned::new(
             CreateJobObjectW(None, PCWSTR(wide.as_ptr()))
-                .map_err(|error| format!("cannot create Cursor Agent process job: {error}"))?,
+                .map_err(|error| format!("cannot create ACP provider process job: {error}"))?,
         )
     };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -46,9 +47,9 @@ pub fn new_windows_job() -> Result<(String, WindowsJob), String> {
             JobObjectExtendedLimitInformation,
             std::ptr::from_ref(&limits).cast(),
             u32::try_from(std::mem::size_of_val(&limits))
-                .map_err(|_| "Cursor Agent process job limits are too large")?,
+                .map_err(|_| "ACP provider process job limits are too large")?,
         )
-        .map_err(|error| format!("cannot configure Cursor Agent process job: {error}"))?;
+        .map_err(|error| format!("cannot configure ACP provider process job: {error}"))?;
     }
     Ok((name, WindowsJob { _handle: handle }))
 }
@@ -71,17 +72,20 @@ pub fn join_windows_job(name: &str) -> Result<(), String> {
     let handle = unsafe {
         Owned::new(
             OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS, false, PCWSTR(wide.as_ptr()))
-                .map_err(|error| format!("cannot open Cursor Agent process job: {error}"))?,
+                .map_err(|error| format!("cannot open ACP provider process job: {error}"))?,
         )
     };
     unsafe {
         AssignProcessToJobObject(*handle, GetCurrentProcess())
-            .map_err(|error| format!("cannot contain Cursor Agent process tree: {error}"))?;
+            .map_err(|error| format!("cannot contain ACP provider process tree: {error}"))?;
     }
     Ok(())
 }
 
-pub fn run_managed_process(project_root: &std::path::Path) -> Result<(), String> {
+pub fn run_managed_process(
+    provider: provider::ProviderId,
+    project_root: &std::path::Path,
+) -> Result<(), String> {
     let project_root = std::fs::canonicalize(project_root).map_err(|error| {
         format!(
             "cannot open agent workspace {}: {error}",
@@ -95,19 +99,19 @@ pub fn run_managed_process(project_root: &std::path::Path) -> Result<(), String>
         ));
     }
     let data_dir = crate::syntax::data_dir()?;
-    let manifest = provision::embedded_manifest()?;
-    let sidecar = provision::installed(&manifest, &data_dir)?;
+    let bundle = provision::embedded_bundle()?;
+    let installed = provision::installed(bundle.manifest(provider)?, &data_dir)?;
+    let prepared = provider::prepare_installed(provider, installed, &data_dir);
     #[cfg(windows)]
     join_windows_job(
         &std::env::var(WINDOWS_JOB_ENV)
-            .map_err(|_| "Cursor Agent process job was not supplied".to_owned())?,
+            .map_err(|_| "agent process job was not supplied".to_owned())?,
     )?;
-    let mut process = std::process::Command::new(&sidecar.command);
+    let mut process = std::process::Command::new(&prepared.command);
     process
-        .args(&sidecar.args)
+        .args(&prepared.args)
         .current_dir(&project_root)
-        .env("CURSOR_INVOKED_AS", "cursor-agent")
-        .env("NODE_COMPILE_CACHE", data_dir.join("agents/cursor/cache"));
+        .envs(prepared.env.iter().map(|(name, value)| (name, value)));
     #[cfg(windows)]
     process.env_remove(WINDOWS_JOB_ENV);
 
@@ -116,19 +120,28 @@ pub fn run_managed_process(project_root: &std::path::Path) -> Result<(), String>
         use std::os::unix::process::CommandExt as _;
 
         let error = process.exec();
-        Err(format!("cannot start managed Cursor Agent: {error}"))
+        Err(format!(
+            "cannot start managed {}: {error}",
+            prepared.display_name
+        ))
     }
     #[cfg(windows)]
     {
         let status = process
             .status()
-            .map_err(|error| format!("cannot start managed Cursor Agent: {error}"))?;
+            .map_err(|error| format!("cannot start managed {}: {error}", prepared.display_name))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("managed Cursor Agent exited with {status}"))
+            Err(format!(
+                "managed {} exited with {status}",
+                prepared.display_name
+            ))
         }
     }
     #[cfg(not(any(unix, windows)))]
-    Err("managed Cursor Agent is unsupported on this operating system".into())
+    Err(format!(
+        "managed {} is unsupported on this operating system",
+        prepared.display_name
+    ))
 }

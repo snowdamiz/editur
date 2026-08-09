@@ -72,17 +72,21 @@ Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F
 
 `editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, asks a clean resident editor to exit, and replaces the installation after verification. An update refuses to discard unsaved work. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
 
-## Cursor Agent sidebar
+## ACP Agent sidebar
 
-Use the sidebar icon at the right of the titlebar to toggle the independent Cursor Agent sidebar for the current project; the Files explorer remains visible on the left and the collapsed Agent sidebar consumes no workspace. Nothing agent-related is launched, inspected, or downloaded until the sidebar is first opened. The Agent sidebar supports streamed replies, plans, tool activity and supplied diffs, follow-ups in one session, advertised model/mode controls, ACP image, audio, and resource attachments from the + button or drag and drop, exact permission choices, cancellation, reconnect, and in-memory transcript truncation. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
+Use the sidebar icon at the right of the titlebar to open an ACP coding agent for the current project; the Files explorer remains visible on the left and the collapsed Agent sidebar consumes no workspace. Nothing provider-related is inspected, provisioned, or launched until Agent is first opened. Release builds offer Cursor by default and Codex from the provider selector. Provider switches stop the old process before starting the replacement, keep the unsent composer draft, and isolate sessions and managed files by provider.
 
-Official release builds embed a tested per-platform Cursor manifest. To run the same pinned Cursor Agent flow from a local source checkout, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`, then launches Editur with it embedded. A plain `cargo run` intentionally omits the manifest.
+The shared Agent UI supports streamed replies, plans, tool activity and supplied diffs, follow-ups, advertised model/mode controls, ACP image, audio, and resource attachments, exact permission choices, cancellation, reconnect, and bounded in-memory transcripts. History and provider-specific permission controls appear only when the connected agent advertises them. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
-Cursor authentication is handled by Cursor Agent. Choose its advertised login method in the sidebar to open the browser flow; Editur does not ask for, print, or store Cursor credentials. A Cursor account is required. Agent use consumes the limits or usage-based billing of that account and selected model; check [Cursor's current pricing](https://cursor.com/pricing) before use.
+Official release builds embed one attested provider bundle. Cursor `2026.07.23-e383d2b` is provisioned during installation. Codex uses the canonical `@agentclientprotocol/codex-acp` `1.1.14` adapter, its locked `@openai/codex` `0.147.0` dependency, and a private Node.js `22.22.0` runtime; it is downloaded lazily only after its first-use license and provider-terms notice is accepted. Editur never invokes `npx`, a global Node installation, or a mutable package tag. Claude remains an unavailable catalog entry until its canonical distribution and licensing can meet the same pinned private-package policy.
 
-Prompts, relevant project code, tool results, and conversation context may be sent by Cursor Agent to Cursor and its model providers. Editur does not add its own telemetry or persist the agent transcript, but Cursor's retention and training behavior depends on the account's Privacy Mode and provider choices. Review [Cursor's data-use policy](https://cursor.com/data-use), use `.cursorignore` for files Cursor should avoid, and do not submit regulated or third-party data unless your agreements permit it.
+To run the Cursor-only local development flow, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`. A plain `cargo run` intentionally omits provider metadata.
 
-Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. This integration uses the beta Cursor CLI/ACP surface and currently provides one local process, one active session, and one active turn. It has no cloud agents, parallel chats, persistent history, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
+Authentication is owned by the selected agent. Editur renders agent-launched login methods separately from terminal or environment setup methods and does not ask for, print, or store provider credentials. Provider use consumes that account's limits or usage-based billing; review [Cursor pricing](https://cursor.com/pricing) or [OpenAI API pricing](https://openai.com/api/pricing/) before use.
+
+Prompts, relevant project code, tool results, and conversation context may be sent to the selected provider and its model providers. Editur does not add telemetry or persist the transcript. Review [Cursor's data-use policy](https://cursor.com/data-use) or [OpenAI's data controls](https://platform.openai.com/docs/guides/your-data), use provider ignore controls where available, and do not submit regulated or third-party data unless your agreements permit it.
+
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
 
 ## Continuous releases
 
@@ -92,7 +96,7 @@ Push the commit to the dedicated delivery branch:
 git push origin HEAD:release
 ```
 
-The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, build attestations, and syntax catalog. Version tags matching `v*` still publish versioned application releases.
+The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and Windows x86_64. It builds the pinned Codex adapter from its locked upstream commit, packages the exact private runtime deterministically, verifies its version probe, and attests both package and provider bundle. A successful run moves the `release` tag and refreshes the continuous prerelease archives, updater binaries, checksums, provider packages, build attestations, and syntax catalog. Version tags matching `v*` still publish versioned application releases.
 
 ## Syntax packages
 

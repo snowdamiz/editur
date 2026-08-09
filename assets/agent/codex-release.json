@@ -1,0 +1,38 @@
+{
+  "provider": "codex",
+  "version": "1.1.14",
+  "distributions": [
+    {
+      "os": "macos",
+      "architecture": "aarch64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-macos-aarch64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "archive_format": "zip"
+    },
+    {
+      "os": "macos",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-macos-x86_64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "archive_format": "zip"
+    },
+    {
+      "os": "linux",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-linux-x86_64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "archive_format": "zip"
+    },
+    {
+      "os": "windows",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-codex-windows-x86_64.zip",
+      "command": "runtime/node.exe",
+      "entrypoint": "package/dist/index.js",
+      "archive_format": "zip"
+    }
+  ]
+}

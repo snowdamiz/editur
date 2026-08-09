@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use editur::agent::controller::{
-    AgentController, Command, ConfigValue, ConnectionState, Event, InteractionResponse,
+    AgentController, AuthKind, Command, ConfigValue, ConnectionState, Event, InteractionResponse,
     PromptAttachment, QuestionAnswer,
 };
+use editur::agent::provider::ProviderId;
 
 fn receive_until(
     controller: &AgentController,
@@ -105,6 +106,11 @@ fn authentication_required_is_a_status_not_a_transcript_error() {
             )
         )
     });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ConnectionChanged(ConnectionState::AuthenticationRequired(methods))
+            if matches!(methods.as_slice(), [method] if method.kind == AuthKind::Agent)
+    )));
 
     controller
         .send(Command::Authenticate("cursor_login".into()))
@@ -116,6 +122,60 @@ fn authentication_required_is_a_status_not_a_transcript_error() {
     ));
 
     assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+}
+
+#[test]
+fn terminal_authentication_kind_is_preserved_without_collecting_credentials() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--terminal-auth".into()],
+    );
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::ConnectionChanged(ConnectionState::AuthenticationRequired(_))
+        )
+    });
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ConnectionChanged(ConnectionState::AuthenticationRequired(methods))
+            if matches!(methods.as_slice(), [method]
+                if method.id == "terminal_login"
+                    && method.kind == AuthKind::Terminal
+                    && method.setup.as_deref() == Some("arguments: login"))
+    )));
+}
+
+#[test]
+fn history_and_cursor_only_controls_are_capability_events() {
+    for (provider, args, expected_history, expected_allow_all) in [
+        (ProviderId::Cursor, vec!["--sessions".into()], true, true),
+        (ProviderId::Codex, Vec::new(), false, false),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        let controller = AgentController::start_process_for(
+            provider,
+            project.path().to_path_buf(),
+            env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+            args,
+        );
+        let events = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                Event::SessionReady { .. } | Event::SessionLoaded { .. }
+            )
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Capabilities { history, allow_run_everything }
+                if (*history, *allow_run_everything) == (expected_history, expected_allow_all)
+        )));
+    }
 }
 
 #[test]
@@ -613,6 +673,80 @@ fn cursor_extension_notifications_reach_structured_tool_cards() {
                     if content == "Ship it"
             ))
     )));
+}
+
+#[test]
+fn cursor_extensions_are_ignored_for_a_non_cursor_provider() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("cursor-question".into()))
+        .unwrap();
+    let question = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(
+        !question
+            .iter()
+            .any(|event| { matches!(event, Event::InteractionRequested(_) | Event::Error(_)) })
+    );
+    assert!(
+        question
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "cancelled"))
+    );
+
+    controller
+        .send(Command::Prompt("cursor-notification".into()))
+        .unwrap();
+    let notification = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(
+        !notification
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallUpdated(_)))
+    );
+}
+
+#[test]
+fn standard_acp_behavior_is_shared_by_two_provider_ids() {
+    for provider in [ProviderId::Cursor, ProviderId::Codex] {
+        let project = tempfile::tempdir().unwrap();
+        let controller = AgentController::start_process_for(
+            provider,
+            project.path().to_path_buf(),
+            env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+            Vec::new(),
+        );
+        receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::SessionReady { .. })
+        });
+        controller.send(Command::Prompt("tool".into())).unwrap();
+        let events = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallUpdated(tool) if tool.id == "fake-edit"
+        )));
+        controller.send(Command::Shutdown).unwrap();
+        receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                Event::ConnectionChanged(ConnectionState::Disconnected)
+            )
+        });
+    }
 }
 
 #[test]

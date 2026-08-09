@@ -66,6 +66,8 @@ pub struct AgentState {
     pub connection: ConnectionState,
     pub session_ready: bool,
     pub active: bool,
+    pub history_available: bool,
+    pub allow_run_everything: bool,
     pub prompt: String,
     pub transcript: VecDeque<TranscriptItem>,
     pub changed_paths: HashSet<PathBuf>,
@@ -86,6 +88,8 @@ impl Default for AgentState {
             connection: ConnectionState::Disconnected,
             session_ready: false,
             active: false,
+            history_available: false,
+            allow_run_everything: false,
             prompt: String::new(),
             transcript: VecDeque::new(),
             changed_paths: HashSet::new(),
@@ -103,6 +107,16 @@ impl Default for AgentState {
 }
 
 impl AgentState {
+    pub fn reset_for_provider_switch(&mut self) {
+        let prompt = std::mem::take(&mut self.prompt);
+        *self = Self::default();
+        self.prompt = prompt;
+    }
+
+    pub fn can_switch_provider(&self) -> bool {
+        !self.active && !self.waiting_permission()
+    }
+
     pub fn can_send(&self, buffer_saved: bool) -> bool {
         buffer_saved && self.session_ready && !self.active && !self.prompt.trim().is_empty()
     }
@@ -150,6 +164,16 @@ impl AgentState {
             Event::ConnectionChanged(connection) => {
                 self.session_ready = matches!(connection, ConnectionState::Ready);
                 self.connection = connection;
+            }
+            Event::Capabilities {
+                history,
+                allow_run_everything,
+            } => {
+                self.history_available = history;
+                self.allow_run_everything = allow_run_everything;
+                if !history {
+                    self.sessions = None;
+                }
             }
             Event::SessionReady {
                 current_mode,

@@ -7,16 +7,17 @@ use std::{
 };
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, Diff, EmbeddedResourceResource,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionConfigOption,
-    SessionConfigSelectOption, SessionInfo, SessionListCapabilities, SessionMode, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, CancelNotification, ContentBlock, ContentChunk, Diff,
+    EmbeddedResourceResource, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
+    SessionConfigOption, SessionConfigSelectOption, SessionInfo, SessionListCapabilities,
+    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Result, Stdio};
 
@@ -57,12 +58,17 @@ fn main() {
         return;
     }
     let mut authentication_required = false;
+    let mut terminal_auth = false;
     let mut sessions_supported = false;
     let mut stale_session = false;
     let mut address_file = None;
     for argument in std::env::args_os().skip(1) {
         match argument.to_str() {
             Some("--auth-required") => authentication_required = true,
+            Some("--terminal-auth") => {
+                authentication_required = true;
+                terminal_auth = true;
+            }
             Some("--sessions") => sessions_supported = true,
             Some("--stale-session") => stale_session = true,
             _ if address_file.is_none() => address_file = Some(argument),
@@ -77,6 +83,7 @@ fn main() {
     });
     let result = async_io::block_on(run(
         authentication_required,
+        terminal_auth,
         sessions_supported,
         stale_session,
     ));
@@ -123,6 +130,7 @@ fn run_windows_job_fixture() -> bool {
 
 async fn run(
     authentication_required: bool,
+    terminal_auth: bool,
     sessions_supported: bool,
     stale_session: bool,
 ) -> Result<()> {
@@ -160,9 +168,17 @@ async fn run(
                         );
                     }
                     if authentication_required {
-                        response = response.auth_methods(vec![AuthMethod::Agent(
-                            AuthMethodAgent::new("cursor_login", "Cursor Login"),
-                        )]);
+                        response = response.auth_methods(vec![if terminal_auth {
+                            AuthMethod::Terminal(
+                                AuthMethodTerminal::new("terminal_login", "Terminal Login")
+                                    .args(vec!["login".into()]),
+                            )
+                        } else {
+                            AuthMethod::Agent(AuthMethodAgent::new(
+                                "cursor_login",
+                                "Cursor Login",
+                            ))
+                        }]);
                     }
                     response = response.agent_capabilities(capabilities);
                     responder.respond(response)

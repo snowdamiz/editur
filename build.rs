@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icons/editur.ico");
     println!("cargo:rerun-if-env-changed=EDITUR_REQUIRE_PRECOMPILED_METAL");
     println!("cargo:rerun-if-env-changed=EDITUR_AGENT_MANIFEST");
+    println!("cargo:rerun-if-env-changed=EDITUR_PROVIDER_BUNDLE");
     println!("cargo:rustc-check-cfg=cfg(editur_precompiled_metal)");
     println!("cargo:rustc-check-cfg=cfg(feature, values(\"cargo-clippy\"))");
     let mut builder = SyntaxSetBuilder::new();
@@ -35,20 +36,22 @@ fn main() {
     .unwrap_or_else(|error| panic!("failed to validate Vulkan shader: {error}"));
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap_or_default());
     let agent_manifest = output_dir.join("agent-sidecar.json");
-    if let Some(source) = env::var_os("EDITUR_AGENT_MANIFEST") {
+    if let Some(source) =
+        env::var_os("EDITUR_PROVIDER_BUNDLE").or_else(|| env::var_os("EDITUR_AGENT_MANIFEST"))
+    {
         println!(
             "cargo:rerun-if-changed={}",
             PathBuf::from(&source).display()
         );
         fs::copy(&source, &agent_manifest).unwrap_or_else(|error| {
             panic!(
-                "failed to embed Cursor Agent manifest {}: {error}",
+                "failed to embed ACP provider bundle {}: {error}",
                 PathBuf::from(source).display()
             )
         });
     } else {
         fs::write(&agent_manifest, [])
-            .unwrap_or_else(|error| panic!("failed to write empty Cursor Agent manifest: {error}"));
+            .unwrap_or_else(|error| panic!("failed to write empty ACP provider bundle: {error}"));
     }
     for (name, stage) in [
         ("vertex", naga::ShaderStage::Vertex),

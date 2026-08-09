@@ -32,6 +32,8 @@ Measured 2026-08-06 on the same Apple M4 reference machine. The comparison used 
 
 Normal startup constructs only the Agent titlebar toggle: it performs no sidecar lookup, ACP initialization, network request, child-process launch, or agent repaint polling. Agent events wake egui immediately and are drained 64 at a time; while a turn is active, open-file reconciliation requests a frame at 500 ms intervals. A native input-to-present trace during authenticated streaming remains part of the release smoke test.
 
+The multi-provider refactor keeps that unopened path unchanged: catalog availability, persisted selection, bundle parsing, installation checks, and provisioning begin only when Agent is opened. CI verifies the exact Codex `1.1.14` adapter and private Node.js `22.22.0` runtime by deterministically packaging, extracting, and executing its version probe; networked authentication and paid prompts remain manual release checks.
+
 The pinned package is Cursor Agent `2026.07.23-e383d2b`. A direct managed-command spike negotiated stable protocol v1 and advertised load-session, HTTP/SSE MCP, image prompt, session-list, and `cursor_login` authentication capabilities. Starting it with its supported `--disable-auto-update` option left the executable and entrypoint hashes unchanged. Deterministic tests cover streaming, split tool updates and supplied diffs, same-session follow-ups, exact allow/reject decisions, cancellation, unknown notifications, malformed stdout, bounded stderr, unexpected exit, and descendant-free shutdown without credentials or network access. Windows release tests additionally put the wrapper and a fake descendant in the same kill-on-close job object and verify that closing the job releases the descendant's marker socket.
 
 | Cursor release target | Archive | Extracted package | Entries |
@@ -42,6 +44,19 @@ The pinned package is Cursor Agent `2026.07.23-e383d2b`. A direct managed-comman
 | Windows x86_64 | 60.15 MiB | 160.15 MiB | 249 |
 
 Before promoting a continuous build to stable, the release owner must repeat the authenticated paid smoke on native macOS, Linux, and Windows: streaming, follow-up context, permission allow/reject coverage, cancellation, a reported file edit, browser authentication, and child-tree teardown. The project owner confirmed on 2026-08-06 that the direct installer-mediated Cursor ACP package flow is permitted; each stable release must still recheck that Cursor's registry distribution and terms have not changed.
+
+### Provider release smoke matrix
+
+Run every non-package column with a disposable provider account; CI must not receive real credentials or paid tokens.
+
+| Provider / target | Package + version probe | Auth + initialize | Session/history | Tools/permissions/cancel | Switch/teardown/repair |
+| --- | --- | --- | --- | --- | --- |
+| Cursor / macOS arm64 | Baseline passed 2026-08-06 | Baseline passed | Baseline passed | Baseline passed | Automated teardown and repair; repeat manually |
+| Cursor / macOS x86_64, Linux x86_64, Windows x86_64 | Release CI | Required before stable | Required before stable | Required before stable | Required before stable |
+| Codex / all release targets | Release CI: pinned adapter, runtime, checksum, extraction, version | Required before stable | Required before stable | Required before stable | Required before stable |
+| Claude | Blocked distribution; not shipped | Not applicable | Not applicable | Not applicable | Not applicable |
+
+For each completed run, record advertised protocol/capabilities, archive and installed sizes, time to connection, unsupported features, corrupt-package repair, and confirmation that application exit leaves no descendant process. A provider that fails a distribution, terms, auth, or teardown gate is removed from the bundle without removing its existing on-disk namespace.
 
 ## Rust highlighting
 

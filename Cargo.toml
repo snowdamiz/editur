@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 build = "build.rs"
 
 [dependencies]
-agent-client-protocol = "=2.0.0"
+agent-client-protocol = { version = "=2.0.0", features = ["unstable_auth_methods"] }
 async-channel = "2.5.0"
 async-io = "2.6.0"
 directories = "6.0.0"

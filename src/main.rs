@@ -54,19 +54,27 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
             app::run(resolve_target(&cwd, Some(&path))?, started)
         }
         Command::QuitRunning => app::quit_running(),
-        Command::AgentProcess(project_root) => editur::agent::run_managed_process(&project_root),
-        Command::AgentProvision => {
-            let manifest = editur::agent::provision::embedded_manifest()?;
-            let sidecar = editur::agent::provision::ensure(&manifest, &data_dir()?, |progress| {
+        Command::AgentProcess(provider, project_root) => {
+            editur::agent::run_managed_process(provider, &project_root)
+        }
+        Command::AgentProvision(provider) => {
+            let bundle = editur::agent::provision::embedded_bundle()?;
+            let manifest = bundle.manifest(provider)?;
+            let sidecar = editur::agent::provision::ensure(manifest, &data_dir()?, |progress| {
                 if let Some(total) = progress.total {
                     eprint!(
-                        "\rProvisioning Cursor Agent: {}/{} MiB",
+                        "\rProvisioning {}: {}/{} MiB",
+                        editur::agent::provider::descriptor(provider).display_name,
                         progress.downloaded / 1_048_576,
                         total / 1_048_576
                     );
                 }
             })?;
-            println!("\nProvisioned Cursor Agent {}.", sidecar.version);
+            println!(
+                "\nProvisioned {} {}.",
+                editur::agent::provider::descriptor(provider).display_name,
+                sidecar.version
+            );
             Ok(())
         }
         Command::Syntax(command) => syntax_command(command),

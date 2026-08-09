@@ -5,7 +5,7 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
 };
 
@@ -25,10 +25,14 @@ use winit::{
 use crate::{
     agent::{
         controller::{
-            AgentController, Command as AgentCommand, ConfigValue, ConnectionState, ContentRole,
-            DisplayContent, Event as AgentEvent, InteractionKind, InteractionResponse,
+            AgentController, AuthKind, Command as AgentCommand, ConfigValue, ConnectionState,
+            ContentRole, DisplayContent, Event as AgentEvent, InteractionKind, InteractionResponse,
             MAX_PROMPT_ATTACHMENT_TOTAL_BYTES, MAX_PROMPT_ATTACHMENTS, PromptAttachment,
             QuestionAnswer, SessionChoice, ToolOutput,
+        },
+        provider::{
+            InstallPolicy, ProviderDescriptor, ProviderIcon, ProviderId,
+            catalog as provider_catalog, descriptor as provider_descriptor,
         },
         state::{AgentState, TranscriptItem},
     },
@@ -68,7 +72,9 @@ const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
 const AGENT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
 const AGENT_MENU_WIDTH: f32 = 240.0;
+const AGENT_PROVIDER_MENU_WIDTH: f32 = 320.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
+const AGENT_PROVIDER_ROW_HEIGHT: f32 = 58.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
 const AGENT_FOLLOW_THRESHOLD: f32 = 48.0;
@@ -486,7 +492,7 @@ fn paint_agent_disclosure(ui: &mut egui::Ui, openness: f32, response: &egui::Res
     ));
 }
 
-fn paint_cursor_mark(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_cursor_mark(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let center = rect.center();
     let top = center + egui::vec2(0.0, -7.0);
     let upper_right = center + egui::vec2(6.1, -3.5);
@@ -494,7 +500,6 @@ fn paint_cursor_mark(painter: &egui::Painter, rect: egui::Rect) {
     let bottom = center + egui::vec2(0.0, 7.0);
     let lower_left = center + egui::vec2(-6.1, 3.5);
     let upper_left = center + egui::vec2(-6.1, -3.5);
-    let color = Color32::from_rgb(238, 240, 246);
     for points in [
         vec![top, upper_right, upper_left],
         vec![upper_right, lower_right, bottom],
@@ -508,19 +513,73 @@ fn paint_cursor_mark(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
-fn draw_cursor_identity(ui: &mut egui::Ui) {
+fn paint_provider_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: ProviderIcon,
+    color: Color32,
+) {
+    match icon {
+        ProviderIcon::CursorMark => paint_cursor_mark(painter, rect, color),
+        ProviderIcon::Glyph(glyph) => {
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::proportional(14.0),
+                color,
+            );
+        }
+    }
+}
+
+fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
+    let provider = provider_descriptor(provider);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 18.0), Sense::hover());
-        paint_cursor_mark(ui.painter(), rect);
+        paint_provider_icon(
+            ui.painter(),
+            rect,
+            provider.icon,
+            Color32::from_rgb(238, 240, 246),
+        );
         ui.label(
-            RichText::new("Cursor")
+            RichText::new(provider.display_name)
                 .size(13.0)
                 .strong()
                 .color(Color32::from_rgb(238, 240, 246)),
         );
     });
     ui.add_space(2.0);
+}
+
+fn draw_provider_selector_identity(
+    ui: &mut egui::Ui,
+    provider: ProviderId,
+    enabled: bool,
+) -> egui::Response {
+    let response = ui
+        .add_enabled_ui(enabled, |ui| {
+            let inner = ui.horizontal(|ui| {
+                draw_provider_identity(ui, provider);
+                ui.label(RichText::new("⌄").weak());
+            });
+            ui.interact(
+                inner.response.rect,
+                Id::new(("agent_provider_selector", ui.id())),
+                Sense::click(),
+            )
+        })
+        .inner;
+    let label = format!(
+        "Select ACP provider: {}",
+        provider_descriptor(provider).display_name
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label.clone())
+    });
+    response.on_hover_text(label)
 }
 
 #[derive(Clone, Default)]
@@ -1056,10 +1115,12 @@ fn agent_session_menu_rect(
     transcript: egui::Rect,
     anchor: egui::Rect,
     item_count: usize,
+    row_height: f32,
+    width: f32,
 ) -> egui::Rect {
-    let width = AGENT_MENU_WIDTH.min((transcript.width() - 12.0).max(1.0));
+    let width = width.min((transcript.width() - 12.0).max(1.0));
     let top = anchor.bottom() + 4.0;
-    let height = (16.0 + item_count as f32 * AGENT_SESSION_ROW_HEIGHT)
+    let height = (16.0 + item_count as f32 * row_height)
         .min(280.0)
         .min((transcript.bottom() - top - 8.0).max(1.0));
     let left = (anchor.right() - width).clamp(
@@ -1089,13 +1150,39 @@ fn run_everything_state(commands: &[crate::agent::controller::CommandChoice]) ->
         .then(|| description.contains("currently enabled"))
 }
 
+fn provider_selector_visible(available: &[crate::agent::provider::ProviderId]) -> bool {
+    available.len() >= 2
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum AgentMenu {
+    Providers,
     Sessions,
     Commands(String),
     Permissions,
     Mode,
     Config(String),
+}
+
+struct ProviderTransition {
+    target: ProviderId,
+    shutdown: Receiver<()>,
+}
+
+fn shutdown_agent_in_background(
+    controller: impl Send + 'static,
+    wake: impl FnOnce() + Send + 'static,
+) -> Result<Receiver<()>, String> {
+    let (done, shutdown) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("editur-agent-shutdown".into())
+        .spawn(move || {
+            drop(controller);
+            let _ = done.send(());
+            wake();
+        })
+        .map_err(|error| format!("cannot stop the previous ACP provider: {error}"))?;
+    Ok(shutdown)
 }
 
 struct TreeState {
@@ -1648,6 +1735,12 @@ pub struct EditorApp {
     agent_drop_hovered: bool,
     agent_file_picker: Option<AgentFilePicker>,
     agent_run_everything: Option<bool>,
+    selected_provider: ProviderId,
+    available_providers: Vec<ProviderId>,
+    provider_menu_anchor: Option<egui::Rect>,
+    pending_provider_confirmation: Option<ProviderId>,
+    pending_provider_terms: Option<ProviderId>,
+    provider_transition: Option<ProviderTransition>,
     scrollbar_activity: crate::scrollbar::Activity,
     agent: AgentState,
     agent_controller: Option<AgentController>,
@@ -1720,6 +1813,12 @@ impl EditorApp {
             agent_drop_hovered: false,
             agent_file_picker: None,
             agent_run_everything: None,
+            selected_provider: ProviderId::Cursor,
+            available_providers: Vec::new(),
+            provider_menu_anchor: None,
+            pending_provider_confirmation: None,
+            pending_provider_terms: None,
+            provider_transition: None,
             scrollbar_activity: crate::scrollbar::Activity::default(),
             agent: AgentState::default(),
             agent_controller: None,
@@ -2146,12 +2245,35 @@ impl EditorApp {
                 .layout(Layout::top_down(Align::LEFT)),
             |ui| {
                 ui.set_width(content.width());
-                draw_cursor_identity(ui);
+                if provider_selector_visible(&self.available_providers) {
+                    let switchable =
+                        self.agent.can_switch_provider() && self.provider_transition.is_none();
+                    let response =
+                        draw_provider_selector_identity(ui, self.selected_provider, switchable);
+                    let response = if switchable {
+                        response
+                    } else {
+                        response.on_hover_text(
+                            "Stop or answer the current request before switching providers.",
+                        )
+                    };
+                    self.provider_menu_anchor = Some(response.rect);
+                    if response.clicked() {
+                        let menu = AgentMenu::Providers;
+                        self.agent_menu = (self.agent_menu.as_ref() != Some(&menu)).then_some(menu);
+                    }
+                } else {
+                    draw_provider_identity(ui, self.selected_provider);
+                    self.provider_menu_anchor = None;
+                }
                 ui.add_space(8.0);
                 new_session = ui
                     .add_enabled_ui(self.agent.session_ready, agentic_new_session_button)
                     .inner
-                    .on_hover_text("Start a new Cursor Agent session")
+                    .on_hover_text(format!(
+                        "Start a new {} Agent session",
+                        provider_descriptor(self.selected_provider).display_name
+                    ))
                     .clicked();
                 ui.add_space(16.0);
                 ScrollArea::vertical()
@@ -2161,6 +2283,14 @@ impl EditorApp {
                         draw_agentic_project_header(ui, project.as_ref());
                         ui.add_space(1.0);
                         match &self.agent.sessions {
+                            _ if !self.agent.history_available => {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new("Session history unavailable").small().weak(),
+                                    );
+                                });
+                            }
                             None => {
                                 ui.horizontal(|ui| {
                                     ui.add_space(10.0);
@@ -2626,9 +2756,9 @@ impl EditorApp {
 
     fn draw_agent_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
         let label = if self.agent_sidebar {
-            "Close Cursor Agent"
+            "Close Agent"
         } else {
-            "Open Cursor Agent"
+            "Open Agent"
         };
         let response = ui
             .interact(button, Id::new("agent_sidebar_toggle"), Sense::click())
@@ -2938,8 +3068,21 @@ impl EditorApp {
     }
 
     fn open_agent(&mut self, ctx: &egui::Context) {
+        self.ensure_provider_catalog();
         let wake = ctx.clone();
         self.start_agent(move || wake.request_repaint());
+    }
+
+    fn ensure_provider_catalog(&mut self) {
+        if !self.available_providers.is_empty() {
+            return;
+        }
+        self.available_providers = crate::agent::provision::embedded_bundle()
+            .map(|bundle| bundle.available())
+            .unwrap_or_else(|_| vec![ProviderId::Cursor]);
+        self.selected_provider = data_dir().map_or(ProviderId::Cursor, |directory| {
+            crate::agent::provider::load_selected(&directory, &self.available_providers)
+        });
     }
 
     fn start_agent(&mut self, wake: impl Fn() + Send + Sync + 'static) {
@@ -2951,21 +3094,97 @@ impl EditorApp {
         self.agent.connection = ConnectionState::Starting;
         self.agent_run_everything = None;
         self.agent_controller = Some(AgentController::start_with_wake(
+            self.selected_provider,
             self.tree.root.clone(),
             wake,
         ));
     }
 
     fn reconnect_agent(&mut self, ctx: &egui::Context) {
-        if let Some(controller) = self.agent_controller.take() {
-            let _ = std::thread::Builder::new()
-                .name("editur-agent-shutdown".into())
-                .spawn(move || drop(controller));
+        self.begin_provider_transition(self.selected_provider, ctx);
+    }
+
+    fn request_provider_switch(&mut self, target: ProviderId, ctx: &egui::Context) {
+        if target == self.selected_provider
+            || !self.available_providers.contains(&target)
+            || !self.agent.can_switch_provider()
+        {
+            return;
         }
-        self.open_agent(ctx);
+        if self.agent.transcript.is_empty() {
+            self.request_provider_terms_or_transition(target, ctx);
+        } else {
+            self.pending_provider_confirmation = Some(target);
+        }
+    }
+
+    fn request_provider_terms_or_transition(&mut self, target: ProviderId, ctx: &egui::Context) {
+        let provider = provider_descriptor(target);
+        if provider.install_policy == InstallPolicy::Bundled {
+            self.begin_provider_transition(target, ctx);
+            return;
+        }
+        match data_dir() {
+            Ok(directory) if crate::agent::provider::terms_accepted(&directory, target) => {
+                self.begin_provider_transition(target, ctx);
+            }
+            Ok(_) => self.pending_provider_terms = Some(target),
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    fn begin_provider_transition(&mut self, target: ProviderId, ctx: &egui::Context) {
+        if self.provider_transition.is_some() || !self.agent.can_switch_provider() {
+            return;
+        }
+        self.selected_provider = target;
+        if let Ok(directory) = data_dir()
+            && let Err(error) = crate::agent::provider::save_selected(&directory, target)
+        {
+            self.show_error(error);
+        }
+        self.agent.reset_for_provider_switch();
+        self.agent.connection = ConnectionState::Switching {
+            provider: provider_descriptor(target).display_name.to_owned(),
+        };
+        self.agent_menu = None;
+        self.agent_menu_popup = None;
+        self.agent_prompt_history_index = None;
+        self.agent_prompt_history_draft.clear();
+        self.agent_follow_transcript = true;
+        self.agent_file_picker = None;
+        self.agent_run_everything = None;
+        self.pending_provider_confirmation = None;
+        self.pending_provider_terms = None;
+        let Some(controller) = self.agent_controller.take() else {
+            let wake = ctx.clone();
+            self.start_agent(move || wake.request_repaint());
+            return;
+        };
+        let wake = ctx.clone();
+        match shutdown_agent_in_background(controller, move || wake.request_repaint()) {
+            Ok(shutdown) => {
+                self.provider_transition = Some(ProviderTransition { target, shutdown })
+            }
+            Err(error) => {
+                self.agent.connection = ConnectionState::Failed(error);
+            }
+        }
     }
 
     fn poll_agent(&mut self, ctx: &egui::Context) {
+        let transition_ready = self.provider_transition.as_ref().is_some_and(|transition| {
+            !matches!(
+                transition.shutdown.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            )
+        });
+        if transition_ready {
+            let transition = self.provider_transition.take().unwrap();
+            debug_assert_eq!(transition.target, self.selected_provider);
+            let wake = ctx.clone();
+            self.start_agent(move || wake.request_repaint());
+        }
         let mut events = Vec::new();
         if let Some(controller) = &self.agent_controller {
             for _ in 0..64 {
@@ -2992,10 +3211,20 @@ impl EditorApp {
             if matches!(event, AgentEvent::UserMessage(_)) {
                 self.agent_attachments.clear();
             }
-            if let AgentEvent::CommandsUpdated(commands) = &event
+            if self.agent.allow_run_everything
+                && let AgentEvent::CommandsUpdated(commands) = &event
                 && let Some(enabled) = run_everything_state(commands)
             {
                 self.agent_run_everything = Some(enabled);
+            }
+            if matches!(
+                &event,
+                AgentEvent::Capabilities {
+                    allow_run_everything: false,
+                    ..
+                }
+            ) {
+                self.agent_run_everything = None;
             }
             let reconcile_path = match &event {
                 AgentEvent::ToolCallUpdated(tool) => self
@@ -3297,6 +3526,7 @@ impl EditorApp {
         let mut new_session = false;
         let mut session_menu_anchor = None;
         let mut session_menu_toggled = false;
+        let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
         painter.rect_filled(header, 0.0, Color32::from_rgb(24, 24, 26));
         painter.hline(
@@ -3316,17 +3546,53 @@ impl EditorApp {
             "Agent"
         });
         #[cfg(target_os = "macos")]
-        let title_x = if self.agentic_mode && !self.sidebar {
+        let mut title_x = if self.agentic_mode && !self.sidebar {
             header.left() + 166.0
         } else {
             header.left() + 14.0
         };
         #[cfg(not(target_os = "macos"))]
-        let title_x = if self.agentic_mode {
+        let mut title_x = if self.agentic_mode {
             header.left() + if self.sidebar { 76.0 } else { 90.0 }
         } else {
             header.left() + 14.0
         };
+        if !self.agentic_mode && provider_selector_visible(&self.available_providers) {
+            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
+            let provider_rect = egui::Rect::from_min_max(
+                egui::pos2(header.left() + 10.0, header.top() + 3.0),
+                egui::pos2(
+                    (header.left() + 102.0).min(header.right()),
+                    header.bottom() - 2.0,
+                ),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("agent_provider_header")
+                    .max_rect(provider_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    let response =
+                        draw_provider_selector_identity(ui, self.selected_provider, switchable);
+                    let response = if switchable {
+                        response
+                    } else {
+                        response.on_hover_text(
+                            "Stop or answer the current request before switching providers.",
+                        )
+                    };
+                    self.provider_menu_anchor = Some(response.rect);
+                    if response.clicked() {
+                        let menu = AgentMenu::Providers;
+                        self.agent_menu = (self.agent_menu.as_ref() != Some(&menu)).then_some(menu);
+                        provider_menu_toggled = true;
+                    }
+                },
+            );
+            title_x = header.left() + 112.0;
+        } else if !self.agentic_mode {
+            self.provider_menu_anchor = None;
+        }
         painter.text(
             egui::pos2(title_x, header.center().y - 0.5),
             Align2::LEFT_CENTER,
@@ -3371,7 +3637,7 @@ impl EditorApp {
             );
             new_session = response.clicked();
         }
-        if !self.agentic_mode && self.agent.session_ready && self.agent.sessions.is_some() {
+        if !self.agentic_mode && self.agent.session_ready && self.agent.history_available {
             let button = agent_sessions_rect(header);
             let response = ui
                 .interact(button, Id::new("agent_sessions"), Sense::click())
@@ -3438,7 +3704,10 @@ impl EditorApp {
             |ui| match &status {
                 ConnectionState::Provisioning { downloaded, total } => {
                     ui.label(
-                        RichText::new("Installing Cursor Agent")
+                        RichText::new(format!(
+                            "Installing {} Agent",
+                            provider_descriptor(self.selected_provider).display_name
+                        ))
                             .size(15.0)
                             .strong()
                             .color(Color32::from_rgb(224, 228, 236)),
@@ -3453,9 +3722,19 @@ impl EditorApp {
                         .color(Color32::from_rgb(132, 141, 156)),
                     );
                 }
+                ConnectionState::Switching { provider } => {
+                    ui.label(
+                        RichText::new(format!("Switching to {provider}…"))
+                            .size(14.0)
+                            .color(Color32::from_rgb(174, 181, 194)),
+                    );
+                }
                 ConnectionState::Starting => {
                     ui.label(
-                        RichText::new("Connecting to Cursor…")
+                        RichText::new(format!(
+                            "Connecting to {}…",
+                            provider_descriptor(self.selected_provider).display_name
+                        ))
                             .size(14.0)
                             .color(Color32::from_rgb(174, 181, 194)),
                     );
@@ -3469,7 +3748,10 @@ impl EditorApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(
-                                RichText::new("Connect Cursor")
+                                RichText::new(format!(
+                                    "Connect {}",
+                                    provider_descriptor(self.selected_provider).display_name
+                                ))
                                     .size(15.0)
                                     .strong()
                                     .color(Color32::from_rgb(226, 230, 238)),
@@ -3477,30 +3759,56 @@ impl EditorApp {
                             ui.add_space(3.0);
                             ui.add(
                                 Label::new(
-                                    RichText::new(
-                                        "Sign in with your Cursor account to start an Agent session in this project.",
-                                    )
+                                    RichText::new(format!(
+                                        "Sign in with your {} account to start an Agent session in this project.",
+                                        provider_descriptor(self.selected_provider).display_name
+                                    ))
                                     .color(Color32::from_rgb(142, 150, 164)),
                                 )
                                 .wrap(),
                             );
                             ui.add_space(10.0);
                             for method in methods {
-                                let button = egui::Button::new(
-                                    RichText::new(&method.name)
-                                        .strong()
-                                        .color(Color32::from_rgb(10, 27, 31)),
-                                )
-                                .fill(Color32::from_rgb(94, 210, 224))
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(5)
-                                .min_size(egui::vec2(ui.available_width(), 30.0));
-                                if ui.add(button).clicked() {
-                                    authenticate = Some(method.id.clone());
+                                if method.kind == AuthKind::Agent {
+                                    let button = egui::Button::new(
+                                        RichText::new(&method.name)
+                                            .strong()
+                                            .color(Color32::from_rgb(10, 27, 31)),
+                                    )
+                                    .fill(Color32::from_rgb(94, 210, 224))
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(5)
+                                    .min_size(egui::vec2(ui.available_width(), 30.0));
+                                    if ui.add(button).clicked() {
+                                        authenticate = Some(method.id.clone());
+                                    }
+                                } else {
+                                    ui.label(RichText::new(&method.name).strong());
                                 }
                                 if let Some(description) = &method.description {
                                     ui.add(
                                         Label::new(RichText::new(description).small().weak())
+                                            .wrap(),
+                                    );
+                                }
+                                let setup = match method.kind {
+                                    AuthKind::Agent => None,
+                                    AuthKind::Terminal => Some(
+                                        "Complete this sign-in in a terminal, then try again.",
+                                    ),
+                                    AuthKind::Environment => Some(
+                                        "Set the required environment credentials before launching Editur again.",
+                                    ),
+                                    AuthKind::Unsupported => Some(
+                                        "This authentication method is not supported in Editur.",
+                                    ),
+                                };
+                                if let Some(setup) = setup {
+                                    ui.add(Label::new(RichText::new(setup).small().weak()).wrap());
+                                }
+                                if let Some(details) = &method.setup {
+                                    ui.add(
+                                        Label::new(RichText::new(details).small().monospace().weak())
                                             .wrap(),
                                     );
                                 }
@@ -3516,7 +3824,10 @@ impl EditorApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.label(
-                                RichText::new("Cursor Agent unavailable")
+                                RichText::new(format!(
+                                    "{} Agent unavailable",
+                                    provider_descriptor(self.selected_provider).display_name
+                                ))
                                     .strong()
                                     .color(Color32::from_rgb(237, 191, 194)),
                             );
@@ -3526,7 +3837,13 @@ impl EditorApp {
                         });
                 }
                 ConnectionState::Disconnected => {
-                    ui.label(RichText::new("Cursor Agent is offline.").weak());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} Agent is offline.",
+                            provider_descriptor(self.selected_provider).display_name
+                        ))
+                        .weak(),
+                    );
                     reconnect = ui.button("Connect").clicked();
                 }
                 ConnectionState::Ready if self.agent.transcript.is_empty() => {
@@ -3605,7 +3922,10 @@ impl EditorApp {
                             ui.add(
                                 Label::new(
                                     RichText::new(
-                                        "Ask Cursor to edit, explain, or run commands in this project.",
+                                        format!(
+                                            "Ask {} to edit, explain, or run commands in this project.",
+                                            provider_descriptor(self.selected_provider).display_name
+                                        ),
                                     )
                                     .size(13.5)
                                     .color(Color32::from_rgb(112, 121, 136)),
@@ -3669,7 +3989,7 @@ impl EditorApp {
                                             });
                                     }
                                     TranscriptItem::Assistant(text) => {
-                                        draw_cursor_identity(ui);
+                                        draw_provider_identity(ui, self.selected_provider);
                                         let width = ui.available_width();
                                         let galley = agent_markdown_galley(
                                             ui,
@@ -3693,7 +4013,9 @@ impl EditorApp {
                                     }
                                     TranscriptItem::Content { role, content } => {
                                         match role {
-                                            ContentRole::Assistant => draw_cursor_identity(ui),
+                                            ContentRole::Assistant => {
+                                                draw_provider_identity(ui, self.selected_provider)
+                                            }
                                             ContentRole::User => {
                                                 ui.label(RichText::new("You").small().strong());
                                             }
@@ -4287,6 +4609,7 @@ impl EditorApp {
         let mut mode_change = None;
         let mut config_changes = Vec::new();
         let mut run_everything_change = None;
+        let mut provider_change = None;
         let mut session_load = None;
         let mut session_remove = None;
         let has_config_mode = self.agent.config_options.iter().any(|option| {
@@ -4301,16 +4624,28 @@ impl EditorApp {
         let mut history_navigated = false;
         let composer_enabled = self.agent.session_ready && !self.agent.active;
         let composer_hint = if self.agent.session_ready {
-            "Ask Cursor Agent…"
+            format!(
+                "Ask {} Agent…",
+                provider_descriptor(self.selected_provider).display_name
+            )
         } else {
-            "Connect Cursor to start…"
+            format!(
+                "Connect {} to start…",
+                provider_descriptor(self.selected_provider).display_name
+            )
         };
         let mut open_menu = self.agent_menu.clone();
-        if !self.agent.session_ready || self.agent.active {
+        if (!self.agent.session_ready || self.agent.active)
+            && !matches!(open_menu, Some(AgentMenu::Providers))
+        {
             open_menu = None;
         }
-        let mut menu_anchor = session_menu_anchor;
-        let mut menu_toggled = session_menu_toggled;
+        let mut menu_anchor = if matches!(open_menu, Some(AgentMenu::Providers)) {
+            self.provider_menu_anchor
+        } else {
+            session_menu_anchor
+        };
+        let mut menu_toggled = session_menu_toggled || provider_menu_toggled;
         let composer_panel = if self.agentic_mode {
             let padding = ((composer.width() - AGENTIC_CONTENT_WIDTH) * 0.5).max(20.0);
             let panel = egui::Rect::from_min_max(
@@ -4510,7 +4845,7 @@ impl EditorApp {
                             composer_enabled,
                             TextEdit::multiline(&mut self.agent.prompt)
                                 .id(prompt_id)
-                                .hint_text(composer_hint)
+                                .hint_text(&composer_hint)
                                 .desired_rows(3)
                                 .desired_width(f32::INFINITY)
                                 .return_key(egui::KeyboardShortcut::new(
@@ -4577,22 +4912,24 @@ impl EditorApp {
                     .on_hover_text("Attach files");
                 open_file_picker = attach.clicked();
                 ui.add_enabled_ui(!self.agent.active, |ui| {
-                    let run_everything = self
-                        .agent_run_everything
-                        .or_else(|| run_everything_state(&self.agent.commands))
-                        .unwrap_or(false);
-                    let menu = AgentMenu::Permissions;
-                    let selector = agent_selector_button(
-                        ui,
-                        if run_everything { "Allow all" } else { "Ask" },
-                        "Permissions",
-                    );
-                    if selector.clicked() {
-                        open_menu = (open_menu.as_ref() != Some(&menu)).then_some(menu.clone());
-                        menu_toggled = true;
-                    }
-                    if open_menu.as_ref() == Some(&menu) {
-                        menu_anchor = Some(selector.rect);
+                    if self.agent.allow_run_everything {
+                        let run_everything = self
+                            .agent_run_everything
+                            .or_else(|| run_everything_state(&self.agent.commands))
+                            .unwrap_or(false);
+                        let menu = AgentMenu::Permissions;
+                        let selector = agent_selector_button(
+                            ui,
+                            if run_everything { "Allow all" } else { "Ask" },
+                            "Permissions",
+                        );
+                        if selector.clicked() {
+                            open_menu = (open_menu.as_ref() != Some(&menu)).then_some(menu.clone());
+                            menu_toggled = true;
+                        }
+                        if open_menu.as_ref() == Some(&menu) {
+                            menu_anchor = Some(selector.rect);
+                        }
                     }
                     if !has_config_mode && !self.agent.modes.is_empty() {
                         let current = self.agent.current_mode.as_deref().unwrap_or_default();
@@ -4761,6 +5098,7 @@ impl EditorApp {
         let mut menu_popup = None;
         if let (Some(menu), Some(anchor)) = (open_menu.as_ref(), menu_anchor) {
             let item_count = match menu {
+                AgentMenu::Providers => Some(provider_catalog().len()),
                 AgentMenu::Sessions => self
                     .agent
                     .sessions
@@ -4788,12 +5126,18 @@ impl EditorApp {
                     self.agent_menu_scroll_y = 0.0;
                 }
                 let row_height = match menu {
+                    AgentMenu::Providers => AGENT_PROVIDER_ROW_HEIGHT,
                     AgentMenu::Commands(_) => AGENT_COMMAND_ROW_HEIGHT,
                     AgentMenu::Sessions => AGENT_SESSION_ROW_HEIGHT,
                     _ => AGENT_MENU_ROW_HEIGHT,
                 };
-                let popup = if matches!(menu, AgentMenu::Sessions) {
-                    agent_session_menu_rect(transcript, anchor, item_count)
+                let popup = if matches!(menu, AgentMenu::Sessions | AgentMenu::Providers) {
+                    let width = if matches!(menu, AgentMenu::Providers) {
+                        AGENT_PROVIDER_MENU_WIDTH
+                    } else {
+                        AGENT_MENU_WIDTH
+                    };
+                    agent_session_menu_rect(transcript, anchor, item_count, row_height, width)
                 } else {
                     agent_menu_rect(transcript, anchor, item_count, row_height)
                 };
@@ -4855,6 +5199,40 @@ impl EditorApp {
                                         ui.spacing_mut().interact_size.y = row_height;
                                         ui.spacing_mut().item_spacing.y = 0.0;
                                         match menu {
+                                        AgentMenu::Providers => {
+                                            let switchable = self.agent.can_switch_provider()
+                                                && self.provider_transition.is_none();
+                                            for provider in provider_catalog() {
+                                                let packaged = self
+                                                    .available_providers
+                                                    .contains(&provider.id);
+                                                let reason = provider.unavailable_reason.or_else(|| {
+                                                    (!packaged).then_some("Unavailable in this build")
+                                                });
+                                                let response = ui
+                                                    .add_enabled_ui(
+                                                        packaged && reason.is_none() && switchable,
+                                                        |ui| {
+                                                            provider_menu_option(
+                                                                ui,
+                                                                provider,
+                                                                packaged,
+                                                                self.selected_provider == provider.id,
+                                                            )
+                                                        },
+                                                    )
+                                                    .inner
+                                                    .on_hover_text(reason.unwrap_or(if switchable {
+                                                        provider.description
+                                                    } else {
+                                                        "Stop or answer the current request before switching providers."
+                                                    }));
+                                                if response.clicked() {
+                                                    provider_change = Some(provider.id);
+                                                    selected = true;
+                                                }
+                                            }
+                                        }
                                         AgentMenu::Sessions => {
                                             if let Some(sessions) = &self.agent.sessions {
                                                 if sessions.is_empty() {
@@ -4933,7 +5311,7 @@ impl EditorApp {
                                                 (
                                                     true,
                                                     "Allow all",
-                                                    "Approve every Cursor tool unless explicitly denied",
+                                                    "Approve every supported provider tool unless explicitly denied",
                                             ),
                                         ] {
                                             if agent_menu_option(
@@ -5090,6 +5468,9 @@ impl EditorApp {
                 }
                 Err(error) => self.show_error(error),
             }
+        }
+        if let Some(provider) = provider_change {
+            self.request_provider_switch(provider, ui.ctx());
         }
         if let Some(controller) = &self.agent_controller {
             if let Some(session_id) = session_remove {
@@ -6113,6 +6494,97 @@ impl EditorApp {
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
         self.draw_agent_file_picker(ctx);
+        if let Some(target) = self.pending_provider_confirmation {
+            let current = provider_descriptor(self.selected_provider).display_name;
+            let next = provider_descriptor(target).display_name;
+            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
+            let mut proceed = false;
+            let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
+            egui::Window::new("Switch ACP provider")
+                .id(Id::new("provider_switch_dialog"))
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.add(
+                        Label::new(format!(
+                            "Switching from {current} to {next} will end the current provider session and clear its transcript. Your composer draft will be preserved."
+                        ))
+                        .wrap(),
+                    );
+                    if !switchable {
+                        ui.label(
+                            RichText::new(
+                                "Stop or answer the current request before switching providers.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        proceed = ui
+                            .add_enabled(switchable, egui::Button::new(format!("Switch to {next}")))
+                            .clicked();
+                        cancel |= ui.button("Cancel").clicked();
+                    });
+                });
+            if proceed {
+                self.pending_provider_confirmation = None;
+                self.request_provider_terms_or_transition(target, ctx);
+            } else if cancel {
+                self.pending_provider_confirmation = None;
+            }
+        }
+        if let Some(target) = self.pending_provider_terms {
+            let provider = provider_descriptor(target);
+            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
+            let mut accept = false;
+            let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
+            egui::Window::new(format!("Use {} Agent", provider.display_name))
+                .id(Id::new("provider_terms_dialog"))
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.add(
+                        Label::new(format!(
+                            "Editur will download and run a pinned {} package in Editur's private application-data directory.",
+                            provider.display_name
+                        ))
+                        .wrap(),
+                    );
+                    ui.hyperlink_to("Provider license", provider.license_url);
+                    ui.hyperlink_to("Provider terms", provider.terms_url);
+                    if !switchable {
+                        ui.label(
+                            RichText::new(
+                                "Stop or answer the current request before switching providers.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        accept = ui
+                            .add_enabled(switchable, egui::Button::new("Accept and Continue"))
+                            .clicked();
+                        cancel |= ui.button("Cancel").clicked();
+                    });
+                });
+            if accept {
+                match data_dir()
+                    .and_then(|directory| crate::agent::provider::accept_terms(&directory, target))
+                {
+                    Ok(()) => {
+                        self.pending_provider_terms = None;
+                        self.begin_provider_transition(target, ctx);
+                    }
+                    Err(error) => self.show_error(error),
+                }
+            } else if cancel {
+                self.pending_provider_terms = None;
+            }
+        }
         if self.pending_agent_prompt {
             let mut save_and_run = false;
             let mut cancel = false;
@@ -6122,7 +6594,10 @@ impl EditorApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label("Cursor Agent reads files from disk. Save the current buffer first?");
+                    ui.label(format!(
+                        "{} Agent reads files from disk. Save the current buffer first?",
+                        provider_descriptor(self.selected_provider).display_name
+                    ));
                     ui.horizontal(|ui| {
                         save_and_run = ui.button("Save and Run").clicked();
                         cancel = ui.button("Cancel").clicked();
@@ -7068,6 +7543,114 @@ fn model_display_name<'a>(id: &str, name: &'a str) -> Cow<'a, str> {
     Cow::Owned(words.join(" "))
 }
 
+fn provider_menu_option(
+    ui: &mut egui::Ui,
+    provider: &ProviderDescriptor,
+    packaged: bool,
+    selected: bool,
+) -> egui::Response {
+    let unavailable = provider
+        .unavailable_reason
+        .or_else(|| (!packaged).then_some("Unavailable in this build"));
+    let status = unavailable.or_else(|| {
+        (provider.install_policy == InstallPolicy::Lazy).then_some("Installs on first use")
+    });
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), AGENT_PROVIDER_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let accessibility = status.map_or_else(
+        || format!("{}: {}", provider.display_name, provider.description),
+        |status| {
+            format!(
+                "{}: {}. {status}",
+                provider.display_name, provider.description
+            )
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            accessibility.clone(),
+        )
+    });
+    let fill = if selected {
+        Color32::from_rgb(38, 55, 62)
+    } else if response.hovered() {
+        Color32::from_rgb(39, 40, 46)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, fill);
+    }
+    let name_color = if !ui.is_enabled() {
+        Color32::from_rgb(105, 111, 123)
+    } else if selected || response.hovered() {
+        Color32::from_rgb(230, 233, 240)
+    } else {
+        Color32::from_rgb(198, 204, 215)
+    };
+    let detail_color = if ui.is_enabled() {
+        Color32::from_rgb(145, 153, 168)
+    } else {
+        Color32::from_rgb(88, 94, 106)
+    };
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 9.0, rect.top() + 5.0),
+        egui::vec2(16.0, 16.0),
+    );
+    paint_provider_icon(ui.painter(), icon_rect, provider.icon, name_color);
+    ui.painter().text(
+        egui::pos2(rect.left() + 31.0, rect.top() + 13.0),
+        Align2::LEFT_CENTER,
+        provider.display_name,
+        FontId::proportional(12.5),
+        name_color,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 9.0, rect.top() + 32.0),
+        Align2::LEFT_CENTER,
+        provider.description,
+        FontId::proportional(11.0),
+        detail_color,
+    );
+    if let Some(status) = status {
+        ui.painter().text(
+            egui::pos2(rect.left() + 9.0, rect.top() + 48.0),
+            Align2::LEFT_CENTER,
+            status,
+            FontId::proportional(10.5),
+            if unavailable.is_some() {
+                Color32::from_rgb(184, 121, 126)
+            } else {
+                Color32::from_rgb(109, 174, 186)
+            },
+        );
+    }
+    if selected {
+        let center = egui::pos2(rect.right() - 12.0, rect.top() + 13.0);
+        let stroke = egui::Stroke::new(1.4, Color32::from_rgb(105, 205, 220));
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-4.0, 0.0),
+                center + egui::vec2(-1.0, 3.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-1.0, 3.0),
+                center + egui::vec2(4.0, -3.0),
+            ],
+            stroke,
+        );
+    }
+    response
+}
+
 fn agent_menu_option(
     ui: &mut egui::Ui,
     label: &str,
@@ -7689,9 +8272,10 @@ mod tests {
         agentic_new_session_button, build_agent_diff, cached_agent_diff, defer_resize,
         disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
         install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, plain_text_job, presentation_job, repaint_deadline,
-        repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
-        search_selection_after_navigation, skip_transition_render, slash_command_query,
+        model_display_name, next_find_match, plain_text_job, presentation_job,
+        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
+        run_everything_state, search_needs_polling, search_selection_after_navigation,
+        shutdown_agent_in_background, skip_transition_render, slash_command_query,
         split_agent_sidebar, split_agentic_workspace, split_editor_column, split_workspace,
     };
     use crate::{
@@ -7699,10 +8283,201 @@ mod tests {
             CommandChoice, ConfigChoice, ConfigValue, ConfigValueChoice, ConnectionState,
             ModeChoice, PermissionChoice, SessionChoice, ToolActivity, ToolDetail,
         },
+        agent::provider::ProviderId,
         agent::state::{PermissionCard, TranscriptItem},
         buffer::Buffer,
         file_io::OpenTarget,
     };
+
+    #[test]
+    fn provider_selector_requires_two_available_providers() {
+        assert!(!provider_selector_visible(&[]));
+        assert!(!provider_selector_visible(&[ProviderId::Cursor]));
+        assert!(provider_selector_visible(&[
+            ProviderId::Cursor,
+            ProviderId::Codex,
+        ]));
+    }
+
+    #[test]
+    fn provider_selector_and_provider_specific_controls_follow_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        assert!(app.available_providers.is_empty());
+        assert!(app.agent_controller.is_none());
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        let context = egui::Context::default();
+        let draw = |app: &mut EditorApp| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+
+        app.available_providers = vec![ProviderId::Cursor];
+        draw(&mut app);
+        assert!(app.provider_menu_anchor.is_none());
+
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+        draw(&mut app);
+        assert!(app.provider_menu_anchor.is_some());
+
+        app.agent_menu = Some(super::AgentMenu::Providers);
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let text_shapes = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        });
+        let text = text_shapes.collect::<Vec<_>>();
+        assert!(text.contains(&"Cursor"));
+        assert!(text.contains(&"Cursor's ACP coding agent"));
+        assert!(text.contains(&"◎"));
+        assert!(text.contains(&"Codex"));
+        assert!(text.contains(&"OpenAI Codex through the canonical ACP adapter"));
+        assert!(text.contains(&"Installs on first use"));
+        assert!(text.contains(&"✦"));
+        assert!(text.contains(&"Claude"));
+        assert!(text.contains(&"Anthropic Claude through the canonical ACP adapter"));
+        assert!(text.iter().any(|text| text.starts_with("Unavailable:")));
+        let popup = app.agent_menu_popup.unwrap();
+        assert!(popup.top() >= app.provider_menu_anchor.unwrap().bottom());
+        for expected in [
+            "OpenAI Codex through the canonical ACP adapter",
+            "Anthropic Claude through the canonical ACP adapter",
+            "Unavailable: distribution and licensing review incomplete",
+        ] {
+            let shape = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == expected => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(shape.pos.x >= popup.left());
+            assert!(shape.pos.x + shape.galley.size().x <= popup.right());
+        }
+
+        app.agent_menu = Some(super::AgentMenu::Permissions);
+        draw(&mut app);
+        assert!(app.agent_menu_popup.is_none());
+
+        app.agent.allow_run_everything = true;
+        app.agent_menu = Some(super::AgentMenu::Permissions);
+        draw(&mut app);
+        assert!(app.agent_menu_popup.is_some());
+    }
+
+    #[test]
+    fn selected_provider_drives_agent_identity_and_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+        app.selected_provider = ProviderId::Codex;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Codex"))
+        );
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Cursor"))
+        );
+    }
+
+    #[test]
+    fn provider_switch_requires_confirmation_and_is_blocked_during_a_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+        app.agent.prompt = "keep this draft".into();
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("provider-bound output".into()));
+        let context = egui::Context::default();
+
+        app.agent.active = true;
+        app.request_provider_switch(ProviderId::Codex, &context);
+        assert!(app.pending_provider_confirmation.is_none());
+
+        app.agent.active = false;
+        app.request_provider_switch(ProviderId::Codex, &context);
+        assert_eq!(app.selected_provider, ProviderId::Cursor);
+        assert_eq!(app.pending_provider_confirmation, Some(ProviderId::Codex));
+        assert_eq!(app.agent.prompt, "keep this draft");
+    }
+
+    #[test]
+    fn provider_shutdown_signal_is_sent_only_after_the_old_owner_drops() {
+        struct OldProvider(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OldProvider {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = shutdown_agent_in_background(OldProvider(dropped.clone()), || {}).unwrap();
+
+        shutdown.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
     use egui::{
         Color32, CursorIcon, DroppedFile, Event, HoveredFile, Id, Key, Modifiers, MouseWheelUnit,
         PointerButton, RawInput, Rect, TouchPhase, Vec2, epaint::Shape, pos2,
@@ -7934,6 +8709,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(Vec::new());
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let (_, _, sidebar) = split_workspace(
@@ -9625,6 +10401,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.allow_run_everything = true;
         app.agent.current_mode = Some("agent".into());
         app.agent.modes = vec![ModeChoice {
             id: "agent".into(),
@@ -9695,6 +10472,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "session-1".into(),
             title: Some("Previous landing page".into()),
@@ -9745,6 +10523,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(
             (0..24)
                 .map(|index| SessionChoice {
@@ -10756,6 +11535,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "session-1".into(),
             title: Some("Build the agentic workspace".into()),
@@ -10826,6 +11606,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "hidden-session".into(),
             title: Some("Agent sidebar entry".into()),
@@ -10935,6 +11716,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "session-1".into(),
             title: Some("Polish the agentic workspace".into()),
@@ -10973,6 +11755,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "session-1".into(),
             title: Some("Compact session".into()),
@@ -11012,6 +11795,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        app.agent.history_available = true;
         app.agent.sessions = Some(vec![SessionChoice {
             id: "session-1".into(),
             title: Some("Current session".into()),

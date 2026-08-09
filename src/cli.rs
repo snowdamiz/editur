@@ -1,13 +1,15 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::agent::provider::ProviderId;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
     Open(Option<PathBuf>),
     Resident(PathBuf),
     QuitRunning,
-    AgentProcess(PathBuf),
-    AgentProvision,
+    AgentProcess(ProviderId, PathBuf),
+    AgentProvision(ProviderId),
     Syntax(SyntaxCommand),
     Update,
     #[cfg(windows)]
@@ -34,7 +36,7 @@ where
         return Ok(Command::Open(None));
     };
 
-    if first == "--resident" || first == "--agent-process" {
+    if first == "--resident" {
         let target = args
             .next()
             .filter(|value| !value.is_empty())
@@ -43,18 +45,41 @@ where
         if args.next().is_some() {
             return Err("too many internal process arguments".into());
         }
-        return Ok(if first == "--resident" {
-            Command::Resident(target)
-        } else {
-            Command::AgentProcess(target)
-        });
+        return Ok(Command::Resident(target));
+    }
+
+    if first == "--agent-process" {
+        let provider = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or_else(|| "missing internal ACP provider id".to_owned())?
+            .parse::<ProviderId>()?;
+        let target = args
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "missing internal agent process target".to_owned())?;
+        if args.next().is_some() {
+            return Err("too many internal process arguments".into());
+        }
+        return Ok(Command::AgentProcess(provider, target));
     }
 
     if first == "--provision-agent" {
+        let provider = args
+            .next()
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| "ACP provider id must be valid UTF-8".to_owned())?
+                    .parse::<ProviderId>()
+            })
+            .transpose()?
+            .unwrap_or(ProviderId::Cursor);
         if args.next().is_some() {
             return Err("too many internal provision arguments".into());
         }
-        return Ok(Command::AgentProvision);
+        return Ok(Command::AgentProvision(provider));
     }
 
     if first == "--quit-running" {
@@ -176,11 +201,26 @@ mod tests {
     #[test]
     fn parses_hidden_managed_agent_launcher_with_its_project_root() {
         assert_eq!(
-            parse(&["--agent-process", "/tmp/project"]),
-            Ok(Command::AgentProcess(PathBuf::from("/tmp/project")))
+            parse(&["--agent-process", "codex", "/tmp/project"]),
+            Ok(Command::AgentProcess(
+                crate::agent::provider::ProviderId::Codex,
+                PathBuf::from("/tmp/project")
+            ))
         );
         assert!(parse(&["--agent-process"]).is_err());
-        assert_eq!(parse(&["--provision-agent"]), Ok(Command::AgentProvision));
+        assert_eq!(
+            parse(&["--provision-agent"]),
+            Ok(Command::AgentProvision(
+                crate::agent::provider::ProviderId::Cursor
+            ))
+        );
+        assert_eq!(
+            parse(&["--provision-agent", "codex"]),
+            Ok(Command::AgentProvision(
+                crate::agent::provider::ProviderId::Codex
+            ))
+        );
+        assert!(parse(&["--provision-agent", "unknown"]).is_err());
     }
 
     #[test]

@@ -255,3 +255,64 @@ fn zero_detail_tools_and_changed_paths_are_bounded() {
         Some(TranscriptItem::Truncated)
     ));
 }
+
+#[test]
+fn provider_switch_clears_bound_state_and_preserves_the_unsent_draft() {
+    let mut state = AgentState::default();
+    state.prompt = "keep this draft".into();
+    state.apply(Event::Capabilities {
+        history: true,
+        allow_run_everything: true,
+    });
+    state.apply(Event::ConnectionChanged(ConnectionState::Ready));
+    state.apply(Event::SessionReady {
+        current_mode: Some("agent".into()),
+        modes: vec![],
+        config_options: vec![],
+    });
+    state.apply(Event::ActiveSessionChanged("cursor-session".into()));
+    state.apply(Event::AssistantDelta("provider transcript".into()));
+    state.apply(Event::UsageUpdated {
+        used: 1,
+        size: 2,
+        cost: None,
+    });
+
+    state.reset_for_provider_switch();
+
+    assert_eq!(state.prompt, "keep this draft");
+    assert_eq!(state.connection, ConnectionState::Disconnected);
+    assert!(!state.session_ready);
+    assert!(!state.active);
+    assert!(!state.history_available);
+    assert!(!state.allow_run_everything);
+    assert!(state.transcript.is_empty());
+    assert!(state.sessions.is_none());
+    assert!(state.session_id.is_none());
+    assert!(state.current_mode.is_none());
+    assert!(state.config_options.is_empty());
+    assert!(state.usage.is_none());
+}
+
+#[test]
+fn provider_switch_is_blocked_by_turn_permission_or_interaction() {
+    let mut state = AgentState::default();
+    assert!(state.can_switch_provider());
+
+    state.active = true;
+    assert!(!state.can_switch_provider());
+    state.active = false;
+    state.apply(Event::PermissionRequested(PermissionRequest {
+        request_id: 1,
+        tool_call_id: "tool".into(),
+        action: "run".into(),
+        options: vec![PermissionChoice {
+            id: "no".into(),
+            name: "No".into(),
+            kind: "RejectOnce".into(),
+        }],
+    }));
+    assert!(!state.can_switch_provider());
+    assert!(state.decide_permission(1, "no"));
+    assert!(state.can_switch_provider());
+}

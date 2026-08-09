@@ -18,6 +18,8 @@ use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::provider::{ProviderExtensions, ProviderId, descriptor};
+
 const EVENT_CAPACITY: usize = 512;
 const COMMAND_CAPACITY: usize = 64;
 const MAX_DETAIL_BYTES: usize = 64 * 1024;
@@ -158,6 +160,7 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
     Provisioning { downloaded: u64, total: Option<u64> },
+    Switching { provider: String },
     Starting,
     Ready,
     AuthenticationRequired(Vec<AuthChoice>),
@@ -170,6 +173,16 @@ pub struct AuthChoice {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub kind: AuthKind,
+    pub setup: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthKind {
+    Agent,
+    Terminal,
+    Environment,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +269,10 @@ pub enum DisplayContent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     ConnectionChanged(ConnectionState),
+    Capabilities {
+        history: bool,
+        allow_run_everything: bool,
+    },
     SessionReady {
         current_mode: Option<String>,
         modes: Vec<ModeChoice>,
@@ -469,20 +486,50 @@ pub struct AgentController {
 }
 
 impl AgentController {
-    pub fn start(project_root: PathBuf) -> Self {
-        let history = session_history_path(&project_root);
-        Self::start_launch(project_root, Launch::Managed, Arc::new(|| {}), history)
+    pub fn start(provider: ProviderId, project_root: PathBuf) -> Self {
+        let history = session_history_path(provider, &project_root);
+        Self::start_launch(
+            provider,
+            project_root,
+            Launch::Managed,
+            Arc::new(|| {}),
+            history,
+        )
     }
 
-    pub fn start_with_wake(project_root: PathBuf, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        let history = session_history_path(&project_root);
-        Self::start_launch(project_root, Launch::Managed, Arc::new(wake), history)
+    pub fn start_with_wake(
+        provider: ProviderId,
+        project_root: PathBuf,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let history = session_history_path(provider, &project_root);
+        Self::start_launch(
+            provider,
+            project_root,
+            Launch::Managed,
+            Arc::new(wake),
+            history,
+        )
     }
 
     #[doc(hidden)]
     pub fn start_process(project_root: PathBuf, command: PathBuf, args: Vec<String>) -> Self {
-        let history = Some(project_root.join(".editur-test-hidden-sessions.json"));
+        Self::start_process_for(ProviderId::Cursor, project_root, command, args)
+    }
+
+    #[doc(hidden)]
+    pub fn start_process_for(
+        provider: ProviderId,
+        project_root: PathBuf,
+        command: PathBuf,
+        args: Vec<String>,
+    ) -> Self {
+        let history = Some(project_root.join(format!(
+            ".editur-test-hidden-sessions-{}.json",
+            provider.as_str()
+        )));
         Self::start_launch(
+            provider,
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
             Arc::new(|| {}),
@@ -491,6 +538,7 @@ impl AgentController {
     }
 
     fn start_launch(
+        provider: ProviderId,
         project_root: PathBuf,
         launch: Launch,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -504,6 +552,7 @@ impl AgentController {
             .name("editur-agent".into())
             .spawn(move || {
                 run_thread(
+                    provider,
                     project_root,
                     launch,
                     command_rx,
@@ -567,6 +616,7 @@ struct EventSender {
 }
 
 fn run_thread(
+    provider: ProviderId,
     project_root: PathBuf,
     launch: Launch,
     commands: async_channel::Receiver<Command>,
@@ -575,7 +625,7 @@ fn run_thread(
     history: Option<PathBuf>,
 ) {
     let (config, _managed_tree) = match launch {
-        Launch::Managed => match managed_config(&project_root, &events) {
+        Launch::Managed => match managed_config(provider, &project_root, &events) {
             Ok(config) => (config.0, Some(config.1)),
             Err(error) => {
                 send_event(
@@ -607,15 +657,17 @@ fn run_thread(
                 serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
             };
             if !valid {
-                let _ = debug_commands.try_send(Command::TransportFailed(
-                    "Cursor Agent wrote malformed JSON to stdout".into(),
-                ));
+                let _ = debug_commands.try_send(Command::TransportFailed(format!(
+                    "{} wrote malformed JSON to stdout",
+                    descriptor(provider).display_name
+                )));
             }
         }
     });
     let shutdown = Arc::new(AtomicBool::new(false));
     let result = async_io::block_on(run_connection(
         agent,
+        provider,
         project_root,
         commands,
         events.clone(),
@@ -669,12 +721,12 @@ fn connection_error(error: &agent_client_protocol::Error, diagnostics: &str) -> 
 }
 
 fn managed_config(
+    provider: ProviderId,
     project_root: &std::path::Path,
     events: &EventSender,
 ) -> Result<(AcpAgentConfig, ManagedTree), String> {
-    let manifest = super::provision::embedded_manifest()?;
     let data_dir = crate::syntax::data_dir()?;
-    super::provision::ensure(&manifest, &data_dir, |progress| {
+    super::provider::prepare(provider, &data_dir, |progress| {
         send_event(
             events,
             Event::ConnectionChanged(ConnectionState::Provisioning {
@@ -687,6 +739,7 @@ fn managed_config(
         .map_err(|error| format!("cannot locate Editur agent launcher: {error}"))?;
     let config = AcpAgentConfig::new(executable)
         .arg("--agent-process")
+        .arg(provider.as_str())
         .arg(project_root.to_string_lossy());
     protect_managed_process(config)
 }
@@ -716,12 +769,14 @@ fn protect_managed_process(
 
 async fn run_connection(
     agent: AcpAgent,
+    provider: ProviderId,
     project_root: PathBuf,
     commands: async_channel::Receiver<Command>,
     events: EventSender,
     shutdown: Arc<AtomicBool>,
     history: Option<PathBuf>,
 ) -> agent_client_protocol::Result<()> {
+    let extensions = descriptor(provider).extensions;
     let active = Arc::new(AtomicBool::new(false));
     let auto_approve_permissions = Arc::new(AtomicBool::new(false));
     let permissions = Arc::new(Mutex::new(HashMap::new()));
@@ -745,11 +800,13 @@ async fn run_connection(
             {
                 let events = events.clone();
                 async move |notification: agent_client_protocol::UntypedMessage, _connection| {
-                    normalize_cursor_notification(
-                        notification.method(),
-                        notification.params().clone(),
-                        &events,
-                    );
+                    if extensions == ProviderExtensions::Cursor {
+                        normalize_cursor_notification(
+                            notification.method(),
+                            notification.params().clone(),
+                            &events,
+                        );
+                    }
                     Ok(())
                 }
             },
@@ -857,6 +914,12 @@ async fn run_connection(
                 let interactions = Arc::clone(&interactions);
                 let next_request = Arc::clone(&next_permission);
                 async move |request: CursorRequest, responder, connection: ConnectionTo<Agent>| {
+                    if extensions != ProviderExtensions::Cursor {
+                        responder.respond(
+                            serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                        )?;
+                        return Ok(());
+                    }
                     let request_id = next_request.fetch_add(1, Ordering::Relaxed);
                     let (request, kind) = match parse_cursor_interaction(request_id, request) {
                         Ok(parsed) => parsed,
@@ -910,7 +973,7 @@ async fn run_connection(
                     .await?;
                 if initialized.protocol_version != ProtocolVersion::V1 {
                     return Err(agent_client_protocol::Error::invalid_request()
-                        .data("Cursor Agent does not support stable ACP v1"));
+                        .data("agent does not support stable ACP v1"));
                 }
                 let attachment_support = AttachmentSupport {
                     image: initialized.agent_capabilities.prompt_capabilities.image,
@@ -924,10 +987,42 @@ async fn run_connection(
                     .auth_methods
                     .iter()
                     .take(MAX_CHOICES)
-                    .map(|method| AuthChoice {
-                        id: method.id().0.to_string(),
-                        name: method.name().to_owned(),
-                        description: method.description().map(str::to_owned),
+                    .map(|method| {
+                        let (kind, setup) = match method {
+                            AuthMethod::Agent(_) => (AuthKind::Agent, None),
+                            AuthMethod::Terminal(terminal) => {
+                                let mut details = Vec::new();
+                                if !terminal.args.is_empty() {
+                                    details.push(format!("arguments: {}", terminal.args.join(" ")));
+                                }
+                                if !terminal.env.is_empty() {
+                                    let mut names = terminal.env.keys().cloned().collect::<Vec<_>>();
+                                    names.sort();
+                                    details.push(format!("environment: {}", names.join(", ")));
+                                }
+                                (AuthKind::Terminal, (!details.is_empty()).then(|| details.join("; ")))
+                            }
+                            AuthMethod::EnvVar(environment) => {
+                                let names = environment
+                                    .vars
+                                    .iter()
+                                    .map(|variable| variable.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                (
+                                    AuthKind::Environment,
+                                    (!names.is_empty()).then(|| format!("variables: {names}")),
+                                )
+                            }
+                            _ => (AuthKind::Unsupported, None),
+                        };
+                        AuthChoice {
+                            id: method.id().0.to_string(),
+                            name: method.name().to_owned(),
+                            description: method.description().map(str::to_owned),
+                            kind,
+                            setup,
+                        }
                     })
                     .collect::<Vec<_>>();
                 let supports_history = initialized.agent_capabilities.load_session
@@ -936,6 +1031,13 @@ async fn run_connection(
                         .session_capabilities
                         .list
                         .is_some();
+                send_event(
+                    &events,
+                    Event::Capabilities {
+                        history: supports_history,
+                        allow_run_everything: extensions == ProviderExtensions::Cursor,
+                    },
+                );
                 let (mut session_id, mut sessions) = match start_session(
                     &connection,
                     &project_root,
@@ -969,6 +1071,16 @@ async fn run_connection(
                                 );
                                 continue;
                             };
+                            if method.kind != AuthKind::Agent {
+                                send_event(
+                                    &events,
+                                    Event::Error(format!(
+                                        "{} authentication requires a setup flow Editur does not support",
+                                        method.name
+                                    )),
+                                );
+                                continue;
+                            }
                             let authenticated = connection
                                 .send_request(AuthenticateRequest::new(method.id.clone()))
                                 .block_task()
@@ -1157,7 +1269,9 @@ async fn run_connection(
                             }
                         }
                         Command::SetRunEverything(enabled) => {
-                            auto_approve_permissions.store(enabled, Ordering::Release);
+                            if extensions == ProviderExtensions::Cursor {
+                                auto_approve_permissions.store(enabled, Ordering::Release);
+                            }
                         }
                         Command::Prompt(text) => {
                             send_prompt(
@@ -1568,16 +1682,38 @@ impl HiddenSessions {
     }
 }
 
-fn session_history_path(project_root: &std::path::Path) -> Option<PathBuf> {
+fn session_history_path(provider: ProviderId, project_root: &std::path::Path) -> Option<PathBuf> {
+    crate::syntax::data_dir()
+        .ok()
+        .map(|directory| session_history_path_in(&directory, provider, project_root))
+}
+
+fn session_history_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
     let digest = Sha256::digest(project_root.as_os_str().as_encoded_bytes());
     let mut name = String::with_capacity(digest.len() * 2 + 5);
     for byte in digest {
         write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
     }
     name.push_str(".json");
-    crate::syntax::data_dir()
-        .ok()
-        .map(|directory| directory.join("agents/session-history").join(name))
+    let destination = super::provision::provider_root(data_dir, provider)
+        .join("session-history")
+        .join(&name);
+    if provider == ProviderId::Cursor && !destination.exists() {
+        let legacy = data_dir.join("agents/session-history").join(name);
+        let migratable = fs::symlink_metadata(&legacy).ok().is_some_and(|metadata| {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= MAX_DETAIL_BYTES as u64
+        });
+        if migratable
+            && destination
+                .parent()
+                .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
+        {
+            let _ = fs::rename(legacy, &destination);
+        }
+    }
+    destination
 }
 
 fn save_hidden_sessions(path: &std::path::Path, ids: &HashSet<String>) -> Result<(), String> {
@@ -2465,6 +2601,40 @@ mod tests {
             },
         );
         event_rx.recv().expect("update should be visible")
+    }
+
+    #[test]
+    fn hidden_session_history_is_provider_scoped_and_migrates_cursor_once() {
+        let data = tempfile::tempdir().unwrap();
+        let project = Path::new("/work/project");
+        let codex = session_history_path_in(data.path(), ProviderId::Codex, project);
+        let legacy = data
+            .path()
+            .join("agents/session-history")
+            .join(codex.file_name().unwrap());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, br#"["cursor-session"]"#).unwrap();
+
+        let cursor = session_history_path_in(data.path(), ProviderId::Cursor, project);
+
+        assert_ne!(cursor, codex);
+        assert_eq!(
+            std::fs::read_to_string(&cursor).unwrap(),
+            r#"["cursor-session"]"#
+        );
+        assert!(!legacy.exists());
+
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, br#"["later"]"#).unwrap();
+        assert_eq!(
+            session_history_path_in(data.path(), ProviderId::Cursor, project),
+            cursor
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cursor).unwrap(),
+            r#"["cursor-session"]"#
+        );
+        assert!(legacy.exists());
     }
 
     #[test]

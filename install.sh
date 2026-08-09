@@ -56,6 +56,7 @@ fi
 
 printf '%s\n' 'Editur includes Cursor Agent as a proprietary third-party dependency.'
 printf '%s\n' 'It is downloaded directly from Cursor and is subject to https://cursor.com/terms-of-service.'
+printf '%s\n' 'Codex is optional and is downloaded only after you select it and accept its license and provider terms.'
 
 mkdir -p "$install_dir"
 if [ "$package" = app ]; then

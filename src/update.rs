@@ -96,8 +96,9 @@ fn sidecar_manifest_url(binary_url: &str) -> String {
 
 fn provision_sidecar(url: &str) -> Result<(), String> {
     let bytes = download(url, MAX_AGENT_MANIFEST_SIZE)?;
-    let manifest = crate::agent::provision::SidecarManifest::parse(&bytes)?;
-    crate::agent::provision::ensure(&manifest, &crate::syntax::data_dir()?, |_| {})?;
+    let bundle = crate::agent::provision::ProviderBundle::parse(&bytes)?;
+    let manifest = bundle.manifest(crate::agent::provider::ProviderId::Cursor)?;
+    crate::agent::provision::ensure(manifest, &crate::syntax::data_dir()?, |_| {})?;
     Ok(())
 }
 

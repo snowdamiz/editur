@@ -39,6 +39,7 @@ try {
 
     Write-Host 'Editur includes Cursor Agent as a proprietary third-party dependency.'
     Write-Host 'It is downloaded directly from Cursor and is subject to https://cursor.com/terms-of-service.'
+    Write-Host 'Codex is optional and is downloaded only after you select it and accept its license and provider terms.'
     & $binary --provision-agent
     if ($LASTEXITCODE -ne 0) {
         throw "Cursor Agent provisioning failed with exit code $LASTEXITCODE."
