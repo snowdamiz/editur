@@ -76,16 +76,16 @@ const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
 const AGENTIC_SESSION_RAIL_WIDTH: f32 = 248.0;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
+const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
 const TITLEBAR_PAINT_KEY: u64 = 0xa000_0000_0000_0000;
 
 fn agent_near_bottom(offset: f32, max_offset: f32) -> bool {
     max_offset - offset <= AGENT_FOLLOW_THRESHOLD
 }
 
-fn agent_transcript_fade_mesh(rect: egui::Rect) -> egui::Mesh {
+fn agent_transcript_fade_mesh(rect: egui::Rect, opaque: Color32) -> egui::Mesh {
     let mut mesh = egui::Mesh::default();
     let height = AGENT_TRANSCRIPT_EDGE_FADE.min(rect.height() * 0.5);
-    let opaque = Color32::from_rgb(20, 20, 22);
     for (position, color) in [
         (rect.left_top(), opaque),
         (rect.right_top(), opaque),
@@ -851,11 +851,17 @@ fn split_workspace(
     (explorer, editor, agent)
 }
 
-fn split_agentic_workspace(content: egui::Rect) -> (egui::Rect, egui::Rect) {
+fn split_agentic_workspace(
+    content: egui::Rect,
+    sidebar_open: bool,
+) -> (Option<egui::Rect>, egui::Rect) {
+    if !sidebar_open {
+        return (None, content);
+    }
     let rail_width = AGENTIC_SESSION_RAIL_WIDTH.min(content.width() * 0.36);
     let sessions = content.with_max_x(content.left() + rail_width);
     let agent = content.with_min_x(sessions.right());
-    (sessions, agent)
+    (Some(sessions), agent)
 }
 
 fn split_editor_column(rect: egui::Rect, find_open: bool) -> (egui::Rect, Option<egui::Rect>) {
@@ -943,8 +949,23 @@ fn file_tree_toggle_rect(titlebar: egui::Rect, _editor_header: egui::Rect) -> eg
     )
 }
 
-fn agentic_toggle_rect(file_tree_button: egui::Rect) -> egui::Rect {
-    file_tree_button.translate(egui::vec2(file_tree_button.width(), 0.0))
+fn agentic_toggle_rect(file_tree_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
+    let right = sidebar_right
+        .map(|right| {
+            if file_tree_button.left() >= right {
+                right
+            } else {
+                right.max(file_tree_button.right() + AGENTIC_MODE_TOGGLE_WIDTH)
+            }
+        })
+        .unwrap_or(file_tree_button.right() + AGENTIC_MODE_TOGGLE_WIDTH);
+    egui::Rect::from_center_size(
+        egui::pos2(
+            right - AGENTIC_MODE_TOGGLE_WIDTH * 0.5,
+            file_tree_button.center().y,
+        ),
+        egui::vec2(AGENTIC_MODE_TOGGLE_WIDTH, file_tree_button.height()),
+    )
 }
 
 fn draw_sidebar_toggle_icon(
@@ -1691,37 +1712,40 @@ impl EditorApp {
     }
 
     fn draw_agentic_workspace(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        let (sessions, agent) = split_agentic_workspace(window);
-        root.scope_builder(
-            UiBuilder::new()
-                .id_salt("agentic_sessions")
-                .max_rect(sessions),
-            |ui| self.draw_agentic_sessions(ui),
-        );
+        let (sessions, agent) = split_agentic_workspace(window, self.sidebar);
+        if let Some(sessions) = sessions {
+            root.scope_builder(
+                UiBuilder::new()
+                    .id_salt("agentic_sessions")
+                    .max_rect(sessions),
+                |ui| self.draw_agentic_sessions(ui),
+            );
+            root.painter().vline(
+                sessions.right(),
+                sessions.y_range(),
+                egui::Stroke::new(1.0, Color32::from_rgb(48, 48, 53)),
+            );
+        }
         root.scope_builder(
             UiBuilder::new().id_salt("agentic_canvas").max_rect(agent),
             |ui| {
                 ui.painter()
-                    .rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(20, 20, 22));
+                    .rect_filled(ui.max_rect(), 0.0, EDITOR_BACKGROUND);
                 self.draw_agent(ui, ui.max_rect());
             },
-        );
-        root.painter().vline(
-            sessions.right(),
-            sessions.y_range(),
-            egui::Stroke::new(1.0, Color32::from_rgb(48, 48, 53)),
         );
         self.draw_agentic_titlebar(
             root,
             window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom())),
             agent,
+            sessions,
         );
     }
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(25, 25, 28));
+            .rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 22));
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
             egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
@@ -1742,12 +1766,7 @@ impl EditorApp {
                 .layout(Layout::top_down(Align::LEFT)),
             |ui| {
                 ui.set_width(content.width());
-                ui.label(
-                    RichText::new("Cursor Agent")
-                        .size(14.0)
-                        .strong()
-                        .color(Color32::from_rgb(225, 229, 237)),
-                );
+                draw_cursor_identity(ui);
                 ui.add_space(8.0);
                 new_session = ui
                     .add_enabled_ui(self.agent.session_ready, agentic_new_session_button)
@@ -1808,7 +1827,13 @@ impl EditorApp {
         }
     }
 
-    fn draw_agentic_titlebar(&mut self, ui: &mut egui::Ui, rect: egui::Rect, agent: egui::Rect) {
+    fn draw_agentic_titlebar(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        agent: egui::Rect,
+        sessions: Option<egui::Rect>,
+    ) {
         crate::renderer::mark_retained(
             ui.painter(),
             rect,
@@ -1820,17 +1845,37 @@ impl EditorApp {
             egui::pos2(agent.right(), rect.bottom()),
         );
         let file_tree_button = file_tree_toggle_rect(rect, agent_header);
-        let agentic_button = agentic_toggle_rect(file_tree_button);
+        let agentic_button =
+            agentic_toggle_rect(file_tree_button, sessions.map(|sessions| sessions.right()));
         #[cfg(target_os = "macos")]
         let controls_right = rect.right();
         #[cfg(not(target_os = "macos"))]
         let controls_right = rect.right() - 3.0 * 46.0;
+        let sidebar_drag_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                if cfg!(target_os = "macos") {
+                    file_tree_button.right()
+                } else {
+                    rect.left()
+                },
+                rect.top(),
+            ),
+            egui::pos2(agentic_button.left(), rect.bottom()),
+        );
         let drag_rect = egui::Rect::from_min_max(
-            egui::pos2(agentic_button.right() + 4.0, rect.top()),
+            egui::pos2(
+                agentic_button.right().max(file_tree_button.right()) + 4.0,
+                rect.top(),
+            ),
             egui::pos2(controls_right, rect.bottom()),
         );
-        if let Some(action) = titlebar_drag_action(ui, drag_rect, "agentic") {
-            self.window_action = Some(action);
+        for (region, drag_rect) in [
+            ("agentic_sidebar", sidebar_drag_rect),
+            ("agentic", drag_rect),
+        ] {
+            if let Some(action) = titlebar_drag_action(ui, drag_rect, region) {
+                self.window_action = Some(action);
+            }
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
             self.sidebar = !self.sidebar;
@@ -1869,7 +1914,10 @@ impl EditorApp {
             egui::Stroke::new(1.0, Color32::from_rgb(42, 42, 47)),
         );
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
-        let agentic_button = agentic_toggle_rect(file_tree_button);
+        let agentic_button = agentic_toggle_rect(
+            file_tree_button,
+            self.sidebar.then_some(editor_header.left()),
+        );
         #[cfg(target_os = "macos")]
         let controls_left = editor_header.right();
         #[cfg(not(target_os = "macos"))]
@@ -1936,12 +1984,16 @@ impl EditorApp {
         );
         #[cfg(target_os = "macos")]
         let tabs_left = if self.sidebar {
-            editor_header.left().max(agentic_button.right() + 4.0)
+            if agentic_button.right() > editor_header.left() {
+                agentic_button.right() + 4.0
+            } else {
+                editor_header.left()
+            }
         } else {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let tabs_left = agentic_button.right() + 4.0;
+        let tabs_left = file_tree_button.right().max(agentic_button.right()) + 4.0;
         let tabs_right = (controls_start - 8.0).max(tabs_left);
         let tabs_used_right = (tabs_left + self.tabs.len() as f32 * TAB_WIDTH).min(tabs_right);
         if tabs_used_right > tabs_left {
@@ -1958,10 +2010,10 @@ impl EditorApp {
             egui::pos2(controls_start, editor_header.bottom()),
         );
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = agentic_button.right();
+        let sidebar_drag_left = file_tree_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
-        let sidebar_drag_right = (editor_header.left() - 3.0).max(sidebar_drag_left);
+        let sidebar_drag_right = (agentic_button.left() - 3.0).max(sidebar_drag_left);
         let sidebar_drag_rect = egui::Rect::from_min_max(
             egui::pos2(sidebar_drag_left, rect.top()),
             egui::pos2(sidebar_drag_right, rect.bottom()),
@@ -2232,51 +2284,36 @@ impl EditorApp {
     }
 
     fn draw_agentic_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
-        let label = if self.agentic_mode {
-            "Return to Editor"
+        let (label, tooltip) = if self.agentic_mode {
+            ("IDE", "Switch to IDE")
         } else {
-            "Open Agentic Mode"
+            ("Agent", "Switch to Agent")
         };
         let response = ui
             .interact(button, Id::new("agentic_mode_toggle"), Sense::click())
-            .on_hover_text(label);
+            .on_hover_text(tooltip);
         response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
         });
-        let color = if response.hovered() || self.agentic_mode {
+        if response.hovered() {
+            ui.painter().rect_filled(
+                button.shrink2(egui::vec2(3.0, 4.0)),
+                4.0,
+                Color32::from_rgb(38, 38, 42),
+            );
+        }
+        let color = if response.hovered() {
             Color32::from_rgb(218, 224, 235)
         } else {
-            Color32::from_rgb(155, 163, 177)
+            Color32::from_rgb(174, 181, 194)
         };
-        let center = button.center();
-        let stroke = egui::Stroke::new(1.3, color);
-        let star = [
-            center + egui::vec2(-2.0, -7.0),
-            center + egui::vec2(-1.0, -1.0),
-            center + egui::vec2(4.0, 0.0),
-            center + egui::vec2(-1.0, 1.0),
-            center + egui::vec2(-2.0, 7.0),
-            center + egui::vec2(-3.0, 1.0),
-            center + egui::vec2(-7.0, 0.0),
-            center + egui::vec2(-3.0, -1.0),
-            center + egui::vec2(-2.0, -7.0),
-        ];
-        ui.painter().add(egui::Shape::line(star.to_vec(), stroke));
-        let sparkle = center + egui::vec2(5.0, -5.0);
-        ui.painter().hline(
-            (sparkle.x - 2.0)..=(sparkle.x + 2.0),
-            sparkle.y,
-            egui::Stroke::new(1.0, color),
+        ui.painter().text(
+            button.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(12.0),
+            color,
         );
-        ui.painter().vline(
-            sparkle.x,
-            (sparkle.y - 2.0)..=(sparkle.y + 2.0),
-            egui::Stroke::new(1.0, color),
-        );
-        if self.agentic_mode || response.hovered() {
-            ui.painter()
-                .circle_filled(center + egui::vec2(5.0, 5.0), 1.0, color);
-        }
         response.clicked()
     }
 
@@ -2815,10 +2852,14 @@ impl EditorApp {
             "Agent"
         });
         #[cfg(target_os = "macos")]
-        let title_x = header.left() + 14.0;
+        let title_x = if self.agentic_mode && !self.sidebar {
+            header.left() + 166.0
+        } else {
+            header.left() + 14.0
+        };
         #[cfg(not(target_os = "macos"))]
         let title_x = if self.agentic_mode {
-            header.left() + 76.0
+            header.left() + if self.sidebar { 76.0 } else { 90.0 }
         } else {
             header.left() + 14.0
         };
@@ -2918,10 +2959,16 @@ impl EditorApp {
         };
         let transcript_content = transcript.shrink2(egui::vec2(transcript_padding, 0.0));
         let transcript_width = transcript_content.width();
+        let transcript_region =
+            if matches!(&status, ConnectionState::Ready) && !self.agent.transcript.is_empty() {
+                transcript
+            } else {
+                transcript_content
+            };
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agent_transcript_region")
-                .max_rect(transcript_content)
+                .max_rect(transcript_region)
                 .layout(Layout::top_down(Align::LEFT)),
             |ui| match &status {
                 ConnectionState::Provisioning { downloaded, total } => {
@@ -3035,17 +3082,17 @@ impl EditorApp {
                             ui.painter().rect_filled(
                                 mark,
                                 14.0,
-                                Color32::from_rgb(28, 28, 31),
+                                Color32::from_rgb(30, 57, 66),
                             );
                             ui.painter().rect_stroke(
                                 mark,
                                 14.0,
-                                egui::Stroke::new(1.0, Color32::from_rgb(53, 53, 59)),
+                                egui::Stroke::new(1.0, Color32::from_rgb(47, 78, 88)),
                                 egui::StrokeKind::Inside,
                             );
                             let center = mark.center();
                             let stroke =
-                                egui::Stroke::new(1.8, Color32::from_rgb(142, 151, 165));
+                                egui::Stroke::new(1.8, Color32::from_rgb(103, 196, 208));
                             ui.painter().line_segment(
                                 [
                                     center + egui::vec2(-8.0, -5.0),
@@ -3127,9 +3174,14 @@ impl EditorApp {
                         ))
                         .stick_to_bottom(self.agent_follow_transcript)
                         .show(ui, |ui| {
-                            ui.set_width(transcript_width);
-                            ui.set_max_width(transcript_width);
-                            for (item_index, item) in self.agent.transcript.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(transcript_padding);
+                                ui.vertical(|ui| {
+                                    ui.set_width(transcript_width);
+                                    ui.set_max_width(transcript_width);
+                                    for (item_index, item) in
+                                        self.agent.transcript.iter_mut().enumerate()
+                                    {
                                 match item {
                                     TranscriptItem::User(text) => {
                                         ui.label(
@@ -3692,6 +3744,8 @@ impl EditorApp {
                                 }
                                 ui.add_space(16.0);
                             }
+                                });
+                            });
                         });
                     let max_offset =
                         (output.content_size.y - output.inner_rect.height()).max(0.0);
@@ -3711,11 +3765,16 @@ impl EditorApp {
                     }
                     ui.painter().add(egui::Shape::mesh(agent_transcript_fade_mesh(
                         output.inner_rect,
+                        if self.agentic_mode {
+                            EDITOR_BACKGROUND
+                        } else {
+                            Color32::from_rgb(20, 20, 22)
+                        },
                     )));
                     if !self.agent_follow_transcript {
                         let button = egui::Rect::from_min_size(
                             egui::pos2(
-                                output.inner_rect.right() - 32.0,
+                                output.inner_rect.right() - transcript_padding - 32.0,
                                 output.inner_rect.bottom() - 32.0,
                             ),
                             egui::vec2(26.0, 26.0),
@@ -3788,24 +3847,26 @@ impl EditorApp {
         let mut menu_toggled = session_menu_toggled;
         let composer_panel = if self.agentic_mode {
             let padding = ((composer.width() - AGENTIC_CONTENT_WIDTH) * 0.5).max(20.0);
-            let panel = composer.shrink2(egui::vec2(padding, 12.0));
-            ui.painter()
-                .rect_filled(composer, 0.0, Color32::from_rgb(20, 20, 22));
+            let panel = egui::Rect::from_min_max(
+                egui::pos2(composer.left() + padding, composer.top() + 10.0),
+                egui::pos2(composer.right() - padding, composer.bottom() - 18.0),
+            );
+            ui.painter().rect_filled(composer, 0.0, EDITOR_BACKGROUND);
             ui.painter().add(
                 egui::Shadow {
                     offset: [0, 5],
                     blur: 18,
                     spread: 0,
-                    color: Color32::from_black_alpha(96),
+                    color: Color32::from_black_alpha(80),
                 }
                 .as_shape(panel, 14),
             );
             ui.painter()
-                .rect_filled(panel, 14.0, Color32::from_rgb(34, 34, 37));
+                .rect_filled(panel, 14.0, Color32::from_rgb(27, 31, 35));
             ui.painter().rect_stroke(
                 panel,
                 14.0,
-                egui::Stroke::new(1.0, Color32::from_white_alpha(18)),
+                egui::Stroke::new(1.0, Color32::from_rgb(49, 59, 68)),
                 egui::StrokeKind::Inside,
             );
             panel
@@ -6060,7 +6121,7 @@ fn agent_menu_option(
 
 fn agentic_new_session_button(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "New session")
     });
@@ -6068,20 +6129,25 @@ fn agentic_new_session_button(ui: &mut egui::Ui) -> egui::Response {
         ui.painter().rect_filled(
             rect,
             6.0,
-            Color32::from_white_alpha(if response.is_pointer_button_down_on() {
-                14
+            if response.is_pointer_button_down_on() {
+                Color32::from_rgb(25, 48, 56)
             } else {
-                9
-            }),
+                Color32::from_rgb(30, 57, 66)
+            },
         );
     }
-    let color = if ui.is_enabled() {
+    let text_color = if ui.is_enabled() {
         Color32::from_rgb(211, 216, 226)
     } else {
         Color32::from_rgb(103, 110, 123)
     };
+    let icon_color = if ui.is_enabled() {
+        Color32::from_rgb(103, 196, 208)
+    } else {
+        Color32::from_rgb(103, 110, 123)
+    };
     let icon_center = egui::pos2(rect.left() + 12.0, rect.center().y);
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4, icon_color);
     ui.painter().hline(
         (icon_center.x - 4.0)..=(icon_center.x + 4.0),
         icon_center.y,
@@ -6097,14 +6163,14 @@ fn agentic_new_session_button(ui: &mut egui::Ui) -> egui::Response {
         Align2::LEFT_CENTER,
         "New session",
         FontId::proportional(13.0),
-        color,
+        text_color,
     );
     response
 }
 
 fn draw_agentic_project_header(ui: &mut egui::Ui, name: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
-    let color = Color32::from_rgb(185, 192, 204);
+    let color = Color32::from_rgb(103, 196, 208);
     let folder = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 1.0, rect.center().y - 4.5),
         egui::vec2(14.0, 10.0),
@@ -6132,7 +6198,7 @@ fn draw_agentic_project_header(ui: &mut egui::Ui, name: &str) {
         Align2::LEFT_CENTER,
         name,
         FontId::proportional(12.5),
-        Color32::from_rgb(207, 212, 221),
+        Color32::from_rgb(213, 218, 227),
     );
 }
 
@@ -6189,26 +6255,28 @@ fn agent_session_row(
     });
     if selected {
         ui.painter()
-            .rect_filled(row, 6.0, Color32::from_rgb(39, 39, 44));
+            .rect_filled(row, 6.0, Color32::from_rgb(30, 57, 66));
         if compact {
             ui.painter().vline(
                 row.left() + 1.0,
                 (row.top() + 6.0)..=(row.bottom() - 6.0),
-                egui::Stroke::new(2.0, Color32::from_rgb(205, 211, 222)),
+                egui::Stroke::new(2.0, Color32::from_rgb(86, 207, 225)),
             );
         }
     } else if open_response.hovered() {
         ui.painter()
-            .rect_filled(row, 6.0, Color32::from_white_alpha(8));
+            .rect_filled(row, 6.0, Color32::from_rgb(29, 29, 32));
     }
     if remove_response.hovered() {
         ui.painter()
             .rect_filled(remove, 4.0, Color32::from_rgb(63, 37, 42));
     }
-    let color = if selected || open_response.hovered() {
+    let color = if selected {
+        Color32::from_rgb(213, 231, 235)
+    } else if open_response.hovered() {
         Color32::from_rgb(220, 224, 232)
     } else {
-        Color32::from_rgb(176, 183, 196)
+        Color32::from_rgb(174, 181, 194)
     };
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -6602,18 +6670,19 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, EditorApp, PendingAction,
+        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, EDITOR_BACKGROUND, EditorApp, PendingAction,
         RESIZE_SETTLE_DELAY, TAB_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TreeState,
         agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
         agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
         agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
-        agent_transcript_fade_mesh, build_agent_diff, cached_agent_diff, defer_resize,
-        disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
-        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, plain_text_job, presentation_job, repaint_deadline,
+        agent_transcript_fade_mesh, agentic_new_session_button, build_agent_diff,
+        cached_agent_diff, defer_resize, disable_transient_egui_debug_overlays,
+        draw_sidebar_toggle_icon, find_highlighted_job, install_repaint_wake,
+        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
+        next_find_match, plain_text_job, presentation_job, repaint_deadline,
         repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
         search_selection_after_navigation, skip_transition_render, slash_command_query,
-        split_agent_sidebar, split_editor_column, split_workspace,
+        split_agent_sidebar, split_agentic_workspace, split_editor_column, split_workspace,
     };
     use crate::{
         agent::controller::{
@@ -7228,7 +7297,7 @@ mod tests {
     #[test]
     fn agent_transcript_fades_cover_both_scroll_edges() {
         let rect = Rect::from_min_size(pos2(10.0, 20.0), Vec2::new(300.0, 400.0));
-        let mesh = agent_transcript_fade_mesh(rect);
+        let mesh = agent_transcript_fade_mesh(rect, Color32::from_rgb(20, 20, 22));
 
         assert_eq!(mesh.vertices.len(), 8);
         assert_eq!(mesh.indices.len(), 12);
@@ -8094,6 +8163,15 @@ mod tests {
             .push_back(TranscriptItem::Assistant("followed output".into()));
         let _ = draw(&context, &mut app, Vec::new(), 1.5);
         let followed = draw(&context, &mut app, Vec::new(), 1.6);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (_, _, agent) = split_workspace(
+            screen,
+            app.sidebar,
+            app.sidebar_width,
+            true,
+            app.agent_sidebar_width,
+        );
+        let transcript_gutter = pos2(agent.left() + 4.0, 250.0);
         fn text_rect(shape: &Shape, label: &str) -> Option<Rect> {
             match shape {
                 Shape::Text(text) if text.galley.text().trim_end() == label => {
@@ -8111,7 +8189,7 @@ mod tests {
             &context,
             &mut app,
             vec![
-                Event::PointerMoved(pos2(820.0, 250.0)),
+                Event::PointerMoved(transcript_gutter),
                 Event::MouseWheel {
                     unit: MouseWheelUnit::Line,
                     delta: Vec2::new(0.0, 1.0),
@@ -8132,7 +8210,7 @@ mod tests {
             &context,
             &mut app,
             vec![
-                Event::PointerMoved(pos2(820.0, 250.0)),
+                Event::PointerMoved(transcript_gutter),
                 Event::MouseWheel {
                     unit: MouseWheelUnit::Line,
                     delta: Vec2::new(0.0, -200.0),
@@ -8144,6 +8222,58 @@ mod tests {
         );
         let _ = draw(&context, &mut app, Vec::new(), 5.0);
         assert!(app.agent_follow_transcript);
+    }
+
+    #[test]
+    fn agentic_transcript_scrolls_from_the_side_gutters() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.transcript.extend(
+            (0..80)
+                .map(|line| TranscriptItem::Assistant(format!("transcript overflow line {line}"))),
+        );
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1600.0, 700.0));
+        let (_, agent) = split_agentic_workspace(screen, app.sidebar);
+        let pointer = pos2(agent.left() + 10.0, 250.0);
+
+        for time in [0.0, 1.0] {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        }
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                time: Some(2.0),
+                events: vec![
+                    Event::PointerMoved(pointer),
+                    Event::MouseWheel {
+                        unit: MouseWheelUnit::Line,
+                        delta: Vec2::new(0.0, 1.0),
+                        phase: TouchPhase::Move,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(!app.agent_follow_transcript);
     }
 
     #[test]
@@ -9357,22 +9487,115 @@ mod tests {
             updated_at: None,
         }]);
         let context = egui::Context::default();
-        let _ = context.run_ui(
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let output = context.run_ui(
             RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    pos2(0.0, 0.0),
-                    Vec2::new(1000.0, 700.0),
-                )),
+                screen_rect: Some(screen),
                 ..RawInput::default()
             },
             |root| app.ui(root),
         );
+        let mode_toggle = context
+            .read_response(Id::new("agentic_mode_toggle"))
+            .expect("agentic mode toggle")
+            .rect;
+        let (sessions, agent) = split_agentic_workspace(screen, true);
+        let sessions = sessions.expect("open agentic sidebar");
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+        fn has_background(shape: &Shape, expected: Rect) -> bool {
+            match shape {
+                Shape::Rect(rect) => rect.rect == expected && rect.fill == EDITOR_BACKGROUND,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_background(shape, expected)),
+                _ => false,
+            }
+        }
 
         assert!(
             context
                 .read_response(Id::new(("agent_session_open", "session-1")))
                 .is_some()
         );
+        assert_eq!(mode_toggle.right(), sessions.right());
+        assert!(mode_toggle.width() >= 44.0);
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "IDE"))
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_background(&shape.shape, agent))
+        );
+    }
+
+    #[test]
+    fn sidebar_visibility_is_shared_by_ide_and_agentic_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("ide-sidebar-entry.txt"), "text\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.sidebar = false;
+        app.agentic_mode = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.sessions = Some(vec![SessionChoice {
+            id: "hidden-session".into(),
+            title: Some("Agent sidebar entry".into()),
+            updated_at: None,
+        }]);
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        };
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+        let context = egui::Context::default();
+        let agentic = context.run_ui(input(), |root| app.ui(root));
+        app.agentic_mode = false;
+        let ide = context.run_ui(input(), |root| app.ui(root));
+
+        assert!(
+            !agentic
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Agent sidebar entry"))
+        );
+        assert!(
+            !ide.shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "ide-sidebar-entry.txt"))
+        );
+    }
+
+    #[test]
+    fn agentic_new_session_matches_the_compact_session_height() {
+        let mut button = Rect::NOTHING;
+        let _ = egui::Context::default().run_ui(RawInput::default(), |ui| {
+            button = agentic_new_session_button(ui).rect;
+        });
+
+        assert_eq!(button.height(), 32.0);
     }
 
     #[test]
@@ -9410,6 +9633,18 @@ mod tests {
                 .shapes
                 .iter()
                 .any(|shape| has_text(&shape.shape, "New session"))
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Cursor"))
+        );
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Cursor Agent"))
         );
     }
 
@@ -9523,7 +9758,7 @@ mod tests {
         );
         fn has_selected_fill(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == Color32::from_rgb(39, 39, 44),
+                Shape::Rect(rect) => rect.fill == Color32::from_rgb(30, 57, 66),
                 Shape::Vec(shapes) => shapes.iter().any(has_selected_fill),
                 _ => false,
             }
@@ -9535,6 +9770,42 @@ mod tests {
                 .iter()
                 .any(|shape| has_selected_fill(&shape.shape))
         );
+    }
+
+    #[test]
+    fn agentic_composer_leaves_clearance_above_the_window_edge() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn composer_rect(shape: &Shape) -> Option<Rect> {
+            match shape {
+                Shape::Rect(rect) if rect.fill == Color32::from_rgb(27, 31, 35) => Some(rect.rect),
+                Shape::Vec(shapes) => shapes.iter().find_map(composer_rect),
+                _ => None,
+            }
+        }
+        let composer = output
+            .shapes
+            .iter()
+            .find_map(|shape| composer_rect(&shape.shape))
+            .expect("agentic composer panel");
+
+        assert!(screen.bottom() - composer.bottom() >= 18.0);
     }
 
     #[test]
@@ -9551,7 +9822,7 @@ mod tests {
         .unwrap();
         app.sidebar_width = 120.0;
         let context = egui::Context::default();
-        let _ = context.run_ui(
+        let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -9561,6 +9832,13 @@ mod tests {
             },
             |root| app.ui(root),
         );
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
         let agentic_button = context
             .read_response(Id::new("agentic_mode_toggle"))
             .expect("agentic mode toggle")
@@ -9571,6 +9849,12 @@ mod tests {
             .rect;
 
         assert!(tab.left() >= agentic_button.right());
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Agent"))
+        );
     }
 
     #[test]
