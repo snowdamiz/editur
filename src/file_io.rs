@@ -114,6 +114,7 @@ pub fn safe_save(buffer: &mut Buffer, destination: &Path) -> Result<(), SaveErro
     let parent = destination.parent().ok_or_else(|| {
         SaveError::Io(format!("{} has no parent directory", destination.display()))
     })?;
+    let encoded = buffer.encoded();
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
         SaveError::Io(format!(
             "cannot create temporary file in {}: {error}",
@@ -121,7 +122,7 @@ pub fn safe_save(buffer: &mut Buffer, destination: &Path) -> Result<(), SaveErro
         ))
     })?;
     temporary
-        .write_all(&buffer.encoded())
+        .write_all(&encoded)
         .and_then(|()| temporary.flush())
         .map_err(|error| {
             SaveError::Io(format!("cannot write {}: {error}", destination.display()))
@@ -148,7 +149,10 @@ pub fn safe_save(buffer: &mut Buffer, destination: &Path) -> Result<(), SaveErro
         ))
     })?;
 
-    let fingerprint = disk_fingerprint(destination).map_err(SaveError::Io)?;
+    let metadata = fs::metadata(destination).map_err(|error| {
+        SaveError::Io(format!("cannot inspect {}: {error}", destination.display()))
+    })?;
+    let fingerprint = fingerprint_from(&metadata, &encoded);
     buffer.mark_saved(destination, fingerprint);
     Ok(())
 }

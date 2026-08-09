@@ -368,7 +368,6 @@ impl AgentState {
 
     fn push(&mut self, item: TranscriptItem) {
         self.transcript.push_back(item);
-        self.trim();
     }
 
     fn trim(&mut self) {

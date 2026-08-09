@@ -15,11 +15,12 @@ use egui::{
 #[cfg(not(editur_precompiled_metal))]
 use metal::CompileOptions;
 use metal::{
-    Buffer as MetalBuffer, CommandBuffer, Device, MTLBlendFactor, MTLClearColor, MTLIndexType,
-    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions,
-    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLScissorRect, MTLStorageMode, MTLStoreAction,
-    MTLTextureType, MTLTextureUsage, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
-    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    Buffer as MetalBuffer, CommandBuffer, Device, MTLBlendFactor, MTLClearColor,
+    MTLCommandBufferStatus, MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+    MTLRegion, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLScissorRect,
+    MTLStorageMode, MTLStoreAction, MTLTextureType, MTLTextureUsage, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use objc::{
     Message,
@@ -67,9 +68,7 @@ impl FrameBuffers {
     }
 
     fn prepare(&mut self, device: &Device, vertex_bytes: usize, index_bytes: usize) {
-        if let Some(command) = self.pending.take() {
-            command.wait_until_completed();
-        }
+        self.pending = None;
         let vertex_capacity = buffer_capacity(self.vertex_capacity, vertex_bytes);
         if vertex_capacity != self.vertex_capacity {
             self.vertex = device.new_buffer(
@@ -87,6 +86,13 @@ impl FrameBuffers {
             self.retained.clear();
         }
     }
+}
+
+fn frame_slot_available(status: Option<MTLCommandBufferStatus>) -> bool {
+    matches!(
+        status,
+        None | Some(MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error)
+    )
 }
 
 pub struct Renderer {
@@ -207,7 +213,7 @@ impl Renderer {
         pixels_per_point: f32,
         primitives: &[ClippedPrimitive],
         textures_delta: &TexturesDelta,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         for frame in &mut self.frames {
             super::invalidate_retained_uploads_on_texture_replace(
                 &mut frame.retained,
@@ -220,11 +226,43 @@ impl Renderer {
 
         if self.size.width == 0 || self.size.height == 0 {
             self.free_textures(&textures_delta.free);
-            return Ok(());
+            return Ok(true);
         }
+        let total_vertex_bytes = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(size_of_val(mesh.vertices.as_slice())),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let total_index_bytes = primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => Some(size_of_val(mesh.indices.as_slice())),
+                Primitive::Callback(_) => None,
+            })
+            .sum();
+        let frame_index = (0..self.frames.len())
+            .map(|offset| (self.next_frame + offset) % self.frames.len())
+            .find(|index| {
+                frame_slot_available(
+                    self.frames[*index]
+                        .pending
+                        .as_ref()
+                        .map(|command| command.status()),
+                )
+            });
+        let Some(frame_index) = frame_index else {
+            self.free_textures(&textures_delta.free);
+            return Ok(false);
+        };
+        self.next_frame = (frame_index + 1) % self.frames.len();
+        let frame = &mut self.frames[frame_index];
+        frame.prepare(&self.device, total_vertex_bytes, total_index_bytes);
+
         let Some(drawable) = self.layer.next_drawable() else {
             self.free_textures(&textures_delta.free);
-            return Ok(());
+            return Ok(false);
         };
         let drawable_size = PhysicalSize::new(
             drawable.texture().width() as u32,
@@ -254,24 +292,6 @@ impl Renderer {
             screen_size.as_ptr().cast(),
         );
 
-        let total_vertex_bytes = primitives
-            .iter()
-            .filter_map(|primitive| match &primitive.primitive {
-                Primitive::Mesh(mesh) => Some(size_of_val(mesh.vertices.as_slice())),
-                Primitive::Callback(_) => None,
-            })
-            .sum();
-        let total_index_bytes = primitives
-            .iter()
-            .filter_map(|primitive| match &primitive.primitive {
-                Primitive::Mesh(mesh) => Some(size_of_val(mesh.indices.as_slice())),
-                Primitive::Callback(_) => None,
-            })
-            .sum();
-        let frame_index = self.next_frame;
-        self.next_frame = (self.next_frame + 1) % self.frames.len();
-        let frame = &mut self.frames[frame_index];
-        frame.prepare(&self.device, total_vertex_bytes, total_index_bytes);
         let mut vertex_offset = 0;
         let mut index_offset = 0;
         let mut retained = None;
@@ -353,7 +373,7 @@ impl Renderer {
         command_buffer.commit();
         frame.pending = Some(pending);
         self.free_textures(&textures_delta.free);
-        Ok(())
+        Ok(true)
     }
 
     fn update_texture(&mut self, id: TextureId, delta: &ImageDelta) -> Result<(), String> {
@@ -537,10 +557,30 @@ fn round_layer(layer: &Object) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use metal::MTLCommandBufferStatus;
     use objc::{
         Message,
         runtime::{Class, Object, Sel, YES},
     };
+
+    #[test]
+    fn busy_frame_slots_are_deferred_instead_of_waited_on() {
+        assert!(super::frame_slot_available(None));
+        assert!(super::frame_slot_available(Some(
+            MTLCommandBufferStatus::Completed
+        )));
+        assert!(super::frame_slot_available(Some(
+            MTLCommandBufferStatus::Error
+        )));
+        for status in [
+            MTLCommandBufferStatus::NotEnqueued,
+            MTLCommandBufferStatus::Enqueued,
+            MTLCommandBufferStatus::Committed,
+            MTLCommandBufferStatus::Scheduled,
+        ] {
+            assert!(!super::frame_slot_available(Some(status)));
+        }
+    }
 
     #[test]
     fn macos_layer_rounding_sets_radius_and_clips() {

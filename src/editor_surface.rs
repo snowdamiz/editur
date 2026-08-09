@@ -17,6 +17,7 @@ pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 24, 26);
 struct RetainedLine {
     job: LayoutJob,
     char_start: usize,
+    character_len: usize,
     height: f32,
     galley: Option<Arc<Galley>>,
     revision: u64,
@@ -59,6 +60,7 @@ pub struct EditorOutput {
 pub(crate) struct DocumentMetrics {
     pub revision: u64,
     pub line_count: usize,
+    pub character_len: usize,
 }
 
 impl EditorSurface {
@@ -133,6 +135,7 @@ impl EditorSurface {
         let document = DocumentMetrics {
             revision: visual_revision,
             line_count: line_count(text),
+            character_len: text.chars().count(),
         };
         self.show_document(
             ui,
@@ -175,7 +178,7 @@ impl EditorSurface {
         );
         let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
         self.sync_lines(highlighted, document.revision, wrap_width);
-        self.clamp_selection(text);
+        self.clamp_selection(document.character_len);
         let cursor_before_input = self.cursor;
 
         if request_focus {
@@ -247,7 +250,7 @@ impl EditorSurface {
         }
         ensure_cursor_visible |= self.cursor != cursor_before_events && !response.dragged();
 
-        self.clamp_selection(text);
+        self.clamp_selection(document.character_len);
         if ensure_cursor_visible {
             self.scroll_character_into_view(self.cursor, content.height());
         }
@@ -298,7 +301,17 @@ impl EditorSurface {
 
     fn sync_lines(&mut self, highlighted: &LayoutJob, revision: u64, wrap_width: f32) {
         let width = wrap_width.round().to_bits();
-        if self.visual_revision == Some(revision) && self.wrap_width == width {
+        if self.visual_revision == Some(revision) {
+            if self.wrap_width == width {
+                return;
+            }
+            for line in &mut self.lines {
+                line.job.wrap.max_width = wrap_width;
+                line.height = estimated_height(line.character_len, wrap_width);
+                line.galley = None;
+            }
+            self.wrap_width = width;
+            self.rebuild_offsets();
             return;
         }
         let specs = split_layout_job(highlighted, wrap_width);
@@ -336,9 +349,10 @@ impl EditorSurface {
                     line
                 } else {
                     RetainedLine {
-                        height: estimated_height(&spec.job.text, wrap_width),
+                        height: estimated_height(spec.character_len, wrap_width),
                         job: spec.job,
                         char_start: spec.char_start,
+                        character_len: spec.character_len,
                         galley: None,
                         revision,
                     }
@@ -435,7 +449,7 @@ impl EditorSurface {
                 continue;
             };
             let y = content.top() + self.offsets[index] - self.scroll_y;
-            let line_end = line.char_start + line.job.text.chars().count();
+            let line_end = line.char_start + line.character_len;
             let selected = selection.start.max(line.char_start)..selection.end.min(line_end);
             let selection_state = (selected.start < selected.end).then_some(
                 (selected.start as u64).rotate_left(17) ^ (selected.end as u64).rotate_left(31),
@@ -600,7 +614,7 @@ impl EditorSurface {
                 let line = self.line_for_character(self.cursor);
                 let end = self.lines.get(line).map_or_else(
                     || text.chars().count(),
-                    |line| line.char_start + line.job.text.chars().count(),
+                    |line| line.char_start + line.character_len,
                 );
                 self.move_cursor(end, modifiers.shift);
                 false
@@ -752,10 +766,9 @@ impl EditorSurface {
         self.clamp_scroll(viewport_height);
     }
 
-    fn clamp_selection(&mut self, text: &str) {
-        let len = text.chars().count();
-        self.anchor = self.anchor.min(len);
-        self.cursor = self.cursor.min(len);
+    fn clamp_selection(&mut self, character_len: usize) {
+        self.anchor = self.anchor.min(character_len);
+        self.cursor = self.cursor.min(character_len);
     }
 
     fn clamp_scroll(&mut self, viewport_height: f32) {
@@ -779,6 +792,7 @@ impl EditorSurface {
 struct LineSpec {
     job: LayoutJob,
     char_start: usize,
+    character_len: usize,
 }
 
 fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
@@ -824,7 +838,8 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
                 });
             }
             let line_start = char_start;
-            char_start += text.chars().count() + 1;
+            let character_len = text.chars().count();
+            char_start += character_len + 1;
             range_start = range.end.saturating_add(1);
             LineSpec {
                 job: LayoutJob {
@@ -838,13 +853,14 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
                     ..Default::default()
                 },
                 char_start: line_start,
+                character_len,
             }
         })
         .collect()
 }
 
-fn estimated_height(text: &str, wrap_width: f32) -> f32 {
-    let width = text.chars().count() as f32 * 8.4;
+fn estimated_height(character_len: usize, wrap_width: f32) -> f32 {
+    let width = character_len as f32 * 8.4;
     LINE_HEIGHT * (width / wrap_width.max(1.0)).ceil().max(1.0)
 }
 
@@ -972,6 +988,34 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "retained-line split took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn width_only_resize_reuses_retained_line_storage() {
+        let job = LayoutJob::simple(
+            "first\nsecond\nthird".to_owned(),
+            FontId::monospace(14.0),
+            Color32::WHITE,
+            400.0,
+        );
+        let mut editor = EditorSurface::default();
+        editor.sync_lines(&job, 1, 400.0);
+        let allocations = editor
+            .lines
+            .iter()
+            .map(|line| line.job.text.as_ptr())
+            .collect::<Vec<_>>();
+
+        editor.sync_lines(&job, 1, 800.0);
+
+        assert_eq!(
+            allocations,
+            editor
+                .lines
+                .iter()
+                .map(|line| line.job.text.as_ptr())
+                .collect::<Vec<_>>()
         );
     }
 

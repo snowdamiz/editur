@@ -55,12 +55,34 @@ Run `cargo run --release --locked --example benchmark_highlighting`. Each edit a
 
 The 1 MiB incremental highlighting component is below the 16 ms input-to-painted target. A full OS-input-to-present p95 still needs native UI automation; this benchmark does not claim to include egui layout, event delivery, or presentation.
 
+## Window resize
+
+Run `cargo run --release --locked --example benchmark_resize`. The benchmark drives 60 successive widths through the retained editor, matching the CPU-heavy portion of a native maximize animation with a 1 MiB syntax-sectioned document.
+
+Five fresh-process trials isolated the macOS titlebar toggle after the first editable frame. The old winit borderless path spent a 2.06 s median querying maximized state because it temporarily installed and removed native title styles; calling AppKit's native toggle directly avoids that cold initialization.
+
+| First titlebar maximize | Median | Range | Improvement |
+| --- | ---: | ---: | ---: |
+| winit query + maximize | 2.40 s | 2.39–2.42 s | — |
+| Direct AppKit toggle | 329.54 ms | 329.23–330.33 ms | 7.28x faster |
+
+| Metric | Before | Optimized | Improvement |
+| --- | ---: | ---: | ---: |
+| 60 resize frames | 116.22 ms | 19.88 ms | 5.85x faster |
+| Median frame | 1.64 ms | 0.256 ms | 6.41x faster |
+| p95 frame | 3.05 ms | 0.287 ms | 10.63x faster |
+| Cold first frame | — | 5.00 ms | Recorded |
+| Warm frame | — | 0.233 ms | Recorded |
+
+The optimized path retains per-line text and syntax allocations across width-only changes, uses cached document metrics, and skips the stale frame that initiates native maximize. The native toggle runs outside the redraw callback, and its resize burst is coalesced to one final Metal surface update after 50 ms of quiet; ordinary manual resizing remains live. A busy Metal frame slot also defers the redraw instead of synchronously waiting on the UI thread. The editor benchmark measures CPU work; the fresh-process titlebar trials cover the reported cold AppKit stall.
+
 ## Reproduction and platform status
 
 ```sh
 cargo build --release --locked
 EDITUR_LOG=debug target/release/editur PLAN.md
 cargo run --release --locked --example benchmark_highlighting
+cargo run --release --locked --example benchmark_resize
 ```
 
 Metal was launched and rendered on the reference Mac with the custom borderless chrome. The DX12 and Vulkan modules pass cross-target Clippy with warnings denied; their native runtime builds remain encoded in CI. Vulkan host checking used a metadata-only `pkg-config` shim because macOS has no Linux Wayland sysroot. Native keyboard-only GUI smoke tests and complete resource baselines remain release-approval checks on Windows and Linux.

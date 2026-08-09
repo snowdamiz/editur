@@ -106,6 +106,10 @@ impl Buffer {
         self.line_starts.len()
     }
 
+    pub fn character_len(&self) -> usize {
+        self.character_len
+    }
+
     pub fn byte_index(&self, character_offset: usize) -> usize {
         let offset = character_offset.min(self.character_len);
         let line = self

@@ -1192,7 +1192,6 @@ struct HighlightCache {
 struct GalleyKey {
     revision: u64,
     syntax: String,
-    wrap_width: u32,
     find: Option<(String, usize)>,
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
 }
@@ -1200,6 +1199,7 @@ struct GalleyKey {
 struct FileTab {
     buffer: Buffer,
     editor_surface: EditorSurface,
+    highlight_cache: HighlightCache,
 }
 
 impl FileTab {
@@ -1207,6 +1207,7 @@ impl FileTab {
         Self {
             buffer,
             editor_surface: EditorSurface::default(),
+            highlight_cache: HighlightCache::default(),
         }
     }
 }
@@ -1218,7 +1219,6 @@ pub struct EditorApp {
     tree_surface: TreeSurface,
     syntaxes: SyntaxManager,
     highlighter: Highlighter,
-    highlight_cache: HighlightCache,
     search: SearchController,
     search_open: bool,
     search_query: String,
@@ -1254,7 +1254,6 @@ pub struct EditorApp {
     agent: AgentState,
     agent_controller: Option<AgentController>,
     pending_agent_prompt: bool,
-    last_agent_reconcile: Instant,
     focus_editor: bool,
     tree_focused: bool,
     cursor: (usize, usize),
@@ -1289,7 +1288,6 @@ impl EditorApp {
             tree_surface: TreeSurface::default(),
             syntaxes,
             highlighter: Highlighter::new()?,
-            highlight_cache: HighlightCache::default(),
             search,
             search_open: false,
             search_query: String::new(),
@@ -1325,7 +1323,6 @@ impl EditorApp {
             agent: AgentState::default(),
             agent_controller: None,
             pending_agent_prompt: false,
-            last_agent_reconcile: Instant::now(),
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
             cursor: (1, 1),
@@ -1366,7 +1363,6 @@ impl EditorApp {
         self.active_tab = Some(index);
         self.tree.select(Some(self.tabs[index].buffer.path.clone()));
         if changed {
-            self.highlight_cache = HighlightCache::default();
             self.find_match_revision = u64::MAX;
             self.scroll_to_find_match = self.find_open;
             self.bracket_pair = None;
@@ -1483,8 +1479,14 @@ impl EditorApp {
         let buffer = &mut self.tabs[index].buffer;
         let save_as = destination.is_some();
         let path = destination.unwrap_or_else(|| buffer.path.clone());
+        let path_changed = path != buffer.path;
         match safe_save(buffer, &path) {
-            Ok(()) => true,
+            Ok(()) => {
+                if path_changed {
+                    self.tabs[index].highlight_cache.valid = false;
+                }
+                true
+            }
             Err(SaveError::Conflict) => {
                 if save_as {
                     self.show_error(format!(
@@ -1537,10 +1539,6 @@ impl EditorApp {
         self.poll_agent(&ctx);
         if self.agent.active {
             ctx.request_repaint_after(Duration::from_millis(500));
-            if self.last_agent_reconcile.elapsed() >= Duration::from_millis(500) {
-                self.reconcile_open_buffer();
-                self.last_agent_reconcile = Instant::now();
-            }
         }
         self.shortcuts(&ctx);
         if self.find_open {
@@ -1550,7 +1548,7 @@ impl EditorApp {
             self.search.poll(&self.search_query);
             let results = self.search.results();
             if search_needs_polling(&self.search_query, &results.query, results.complete) {
-                ctx.request_repaint_after(Duration::from_millis(16));
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
 
@@ -2503,7 +2501,7 @@ impl EditorApp {
         self.find_selected = self
             .find_selected
             .min(self.find_matches.len().saturating_sub(1));
-        self.highlight_cache.find_valid = false;
+        self.tabs[index].highlight_cache.find_valid = false;
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2541,7 +2539,11 @@ impl EditorApp {
     }
 
     fn reconnect_agent(&mut self, ctx: &egui::Context) {
-        self.agent_controller = None;
+        if let Some(controller) = self.agent_controller.take() {
+            let _ = std::thread::Builder::new()
+                .name("editur-agent-shutdown".into())
+                .spawn(move || drop(controller));
+        }
         self.open_agent(ctx);
     }
 
@@ -2603,6 +2605,7 @@ impl EditorApp {
                     let cursor = tab.editor_surface.cursor();
                     tab.editor_surface = EditorSurface::default();
                     tab.editor_surface.set_selection(cursor, cursor);
+                    tab.highlight_cache = HighlightCache::default();
                     active_reloaded |= self.active_tab == Some(index);
                 }
                 Ok(ReconcileOutcome::Conflict) => {
@@ -2613,7 +2616,6 @@ impl EditorApp {
             };
         }
         if active_reloaded {
-            self.highlight_cache.valid = false;
             self.find_match_revision = u64::MAX;
             self.bracket_pair = None;
             self.bracket_pair_key = None;
@@ -4559,7 +4561,9 @@ impl EditorApp {
                 self.find_matches.len(),
                 previous || (enter && backwards),
             );
-            self.highlight_cache.find_valid = false;
+            if let Some(index) = self.active_tab {
+                self.tabs[index].highlight_cache.find_valid = false;
+            }
             self.scroll_to_find_match = true;
             ctx.request_repaint();
         }
@@ -4921,8 +4925,11 @@ impl EditorApp {
             });
             return;
         };
-        let tab = &mut self.tabs[index];
-        let buffer = &mut tab.buffer;
+        let FileTab {
+            buffer,
+            editor_surface,
+            highlight_cache: cache,
+        } = &mut self.tabs[index];
         if buffer.large_file_warning {
             ui.colored_label(
                 Color32::YELLOW,
@@ -4930,18 +4937,14 @@ impl EditorApp {
             );
         }
 
-        let syntax = self
-            .syntaxes
-            .detect(&buffer.path, buffer.large_file_warning);
         let revision = buffer.revision;
-        let syntax_name = syntax.name.clone();
-        let cache = &mut self.highlight_cache;
         let highlighter = &self.highlighter;
         let syntaxes = &self.syntaxes;
         let large_file = buffer.large_file_warning;
         let mut highlight_error = None;
         let wrap_width = ui.available_width().max(1.0);
-        if !cache.valid || cache.revision != revision || cache.syntax != syntax_name {
+        if !cache.valid || cache.revision != revision {
+            let syntax = syntaxes.detect(&buffer.path, large_file);
             if large_file {
                 cache.job = plain_text_job(&buffer.text, wrap_width);
                 cache.incremental = IncrementalHighlightCache::default();
@@ -4961,10 +4964,11 @@ impl EditorApp {
                 }
             }
             cache.revision = revision;
-            cache.syntax.clone_from(&syntax_name);
+            cache.syntax.clone_from(&syntax.name);
             cache.valid = true;
             cache.find_valid = false;
         }
+        let syntax_name = cache.syntax.clone();
         let job = if find_open && !find_matches.is_empty() {
             if !cache.find_valid
                 || cache.find_revision != revision
@@ -4984,7 +4988,6 @@ impl EditorApp {
         let galley_key = GalleyKey {
             revision,
             syntax: syntax_name,
-            wrap_width: wrap_width.round().to_bits(),
             find: (find_open && !find_matches.is_empty())
                 .then(|| (find_query.clone(), find_selected)),
             bracket_pair: bracket_pair.clone(),
@@ -5000,8 +5003,9 @@ impl EditorApp {
         let document = DocumentMetrics {
             revision: cache.presentation_revision,
             line_count: buffer.line_count(),
+            character_len: buffer.character_len(),
         };
-        let output = tab.editor_surface.show_document(
+        let output = editor_surface.show_document(
             ui,
             &mut buffer.text,
             job,
@@ -5018,7 +5022,7 @@ impl EditorApp {
         }
         if output.changed {
             buffer.mark_changed();
-            self.highlight_cache.valid = false;
+            cache.valid = false;
         }
         self.cursor = buffer.line_column(output.cursor);
         let bracket_pair_key = (buffer.revision, output.cursor);
@@ -5149,7 +5153,6 @@ impl EditorApp {
                             match load_buffer(&path) {
                                 Ok(buffer) => {
                                     self.tabs[index] = FileTab::new(buffer);
-                                    self.highlight_cache.valid = false;
                                     self.conflict = false;
                                     if self.pending.is_some() {
                                         self.finish_pending();
@@ -5309,6 +5312,8 @@ struct Shell {
     renderer: Option<Renderer>,
     egui: Option<egui_winit::State>,
     repaint_at: Option<Instant>,
+    resize_at: Option<Instant>,
+    pending_maximize: bool,
     pending_resize: Option<winit::dpi::PhysicalSize<u32>>,
     fatal: Option<String>,
     clipboard: Option<arboard::Clipboard>,
@@ -5317,6 +5322,8 @@ struct Shell {
     first_frame_logged: bool,
     event_proxy: EventLoopProxy<InstanceEvent>,
 }
+
+const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(50);
 
 fn repaint_deadline(delay: Duration, now: Instant) -> Option<Instant> {
     (delay != Duration::MAX).then(|| now + delay)
@@ -5329,12 +5336,26 @@ fn queue_resize(
     *pending = Some(size);
 }
 
+fn defer_resize(
+    pending: &mut Option<winit::dpi::PhysicalSize<u32>>,
+    redraw_at: &mut Option<Instant>,
+    size: winit::dpi::PhysicalSize<u32>,
+    now: Instant,
+) {
+    queue_resize(pending, size);
+    *redraw_at = Some(now + RESIZE_SETTLE_DELAY);
+}
+
 fn repaint_delay_after_texture_update(delay: Duration, textures_updated: bool) -> Duration {
     if textures_updated {
         Duration::ZERO
     } else {
         delay
     }
+}
+
+const fn skip_transition_render(maximize_requested: bool, textures_changed: bool) -> bool {
+    maximize_requested && !textures_changed
 }
 
 fn install_repaint_wake(context: &egui::Context, wake: impl Fn() + Send + Sync + 'static) {
@@ -5376,6 +5397,8 @@ impl Shell {
             renderer: None,
             egui: None,
             repaint_at: None,
+            resize_at: None,
+            pending_maximize: false,
             pending_resize: None,
             fatal: None,
             clipboard: None,
@@ -5392,6 +5415,13 @@ impl Shell {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(deadline) = self.resize_at {
+            if Instant::now() < deadline {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+            self.resize_at = None;
+        }
         let (Some(window), Some(renderer), Some(state)) = (
             self.window.as_ref(),
             self.renderer.as_mut(),
@@ -5411,11 +5441,15 @@ impl Shell {
         let input = state.take_egui_input(window);
         let context = state.egui_ctx().clone();
         let output = context.run_ui(input, |root| self.editor.ui(root));
+        let mut maximize_requested = false;
         if let Some(action) = self.editor.take_window_action() {
             match action {
                 WindowAction::Close => self.editor.request_close(),
                 WindowAction::Minimize => window.set_minimized(true),
-                WindowAction::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+                WindowAction::ToggleMaximize => {
+                    self.pending_maximize = true;
+                    maximize_requested = true;
+                }
                 WindowAction::Drag => {
                     if let Err(error) = window.drag_window() {
                         self.editor
@@ -5435,14 +5469,30 @@ impl Shell {
             }
         }
         state.handle_platform_output_with_event_loop(window, event_loop, output.platform_output);
-        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
         let textures_updated = !output.textures_delta.set.is_empty();
+        if skip_transition_render(maximize_requested, !output.textures_delta.is_empty()) {
+            window.request_redraw();
+            return;
+        }
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
         #[cfg(target_os = "linux")]
         window.pre_present_notify();
-        if let Err(error) =
-            renderer.render(output.pixels_per_point, &primitives, &output.textures_delta)
-        {
-            self.fail(event_loop, error);
+        #[cfg(target_os = "macos")]
+        let rendered =
+            renderer.render(output.pixels_per_point, &primitives, &output.textures_delta);
+        #[cfg(not(target_os = "macos"))]
+        let rendered = renderer
+            .render(output.pixels_per_point, &primitives, &output.textures_delta)
+            .map(|()| true);
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        if !rendered {
+            window.request_redraw();
             return;
         }
         if !self.first_frame_logged {
@@ -5589,12 +5639,17 @@ impl ApplicationHandler<InstanceEvent> for Shell {
                     .show_error(format!("cannot paste from system clipboard: {error}")),
             }
         }
-        if !matches!(event, WindowEvent::RedrawRequested)
+        let deferred_resize = self.resize_at.is_some()
+            && matches!(
+                &event,
+                WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+            );
+        let egui_repaint = !matches!(event, WindowEvent::RedrawRequested)
             && self
                 .egui
                 .as_mut()
-                .is_some_and(|state| state.on_window_event(window, &event).repaint)
-        {
+                .is_some_and(|state| state.on_window_event(window, &event).repaint);
+        if egui_repaint && !deferred_resize {
             window.request_redraw();
         }
         match event {
@@ -5607,12 +5662,37 @@ impl ApplicationHandler<InstanceEvent> for Shell {
                 }
             }
             WindowEvent::Resized(size) => {
-                queue_resize(&mut self.pending_resize, size);
-                window.request_redraw();
+                if self.resize_at.is_some() {
+                    defer_resize(
+                        &mut self.pending_resize,
+                        &mut self.resize_at,
+                        size,
+                        Instant::now(),
+                    );
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        self.resize_at.expect("deferred resize has a deadline"),
+                    ));
+                } else {
+                    queue_resize(&mut self.pending_resize, size);
+                    window.request_redraw();
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                queue_resize(&mut self.pending_resize, window.inner_size());
-                window.request_redraw();
+                let size = window.inner_size();
+                if self.resize_at.is_some() {
+                    defer_resize(
+                        &mut self.pending_resize,
+                        &mut self.resize_at,
+                        size,
+                        Instant::now(),
+                    );
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        self.resize_at.expect("deferred resize has a deadline"),
+                    ));
+                } else {
+                    queue_resize(&mut self.pending_resize, size);
+                    window.request_redraw();
+                }
             }
             WindowEvent::Focused(true) => {
                 self.editor.reconcile_open_buffer();
@@ -5623,15 +5703,36 @@ impl ApplicationHandler<InstanceEvent> for Shell {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self
-            .repaint_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if std::mem::take(&mut self.pending_maximize) {
+            if let Some(window) = &self.window
+                && let Err(error) = toggle_window_maximize(window)
+            {
+                self.fail(event_loop, error);
+                return;
+            }
+            self.resize_at = Some(Instant::now() + RESIZE_SETTLE_DELAY);
+        }
+
+        let now = Instant::now();
+        let resize_due = self.resize_at.is_some_and(|deadline| now >= deadline);
+        let repaint_due = self.repaint_at.is_some_and(|deadline| now >= deadline);
+        if resize_due {
+            self.resize_at = None;
+        }
+        if repaint_due {
             self.repaint_at = None;
+        }
+        if resize_due || repaint_due {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
+        } else if let Some(deadline) = [self.resize_at, self.repaint_at]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
     }
 
@@ -5716,6 +5817,35 @@ fn create_macos_window_without_native_title(
         drop(restore);
         window
     }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn toggle_window_maximize(window: &Window) -> Result<(), String> {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window
+        .window_handle()
+        .map_err(|error| format!("cannot obtain the AppKit window handle: {error}"))?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return Err("winit did not provide an AppKit window handle".to_owned());
+    };
+    let view = handle.ns_view.as_ptr().cast::<Object>();
+    unsafe {
+        let native_window: *mut Object = msg_send![view, window];
+        if native_window.is_null() {
+            return Err("cannot obtain the AppKit window".to_owned());
+        }
+        let _: () = msg_send![native_window, zoom: std::ptr::null_mut::<Object>()];
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn toggle_window_maximize(window: &Window) -> Result<(), String> {
+    window.set_maximized(!window.is_maximized());
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -6472,17 +6602,17 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, EditorApp, PendingAction, TAB_WIDTH,
-        TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TreeState, agent_collapsing_header,
-        agent_composer_content, agent_composer_height, agent_diff_preview, agent_markdown_galley,
-        agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
-        agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
-        agent_transcript_fade_mesh, build_agent_diff, cached_agent_diff,
+        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, EditorApp, PendingAction,
+        RESIZE_SETTLE_DELAY, TAB_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TreeState,
+        agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
+        agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
+        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        agent_transcript_fade_mesh, build_agent_diff, cached_agent_diff, defer_resize,
         disable_transient_egui_debug_overlays, draw_sidebar_toggle_icon, find_highlighted_job,
         install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, plain_text_job, presentation_job, queue_resize,
-        repaint_deadline, repaint_delay_after_texture_update, run_everything_state,
-        search_needs_polling, search_selection_after_navigation, slash_command_query,
+        model_display_name, next_find_match, plain_text_job, presentation_job, repaint_deadline,
+        repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
+        search_selection_after_navigation, skip_transition_render, slash_command_query,
         split_agent_sidebar, split_editor_column, split_workspace,
     };
     use crate::{
@@ -7016,6 +7146,38 @@ mod tests {
         let output = draw(&mut app);
 
         assert!(!output.shapes.iter().any(|shape| has_id_clash(&shape.shape)));
+    }
+
+    #[test]
+    fn switching_tabs_preserves_each_tabs_highlight_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, "fn first() {}\n").unwrap();
+        fs::write(&second, "fn second() {}\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(first),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(second, false);
+        let context = egui::Context::default();
+        app.activate_tab(0);
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 700.0))),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let allocation = app.tabs[0].highlight_cache.job.text.as_ptr();
+
+        app.activate_tab(1);
+        app.activate_tab(0);
+
+        assert_eq!(allocation, app.tabs[0].highlight_cache.job.text.as_ptr());
     }
 
     #[test]
@@ -8486,10 +8648,35 @@ mod tests {
     #[test]
     fn rapid_resizes_keep_only_the_latest_surface_size() {
         let mut pending = None;
-        queue_resize(&mut pending, winit::dpi::PhysicalSize::new(800, 600));
-        queue_resize(&mut pending, winit::dpi::PhysicalSize::new(1920, 1080));
+        let mut redraw_at = None;
+        let started = Instant::now();
+        defer_resize(
+            &mut pending,
+            &mut redraw_at,
+            winit::dpi::PhysicalSize::new(800, 600),
+            started,
+        );
+        defer_resize(
+            &mut pending,
+            &mut redraw_at,
+            winit::dpi::PhysicalSize::new(1920, 1080),
+            started + Duration::from_millis(10),
+        );
 
-        assert_eq!(pending, Some(winit::dpi::PhysicalSize::new(1920, 1080)));
+        assert_eq!(
+            (pending, redraw_at),
+            (
+                Some(winit::dpi::PhysicalSize::new(1920, 1080)),
+                Some(started + Duration::from_millis(10) + RESIZE_SETTLE_DELAY),
+            )
+        );
+    }
+
+    #[test]
+    fn maximize_skips_the_stale_frame_unless_it_contains_texture_updates() {
+        assert!(skip_transition_render(true, false));
+        assert!(!skip_transition_render(true, true));
+        assert!(!skip_transition_render(false, false));
     }
 
     #[test]

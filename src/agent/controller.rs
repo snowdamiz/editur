@@ -461,18 +461,21 @@ fn run_thread(
         if direction == LineDirection::Stderr {
             append_bounded(&debug_diagnostics, line, MAX_DIAGNOSTIC_BYTES);
         } else if direction == LineDirection::Stdout {
-            match serde_json::from_str::<serde_json::Value>(line) {
-                Ok(message) if protocol_debug => {
-                    if let Some(label) = protocol_label(&message) {
-                        eprintln!("editur: ACP <- {label}");
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = debug_commands.try_send(Command::TransportFailed(
-                        "Cursor Agent wrote malformed JSON to stdout".into(),
-                    ));
-                }
+            let valid = if protocol_debug {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .inspect(|message| {
+                        if let Some(label) = protocol_label(message) {
+                            eprintln!("editur: ACP <- {label}");
+                        }
+                    })
+                    .is_ok()
+            } else {
+                serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+            };
+            if !valid {
+                let _ = debug_commands.try_send(Command::TransportFailed(
+                    "Cursor Agent wrote malformed JSON to stdout".into(),
+                ));
             }
         }
     });
