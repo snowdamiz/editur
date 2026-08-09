@@ -67,6 +67,7 @@ pub struct AgentState {
     pub config_options: Vec<ConfigChoice>,
     pub commands: Vec<CommandChoice>,
     pub sessions: Option<Vec<SessionChoice>>,
+    pub session_id: Option<String>,
     pub title: Option<String>,
     pub usage: Option<UsageState>,
 }
@@ -85,6 +86,7 @@ impl Default for AgentState {
             config_options: Vec::new(),
             commands: Vec::new(),
             sessions: None,
+            session_id: None,
             title: None,
             usage: None,
         }
@@ -149,6 +151,7 @@ impl AgentState {
                 self.active = false;
                 self.transcript.clear();
                 self.changed_paths.clear();
+                self.session_id = None;
                 self.title = None;
                 self.current_mode = current_mode.map(bounded);
                 self.modes = modes
@@ -186,6 +189,9 @@ impl AgentState {
                     .collect();
                 self.config_options = bounded_configs(config_options);
             }
+            Event::ActiveSessionChanged(session_id) => {
+                self.session_id = Some(bounded(session_id));
+            }
             Event::ModeChanged(mode) => self.current_mode = Some(bounded(mode)),
             Event::ConfigOptionsUpdated(options) => self.config_options = bounded_configs(options),
             Event::CommandsUpdated(commands) => {
@@ -199,7 +205,17 @@ impl AgentState {
                     })
                     .collect();
             }
-            Event::SessionTitleUpdated(title) => self.title = title.map(bounded),
+            Event::SessionTitleUpdated(title) => {
+                self.title = title.map(bounded);
+                if let (Some(session_id), Some(title), Some(sessions)) =
+                    (&self.session_id, &self.title, &mut self.sessions)
+                    && let Some(session) = sessions
+                        .iter_mut()
+                        .find(|session| &session.id == session_id)
+                {
+                    session.title = Some(title.clone());
+                }
+            }
             Event::UserMessage(text) => {
                 self.active = true;
                 self.prompt.clear();

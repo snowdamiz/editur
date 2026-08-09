@@ -60,9 +60,11 @@ fn reconnecting_restores_the_newest_project_session() {
         env!("CARGO_BIN_EXE_editur-fake-agent").into(),
         vec!["--sessions".into()],
     );
-    let events = receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::SessionLoaded { .. })
-    });
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
 
     assert!(events.iter().any(|event| matches!(
         event,
@@ -81,9 +83,11 @@ fn reconnecting_restores_the_newest_project_session() {
     controller
         .send(Command::LoadSession("older-session".into()))
         .unwrap();
-    let older = receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::SessionLoaded { .. })
-    });
+    let older = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "older-session"),
+    );
     assert!(older.iter().any(|event| matches!(
         event,
         Event::AssistantDelta(text) if text == "older reply"

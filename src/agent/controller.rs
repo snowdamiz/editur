@@ -141,6 +141,7 @@ pub enum Event {
         modes: Vec<ModeChoice>,
         config_options: Vec<ConfigChoice>,
     },
+    ActiveSessionChanged(String),
     ModeChanged(String),
     ConfigOptionsUpdated(Vec<ConfigChoice>),
     CommandsUpdated(Vec<CommandChoice>),
@@ -871,7 +872,17 @@ async fn run_connection(
                                 );
                             } else {
                                 match new_session(&connection, &project_root, &events).await {
-                                    Ok(session) => session_id = Some(session),
+                                    Ok(session) => {
+                                        let choice = untitled_session(&session);
+                                        sessions.retain(|candidate| candidate.id != choice.id);
+                                        sessions.insert(0, choice);
+                                        sessions.truncate(MAX_CHOICES);
+                                        send_event(
+                                            &events,
+                                            Event::SessionsUpdated(sessions.clone()),
+                                        );
+                                        session_id = Some(session);
+                                    }
                                     Err(error) => send_event(
                                         &events,
                                         Event::Error(format!("cannot start session: {error}")),
@@ -1111,6 +1122,7 @@ async fn new_session(
         .send_request(NewSessionRequest::new(project_root))
         .block_task()
         .await?;
+    let session_id = response.session_id;
     let (current_mode, modes, config_options) =
         session_controls(response.modes.as_ref(), response.config_options.as_deref());
     send_event(
@@ -1121,8 +1133,12 @@ async fn new_session(
             config_options,
         },
     );
+    send_event(
+        events,
+        Event::ActiveSessionChanged(session_id.0.to_string()),
+    );
     send_event(events, Event::ConnectionChanged(ConnectionState::Ready));
-    Ok(response.session_id)
+    Ok(session_id)
 }
 
 async fn start_session(
@@ -1144,9 +1160,19 @@ async fn start_session(
     {
         return Ok((session_id, sessions));
     }
-    new_session(connection, project_root, events)
-        .await
-        .map(|session_id| (session_id, sessions))
+    let session_id = new_session(connection, project_root, events).await?;
+    let mut sessions = sessions;
+    sessions.insert(0, untitled_session(&session_id));
+    send_event(events, Event::SessionsUpdated(sessions.clone()));
+    Ok((session_id, sessions))
+}
+
+fn untitled_session(session_id: &SessionId) -> SessionChoice {
+    SessionChoice {
+        id: session_id.0.to_string(),
+        title: None,
+        updated_at: None,
+    }
 }
 
 async fn list_sessions(
@@ -1286,6 +1312,10 @@ async fn load_session(
             modes,
             config_options,
         },
+    );
+    send_event(
+        events,
+        Event::ActiveSessionChanged(session_id.0.to_string()),
     );
     send_event(events, Event::ConnectionChanged(ConnectionState::Ready));
     Ok(session_id)
