@@ -6,6 +6,8 @@ Refactor Editur's working Cursor integration so a second ACP agent can be added 
 
 This plan is for the engineer implementing the next stage. After reading it, they should be able to preserve Cursor behavior, establish the smallest useful provider boundary, add Codex as the proof provider, and then add Claude through the same path.
 
+The Codex proof-provider work is specified separately in [CODEX_ACP_PLAN.md](CODEX_ACP_PLAN.md).
+
 In this document, **provider** means an ACP-compatible agent process such as Cursor, Codex, or Claude. It does not mean the model selected inside that agent.
 
 ## 2. Product contract
