@@ -1342,7 +1342,7 @@ fn pane_header_and_content(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DropZone {
+pub(crate) enum DropZone {
     Center,
     Left,
     Right,
@@ -1351,10 +1351,10 @@ enum DropZone {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct PaneId(u64);
+pub(crate) struct PaneId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SplitAxis {
+pub(crate) enum SplitAxis {
     Horizontal,
     Vertical,
 }
@@ -1372,25 +1372,25 @@ enum PaneNode {
 }
 
 #[derive(Clone)]
-struct PaneLayout {
+pub(crate) struct PaneLayout {
     root: PaneNode,
     next_id: u64,
     next_split_id: u64,
 }
 
 #[derive(Clone, Copy)]
-struct PaneSplitHandle {
-    id: u64,
-    axis: SplitAxis,
-    bounds: egui::Rect,
-    hit_rect: egui::Rect,
+pub(crate) struct PaneSplitHandle {
+    pub(crate) id: u64,
+    pub(crate) axis: SplitAxis,
+    pub(crate) bounds: egui::Rect,
+    pub(crate) hit_rect: egui::Rect,
 }
 
 #[derive(Clone, Copy)]
-struct TabDrop {
-    target: PaneId,
-    zone: DropZone,
-    preview: egui::Rect,
+pub(crate) struct TabDrop {
+    pub(crate) target: PaneId,
+    pub(crate) zone: DropZone,
+    pub(crate) preview: egui::Rect,
 }
 
 impl Default for PaneLayout {
@@ -1404,7 +1404,7 @@ impl Default for PaneLayout {
 }
 
 impl PaneLayout {
-    fn split(&mut self, target: PaneId, zone: DropZone) -> Option<PaneId> {
+    pub(crate) fn split(&mut self, target: PaneId, zone: DropZone) -> Option<PaneId> {
         let new = PaneId(self.next_id);
         if self.root.split(target, new, zone, self.next_split_id) {
             self.next_id += 1;
@@ -1415,23 +1415,23 @@ impl PaneLayout {
         }
     }
 
-    fn rects(&self, available: egui::Rect) -> Vec<(PaneId, egui::Rect)> {
+    pub(crate) fn rects(&self, available: egui::Rect) -> Vec<(PaneId, egui::Rect)> {
         let mut rects = Vec::new();
         self.root.append_rects(available, &mut rects);
         rects
     }
 
-    fn split_handles(&self, available: egui::Rect) -> Vec<PaneSplitHandle> {
+    pub(crate) fn split_handles(&self, available: egui::Rect) -> Vec<PaneSplitHandle> {
         let mut handles = Vec::new();
         self.root.append_split_handles(available, &mut handles);
         handles
     }
 
-    fn resize(&mut self, id: u64, bounds: egui::Rect, pointer: egui::Pos2) -> bool {
+    pub(crate) fn resize(&mut self, id: u64, bounds: egui::Rect, pointer: egui::Pos2) -> bool {
         self.root.resize(id, bounds, pointer)
     }
 
-    fn remove(&mut self, target: PaneId) -> bool {
+    pub(crate) fn remove(&mut self, target: PaneId) -> bool {
         if self.root.leaf_count() == 1 || !self.root.contains(target) {
             return false;
         }
@@ -1666,7 +1666,7 @@ fn allowed_tab_drop_zone(rect: egui::Rect, pointer: egui::Pos2) -> DropZone {
     tab_drop_zone(rect, pointer, 0.22)
 }
 
-fn stable_tab_drop_zone(
+pub(crate) fn stable_tab_drop_zone(
     rect: egui::Rect,
     pointer: egui::Pos2,
     previous: Option<DropZone>,
@@ -1699,7 +1699,7 @@ fn can_split(rect: egui::Rect, zone: DropZone) -> bool {
     }
 }
 
-fn tab_drop_preview(rect: egui::Rect, zone: DropZone) -> egui::Rect {
+pub(crate) fn tab_drop_preview(rect: egui::Rect, zone: DropZone) -> egui::Rect {
     match zone {
         DropZone::Center => rect,
         DropZone::Left => rect.with_max_x(rect.center().x),
@@ -1757,7 +1757,7 @@ fn draw_dragged_pane_preview(painter: &egui::Painter, rect: egui::Rect, path: Op
     }
 }
 
-fn draw_tab_drag_ghost(ctx: &egui::Context, path: &Path) {
+pub(crate) fn draw_tab_drag_ghost(ctx: &egui::Context, label: &str) {
     let Some(pointer) = ctx.pointer_hover_pos() else {
         return;
     };
@@ -1766,11 +1766,7 @@ fn draw_tab_drag_ghost(ctx: &egui::Context, path: &Path) {
         egui::Order::Tooltip,
         Id::new("tab_drag_ghost"),
     ));
-    let galley = painter.layout_no_wrap(
-        drag_label(path).into_owned(),
-        FontId::proportional(12.0),
-        TEXT_PRIMARY,
-    );
+    let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(12.0), TEXT_PRIMARY);
     let size = egui::vec2(
         (galley.size().x + 28.0)
             .clamp(100.0, 220.0)
@@ -3297,7 +3293,7 @@ impl EditorApp {
             );
         }
         if let Some(path) = self.tab_drag.as_deref() {
-            draw_tab_drag_ghost(&ctx, path);
+            draw_tab_drag_ghost(&ctx, &drag_label(path));
             ctx.set_cursor_icon(CursorIcon::Grabbing);
         }
         self.draw_search(root);
@@ -10272,7 +10268,7 @@ mod tests {
                     events: vec![Event::PointerMoved(pointer)],
                     ..RawInput::default()
                 },
-                |_| draw_tab_drag_ghost(&context, std::path::Path::new("moving.rs")),
+                |_| draw_tab_drag_ghost(&context, "moving.rs"),
             );
             context
                 .tessellate(output.shapes, output.pixels_per_point)

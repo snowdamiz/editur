@@ -1,17 +1,22 @@
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::Path,
     sync::mpsc::{self, Receiver},
 };
 
 use egui::{
-    Align2, Color32, Event, EventFilter, FontId, Id, Key, Layout, Modifiers, RichText, Sense,
-    TextFormat, UiBuilder, text::LayoutJob,
+    Align2, Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Layout, Modifiers, RichText,
+    Sense, TextFormat, UiBuilder, text::LayoutJob,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::app::{
+    DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, stable_tab_drop_zone, tab_drop_preview,
+};
 use crate::theme::{
-    ACCENT, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    ACCENT, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT,
+    SURFACE_SELECTED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 
 const HEADER_HEIGHT: f32 = 30.0;
@@ -24,8 +29,13 @@ const SCROLLBACK_ROWS: usize = 2_000;
 pub(crate) struct TerminalPanel {
     sessions: Vec<TerminalSession>,
     active: usize,
+    active_pane: PaneId,
+    pane_active_tabs: HashMap<PaneId, u64>,
+    pane_layout: PaneLayout,
     next_id: u64,
     focus_active: bool,
+    tab_drag: Option<u64>,
+    tab_drop: Option<TabDrop>,
 }
 
 pub(crate) struct TerminalOutput {
@@ -36,6 +46,7 @@ pub(crate) struct TerminalOutput {
 struct TerminalSession {
     id: u64,
     title: String,
+    pane: PaneId,
     parser: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -50,8 +61,13 @@ impl Default for TerminalPanel {
         Self {
             sessions: Vec::new(),
             active: 0,
+            active_pane: PaneId(0),
+            pane_active_tabs: HashMap::new(),
+            pane_layout: PaneLayout::default(),
             next_id: 1,
             focus_active: false,
+            tab_drag: None,
+            tab_drop: None,
         }
     }
 }
@@ -70,22 +86,17 @@ impl TerminalPanel {
     }
 
     pub(crate) fn focused(&self, ctx: &egui::Context) -> bool {
-        self.sessions.get(self.active).is_some_and(|session| {
+        self.sessions.iter().any(|session| {
             ctx.memory(|memory| memory.has_focus(Id::new(("terminal_surface", session.id))))
         })
     }
 
     pub(crate) fn close_active(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        self.sessions.remove(self.active);
-        self.active = self.active.min(self.sessions.len().saturating_sub(1));
-        self.focus_active = !self.sessions.is_empty();
+        self.close_tab(self.active);
     }
 
     pub(crate) fn blur(&self, ctx: &egui::Context) {
-        if let Some(session) = self.sessions.get(self.active) {
+        for session in &self.sessions {
             ctx.memory_mut(|memory| {
                 memory.surrender_focus(Id::new(("terminal_surface", session.id)));
             });
@@ -98,37 +109,143 @@ impl TerminalPanel {
         rect: egui::Rect,
         root: &Path,
     ) -> TerminalOutput {
-        let header = rect.with_max_y((rect.top() + HEADER_HEIGHT).min(rect.bottom()));
-        let content = rect.with_min_y(header.bottom());
         ui.painter().rect_filled(rect, 0.0, CANVAS);
-        ui.painter().rect_filled(header, 0.0, SURFACE);
-        ui.painter().hline(
-            header.x_range(),
-            header.bottom() - 0.5,
-            egui::Stroke::new(1.0, crate::theme::BORDER_SUBTLE),
-        );
+        let mut error = None;
+        let mut panes = self.pane_layout.rects(rect);
+        if self.update_tab_drag(ui.ctx(), &panes) {
+            panes = self.pane_layout.rects(rect);
+        }
+        let request_focus = std::mem::take(&mut self.focus_active);
+        let mut clicked = None;
+        for (pane, pane_rect) in panes {
+            let header =
+                pane_rect.with_max_y((pane_rect.top() + HEADER_HEIGHT).min(pane_rect.bottom()));
+            let content = pane_rect.with_min_y(header.bottom());
+            self.draw_tabs(ui, header, pane, root, &mut error);
+            let active = self
+                .pane_active_tabs
+                .get(&pane)
+                .and_then(|id| self.sessions.iter().position(|session| session.id == *id))
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .position(|session| session.pane == pane)
+                });
+            if let Some(index) = active {
+                ui.scope_builder(
+                    UiBuilder::new()
+                        .id_salt(("terminal_pane", pane.0))
+                        .max_rect(content),
+                    |ui| match self.sessions[index].show(
+                        ui,
+                        content,
+                        request_focus && self.active == index,
+                    ) {
+                        Ok(true) => clicked = Some(index),
+                        Ok(false) => {}
+                        Err(session_error) => error = Some(session_error),
+                    },
+                );
+            }
+            ui.painter().vline(
+                pane_rect.right() - 0.5,
+                pane_rect.y_range(),
+                egui::Stroke::new(1.0, BORDER_STRONG),
+            );
+            ui.painter().hline(
+                pane_rect.x_range(),
+                pane_rect.bottom() - 0.5,
+                egui::Stroke::new(1.0, BORDER_STRONG),
+            );
+        }
+        if let Some(index) = clicked {
+            self.activate_tab(index);
+        }
+        self.draw_split_handles(ui, rect);
+        if let Some(drop) = self.tab_drop {
+            let preview = drop.preview.shrink(4.0);
+            ui.painter().rect_filled(
+                preview,
+                5.0,
+                Color32::from_rgba_unmultiplied(74, 197, 225, 42),
+            );
+            ui.painter().rect_stroke(
+                preview,
+                5.0,
+                egui::Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(title) = self
+            .tab_drag
+            .and_then(|id| self.sessions.iter().find(|session| session.id == id))
+            .map(|session| session.title.as_str())
+        {
+            crate::app::draw_tab_drag_ghost(ui.ctx(), title);
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+        TerminalOutput {
+            empty: self.sessions.is_empty(),
+            error,
+        }
+    }
 
+    fn draw_tabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        pane: PaneId,
+        root: &Path,
+        error: &mut Option<String>,
+    ) {
+        ui.painter().rect_filled(rect, 0.0, SURFACE);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        let active = self.pane_active_tabs.get(&pane).copied();
+        let tabs = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| session.pane == pane)
+            .map(|(index, session)| (index, session.id, session.title.clone()))
+            .collect::<Vec<_>>();
         let mut activate = None;
         let mut close = None;
+        let mut reorder = None;
         let mut add = false;
         ui.scope_builder(
             UiBuilder::new()
-                .id_salt("terminal_tabs")
-                .max_rect(header)
+                .id_salt(("terminal_tabs", pane.0))
+                .max_rect(rect)
                 .layout(Layout::left_to_right(egui::Align::Center)),
             |ui| {
+                ui.set_clip_rect(rect);
                 ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                for (index, session) in self.sessions.iter().enumerate() {
-                    let (_, tab) = ui.allocate_space(egui::vec2(TAB_WIDTH, header.height()));
-                    let selected = self.active == index;
-                    let response =
-                        ui.interact(tab, Id::new(("terminal_tab", session.id)), Sense::click());
-                    let hovered = response.hovered();
-                    if selected || hovered {
+                for (position, (index, id, title)) in tabs.iter().enumerate() {
+                    let (_, tab) = ui.allocate_space(egui::vec2(TAB_WIDTH, rect.height()));
+                    let selected = active == Some(*id);
+                    let response = ui
+                        .interact(tab, Id::new(("terminal_tab", id)), Sense::click_and_drag())
+                        .on_hover_text(title);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::SelectableLabel,
+                            ui.is_enabled(),
+                            selected,
+                            title,
+                        )
+                    });
+                    let dragging = response.dragged();
+                    if selected || response.hovered() || dragging {
                         ui.painter().rect_filled(
                             tab,
                             0.0,
-                            if selected {
+                            if dragging {
+                                SURFACE_SELECTED
+                            } else if selected {
                                 SURFACE_INPUT
                             } else {
                                 SURFACE_HOVER
@@ -149,18 +266,18 @@ impl TerminalPanel {
                     ui.painter().text(
                         egui::pos2(tab.left() + 12.0, tab.center().y),
                         Align2::LEFT_CENTER,
-                        &session.title,
+                        title,
                         FontId::proportional(12.0),
                         if selected { TEXT_PRIMARY } else { TEXT_MUTED },
                     );
                     let close_response = ui
                         .interact(
                             close_rect,
-                            Id::new(("terminal_tab_close", session.id)),
+                            Id::new(("terminal_tab_close", id)),
                             Sense::click(),
                         )
-                        .on_hover_text(format!("Close {}", session.title));
-                    if hovered || selected {
+                        .on_hover_text(format!("Close {title}"));
+                    if response.hovered() || selected {
                         ui.painter().text(
                             close_rect.center(),
                             Align2::CENTER_CENTER,
@@ -174,14 +291,34 @@ impl TerminalPanel {
                         );
                     }
                     if close_response.clicked() {
-                        close = Some(index);
+                        close = Some(*index);
                     } else if response.clicked() {
-                        activate = Some(index);
+                        activate = Some(*index);
+                    }
+                    if response.drag_started() {
+                        self.tab_drag = Some(*id);
+                        activate = Some(*index);
+                    }
+                    if dragging {
+                        self.tab_drag = Some(*id);
+                        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+                            && rect.contains(pointer)
+                        {
+                            let first_left = tab.left() - position as f32 * TAB_WIDTH;
+                            let target_position = ((pointer.x - first_left) / TAB_WIDTH)
+                                .floor()
+                                .clamp(0.0, (tabs.len() - 1) as f32)
+                                as usize;
+                            let target = tabs[target_position].0;
+                            if target != *index {
+                                reorder = Some((*index, target));
+                            }
+                        }
                     }
                 }
                 if ui
                     .add_sized(
-                        egui::vec2(32.0, header.height()),
+                        egui::vec2(32.0, rect.height()),
                         egui::Button::new(RichText::new("+").size(16.0).color(TEXT_SECONDARY))
                             .frame(false),
                     )
@@ -192,37 +329,131 @@ impl TerminalPanel {
                 }
             },
         );
-
-        if let Some(index) = activate {
-            self.active = index;
-            self.focus_active = true;
-        }
         if let Some(index) = close {
-            self.sessions.remove(index);
-            if index < self.active {
-                self.active -= 1;
-            } else if index == self.active {
-                self.active = self.active.min(self.sessions.len().saturating_sub(1));
+            self.close_tab(index);
+        } else if let Some((from, to)) = reorder {
+            self.move_tab(from, to);
+        } else if let Some(index) = activate {
+            self.activate_tab(index);
+        }
+        if add && let Err(add_error) = self.add_to_pane(root, ui.ctx(), pane) {
+            *error = Some(add_error);
+        }
+    }
+
+    fn update_tab_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) -> bool {
+        let Some(id) = self.tab_drag else {
+            self.tab_drop = None;
+            return false;
+        };
+        let index = self.sessions.iter().position(|session| session.id == id);
+        let previous = self.tab_drop;
+        self.tab_drop = ctx.pointer_hover_pos().and_then(|pointer| {
+            panes.iter().find_map(|(target, rect)| {
+                rect.contains(pointer).then(|| {
+                    let previous = previous
+                        .filter(|drop| drop.target == *target)
+                        .map(|drop| drop.zone);
+                    let zone = if pointer.y <= rect.top() + HEADER_HEIGHT
+                        && previous.unwrap_or(DropZone::Center) == DropZone::Center
+                    {
+                        DropZone::Center
+                    } else {
+                        stable_tab_drop_zone(*rect, pointer, previous)
+                    };
+                    TabDrop {
+                        target: *target,
+                        zone,
+                        preview: tab_drop_preview(*rect, zone),
+                    }
+                })
+            })
+        });
+        if index.is_some_and(|index| {
+            self.tab_drop.is_some_and(|drop| {
+                drop.zone != DropZone::Center
+                    && drop.target == self.sessions[index].pane
+                    && self
+                        .sessions
+                        .iter()
+                        .filter(|session| session.pane == drop.target)
+                        .count()
+                        == 1
+            })
+        }) {
+            self.tab_drop = None;
+        }
+        let released = ctx.input(|input| input.pointer.primary_released());
+        if released {
+            let drop = self.tab_drop.take();
+            self.tab_drag = None;
+            if let (Some(index), Some(drop)) = (index, drop) {
+                self.drop_tab(index, drop.target, drop.zone);
+                return true;
             }
-            self.focus_active = !self.sessions.is_empty();
+        } else if !ctx.input(|input| input.pointer.primary_down()) {
+            self.tab_drag = None;
+            self.tab_drop = None;
+        } else {
+            ctx.request_repaint();
         }
-        let mut error = None;
-        if add && let Err(add_error) = self.add(root, ui.ctx()) {
-            error = Some(add_error);
+        false
+    }
+
+    fn draw_split_handles(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        if self.tab_drag.is_some() {
+            return;
         }
-        let request_focus = std::mem::take(&mut self.focus_active);
-        if let Some(session) = self.sessions.get_mut(self.active)
-            && let Err(session_error) = session.show(ui, content, request_focus)
-        {
-            error = Some(session_error);
-        }
-        TerminalOutput {
-            empty: self.sessions.is_empty(),
-            error,
+        for handle in self.pane_layout.split_handles(rect) {
+            let response = ui.interact(
+                handle.hit_rect,
+                Id::new(("terminal_pane_divider", handle.id)),
+                Sense::drag(),
+            );
+            let active = response.hovered() || response.dragged();
+            if active {
+                ui.ctx().set_cursor_icon(match handle.axis {
+                    SplitAxis::Horizontal => CursorIcon::ResizeVertical,
+                    SplitAxis::Vertical => CursorIcon::ResizeHorizontal,
+                });
+            }
+            if response.dragged()
+                && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                && self.pane_layout.resize(handle.id, handle.bounds, pointer)
+            {
+                ui.ctx().request_repaint();
+            }
+            let center = handle.hit_rect.center();
+            let line = match handle.axis {
+                SplitAxis::Horizontal => [
+                    egui::pos2(handle.hit_rect.left(), center.y),
+                    egui::pos2(handle.hit_rect.right(), center.y),
+                ],
+                SplitAxis::Vertical => [
+                    egui::pos2(center.x, handle.hit_rect.top()),
+                    egui::pos2(center.x, handle.hit_rect.bottom()),
+                ],
+            };
+            ui.painter().line_segment(
+                line,
+                egui::Stroke::new(
+                    if active { 2.0 } else { 1.0 },
+                    if active { ACCENT } else { BORDER_STRONG },
+                ),
+            );
         }
     }
 
     fn add(&mut self, root: &Path, ctx: &egui::Context) -> Result<(), String> {
+        self.add_to_pane(root, ctx, self.active_pane)
+    }
+
+    fn add_to_pane(
+        &mut self,
+        root: &Path,
+        ctx: &egui::Context,
+        pane: PaneId,
+    ) -> Result<(), String> {
         let id = self.next_id;
         let mut command = CommandBuilder::new_default_prog();
         command.cwd(root);
@@ -231,13 +462,118 @@ impl TerminalPanel {
         self.sessions.push(TerminalSession::spawn(
             id,
             format!("Terminal {id}"),
+            pane,
             command,
             ctx,
         )?);
         self.next_id += 1;
         self.active = self.sessions.len() - 1;
+        self.active_pane = pane;
+        self.pane_active_tabs.insert(pane, id);
         self.focus_active = true;
         Ok(())
+    }
+
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.sessions.len() || to >= self.sessions.len() {
+            return;
+        }
+        let session = self.sessions.remove(from);
+        self.sessions.insert(to, session);
+        self.active = if self.active == from {
+            to
+        } else if from < self.active && self.active <= to {
+            self.active - 1
+        } else if to <= self.active && self.active < from {
+            self.active + 1
+        } else {
+            self.active
+        };
+    }
+
+    fn activate_tab(&mut self, index: usize) {
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        self.active = index;
+        self.active_pane = session.pane;
+        self.pane_active_tabs.insert(session.pane, session.id);
+        self.focus_active = true;
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        let active_id = self.sessions.get(self.active).map(|session| session.id);
+        let removed = self.sessions.remove(index);
+        let next_in_pane = self
+            .sessions
+            .iter()
+            .position(|session| session.pane == removed.pane);
+        if self.pane_active_tabs.get(&removed.pane) == Some(&removed.id) {
+            if let Some(next) = next_in_pane {
+                self.pane_active_tabs
+                    .insert(removed.pane, self.sessions[next].id);
+            } else {
+                self.pane_active_tabs.remove(&removed.pane);
+                self.pane_layout.remove(removed.pane);
+            }
+        }
+        let next = active_id
+            .filter(|id| *id != removed.id)
+            .and_then(|id| self.sessions.iter().position(|session| session.id == id))
+            .or(next_in_pane)
+            .or_else(|| (!self.sessions.is_empty()).then_some(0));
+        if let Some(next) = next {
+            self.activate_tab(next);
+        } else {
+            self.active = 0;
+            self.active_pane = PaneId(0);
+            self.pane_layout = PaneLayout::default();
+            self.pane_active_tabs.clear();
+            self.focus_active = false;
+        }
+    }
+
+    fn drop_tab(&mut self, index: usize, target: PaneId, zone: DropZone) {
+        let Some(source) = self.sessions.get(index).map(|session| session.pane) else {
+            return;
+        };
+        if source == target
+            && zone != DropZone::Center
+            && self
+                .sessions
+                .iter()
+                .filter(|session| session.pane == source)
+                .count()
+                == 1
+        {
+            return;
+        }
+        let moved_id = self.sessions[index].id;
+        let destination = if zone == DropZone::Center {
+            target
+        } else if let Some(pane) = self.pane_layout.split(target, zone) {
+            pane
+        } else {
+            return;
+        };
+        self.sessions[index].pane = destination;
+        self.active = index;
+        self.active_pane = destination;
+        self.pane_active_tabs.insert(destination, moved_id);
+        if source != destination {
+            if let Some(session) = self.sessions.iter().find(|session| session.pane == source) {
+                if self.pane_active_tabs.get(&source) == Some(&moved_id) {
+                    self.pane_active_tabs.insert(source, session.id);
+                }
+            } else {
+                self.pane_active_tabs.remove(&source);
+                self.pane_layout.remove(source);
+            }
+        }
+        self.focus_active = true;
     }
 }
 
@@ -245,6 +581,7 @@ impl TerminalSession {
     fn spawn(
         id: u64,
         title: String,
+        pane: PaneId,
         command: CommandBuilder,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
@@ -281,6 +618,7 @@ impl TerminalSession {
         Ok(Self {
             id,
             title,
+            pane,
             parser: vt100::Parser::new(size.0, size.1, SCROLLBACK_ROWS),
             master: pair.master,
             writer,
@@ -296,7 +634,7 @@ impl TerminalSession {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         request_focus: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         while let Ok(bytes) = self.output.try_recv() {
             self.parser.process(&bytes);
         }
@@ -427,7 +765,7 @@ impl TerminalSession {
                 TEXT_PRIMARY,
             );
         }
-        Ok(())
+        Ok(response.clicked())
     }
 
     fn handle_events(&mut self, ui: &egui::Ui) -> Result<(), String> {
@@ -592,13 +930,84 @@ const ANSI_COLORS: [Color32; 16] = [
 mod tests {
     use std::{
         io::Write as _,
+        path::Path,
         time::{Duration, Instant},
     };
 
     use egui::{Key, Modifiers};
     use portable_pty::CommandBuilder;
 
-    use super::{TerminalSession, key_sequence};
+    use crate::app::{DropZone, PaneId};
+
+    use super::{TerminalPanel, TerminalSession, key_sequence};
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_tabs_can_be_reordered() {
+        let ctx = egui::Context::default();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+
+        panel.move_tab(0, 1);
+
+        assert_eq!(
+            panel
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(panel.sessions[panel.active].id, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_tabs_can_split_into_panes() {
+        let ctx = egui::Context::default();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+
+        assert_eq!(
+            panel
+                .pane_layout
+                .rects(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0)
+                ))
+                .len(),
+            2
+        );
+        assert_ne!(panel.sessions[0].pane, panel.sessions[1].pane);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_panes_last_terminal_collapses_the_pane() {
+        let ctx = egui::Context::default();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+
+        panel.close_active();
+
+        assert_eq!(panel.sessions.len(), 1);
+        assert_eq!(
+            panel
+                .pane_layout
+                .rects(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0)
+                ))
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn control_keys_use_ascii_control_codes() {
@@ -628,6 +1037,7 @@ mod tests {
         let mut session = TerminalSession::spawn(
             1,
             "Terminal 1".into(),
+            PaneId(0),
             CommandBuilder::new("/bin/sh"),
             &egui::Context::default(),
         )
