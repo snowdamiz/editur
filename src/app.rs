@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -42,8 +43,11 @@ use crate::{
         dialog_frame, dialog_window, icon_button, selectable_content_row, selectable_row,
     },
     data_dir,
-    editor_surface::{DocumentMetrics, EDITOR_BACKGROUND, EditorSurface},
-    file_io::{OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, safe_save},
+    editor_surface::{DocumentMetrics, EDITOR_BACKGROUND, EditorShowOptions, EditorSurface},
+    file_io::{
+        OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, resolve_target,
+        safe_save,
+    },
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     markdown,
     renderer::Renderer,
@@ -96,7 +100,12 @@ const AGENTIC_SESSION_RAIL_WIDTH: f32 = 248.0;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
+const PANE_TAB_HEIGHT: f32 = 30.0;
+const PANE_DIVIDER_HIT_WIDTH: f32 = 8.0;
+const MIN_EDITOR_PANE_WIDTH: f32 = 200.0;
+const MIN_EDITOR_PANE_HEIGHT: f32 = 200.0;
 const TITLEBAR_PAINT_KEY: u64 = 0xa000_0000_0000_0000;
+const TAB_DRAG_GHOST_PAINT_KEY: u64 = 0xb000_0000_0000_0000;
 
 fn agent_near_bottom(offset: f32, max_offset: f32) -> bool {
     max_offset - offset <= AGENT_FOLLOW_THRESHOLD
@@ -1295,10 +1304,521 @@ fn split_editor_column(rect: egui::Rect, find_open: bool) -> (egui::Rect, Option
     (editor, findbar)
 }
 
+fn pane_header_and_content(
+    titlebar: egui::Rect,
+    editor: egui::Rect,
+    pane: egui::Rect,
+) -> (egui::Rect, egui::Rect) {
+    if (pane.top() - editor.top()).abs() <= 0.5 {
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(pane.left(), titlebar.top()),
+                egui::pos2(pane.right(), titlebar.bottom()),
+            ),
+            pane,
+        )
+    } else {
+        let header = pane.with_max_y((pane.top() + PANE_TAB_HEIGHT).min(pane.bottom()));
+        (header, pane.with_min_y(header.bottom()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DropZone {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PaneId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone)]
+enum PaneNode {
+    Leaf(PaneId),
+    Split {
+        id: u64,
+        axis: SplitAxis,
+        fraction: f32,
+        first: Box<Self>,
+        second: Box<Self>,
+    },
+}
+
+#[derive(Clone)]
+struct PaneLayout {
+    root: PaneNode,
+    next_id: u64,
+    next_split_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PaneSplitHandle {
+    id: u64,
+    axis: SplitAxis,
+    bounds: egui::Rect,
+    hit_rect: egui::Rect,
+}
+
+#[derive(Clone, Copy)]
+struct TabDrop {
+    target: PaneId,
+    zone: DropZone,
+    preview: egui::Rect,
+}
+
+impl Default for PaneLayout {
+    fn default() -> Self {
+        Self {
+            root: PaneNode::Leaf(PaneId(0)),
+            next_id: 1,
+            next_split_id: 0,
+        }
+    }
+}
+
+impl PaneLayout {
+    fn split(&mut self, target: PaneId, zone: DropZone) -> Option<PaneId> {
+        let new = PaneId(self.next_id);
+        if self.root.split(target, new, zone, self.next_split_id) {
+            self.next_id += 1;
+            self.next_split_id += 1;
+            Some(new)
+        } else {
+            None
+        }
+    }
+
+    fn rects(&self, available: egui::Rect) -> Vec<(PaneId, egui::Rect)> {
+        let mut rects = Vec::new();
+        self.root.append_rects(available, &mut rects);
+        rects
+    }
+
+    fn split_handles(&self, available: egui::Rect) -> Vec<PaneSplitHandle> {
+        let mut handles = Vec::new();
+        self.root.append_split_handles(available, &mut handles);
+        handles
+    }
+
+    fn resize(&mut self, id: u64, bounds: egui::Rect, pointer: egui::Pos2) -> bool {
+        self.root.resize(id, bounds, pointer)
+    }
+
+    fn remove(&mut self, target: PaneId) -> bool {
+        if self.root.leaf_count() == 1 || !self.root.contains(target) {
+            return false;
+        }
+        let root = std::mem::replace(&mut self.root, PaneNode::Leaf(target));
+        self.root = root
+            .without(target)
+            .expect("another pane remains after removing a split leaf");
+        true
+    }
+}
+
+impl PaneNode {
+    fn split(&mut self, target: PaneId, new: PaneId, zone: DropZone, split_id: u64) -> bool {
+        match self {
+            Self::Leaf(id) if *id == target && zone != DropZone::Center => {
+                let existing = Self::Leaf(*id);
+                let added = Self::Leaf(new);
+                let (axis, first, second) = match zone {
+                    DropZone::Left => (SplitAxis::Vertical, added, existing),
+                    DropZone::Right => (SplitAxis::Vertical, existing, added),
+                    DropZone::Top => (SplitAxis::Horizontal, added, existing),
+                    DropZone::Bottom => (SplitAxis::Horizontal, existing, added),
+                    DropZone::Center => return false,
+                };
+                *self = Self::Split {
+                    id: split_id,
+                    axis,
+                    fraction: 0.5,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                };
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.split(target, new, zone, split_id)
+                    || second.split(target, new, zone, split_id)
+            }
+            Self::Leaf(_) => false,
+        }
+    }
+
+    fn append_rects(&self, available: egui::Rect, rects: &mut Vec<(PaneId, egui::Rect)>) {
+        match self {
+            Self::Leaf(id) => rects.push((*id, available)),
+            Self::Split {
+                axis,
+                fraction,
+                first,
+                second,
+                ..
+            } => {
+                let fraction = Self::clamped_fraction(available, *axis, *fraction, first, second);
+                let (first_rect, second_rect) = match axis {
+                    SplitAxis::Horizontal => {
+                        let middle = available.top() + available.height() * fraction;
+                        (available.with_max_y(middle), available.with_min_y(middle))
+                    }
+                    SplitAxis::Vertical => {
+                        let middle = available.left() + available.width() * fraction;
+                        (available.with_max_x(middle), available.with_min_x(middle))
+                    }
+                };
+                first.append_rects(first_rect, rects);
+                second.append_rects(second_rect, rects);
+            }
+        }
+    }
+
+    fn append_split_handles(&self, available: egui::Rect, handles: &mut Vec<PaneSplitHandle>) {
+        let Self::Split {
+            id,
+            axis,
+            fraction,
+            first,
+            second,
+        } = self
+        else {
+            return;
+        };
+        let fraction = Self::clamped_fraction(available, *axis, *fraction, first, second);
+        let (first_rect, second_rect, hit_rect) = match axis {
+            SplitAxis::Horizontal => {
+                let middle = available.top() + available.height() * fraction;
+                (
+                    available.with_max_y(middle),
+                    available.with_min_y(middle),
+                    egui::Rect::from_center_size(
+                        egui::pos2(available.center().x, middle),
+                        egui::vec2(available.width(), PANE_DIVIDER_HIT_WIDTH),
+                    ),
+                )
+            }
+            SplitAxis::Vertical => {
+                let middle = available.left() + available.width() * fraction;
+                (
+                    available.with_max_x(middle),
+                    available.with_min_x(middle),
+                    egui::Rect::from_center_size(
+                        egui::pos2(middle, available.center().y),
+                        egui::vec2(PANE_DIVIDER_HIT_WIDTH, available.height()),
+                    ),
+                )
+            }
+        };
+        handles.push(PaneSplitHandle {
+            id: *id,
+            axis: *axis,
+            bounds: available,
+            hit_rect,
+        });
+        first.append_split_handles(first_rect, handles);
+        second.append_split_handles(second_rect, handles);
+    }
+
+    fn resize(&mut self, target: u64, bounds: egui::Rect, pointer: egui::Pos2) -> bool {
+        match self {
+            Self::Split {
+                id,
+                axis,
+                fraction,
+                first,
+                second,
+            } if *id == target => {
+                let extent = match axis {
+                    SplitAxis::Horizontal => bounds.height(),
+                    SplitAxis::Vertical => bounds.width(),
+                };
+                if extent <= 0.0 {
+                    return false;
+                }
+                let requested = match axis {
+                    SplitAxis::Horizontal => (pointer.y - bounds.top()) / extent,
+                    SplitAxis::Vertical => (pointer.x - bounds.left()) / extent,
+                };
+                *fraction = Self::clamped_fraction(bounds, *axis, requested, first, second);
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.resize(target, bounds, pointer) || second.resize(target, bounds, pointer)
+            }
+            Self::Leaf(_) => false,
+        }
+    }
+
+    fn clamped_fraction(
+        available: egui::Rect,
+        axis: SplitAxis,
+        fraction: f32,
+        first: &Self,
+        second: &Self,
+    ) -> f32 {
+        let extent = match axis {
+            SplitAxis::Horizontal => available.height(),
+            SplitAxis::Vertical => available.width(),
+        };
+        let first_min = first.minimum_extent(axis);
+        let second_min = second.minimum_extent(axis);
+        if extent <= first_min + second_min {
+            return first_min / (first_min + second_min);
+        }
+        fraction.clamp(first_min / extent, 1.0 - second_min / extent)
+    }
+
+    fn minimum_extent(&self, axis: SplitAxis) -> f32 {
+        match self {
+            Self::Leaf(_) => match axis {
+                SplitAxis::Horizontal => MIN_EDITOR_PANE_HEIGHT,
+                SplitAxis::Vertical => MIN_EDITOR_PANE_WIDTH,
+            },
+            Self::Split {
+                axis: split_axis,
+                first,
+                second,
+                ..
+            } if *split_axis == axis => first.minimum_extent(axis) + second.minimum_extent(axis),
+            Self::Split { first, second, .. } => {
+                first.minimum_extent(axis).max(second.minimum_extent(axis))
+            }
+        }
+    }
+
+    fn contains(&self, target: PaneId) -> bool {
+        match self {
+            Self::Leaf(id) => *id == target,
+            Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
+        }
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    fn without(self, target: PaneId) -> Option<Self> {
+        match self {
+            Self::Leaf(id) => (id != target).then_some(Self::Leaf(id)),
+            Self::Split {
+                id,
+                axis,
+                fraction,
+                first,
+                second,
+            } => match (first.without(target), second.without(target)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    id,
+                    axis,
+                    fraction,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(node), None) | (None, Some(node)) => Some(node),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+fn tab_drop_edges(rect: egui::Rect, pointer: egui::Pos2) -> [(f32, DropZone); 4] {
+    let x = ((pointer.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+    let y = ((pointer.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+    [
+        (x, DropZone::Left),
+        (1.0 - x, DropZone::Right),
+        (y, DropZone::Top),
+        (1.0 - y, DropZone::Bottom),
+    ]
+}
+
+fn allowed_tab_drop_zone(rect: egui::Rect, pointer: egui::Pos2) -> DropZone {
+    tab_drop_zone(rect, pointer, 0.22)
+}
+
+fn stable_tab_drop_zone(
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+    previous: Option<DropZone>,
+) -> DropZone {
+    if let Some(previous) = previous.filter(|zone| *zone != DropZone::Center)
+        && tab_drop_edges(rect, pointer)
+            .into_iter()
+            .any(|(distance, zone)| zone == previous && distance <= 0.32 && can_split(rect, zone))
+    {
+        return previous;
+    }
+    allowed_tab_drop_zone(rect, pointer)
+}
+
+fn tab_drop_zone(rect: egui::Rect, pointer: egui::Pos2, threshold: f32) -> DropZone {
+    tab_drop_edges(rect, pointer)
+        .into_iter()
+        .filter(|(distance, zone)| *distance <= threshold && can_split(rect, *zone))
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map_or(DropZone::Center, |(_, zone)| zone)
+}
+
+fn can_split(rect: egui::Rect, zone: DropZone) -> bool {
+    let can_split_columns = rect.width() >= MIN_EDITOR_PANE_WIDTH * 2.0;
+    let can_split_rows = rect.height() >= MIN_EDITOR_PANE_HEIGHT * 2.0;
+    match zone {
+        DropZone::Left | DropZone::Right => can_split_columns,
+        DropZone::Top | DropZone::Bottom => can_split_rows,
+        DropZone::Center => false,
+    }
+}
+
+fn tab_drop_preview(rect: egui::Rect, zone: DropZone) -> egui::Rect {
+    match zone {
+        DropZone::Center => rect,
+        DropZone::Left => rect.with_max_x(rect.center().x),
+        DropZone::Right => rect.with_min_x(rect.center().x),
+        DropZone::Top => rect.with_max_y(rect.center().y),
+        DropZone::Bottom => rect.with_min_y(rect.center().y),
+    }
+}
+
+fn drag_label(path: &Path) -> Cow<'_, str> {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+}
+
+fn draw_dragged_pane_preview(painter: &egui::Painter, rect: egui::Rect, path: Option<&Path>) {
+    let painter = painter.with_clip_rect(rect);
+    let inset = 2.0_f32.min(rect.width().min(rect.height()).max(0.0) * 0.5);
+    let rect = rect.shrink(inset);
+    let header = rect.with_max_y((rect.top() + PANE_TAB_HEIGHT).min(rect.bottom()));
+    painter.rect_filled(
+        rect,
+        4.0,
+        Color32::from_rgba_unmultiplied(
+            EDITOR_BACKGROUND.r(),
+            EDITOR_BACKGROUND.g(),
+            EDITOR_BACKGROUND.b(),
+            178,
+        ),
+    );
+    painter.rect_filled(
+        header,
+        4.0,
+        Color32::from_rgba_unmultiplied(SURFACE.r(), SURFACE.g(), SURFACE.b(), 196),
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(74, 197, 225, 190)),
+        egui::StrokeKind::Inside,
+    );
+    if let Some(path) = path {
+        painter.text(
+            egui::pos2(header.left() + 12.0, header.center().y),
+            Align2::LEFT_CENTER,
+            drag_label(path),
+            FontId::proportional(12.0),
+            Color32::from_rgba_unmultiplied(
+                TEXT_PRIMARY.r(),
+                TEXT_PRIMARY.g(),
+                TEXT_PRIMARY.b(),
+                190,
+            ),
+        );
+    }
+}
+
+fn draw_tab_drag_ghost(ctx: &egui::Context, path: &Path) {
+    let Some(pointer) = ctx.pointer_hover_pos() else {
+        return;
+    };
+    let screen = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        Id::new("tab_drag_ghost"),
+    ));
+    let galley = painter.layout_no_wrap(
+        drag_label(path).into_owned(),
+        FontId::proportional(12.0),
+        TEXT_PRIMARY,
+    );
+    let size = egui::vec2(
+        (galley.size().x + 28.0)
+            .clamp(100.0, 220.0)
+            .min(screen.width()),
+        30.0_f32.min(screen.height()),
+    );
+    let offset = egui::vec2(14.0, 14.0);
+    let min = egui::pos2(
+        (pointer.x + offset.x).clamp(screen.left(), (screen.right() - size.x).max(screen.left())),
+        (pointer.y + offset.y).clamp(screen.top(), (screen.bottom() - size.y).max(screen.top())),
+    );
+    let rect = egui::Rect::from_min_size(min, size);
+    crate::renderer::mark_retained(
+        &painter,
+        rect,
+        TAB_DRAG_GHOST_PAINT_KEY,
+        u64::from(rect.left().to_bits())
+            ^ u64::from(rect.top().to_bits()).rotate_left(16)
+            ^ u64::from(rect.width().to_bits()).rotate_left(32)
+            ^ u64::from(rect.height().to_bits()).rotate_left(48),
+    );
+    painter.add(
+        egui::Shadow {
+            offset: [0, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(100),
+        }
+        .as_shape(rect, 6.0),
+    );
+    painter.rect_filled(
+        rect,
+        6.0,
+        Color32::from_rgba_unmultiplied(
+            SURFACE_RAISED.r(),
+            SURFACE_RAISED.g(),
+            SURFACE_RAISED.b(),
+            224,
+        ),
+    );
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + 3.0, rect.bottom()),
+        ),
+        6.0,
+        ACCENT,
+    );
+    let clip_inset = 6.0_f32.min(rect.width().min(rect.height()).max(0.0) * 0.5);
+    painter.with_clip_rect(rect.shrink(clip_inset)).galley(
+        egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        TEXT_PRIMARY,
+    );
+}
+
 fn titlebar_drag_action(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    region: &'static str,
+    region: impl Hash + std::fmt::Debug,
 ) -> Option<WindowAction> {
     if rect.width() <= 0.0 {
         return None;
@@ -1315,6 +1835,55 @@ fn titlebar_drag_action(
     } else {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_titlebar_controls(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+) -> Option<WindowAction> {
+    let pointer = ui.ctx().pointer_hover_pos();
+    let button_centers = [17.0, 37.0, 57.0].map(|x| egui::pos2(rect.left() + x, rect.center().y));
+    let hovered = button_centers
+        .iter()
+        .position(|center| pointer.is_some_and(|pointer| pointer.distance(*center) <= 10.0));
+    let actions = [
+        (WindowAction::Close, Color32::from_rgb(255, 95, 87), "×"),
+        (WindowAction::Minimize, Color32::from_rgb(254, 188, 46), "−"),
+        (
+            WindowAction::ToggleMaximize,
+            Color32::from_rgb(40, 200, 64),
+            "+",
+        ),
+    ];
+    let mut selected = None;
+    for (index, ((action, color, symbol), center)) in
+        actions.into_iter().zip(button_centers).enumerate()
+    {
+        let button = egui::Rect::from_center_size(center, egui::vec2(18.0, 24.0));
+        if ui
+            .interact(
+                button,
+                Id::new((id, "titlebar_button", index)),
+                Sense::click(),
+            )
+            .clicked()
+        {
+            selected = Some(action);
+        }
+        ui.painter().circle_filled(center, 6.0, color);
+        if hovered == Some(index) {
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                symbol,
+                FontId::proportional(10.0),
+                Color32::from_black_alpha(150),
+            );
+        }
+    }
+    selected
 }
 
 fn agent_composer_height(text_height: f32, row_height: f32, sidebar_height: f32) -> f32 {
@@ -1653,6 +2222,9 @@ struct FileTab {
     buffer: Buffer,
     editor_surface: EditorSurface,
     highlight_cache: HighlightCache,
+    pane: PaneId,
+    markdown_preview: bool,
+    markdown_layout: Option<((u64, u32), Arc<egui::Galley>)>,
 }
 
 struct AgentComposerAttachment {
@@ -1995,11 +2567,14 @@ fn agent_file_picker_location_row(
 }
 
 impl FileTab {
-    fn new(buffer: Buffer) -> Self {
+    fn new(buffer: Buffer, pane: PaneId) -> Self {
         Self {
             buffer,
             editor_surface: EditorSurface::default(),
             highlight_cache: HighlightCache::default(),
+            pane,
+            markdown_preview: false,
+            markdown_layout: None,
         }
     }
 }
@@ -2007,6 +2582,11 @@ impl FileTab {
 pub struct EditorApp {
     tabs: Vec<FileTab>,
     active_tab: Option<usize>,
+    active_pane: PaneId,
+    pane_active_tabs: HashMap<PaneId, PathBuf>,
+    pane_layout: PaneLayout,
+    tab_drag: Option<PathBuf>,
+    tab_drop: Option<TabDrop>,
     tree: TreeState,
     tree_surface: TreeSurface,
     syntaxes: SyntaxManager,
@@ -2026,8 +2606,6 @@ pub struct EditorApp {
     scroll_to_find_match: bool,
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     bracket_pair_key: Option<(u64, usize)>,
-    markdown_preview: bool,
-    markdown_layout: Option<((u64, u32), Arc<egui::Galley>)>,
     sidebar: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
@@ -2074,13 +2652,26 @@ impl EditorApp {
             }
         })?;
         let selected = buffer.as_ref().map(|buffer| buffer.path.clone());
-        let tabs = buffer.into_iter().map(FileTab::new).collect::<Vec<_>>();
+        let initial_pane = PaneId(0);
+        let tabs = buffer
+            .into_iter()
+            .map(|buffer| FileTab::new(buffer, initial_pane))
+            .collect::<Vec<_>>();
         let active_tab = (!tabs.is_empty()).then_some(0);
+        let pane_active_tabs = tabs
+            .first()
+            .map(|tab| [(initial_pane, tab.buffer.path.clone())].into())
+            .unwrap_or_default();
         let syntaxes = SyntaxManager::built_in()?;
         let search = SearchController::new(target.root.clone())?;
         Ok(Self {
             tabs,
             active_tab,
+            active_pane: initial_pane,
+            pane_active_tabs,
+            pane_layout: PaneLayout::default(),
+            tab_drag: None,
+            tab_drop: None,
             tree: TreeState::new(target.root, selected)?,
             tree_surface: TreeSurface::default(),
             syntaxes,
@@ -2100,8 +2691,6 @@ impl EditorApp {
             scroll_to_find_match: false,
             bracket_pair: None,
             bracket_pair_key: None,
-            markdown_preview: false,
-            markdown_layout: None,
             sidebar: true,
             sidebar_width: 248.0,
             sidebar_dragging: false,
@@ -2165,14 +2754,15 @@ impl EditorApp {
         }
         let changed = self.active_tab != Some(index);
         self.active_tab = Some(index);
+        self.active_pane = self.tabs[index].pane;
+        self.pane_active_tabs
+            .insert(self.active_pane, self.tabs[index].buffer.path.clone());
         self.tree.select(Some(self.tabs[index].buffer.path.clone()));
         if changed {
             self.find_match_revision = u64::MAX;
             self.scroll_to_find_match = self.find_open;
             self.bracket_pair = None;
             self.bracket_pair_key = None;
-            self.markdown_preview = false;
-            self.markdown_layout = None;
             self.cursor = self.tabs[index]
                 .buffer
                 .line_column(self.tabs[index].editor_surface.cursor());
@@ -2193,7 +2783,7 @@ impl EditorApp {
         };
         match buffer {
             Ok(buffer) => {
-                self.tabs.push(FileTab::new(buffer));
+                self.tabs.push(FileTab::new(buffer, self.active_pane));
                 self.activate_tab(self.tabs.len() - 1);
             }
             Err(error) => self.show_error(error),
@@ -2204,24 +2794,33 @@ impl EditorApp {
         if index >= self.tabs.len() {
             return;
         }
-        let active = self.active_tab;
-        self.tabs.remove(index);
-        match active {
-            Some(active) if active == index => {
-                self.active_tab = None;
-                if !self.tabs.is_empty() {
-                    self.activate_tab(index.min(self.tabs.len() - 1));
-                } else {
-                    self.tree.select(None);
-                    self.cursor = (1, 1);
-                    self.markdown_preview = false;
-                    self.bracket_pair = None;
-                    self.bracket_pair_key = None;
-                    self.markdown_layout = None;
-                }
+        let was_active = self.active_tab == Some(index);
+        let removed = self.tabs.remove(index);
+        if self.active_tab.is_some_and(|active| active > index) {
+            self.active_tab = self.active_tab.map(|active| active - 1);
+        }
+        let next_in_pane = self.tabs.iter().position(|tab| tab.pane == removed.pane);
+        if self.pane_active_tabs.get(&removed.pane) == Some(&removed.buffer.path) {
+            if let Some(next) = next_in_pane {
+                self.pane_active_tabs
+                    .insert(removed.pane, self.tabs[next].buffer.path.clone());
+            } else {
+                self.pane_active_tabs.remove(&removed.pane);
             }
-            Some(active) if active > index => self.active_tab = Some(active - 1),
-            _ => {}
+        }
+        if next_in_pane.is_none() {
+            self.pane_layout.remove(removed.pane);
+        }
+        if was_active {
+            self.active_tab = None;
+            if let Some(next) = next_in_pane.or_else(|| (!self.tabs.is_empty()).then_some(0)) {
+                self.activate_tab(next);
+            } else {
+                self.tree.select(None);
+                self.cursor = (1, 1);
+                self.bracket_pair = None;
+                self.bracket_pair_key = None;
+            }
         }
     }
 
@@ -2242,6 +2841,47 @@ impl EditorApp {
                 active
             }
         });
+    }
+
+    fn drop_tab(&mut self, index: usize, target: PaneId, zone: DropZone) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let source = self.tabs[index].pane;
+        if source == target
+            && zone != DropZone::Center
+            && self.tabs.iter().filter(|tab| tab.pane == source).count() == 1
+        {
+            return;
+        }
+        let moved_path = self.tabs[index].buffer.path.clone();
+        let pane = if zone == DropZone::Center {
+            target
+        } else if let Some(pane) = self.pane_layout.split(target, zone) {
+            pane
+        } else {
+            target
+        };
+        self.tabs[index].pane = pane;
+        if source != pane {
+            if let Some(tab) = self.tabs.iter().find(|tab| tab.pane == source) {
+                if self.pane_active_tabs.get(&source) == Some(&moved_path) {
+                    self.pane_active_tabs
+                        .insert(source, tab.buffer.path.clone());
+                }
+            } else {
+                self.pane_active_tabs.remove(&source);
+                self.pane_layout.remove(source);
+            }
+        }
+        self.activate_tab(index);
+    }
+
+    fn drop_path(&mut self, path: PathBuf, target: PaneId, zone: DropZone) {
+        self.open_tab(path.clone(), false);
+        if let Some(index) = self.tabs.iter().position(|tab| tab.buffer.path == path) {
+            self.drop_tab(index, target, zone);
+        }
     }
 
     fn request(&mut self, action: PendingAction) {
@@ -2378,10 +3018,85 @@ impl EditorApp {
                 |ui| self.draw_sidebar(ui),
             );
         }
-        root.scope_builder(
-            UiBuilder::new().id_salt("editor_surface").max_rect(editor),
-            |ui| self.draw_editor(ui),
-        );
+        let mut pane_rects = self.pane_layout.rects(editor);
+        if self.update_tab_drag(&ctx, &pane_rects) {
+            pane_rects = self.pane_layout.rects(editor);
+        }
+        let mut dragged_pane = None;
+        if let (Some(path), Some(drop)) = (self.tab_drag.as_deref(), self.tab_drop)
+            && let Some((preview, pane)) = self.tab_drag_preview(editor, path, drop)
+        {
+            pane_rects = preview;
+            dragged_pane = Some(pane);
+        }
+        let dragged_path = self.tab_drag.clone();
+        let dragged_source = dragged_path.as_deref().and_then(|path| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.buffer.path == path)
+                .map(|tab| tab.pane)
+        });
+        let single_pane = pane_rects.len() == 1;
+        let titlebar = window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom()));
+        for (pane, rect) in pane_rects.iter().copied() {
+            let (header, content) = pane_header_and_content(titlebar, editor, rect);
+            if header.top() >= editor.top() - 0.5 {
+                root.scope_builder(
+                    UiBuilder::new()
+                        .id_salt(("editor_pane_header", pane.0))
+                        .max_rect(header),
+                    |ui| {
+                        self.draw_pane_header(
+                            ui,
+                            header,
+                            pane,
+                            header.left(),
+                            header.right(),
+                            (dragged_pane == Some(pane))
+                                .then_some(dragged_path.as_deref())
+                                .flatten(),
+                        );
+                    },
+                );
+            }
+            if dragged_pane == Some(pane) {
+                if dragged_path
+                    .as_deref()
+                    .is_some_and(|path| self.tabs.iter().any(|tab| tab.buffer.path == path))
+                {
+                    root.scope_builder(
+                        UiBuilder::new()
+                            .id_salt(("editor_pane_preview", pane.0))
+                            .max_rect(content),
+                        |ui| {
+                            self.draw_editor_pane(ui, pane, false, dragged_path.as_deref(), true);
+                        },
+                    );
+                } else {
+                    draw_dragged_pane_preview(root.painter(), content, dragged_path.as_deref());
+                }
+                continue;
+            }
+            let path_override = (dragged_pane.is_some() && dragged_source == Some(pane))
+                .then(|| {
+                    self.tabs
+                        .iter()
+                        .find(|tab| {
+                            tab.pane == pane
+                                && dragged_path.as_deref() != Some(tab.buffer.path.as_path())
+                        })
+                        .map(|tab| tab.buffer.path.clone())
+                })
+                .flatten();
+            root.scope_builder(
+                UiBuilder::new()
+                    .id_salt(("editor_pane", pane.0))
+                    .max_rect(content),
+                |ui| {
+                    self.draw_editor_pane(ui, pane, single_pane, path_override.as_deref(), false);
+                },
+            );
+        }
         if let Some(findbar) = findbar {
             root.scope_builder(
                 UiBuilder::new()
@@ -2398,11 +3113,53 @@ impl EditorApp {
         }
         self.draw_titlebar(
             root,
-            window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom())),
+            titlebar,
             editor,
+            &pane_rects,
             agent_sidebar_at_frame_start,
+            dragged_pane,
         );
         let divider_stroke_width = ctx.input(|input| input.physical_pixel_size());
+        if self.tab_drag.is_none() {
+            for handle in self.pane_layout.split_handles(editor) {
+                let response = root.interact(
+                    handle.hit_rect,
+                    Id::new(("pane_split_divider", handle.id)),
+                    Sense::drag(),
+                );
+                let active = response.hovered() || response.dragged();
+                if active {
+                    ctx.set_cursor_icon(match handle.axis {
+                        SplitAxis::Horizontal => CursorIcon::ResizeVertical,
+                        SplitAxis::Vertical => CursorIcon::ResizeHorizontal,
+                    });
+                }
+                if response.dragged()
+                    && let Some(pointer) = ctx.pointer_interact_pos()
+                    && self.pane_layout.resize(handle.id, handle.bounds, pointer)
+                {
+                    ctx.request_repaint();
+                }
+                let center = handle.hit_rect.center();
+                let line = match handle.axis {
+                    SplitAxis::Horizontal => [
+                        egui::pos2(handle.hit_rect.left(), center.y),
+                        egui::pos2(handle.hit_rect.right(), center.y),
+                    ],
+                    SplitAxis::Vertical => [
+                        egui::pos2(center.x, handle.hit_rect.top()),
+                        egui::pos2(center.x, handle.hit_rect.bottom()),
+                    ],
+                };
+                root.painter().line_segment(
+                    line,
+                    egui::Stroke::new(
+                        if active { 2.0 } else { divider_stroke_width },
+                        if active { ACCENT } else { BORDER_STRONG },
+                    ),
+                );
+            }
+        }
         if let Some(sidebar) = sidebar {
             let divider = egui::Rect::from_center_size(
                 egui::pos2(sidebar.right(), sidebar.center().y),
@@ -2480,6 +3237,23 @@ impl EditorApp {
                     if active { ACCENT } else { BORDER_STRONG },
                 ),
             );
+        }
+        if let Some(drop) = self.tab_drop.filter(|drop| drop.zone == DropZone::Center) {
+            root.painter().rect_filled(
+                drop.preview.shrink(4.0),
+                5.0,
+                Color32::from_rgba_unmultiplied(74, 197, 225, 42),
+            );
+            root.painter().rect_stroke(
+                drop.preview.shrink(4.0),
+                5.0,
+                egui::Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(path) = self.tab_drag.as_deref() {
+            draw_tab_drag_ghost(&ctx, path);
+            ctx.set_cursor_icon(CursorIcon::Grabbing);
         }
         self.draw_search(root);
         self.draw_dialogs(&ctx);
@@ -2674,13 +3448,144 @@ impl EditorApp {
         self.draw_windows_titlebar_controls(ui, rect);
     }
 
+    fn draw_pane_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        pane: PaneId,
+        tabs_left: f32,
+        controls_right: f32,
+        preview_path: Option<&Path>,
+    ) -> (f32, f32) {
+        ui.painter().rect_filled(rect, 0.0, SURFACE);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        let active = self
+            .pane_active_tabs
+            .get(&pane)
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
+        let markdown =
+            active.is_some_and(|index| markdown::is_markdown(&self.tabs[index].buffer.path));
+        let preview = active.is_some_and(|index| self.tabs[index].markdown_preview);
+        let preview_button = markdown.then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2((controls_right - 66.0).max(tabs_left), rect.top()),
+                egui::pos2(controls_right, rect.bottom()),
+            )
+        });
+        if let Some(button) = preview_button {
+            let response = ui
+                .interact(
+                    button,
+                    Id::new(("markdown_preview_toggle", pane.0)),
+                    Sense::click(),
+                )
+                .on_hover_text(if preview {
+                    "Return to Markdown source"
+                } else {
+                    "Preview rendered Markdown"
+                });
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    if preview {
+                        "Edit Markdown"
+                    } else {
+                        "Preview Markdown"
+                    },
+                )
+            });
+            if response.hovered() || preview {
+                ui.painter().rect_filled(
+                    button.shrink2(egui::vec2(3.0, 3.0)),
+                    4.0,
+                    SURFACE_SELECTED,
+                );
+            }
+            ui.painter().text(
+                button.center(),
+                Align2::CENTER_CENTER,
+                if preview { "Edit" } else { "Preview" },
+                FontId::proportional(12.0),
+                TEXT_SECONDARY,
+            );
+            if response.clicked()
+                && let Some(index) = active
+            {
+                self.activate_tab(index);
+                self.tabs[index].markdown_preview = !preview;
+                self.focus_editor = preview;
+                ui.ctx().request_repaint();
+            }
+        }
+
+        let controls_start = preview_button.map_or(controls_right, |button| button.left());
+        let tabs_right = (controls_start - 8.0).max(tabs_left);
+        let hidden_path = self
+            .tab_drop
+            .filter(|drop| drop.zone != DropZone::Center)
+            .and(self.tab_drag.as_deref())
+            .filter(|path| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.pane == pane && tab.buffer.path == **path)
+            });
+        let tab_count = if preview_path.is_some() {
+            1
+        } else {
+            self.tabs
+                .iter()
+                .filter(|tab| tab.pane == pane && hidden_path != Some(tab.buffer.path.as_path()))
+                .count()
+        };
+        let tabs_used_right = (tabs_left + tab_count as f32 * TAB_WIDTH).min(tabs_right);
+        if let Some(path) = preview_path {
+            let tab = egui::Rect::from_min_max(
+                egui::pos2(tabs_left, rect.top()),
+                egui::pos2(tabs_used_right, rect.bottom()),
+            );
+            ui.painter()
+                .rect_filled(tab, 0.0, SURFACE_INPUT.gamma_multiply(0.62));
+            ui.painter().hline(
+                tab.x_range(),
+                tab.bottom() - 1.0,
+                egui::Stroke::new(2.0, ACCENT.gamma_multiply(0.62)),
+            );
+            ui.painter().text(
+                egui::pos2(tab.left() + 12.0, tab.center().y),
+                Align2::LEFT_CENTER,
+                drag_label(path),
+                FontId::proportional(12.0),
+                TEXT_PRIMARY.gamma_multiply(0.62),
+            );
+        } else if tabs_used_right > tabs_left {
+            self.draw_file_tabs(
+                ui,
+                egui::Rect::from_min_max(
+                    egui::pos2(tabs_left, rect.top()),
+                    egui::pos2(tabs_used_right, rect.bottom()),
+                ),
+                pane,
+            );
+        }
+        (tabs_used_right, controls_start)
+    }
+
     fn draw_titlebar(
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
         editor: egui::Rect,
+        panes: &[(PaneId, egui::Rect)],
         agent_sidebar_open: bool,
+        dragged_pane: Option<PaneId>,
     ) {
+        let dragged_path = self.tab_drag.clone();
         crate::renderer::mark_retained(
             ui.painter(),
             rect,
@@ -2689,12 +3594,6 @@ impl EditorApp {
         );
         let editor_header =
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
-        ui.painter().rect_filled(editor_header, 0.0, SURFACE);
-        ui.painter().hline(
-            editor_header.x_range(),
-            editor_header.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
-        );
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         let agentic_button = agentic_toggle_rect(
             file_tree_button,
@@ -2705,67 +3604,8 @@ impl EditorApp {
         #[cfg(not(target_os = "macos"))]
         let controls_left = editor_header.right().min(rect.right() - 3.0 * 46.0);
         let agent_button = (!agent_sidebar_open).then(|| agent_toggle_rect(editor_header));
-
-        let markdown = self
-            .buffer()
-            .is_some_and(|buffer| markdown::is_markdown(&buffer.path));
-        let preview_button = markdown.then(|| {
-            let right = agent_button.map_or(controls_left, |button| button.left());
-            egui::Rect::from_min_max(
-                egui::pos2(right - 66.0, rect.top()),
-                egui::pos2(right, rect.bottom()),
-            )
-        });
-        if let Some(button) = preview_button {
-            let response = ui
-                .interact(button, Id::new("markdown_preview_toggle"), Sense::click())
-                .on_hover_text(if self.markdown_preview {
-                    "Return to Markdown source"
-                } else {
-                    "Preview rendered Markdown"
-                });
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    ui.is_enabled(),
-                    if self.markdown_preview {
-                        "Edit Markdown"
-                    } else {
-                        "Preview Markdown"
-                    },
-                )
-            });
-            if response.hovered() || self.markdown_preview {
-                ui.painter().rect_filled(
-                    button.shrink2(egui::vec2(3.0, 3.0)),
-                    4.0,
-                    SURFACE_SELECTED,
-                );
-            }
-            ui.painter().text(
-                button.center(),
-                Align2::CENTER_CENTER,
-                if self.markdown_preview {
-                    "Edit"
-                } else {
-                    "Preview"
-                },
-                FontId::proportional(12.0),
-                TEXT_SECONDARY,
-            );
-            if response.clicked() {
-                self.markdown_preview = !self.markdown_preview;
-                self.focus_editor = !self.markdown_preview;
-                ui.ctx().request_repaint();
-            }
-        }
-
-        let controls_start = preview_button.map_or_else(
-            || agent_button.map_or(controls_left, |button| button.left()),
-            |button| button.left(),
-        );
         #[cfg(target_os = "macos")]
-        let tabs_left = if self.sidebar {
+        let first_tabs_left = if self.sidebar {
             if agentic_button.right() > editor_header.left() {
                 agentic_button.right() + 4.0
             } else {
@@ -2775,22 +3615,39 @@ impl EditorApp {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let tabs_left = file_tree_button.right().max(agentic_button.right()) + 4.0;
-        let tabs_right = (controls_start - 8.0).max(tabs_left);
-        let tabs_used_right = (tabs_left + self.tabs.len() as f32 * TAB_WIDTH).min(tabs_right);
-        if tabs_used_right > tabs_left {
-            self.draw_file_tabs(
-                ui,
-                egui::Rect::from_min_max(
-                    egui::pos2(tabs_left, editor_header.top()),
-                    egui::pos2(tabs_used_right, editor_header.bottom()),
-                ),
+        let first_tabs_left = file_tree_button.right().max(agentic_button.right()) + 4.0;
+        for (pane, pane_rect) in panes
+            .iter()
+            .copied()
+            .filter(|(_, pane)| (pane.top() - editor.top()).abs() <= 0.5)
+        {
+            let header = egui::Rect::from_min_max(
+                egui::pos2(pane_rect.left(), rect.top()),
+                egui::pos2(pane_rect.right(), rect.bottom()),
             );
+            let tabs_left = if (pane_rect.left() - editor.left()).abs() <= 0.5 {
+                first_tabs_left.max(header.left())
+            } else {
+                header.left()
+            };
+            let controls_right = if (pane_rect.right() - editor.right()).abs() <= 0.5 {
+                agent_button.map_or(controls_left, |button| button.left())
+            } else {
+                header.right()
+            };
+            let preview_path = (dragged_pane == Some(pane))
+                .then_some(dragged_path.as_deref())
+                .flatten();
+            let (tabs_used_right, controls_start) =
+                self.draw_pane_header(ui, header, pane, tabs_left, controls_right, preview_path);
+            let drag_rect = egui::Rect::from_min_max(
+                egui::pos2(tabs_used_right.min(controls_start), header.top()),
+                egui::pos2(controls_start, header.bottom()),
+            );
+            if let Some(action) = titlebar_drag_action(ui, drag_rect, ("editor", pane.0)) {
+                self.window_action = Some(action);
+            }
         }
-        let drag_rect = egui::Rect::from_min_max(
-            egui::pos2(tabs_used_right, editor_header.top()),
-            egui::pos2(controls_start, editor_header.bottom()),
-        );
         #[cfg(target_os = "macos")]
         let sidebar_drag_left = file_tree_button.right();
         #[cfg(not(target_os = "macos"))]
@@ -2817,11 +3674,7 @@ impl EditorApp {
         } else {
             egui::Rect::NOTHING
         };
-        for (region, drag_rect) in [
-            ("sidebar", sidebar_drag_rect),
-            ("editor", drag_rect),
-            ("agent", agent_drag_rect),
-        ] {
+        for (region, drag_rect) in [("sidebar", sidebar_drag_rect), ("agent", agent_drag_rect)] {
             if let Some(action) = titlebar_drag_action(ui, drag_rect, region) {
                 self.window_action = Some(action);
             }
@@ -2848,19 +3701,172 @@ impl EditorApp {
         self.draw_windows_titlebar_controls(ui, rect);
     }
 
-    fn draw_file_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let active = self.active_tab;
+    fn update_tab_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) -> bool {
+        let Some(path) = self.tab_drag.clone() else {
+            self.tab_drop = None;
+            return false;
+        };
+        let index = self.tabs.iter().position(|tab| tab.buffer.path == path);
+        let pointer = ctx.pointer_hover_pos();
+        let previous = self.tab_drop;
+        self.tab_drop = pointer.and_then(|pointer| {
+            panes.iter().find_map(|(target, rect)| {
+                rect.contains(pointer).then(|| {
+                    let previous = previous
+                        .filter(|drop| drop.target == *target)
+                        .map(|drop| drop.zone);
+                    let zone = if pointer.y <= rect.top() + PANE_TAB_HEIGHT
+                        && previous.unwrap_or(DropZone::Center) == DropZone::Center
+                    {
+                        DropZone::Center
+                    } else {
+                        stable_tab_drop_zone(*rect, pointer, previous)
+                    };
+                    TabDrop {
+                        target: *target,
+                        zone,
+                        preview: tab_drop_preview(*rect, zone),
+                    }
+                })
+            })
+        });
+        if index.is_some_and(|index| {
+            self.tab_drop.is_some_and(|drop| {
+                drop.zone != DropZone::Center
+                    && drop.target == self.tabs[index].pane
+                    && self
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.pane == drop.target)
+                        .count()
+                        == 1
+            })
+        }) {
+            self.tab_drop = None;
+        }
+        let released = ctx.input(|input| input.pointer.primary_released());
+        let down = ctx.input(|input| input.pointer.primary_down());
+        if released {
+            let drop = self.tab_drop.take();
+            self.tab_drag = None;
+            if let Some(drop) = drop {
+                self.drop_path(path, drop.target, drop.zone);
+                return true;
+            }
+        } else if !down {
+            self.tab_drag = None;
+            self.tab_drop = None;
+        } else {
+            ctx.request_repaint();
+        }
+        false
+    }
+
+    fn tab_drag_preview(
+        &self,
+        available: egui::Rect,
+        path: &Path,
+        drop: TabDrop,
+    ) -> Option<(Vec<(PaneId, egui::Rect)>, PaneId)> {
+        if drop.zone == DropZone::Center {
+            return None;
+        }
+        let source = self
+            .tabs
+            .iter()
+            .find(|tab| tab.buffer.path == path)
+            .map(|tab| tab.pane);
+        if source == Some(drop.target)
+            && self
+                .tabs
+                .iter()
+                .filter(|tab| tab.pane == drop.target)
+                .count()
+                == 1
+        {
+            return None;
+        }
+        let mut layout = self.pane_layout.clone();
+        let preview = layout.split(drop.target, drop.zone)?;
+        if let Some(source) = source
+            && self.tabs.iter().filter(|tab| tab.pane == source).count() == 1
+        {
+            layout.remove(source);
+        }
+        Some((layout.rects(available), preview))
+    }
+
+    fn draw_editor_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: PaneId,
+        single_pane: bool,
+        path_override: Option<&Path>,
+        preview: bool,
+    ) {
+        let rect = ui.max_rect();
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(("editor_surface", pane.0))
+                .max_rect(rect),
+            |ui| {
+                if preview {
+                    ui.multiply_opacity(0.62);
+                }
+                self.draw_editor(ui, pane, single_pane, path_override, preview);
+            },
+        );
+        ui.painter().vline(
+            rect.right() - 0.5,
+            rect.y_range(),
+            egui::Stroke::new(1.0, BORDER_STRONG),
+        );
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, BORDER_STRONG),
+        );
+    }
+
+    fn draw_file_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect, pane: PaneId) {
+        let hidden_path = self
+            .tab_drop
+            .filter(|drop| drop.zone != DropZone::Center)
+            .and(self.tab_drag.as_deref())
+            .filter(|path| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.pane == pane && tab.buffer.path == **path)
+            });
+        let active = self
+            .pane_active_tabs
+            .get(&pane)
+            .filter(|path| hidden_path != Some(path.as_path()))
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            .or_else(|| {
+                self.tabs.iter().position(|tab| {
+                    tab.pane == pane && hidden_path != Some(tab.buffer.path.as_path())
+                })
+            });
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .filter(|(_, tab)| tab.pane == pane && hidden_path != Some(tab.buffer.path.as_path()))
+            .map(|(index, tab)| {
                 let path = &tab.buffer.path;
                 let label = path
                     .file_name()
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy()
                     .into_owned();
-                (label, path.display().to_string(), tab.buffer.dirty)
+                (
+                    index,
+                    label,
+                    path.clone(),
+                    path.display().to_string(),
+                    tab.buffer.dirty,
+                )
             })
             .collect::<Vec<_>>();
         let mut activate = None;
@@ -2868,13 +3874,13 @@ impl EditorApp {
         let mut reorder = None;
         ui.scope_builder(
             UiBuilder::new()
-                .id_salt("file_tabs")
+                .id_salt(("file_tabs", pane.0))
                 .max_rect(rect)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.set_clip_rect(rect);
                 ScrollArea::horizontal()
-                    .id_salt("file_tabs_scroll")
+                    .id_salt(("file_tabs_scroll", pane.0))
                     .max_width(rect.width())
                     .max_height(rect.height())
                     .auto_shrink([false, false])
@@ -2882,12 +3888,18 @@ impl EditorApp {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                        for (index, (label, path, dirty)) in tabs.iter().enumerate() {
+                        for (position, (index, label, path, path_display, dirty)) in
+                            tabs.iter().enumerate()
+                        {
                             let (_, tab) = ui.allocate_space(egui::vec2(TAB_WIDTH, rect.height()));
-                            let selected = active == Some(index);
+                            let selected = active == Some(*index);
                             let response = ui
-                                .interact(tab, Id::new(("file_tab", path)), Sense::click_and_drag())
-                                .on_hover_text(path);
+                                .interact(
+                                    tab,
+                                    Id::new(("file_tab", path_display)),
+                                    Sense::click_and_drag(),
+                                )
+                                .on_hover_text(path_display);
                             response.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::SelectableLabel,
@@ -2964,7 +3976,7 @@ impl EditorApp {
                             let close_response = ui
                                 .interact(
                                     close_rect,
-                                    Id::new(("file_tab_close", path)),
+                                    Id::new(("file_tab_close", path_display)),
                                     Sense::click(),
                                 )
                                 .on_hover_text(format!("Close {label}"));
@@ -2989,22 +4001,29 @@ impl EditorApp {
                                 );
                             }
                             if close_response.clicked() {
-                                close = Some(index);
+                                close = Some(*index);
                             } else if response.clicked() {
-                                activate = Some(index);
+                                activate = Some(*index);
+                            }
+                            if response.drag_started() {
+                                self.tab_drag = Some(path.clone());
+                                activate = Some(*index);
                             }
                             if dragging {
+                                self.tab_drag = Some(path.clone());
                                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                                 if let Some(pointer) =
                                     ui.input(|input| input.pointer.interact_pos())
+                                    && rect.contains(pointer)
                                 {
-                                    let first_left = tab.left() - index as f32 * TAB_WIDTH;
-                                    let target = ((pointer.x - first_left) / TAB_WIDTH)
+                                    let first_left = tab.left() - position as f32 * TAB_WIDTH;
+                                    let target_position = ((pointer.x - first_left) / TAB_WIDTH)
                                         .floor()
                                         .clamp(0.0, (tabs.len() - 1) as f32)
                                         as usize;
-                                    if target != index {
-                                        reorder = Some((index, target));
+                                    let target = tabs[target_position].0;
+                                    if target != *index {
+                                        reorder = Some((*index, target));
                                     }
                                 }
                             }
@@ -3109,41 +4128,8 @@ impl EditorApp {
 
     #[cfg(target_os = "macos")]
     fn draw_macos_titlebar_controls(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let pointer = ui.ctx().pointer_hover_pos();
-        let button_centers =
-            [17.0, 37.0, 57.0].map(|x| egui::pos2(rect.left() + x, rect.center().y));
-        let hovered = button_centers
-            .iter()
-            .position(|center| pointer.is_some_and(|pointer| pointer.distance(*center) <= 10.0));
-        let actions = [
-            (WindowAction::Close, Color32::from_rgb(255, 95, 87), "×"),
-            (WindowAction::Minimize, Color32::from_rgb(254, 188, 46), "−"),
-            (
-                WindowAction::ToggleMaximize,
-                Color32::from_rgb(40, 200, 64),
-                "+",
-            ),
-        ];
-        for (index, ((action, color, symbol), center)) in
-            actions.into_iter().zip(button_centers).enumerate()
-        {
-            let button = egui::Rect::from_center_size(center, egui::vec2(18.0, 24.0));
-            if ui
-                .interact(button, Id::new(("titlebar_button", index)), Sense::click())
-                .clicked()
-            {
-                self.window_action = Some(action);
-            }
-            ui.painter().circle_filled(center, 6.0, color);
-            if hovered == Some(index) {
-                ui.painter().text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    symbol,
-                    FontId::proportional(10.0),
-                    Color32::from_black_alpha(150),
-                );
-            }
+        if let Some(action) = macos_titlebar_controls(ui, rect, "editor") {
+            self.window_action = Some(action);
         }
     }
 
@@ -3266,7 +4252,9 @@ impl EditorApp {
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
         }
         if find {
-            self.markdown_preview = false;
+            if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+                tab.markdown_preview = false;
+            }
             self.find_open = true;
             self.search_open = false;
             self.focus_find = true;
@@ -3285,7 +4273,9 @@ impl EditorApp {
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
         }
         if editor {
-            self.markdown_preview = false;
+            if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+                tab.markdown_preview = false;
+            }
             self.focus_editor = true;
             self.tree_focused = false;
         }
@@ -3506,6 +4496,7 @@ impl EditorApp {
                     tab.editor_surface = EditorSurface::default();
                     tab.editor_surface.set_selection(cursor, cursor);
                     tab.highlight_cache = HighlightCache::default();
+                    tab.markdown_layout = None;
                     active_reloaded |= self.active_tab == Some(index);
                 }
                 Ok(ReconcileOutcome::Conflict) => {
@@ -3519,7 +4510,6 @@ impl EditorApp {
             self.find_match_revision = u64::MAX;
             self.bracket_pair = None;
             self.bracket_pair_key = None;
-            self.markdown_layout = None;
         }
         if let Some(index) = conflict {
             self.activate_tab(index);
@@ -6171,6 +7161,12 @@ impl EditorApp {
         if output.response.clicked() {
             self.tree_focused = true;
         }
+        if let Some(index) = output.drag_started {
+            let entry = &self.tree.visible[index].entry;
+            self.tab_drag = Some(entry.path.clone());
+            self.tree.select(Some(entry.path.clone()));
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
         if let Some(index) = output.clicked.filter(|_| self.pending.is_none()) {
             let entry = self.tree.visible[index].entry.clone();
             self.tree_focused = true;
@@ -6237,24 +7233,42 @@ impl EditorApp {
         next.is_some()
     }
 
-    fn draw_editor(&mut self, ui: &mut egui::Ui) {
-        let active_tab = self.active_tab;
+    fn draw_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: PaneId,
+        single_pane: bool,
+        path_override: Option<&Path>,
+        preview: bool,
+    ) {
+        let active_tab = path_override
+            .and_then(|path| self.tabs.iter().position(|tab| tab.buffer.path == path))
+            .or_else(|| {
+                self.pane_active_tabs
+                    .get(&pane)
+                    .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            })
+            .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
+        let active_pane = !preview && path_override.is_none() && pane == self.active_pane;
         let markdown =
             active_tab.is_some_and(|index| markdown::is_markdown(&self.tabs[index].buffer.path));
-        if !markdown {
-            self.markdown_preview = false;
-        } else if self.markdown_preview {
-            let buffer = &self.tabs[active_tab.expect("checked above")].buffer;
-            draw_markdown_preview(ui, &buffer.text, buffer.revision, &mut self.markdown_layout);
+        if markdown && active_tab.is_some_and(|index| self.tabs[index].markdown_preview) {
+            let tab = &mut self.tabs[active_tab.expect("checked above")];
+            draw_markdown_preview(
+                ui,
+                &tab.buffer.text,
+                tab.buffer.revision,
+                &mut tab.markdown_layout,
+                pane,
+            );
             return;
         }
-        let find_open = self.find_open;
+        let find_open = self.find_open && active_pane;
         let find_query = &self.find_query;
         let find_matches = &self.find_matches;
         let find_selected = self.find_selected;
-        let bracket_pair = self.bracket_pair.clone();
-        let scroll_character = self
-            .scroll_to_find_match
+        let bracket_pair = active_pane.then(|| self.bracket_pair.clone()).flatten();
+        let scroll_character = (self.scroll_to_find_match && active_pane)
             .then(|| find_matches.get(find_selected).cloned())
             .flatten()
             .map(|span| {
@@ -6274,6 +7288,7 @@ impl EditorApp {
             buffer,
             editor_surface,
             highlight_cache: cache,
+            ..
         } = &mut self.tabs[index];
         if buffer.large_file_warning {
             ui.colored_label(
@@ -6350,18 +7365,34 @@ impl EditorApp {
             line_count: buffer.line_count(),
             character_len: buffer.character_len(),
         };
-        let output = editor_surface.show_document(
+        let editor_id = if preview {
+            Id::new(("editor_preview", pane.0))
+        } else if single_pane {
+            Id::new("editor")
+        } else {
+            Id::new(("editor", pane.0))
+        };
+        let output = editor_surface.show_document_with_options(
             ui,
             &mut buffer.text,
             job,
             document,
-            self.focus_editor,
-            scroll_character,
+            EditorShowOptions {
+                request_focus: active_pane && self.focus_editor,
+                scroll_to_character: scroll_character,
+                id: editor_id,
+            },
         );
-        if self.scroll_to_find_match {
+        let activate_pane = !active_pane
+            && (output.response.has_focus()
+                || output.response.clicked()
+                || output.response.drag_started());
+        if active_pane && self.scroll_to_find_match {
             self.scroll_to_find_match = false;
         }
-        self.focus_editor = false;
+        if active_pane {
+            self.focus_editor = false;
+        }
         if output.response.has_focus() {
             self.tree_focused = false;
         }
@@ -6369,20 +7400,25 @@ impl EditorApp {
             buffer.mark_changed();
             cache.valid = false;
         }
-        self.cursor = buffer.line_column(output.cursor);
-        let bracket_pair_key = (buffer.revision, output.cursor);
-        if self.bracket_pair_key != Some(bracket_pair_key) {
-            let pair = (!buffer.large_file_warning)
-                .then(|| match_bracket_pair(buffer, output.cursor))
-                .flatten();
-            self.bracket_pair_key = Some(bracket_pair_key);
-            if self.bracket_pair != pair {
-                self.bracket_pair = pair;
-                ui.ctx().request_repaint();
+        if active_pane {
+            self.cursor = buffer.line_column(output.cursor);
+            let bracket_pair_key = (buffer.revision, output.cursor);
+            if self.bracket_pair_key != Some(bracket_pair_key) {
+                let pair = (!buffer.large_file_warning)
+                    .then(|| match_bracket_pair(buffer, output.cursor))
+                    .flatten();
+                self.bracket_pair_key = Some(bracket_pair_key);
+                if self.bracket_pair != pair {
+                    self.bracket_pair = pair;
+                    ui.ctx().request_repaint();
+                }
             }
         }
         if let Some(error) = highlight_error {
             self.show_error(error);
+        }
+        if activate_pane {
+            self.activate_tab(index);
         }
     }
 
@@ -6865,7 +7901,8 @@ impl EditorApp {
                         let path = self.tabs[index].buffer.path.clone();
                         match load_buffer(&path) {
                             Ok(buffer) => {
-                                self.tabs[index] = FileTab::new(buffer);
+                                let pane = self.tabs[index].pane;
+                                self.tabs[index] = FileTab::new(buffer, pane);
                                 self.conflict = false;
                                 if self.pending.is_some() {
                                     self.finish_pending();
@@ -6954,6 +7991,591 @@ pub fn launch(target: OpenTarget, started: Instant) -> Result<(), String> {
         .map_err(|error| format!("cannot start the editor resident: {error}"))
 }
 
+const fn should_show_project_chooser(path_provided: bool, macos_bundle_launch: bool) -> bool {
+    !path_provided && macos_bundle_launch
+}
+
+pub fn should_choose_project(path_provided: bool) -> bool {
+    should_show_project_chooser(
+        path_provided,
+        cfg!(target_os = "macos") && std::env::var_os("__CFBundleIdentifier").is_some(),
+    )
+}
+
+pub fn choose_project(started: Instant) -> Result<(), String> {
+    let mut event_loop = EventLoop::<()>::with_user_event();
+    #[cfg(target_os = "macos")]
+    winit::platform::macos::EventLoopBuilderExtMacOS::with_default_menu(&mut event_loop, false);
+    let event_loop = event_loop
+        .build()
+        .map_err(|error| format!("cannot create project chooser event loop: {error}"))?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut chooser = ProjectChooserShell::new(event_loop.create_proxy());
+    #[cfg(target_os = "macos")]
+    chooser.open_before_launch(&event_loop)?;
+    event_loop
+        .run_app(&mut chooser)
+        .map_err(|error| format!("project chooser event loop failed: {error}"))?;
+    let selected = chooser.selected.take();
+    let fatal = chooser.fatal.take();
+    drop(chooser);
+    if let Some(error) = fatal {
+        return Err(error);
+    }
+    let Some(path) = selected else {
+        return Ok(());
+    };
+    let target = resolve_target(&path, Some(&path))?;
+    launch(target, started)
+}
+
+struct ProjectChooserShell {
+    window: Option<Window>,
+    renderer: Option<Renderer>,
+    egui: Option<egui_winit::State>,
+    selected: Option<PathBuf>,
+    error: Option<String>,
+    fatal: Option<String>,
+    repaint_at: Option<Instant>,
+    event_proxy: EventLoopProxy<()>,
+}
+
+impl ProjectChooserShell {
+    fn new(event_proxy: EventLoopProxy<()>) -> Self {
+        Self {
+            window: None,
+            renderer: None,
+            egui: None,
+            selected: None,
+            error: None,
+            fatal: None,
+            repaint_at: None,
+            event_proxy,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    fn open_before_launch(&mut self, event_loop: &EventLoop<()>) -> Result<(), String> {
+        let attributes = project_chooser_window_attributes()?;
+        let window_started = Instant::now();
+        let window = create_macos_window_without_native_title(
+            |attributes| event_loop.create_window(attributes),
+            attributes,
+        )
+        .map_err(|error| format!("cannot create project chooser window: {error}"))?;
+        if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
+            eprintln!(
+                "editur: project chooser window created before launch in {:.2?}",
+                window_started.elapsed()
+            );
+        }
+        self.install_window(window, event_loop)?;
+        self.draw_before_launch()
+    }
+
+    fn install_window(
+        &mut self,
+        window: Window,
+        display_target: &dyn winit::raw_window_handle::HasDisplayHandle,
+    ) -> Result<(), String> {
+        let renderer = Renderer::new(&window)?;
+        let context = egui::Context::default();
+        theme::apply(&context);
+        disable_transient_egui_debug_overlays(&context);
+        let event_proxy = self.event_proxy.clone();
+        install_repaint_wake(&context, move || {
+            let _ = event_proxy.send_event(());
+        });
+        let state = egui_winit::State::new(
+            context,
+            ViewportId::ROOT,
+            display_target,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+        self.egui = Some(state);
+        self.renderer = Some(renderer);
+        self.window = Some(window);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn draw_before_launch(&mut self) -> Result<(), String> {
+        let error = self.error.as_deref();
+        let (window, renderer, state) = (
+            self.window.as_ref().expect("chooser window is installed"),
+            self.renderer
+                .as_mut()
+                .expect("chooser renderer is installed"),
+            self.egui.as_mut().expect("chooser egui state is installed"),
+        );
+        let input = state.take_egui_input(window);
+        let context = state.egui_ctx().clone();
+        let output = context.run_ui(input, |root| {
+            let _ = project_chooser_ui(root, error);
+        });
+        state.handle_platform_output(window, output.platform_output);
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        renderer
+            .render(output.pixels_per_point, &primitives, &output.textures_delta)
+            .map(|_| ())
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
+        self.fatal = Some(error);
+        event_loop.exit();
+    }
+
+    fn select(&mut self, event_loop: &ActiveEventLoop, path: PathBuf) {
+        if path.is_dir() {
+            self.selected = Some(path);
+            event_loop.exit();
+        } else {
+            self.error = Some("Choose a folder containing your project.".into());
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn resize(&mut self, event_loop: &ActiveEventLoop, size: winit::dpi::PhysicalSize<u32>) {
+        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        if let Err(error) = renderer.resize(window, size) {
+            self.fail(event_loop, error);
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        renderer.resize(size);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(renderer), Some(state)) = (
+            self.window.as_ref(),
+            self.renderer.as_mut(),
+            self.egui.as_mut(),
+        ) else {
+            return;
+        };
+        let input = state.take_egui_input(window);
+        let context = state.egui_ctx().clone();
+        let error = self.error.as_deref();
+        let mut chooser_action = (false, None);
+        let output = context.run_ui(input, |root| {
+            chooser_action = project_chooser_ui(root, error);
+        });
+        let (browse, window_action) = chooser_action;
+        state.handle_platform_output_with_event_loop(window, event_loop, output.platform_output);
+        let textures_updated = !output.textures_delta.set.is_empty();
+        let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        #[cfg(target_os = "linux")]
+        window.pre_present_notify();
+        #[cfg(target_os = "macos")]
+        let rendered =
+            renderer.render(output.pixels_per_point, &primitives, &output.textures_delta);
+        #[cfg(not(target_os = "macos"))]
+        let rendered = renderer
+            .render(output.pixels_per_point, &primitives, &output.textures_delta)
+            .map(|()| true);
+        match rendered {
+            Ok(true) => {}
+            Ok(false) => {
+                window.request_redraw();
+                return;
+            }
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+
+        if let Some(action) = window_action {
+            match action {
+                WindowAction::Close => {
+                    event_loop.exit();
+                    return;
+                }
+                WindowAction::Minimize => window.set_minimized(true),
+                WindowAction::ToggleMaximize => {
+                    if let Err(error) = toggle_window_maximize(window) {
+                        self.error = Some(error);
+                        window.request_redraw();
+                    }
+                }
+                WindowAction::Drag => {
+                    if let Err(error) = window.drag_window() {
+                        self.error = Some(format!("cannot drag window: {error}"));
+                        window.request_redraw();
+                    }
+                }
+            }
+        }
+
+        if browse {
+            match choose_project_directory() {
+                Ok(Some(path)) => self.select(event_loop, path),
+                Ok(None) => {}
+                Err(error) => {
+                    self.error = Some(error);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            return;
+        }
+
+        let delay = output
+            .viewport_output
+            .get(&ViewportId::ROOT)
+            .map_or(Duration::MAX, |output| output.repaint_delay);
+        let delay = repaint_delay_after_texture_update(delay, textures_updated);
+        if let Some(repaint_at) = repaint_deadline(delay, Instant::now()) {
+            self.repaint_at = Some(repaint_at);
+            event_loop.set_control_flow(if delay.is_zero() {
+                ControlFlow::Poll
+            } else {
+                ControlFlow::WaitUntil(repaint_at)
+            });
+        } else {
+            self.repaint_at = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+}
+
+impl ApplicationHandler<()> for ProjectChooserShell {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            #[cfg(target_os = "macos")]
+            activate_macos_application();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+        let attributes = match project_chooser_window_attributes() {
+            Ok(attributes) => attributes,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        let attributes = if let Some(display) = opening_display(event_loop, &attributes) {
+            fit_window_attributes_to_display(attributes, display)
+        } else {
+            attributes
+        };
+        let window_started = Instant::now();
+        #[cfg(target_os = "macos")]
+        let window = create_macos_window_without_native_title(
+            |attributes| event_loop.create_window(attributes),
+            attributes,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let window = event_loop.create_window(attributes);
+        let window = match window {
+            Ok(window) => window,
+            Err(error) => {
+                self.fail(
+                    event_loop,
+                    format!("cannot create project chooser window: {error}"),
+                );
+                return;
+            }
+        };
+        if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
+            eprintln!(
+                "editur: project chooser window created in {:.2?}",
+                window_started.elapsed()
+            );
+        }
+        if let Err(error) = self.install_window(window, event_loop) {
+            self.fail(event_loop, error);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            activate_macos_application();
+            if let Some(window) = &self.window {
+                window.focus_window();
+            }
+        }
+        self.redraw(event_loop);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if window.id() != window_id {
+            return;
+        }
+        let repaint = !matches!(event, WindowEvent::RedrawRequested)
+            && self
+                .egui
+                .as_mut()
+                .is_some_and(|state| state.on_window_event(window, &event).repaint);
+        if repaint {
+            window.request_redraw();
+        }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::DroppedFile(path) => self.select(event_loop, path),
+            WindowEvent::Resized(size) => self.resize(event_loop, size),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.resize(event_loop, window.inner_size());
+            }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .repaint_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.repaint_at = None;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else if let Some(deadline) = self.repaint_at {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
+fn project_chooser_window_attributes() -> Result<winit::window::WindowAttributes, String> {
+    let (pixels, width, height) = application_icon_rgba();
+    let icon = Icon::from_rgba(pixels.to_vec(), width, height)
+        .map_err(|error| format!("cannot load application icon: {error}"))?;
+    let attributes = Window::default_attributes()
+        .with_title("Editur")
+        .with_inner_size(LogicalSize::new(760, 520))
+        .with_min_inner_size(LogicalSize::new(560, 420))
+        .with_window_icon(Some(icon));
+    #[cfg(target_os = "macos")]
+    let attributes = attributes.with_decorations(false).with_transparent(true);
+    Ok(attributes)
+}
+
+fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<WindowAction>) {
+    let screen = ui.max_rect();
+    ui.painter().rect_filled(screen, 0.0, CANVAS);
+    #[cfg(target_os = "macos")]
+    let window_action = {
+        let titlebar = screen.with_max_y((screen.top() + TITLEBAR_HEIGHT).min(screen.bottom()));
+        ui.painter().rect_filled(titlebar, 0.0, SURFACE);
+        ui.painter().hline(
+            titlebar.x_range(),
+            titlebar.bottom() - 0.5,
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        ui.painter().text(
+            titlebar.center(),
+            Align2::CENTER_CENTER,
+            "Choose a project",
+            FontId::proportional(12.5),
+            TEXT_SECONDARY,
+        );
+        let mut action = macos_titlebar_controls(ui, titlebar, "project_chooser");
+        let drag = titlebar.with_min_x(titlebar.left() + 72.0);
+        if action.is_none() {
+            action = titlebar_drag_action(ui, drag, "project_chooser");
+        }
+        action
+    };
+    #[cfg(not(target_os = "macos"))]
+    let window_action = None;
+    let width = (screen.width() - 64.0).clamp(420.0, 540.0);
+    let content = egui::Rect::from_center_size(
+        screen.center() - egui::vec2(0.0, 12.0),
+        egui::vec2(width, 330.0),
+    );
+    let mut browse = false;
+    ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
+        ui.vertical_centered(|ui| {
+            let (logo, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), Sense::hover());
+            paint_editur_mark(ui.painter(), logo);
+            ui.add_space(13.0);
+            ui.label(
+                RichText::new("EDITUR")
+                    .size(25.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new("Choose where you want to work")
+                    .size(14.0)
+                    .color(TEXT_MUTED),
+            );
+            ui.add_space(28.0);
+            let (card, response) = ui.allocate_exact_size(egui::vec2(width, 86.0), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Open project folder",
+                )
+            });
+            let hovered = response.hovered();
+            ui.painter().rect_filled(
+                card,
+                10.0,
+                if hovered {
+                    SURFACE_HOVER
+                } else {
+                    SURFACE_RAISED
+                },
+            );
+            ui.painter().rect_stroke(
+                card,
+                10.0,
+                egui::Stroke::new(1.0, if hovered { ACCENT } else { BORDER_SUBTLE }),
+                egui::StrokeKind::Inside,
+            );
+            let folder = egui::Rect::from_center_size(
+                egui::pos2(card.left() + 47.0, card.center().y + 2.0),
+                egui::vec2(24.0, 18.0),
+            );
+            paint_project_folder(
+                ui.painter(),
+                folder,
+                if hovered { ACCENT } else { TEXT_SECONDARY },
+            );
+            ui.painter().text(
+                egui::pos2(card.left() + 82.0, card.center().y - 10.0),
+                Align2::LEFT_CENTER,
+                "Open project",
+                FontId::proportional(15.0),
+                TEXT_PRIMARY,
+            );
+            ui.painter().text(
+                egui::pos2(card.left() + 82.0, card.center().y + 13.0),
+                Align2::LEFT_CENTER,
+                "Select an existing folder",
+                FontId::proportional(12.0),
+                TEXT_MUTED,
+            );
+            let arrow = egui::pos2(card.right() - 28.0, card.center().y);
+            let stroke = egui::Stroke::new(1.5, if hovered { ACCENT } else { TEXT_MUTED });
+            ui.painter()
+                .line_segment([arrow - egui::vec2(4.0, 4.0), arrow], stroke);
+            ui.painter()
+                .line_segment([arrow, arrow - egui::vec2(4.0, -4.0)], stroke);
+            if response.clicked() {
+                browse = true;
+            }
+            ui.add_space(17.0);
+            ui.label(
+                RichText::new("or drop a project folder anywhere in this window")
+                    .size(11.5)
+                    .color(TEXT_DISABLED),
+            );
+            if let Some(error) = error {
+                ui.add_space(13.0);
+                ui.label(
+                    RichText::new(error)
+                        .size(12.0)
+                        .color(Color32::from_rgb(232, 112, 122)),
+                );
+            }
+        });
+    });
+    (browse, window_action)
+}
+
+fn paint_editur_mark(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, 12.0, ACCENT);
+    let stroke = egui::Stroke::new(3.0, ACCENT_INK);
+    let left = rect.left() + 14.0;
+    for y in [rect.top() + 14.0, rect.center().y, rect.bottom() - 14.0] {
+        painter.line_segment(
+            [egui::pos2(left, y), egui::pos2(rect.right() - 13.0, y)],
+            stroke,
+        );
+    }
+}
+
+fn paint_project_folder(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.6, color),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 2.0, rect.top()),
+            egui::pos2(rect.left() + 8.0, rect.top() - 5.0),
+        ],
+        egui::Stroke::new(1.6, color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left() + 8.0, rect.top() - 5.0),
+            egui::pos2(rect.left() + 14.0, rect.top()),
+        ],
+        egui::Stroke::new(1.6, color),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn choose_project_directory() -> Result<Option<PathBuf>, String> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+    unsafe {
+        let panel: *mut Object = msg_send![class!(NSOpenPanel), openPanel];
+        if panel.is_null() {
+            return Err("macOS could not create the folder chooser.".into());
+        }
+        let _: () = msg_send![panel, setCanChooseFiles: objc::runtime::NO];
+        let _: () = msg_send![panel, setCanChooseDirectories: objc::runtime::YES];
+        let _: () = msg_send![panel, setAllowsMultipleSelection: objc::runtime::NO];
+        let response: isize = msg_send![panel, runModal];
+        if response != 1 {
+            return Ok(None);
+        }
+        let url: *mut Object = msg_send![panel, URL];
+        let path: *mut Object = msg_send![url, path];
+        let bytes: *const std::os::raw::c_char = msg_send![path, UTF8String];
+        if bytes.is_null() {
+            return Err("macOS did not return the selected folder path.".into());
+        }
+        Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+            CStr::from_ptr(bytes).to_bytes(),
+        ))))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_project_directory() -> Result<Option<PathBuf>, String> {
+    Err("Drop a project folder into this window to open it.".into())
+}
+
 #[doc(hidden)]
 pub fn quit_running() -> Result<(), String> {
     if crate::instance::quit_running()? {
@@ -7033,6 +8655,140 @@ struct Shell {
 }
 
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const WINDOW_GEOMETRY_FILE: &str = "window.json";
+const MAX_WINDOW_GEOMETRY_BYTES: u64 = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WindowGeometry {
+    position: Option<(i32, i32)>,
+    size: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct DisplayBounds {
+    position: winit::dpi::PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+    scale_factor: f64,
+}
+
+fn startup_display_bounds(display: DisplayBounds) -> DisplayBounds {
+    #[cfg(target_os = "macos")]
+    let display = {
+        let top = ((f64::from(TITLEBAR_HEIGHT) * display.scale_factor).round() as u32)
+            .min(display.size.height);
+        DisplayBounds {
+            position: winit::dpi::PhysicalPosition::new(
+                display.position.x,
+                display.position.y.saturating_add_unsigned(top),
+            ),
+            size: winit::dpi::PhysicalSize::new(display.size.width, display.size.height - top),
+            ..display
+        }
+    };
+    display
+}
+
+impl WindowGeometry {
+    fn apply(self, attributes: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+        let attributes =
+            attributes.with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1));
+        if let Some((x, y)) = self.position {
+            attributes.with_position(winit::dpi::PhysicalPosition::new(x, y))
+        } else {
+            attributes
+        }
+    }
+}
+
+fn fit_window_attributes_to_display(
+    mut attributes: winit::window::WindowAttributes,
+    display: DisplayBounds,
+) -> winit::window::WindowAttributes {
+    let fitted_size = attributes.inner_size.map(|size| {
+        let size = size.to_physical::<u32>(display.scale_factor);
+        winit::dpi::PhysicalSize::new(
+            size.width.min(display.size.width),
+            size.height.min(display.size.height),
+        )
+    });
+    if let Some(size) = fitted_size {
+        attributes.inner_size = Some(size.into());
+        if let Some(minimum) = attributes.min_inner_size {
+            let minimum = minimum.to_physical::<u32>(display.scale_factor);
+            attributes.min_inner_size = Some(
+                winit::dpi::PhysicalSize::new(
+                    minimum.width.min(size.width),
+                    minimum.height.min(size.height),
+                )
+                .into(),
+            );
+        }
+        if let Some(position) = attributes.position {
+            let position = position.to_physical::<i32>(display.scale_factor);
+            let left = i64::from(display.position.x);
+            let top = i64::from(display.position.y);
+            let right = left + i64::from(display.size.width.saturating_sub(size.width));
+            let bottom = top + i64::from(display.size.height.saturating_sub(size.height));
+            attributes.position = Some(
+                winit::dpi::PhysicalPosition::new(
+                    i64::from(position.x).clamp(left, right) as i32,
+                    i64::from(position.y).clamp(top, bottom) as i32,
+                )
+                .into(),
+            );
+        }
+    }
+    attributes
+}
+
+fn opening_display(
+    event_loop: &ActiveEventLoop,
+    attributes: &winit::window::WindowAttributes,
+) -> Option<DisplayBounds> {
+    let bounds = |monitor: winit::monitor::MonitorHandle| DisplayBounds {
+        position: monitor.position(),
+        size: monitor.size(),
+        scale_factor: monitor.scale_factor(),
+    };
+    let requested = attributes.position;
+    requested
+        .and_then(|position| {
+            event_loop.available_monitors().find_map(|monitor| {
+                let display = bounds(monitor);
+                let position = position.to_physical::<i32>(display.scale_factor);
+                let x = i64::from(position.x) - i64::from(display.position.x);
+                let y = i64::from(position.y) - i64::from(display.position.y);
+                (x >= 0
+                    && y >= 0
+                    && x < i64::from(display.size.width)
+                    && y < i64::from(display.size.height))
+                .then_some(display)
+            })
+        })
+        .or_else(|| event_loop.primary_monitor().map(bounds))
+        .or_else(|| event_loop.available_monitors().next().map(bounds))
+        .map(startup_display_bounds)
+}
+
+fn load_window_geometry(path: &Path) -> Option<WindowGeometry> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_WINDOW_GEOMETRY_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "window geometry path has no parent".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create application data directory: {error}"))?;
+    let bytes = serde_json::to_vec(&geometry)
+        .map_err(|error| format!("cannot encode window geometry: {error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("cannot save window geometry: {error}"))
+}
 
 fn repaint_deadline(delay: Duration, now: Instant) -> Option<Instant> {
     (delay != Duration::MAX).then(|| now + delay)
@@ -7257,11 +9013,26 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             .with_min_inner_size(LogicalSize::new(520, 320))
             .with_window_icon(Some(icon))
             .with_decorations(false);
+        let geometry = data_dir()
+            .ok()
+            .and_then(|directory| load_window_geometry(&directory.join(WINDOW_GEOMETRY_FILE)));
+        let attributes = match geometry {
+            Some(geometry) => geometry.apply(attributes),
+            None => attributes,
+        };
+        let attributes = if let Some(display) = opening_display(event_loop, &attributes) {
+            fit_window_attributes_to_display(attributes, display)
+        } else {
+            attributes
+        };
         #[cfg(target_os = "macos")]
         let attributes = attributes.with_transparent(true);
         let window_started = Instant::now();
         #[cfg(target_os = "macos")]
-        let window = create_macos_window_without_native_title(event_loop, attributes);
+        let window = create_macos_window_without_native_title(
+            |attributes| event_loop.create_window(attributes),
+            attributes,
+        );
         #[cfg(not(target_os = "macos"))]
         let window = event_loop.create_window(attributes);
         let window = match window {
@@ -7481,12 +9252,37 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             InstanceEvent::Exit => event_loop.exit(),
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let position = window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y));
+        let size = window.inner_size();
+        let result = data_dir().and_then(|directory| {
+            save_window_geometry(
+                &directory.join(WINDOW_GEOMETRY_FILE),
+                WindowGeometry {
+                    position,
+                    size: (size.width, size.height),
+                },
+            )
+        });
+        if let Err(error) = result
+            && std::env::var("EDITUR_LOG").as_deref() == Ok("debug")
+        {
+            eprintln!("editur: {error}");
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
 fn create_macos_window_without_native_title(
-    event_loop: &ActiveEventLoop,
+    create_window: impl FnOnce(winit::window::WindowAttributes) -> Result<Window, winit::error::OsError>,
     attributes: winit::window::WindowAttributes,
 ) -> Result<Window, winit::error::OsError> {
     use objc::{
@@ -7515,7 +9311,7 @@ fn create_macos_window_without_native_title(
         // Editur draws its own titlebar, so suppress only that synchronous creation-time call.
         let method = runtime::class_getInstanceMethod(class!(NSWindow), sel!(setTitle:));
         if method.is_null() {
-            return event_loop.create_window(attributes);
+            return create_window(attributes);
         }
         let replacement: Imp = std::mem::transmute(
             ignore_title as unsafe extern "C" fn(*mut Object, Sel, *mut Object),
@@ -7524,7 +9320,7 @@ fn create_macos_window_without_native_title(
             method: method.cast_mut(),
             implementation: runtime::method_setImplementation(method.cast_mut(), replacement),
         };
-        let window = event_loop.create_window(attributes);
+        let window = create_window(attributes);
         drop(restore);
         window
     }
@@ -7566,6 +9362,7 @@ fn activate_macos_application() {
 
     unsafe {
         let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let _: objc::runtime::BOOL = msg_send![application, setActivationPolicy: 0_isize];
         let modern: objc::runtime::BOOL =
             msg_send![application, respondsToSelector: sel!(activate)];
         if modern == objc::runtime::YES {
@@ -7949,6 +9746,7 @@ fn draw_markdown_preview(
     source: &str,
     revision: u64,
     cache: &mut Option<((u64, u32), Arc<egui::Galley>)>,
+    pane: PaneId,
 ) {
     let rect = ui.available_rect_before_wrap();
     ui.painter().rect_filled(rect, 0.0, SURFACE);
@@ -7961,7 +9759,7 @@ fn draw_markdown_preview(
     }
     let galley = Arc::clone(&cache.as_ref().expect("Markdown layout was cached").1);
     ScrollArea::vertical()
-        .id_salt("markdown_preview")
+        .id_salt(("markdown_preview", pane.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(24.0);
@@ -8240,20 +10038,22 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, EDITOR_BACKGROUND,
-        EditorApp, PendingAction, RESIZE_SETTLE_DELAY, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
-        TreeState, agent_collapsing_header, agent_composer_content, agent_composer_height,
-        agent_diff_preview, agent_markdown_galley, agent_menu_rect, agent_near_bottom,
-        agent_new_session_rect, agent_selector_button, agent_send_button_colors,
-        agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh, build_agent_diff,
-        cached_agent_diff, defer_resize, disable_transient_egui_debug_overlays, draw_agent_diff,
-        draw_provider_selector_identity, draw_sidebar_toggle_icon, find_highlighted_job,
-        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, plain_text_job, presentation_job,
-        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
-        run_everything_state, search_needs_polling, search_selection_after_navigation,
-        skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_workspace,
-        split_editor_column, split_workspace,
+        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, DropZone, EDITOR_BACKGROUND,
+        EditorApp, PANE_TAB_HEIGHT, PaneId, PaneLayout, PendingAction, RESIZE_SETTLE_DELAY,
+        TAB_DRAG_GHOST_PAINT_KEY, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState,
+        agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
+        agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
+        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        agent_transcript_fade_mesh, allowed_tab_drop_zone, build_agent_diff, cached_agent_diff,
+        defer_resize, disable_transient_egui_debug_overlays, draw_agent_diff,
+        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
+        find_highlighted_job, install_repaint_wake, launch_in_current_process, match_bracket_pair,
+        match_spans, model_display_name, next_find_match, pane_header_and_content, plain_text_job,
+        presentation_job, provider_selector_visible, repaint_deadline,
+        repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
+        search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
+        slash_command_query, split_agent_sidebar, split_agentic_workspace, split_editor_column,
+        split_workspace, stable_tab_drop_zone,
     };
     use crate::{
         agent::controller::{
@@ -8270,6 +10070,528 @@ mod tests {
             TEXT_PRIMARY, TEXT_SECONDARY,
         },
     };
+
+    #[test]
+    fn dragging_a_tab_down_previews_a_horizontal_split() {
+        let pane = Rect::from_min_size(pos2(100.0, 100.0), Vec2::new(600.0, 400.0));
+
+        assert_eq!(
+            allowed_tab_drop_zone(pane, pos2(400.0, 480.0)),
+            DropZone::Bottom
+        );
+    }
+
+    #[test]
+    fn split_preview_stays_stable_near_a_drop_zone_boundary() {
+        let pane = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+
+        assert_eq!(
+            stable_tab_drop_zone(pane, pos2(215.0, 300.0), Some(DropZone::Left)),
+            DropZone::Left
+        );
+        assert_eq!(
+            stable_tab_drop_zone(pane, pos2(280.0, 300.0), Some(DropZone::Left)),
+            DropZone::Center
+        );
+    }
+
+    #[test]
+    fn moving_the_drag_ghost_invalidates_its_retained_geometry() {
+        let context = egui::Context::default();
+        let draw = |pointer| {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0))),
+                    events: vec![Event::PointerMoved(pointer)],
+                    ..RawInput::default()
+                },
+                |_| draw_tab_drag_ghost(&context, std::path::Path::new("moving.rs")),
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .into_iter()
+                .find_map(|primitive| {
+                    crate::renderer::retained_paint(&primitive.primitive)
+                        .ok()
+                        .flatten()
+                        .filter(|paint| paint.key == TAB_DRAG_GHOST_PAINT_KEY)
+                })
+                .expect("retained drag ghost")
+                .revision
+        };
+
+        let before = draw(pos2(100.0, 100.0));
+        let moved = draw(pos2(300.0, 240.0));
+
+        assert_ne!(before, moved);
+    }
+
+    #[test]
+    fn bottom_split_divides_the_target_pane_horizontally() {
+        let mut layout = PaneLayout::default();
+        let lower = layout.split(PaneId(0), DropZone::Bottom).unwrap();
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+
+        assert_eq!(
+            layout.rects(available),
+            [
+                (PaneId(0), available.with_max_y(300.0)),
+                (lower, available.with_min_y(300.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dragging_a_vertical_pane_border_resizes_both_panes() {
+        let mut layout = PaneLayout::default();
+        let right = layout.split(PaneId(0), DropZone::Right).unwrap();
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let handle = layout.split_handles(available)[0];
+
+        assert!(layout.resize(handle.id, handle.bounds, pos2(600.0, 300.0)));
+        assert_eq!(
+            layout.rects(available),
+            [
+                (PaneId(0), available.with_max_x(600.0)),
+                (right, available.with_min_x(600.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dragging_a_pane_border_in_the_app_updates_the_split() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.rs", "second.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Right);
+        let context = egui::Context::default();
+        let draw = |app: &mut EditorApp, events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(&mut app, Vec::new());
+        let divider = context
+            .read_response(Id::new(("pane_split_divider", 0)))
+            .expect("pane divider")
+            .rect
+            .center();
+        let _ = draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(divider),
+                Event::PointerButton {
+                    pos: divider,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let moved = divider + Vec2::new(100.0, 0.0);
+        let _ = draw(&mut app, vec![Event::PointerMoved(moved)]);
+        let _ = draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: moved,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        assert!(app.pane_layout.rects(available)[0].1.width() > 400.0);
+    }
+
+    #[test]
+    fn top_row_panes_use_the_titlebar_without_losing_editor_height() {
+        let titlebar = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, TITLEBAR_HEIGHT));
+        let editor = Rect::from_min_size(pos2(240.0, TITLEBAR_HEIGHT), Vec2::new(760.0, 666.0));
+        let pane = editor.with_max_y(367.0);
+
+        let (header, content) = pane_header_and_content(titlebar, editor, pane);
+
+        assert_eq!(
+            (header, content.top()),
+            (titlebar.with_min_x(240.0), pane.top())
+        );
+    }
+
+    #[test]
+    fn lower_row_panes_keep_their_header_inside_the_pane() {
+        let titlebar = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, TITLEBAR_HEIGHT));
+        let editor = Rect::from_min_size(pos2(240.0, TITLEBAR_HEIGHT), Vec2::new(760.0, 666.0));
+        let pane = editor.with_min_y(367.0);
+
+        let (header, content) = pane_header_and_content(titlebar, editor, pane);
+
+        assert_eq!(
+            (header, content.top()),
+            (
+                pane.with_max_y(pane.top() + PANE_TAB_HEIGHT),
+                pane.top() + PANE_TAB_HEIGHT,
+            )
+        );
+    }
+
+    #[test]
+    fn narrow_panes_merge_tabs_instead_of_splitting_below_the_usable_width() {
+        let pane = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(399.0, 600.0));
+
+        assert_eq!(
+            allowed_tab_drop_zone(pane, pos2(1.0, 300.0)),
+            DropZone::Center
+        );
+    }
+
+    #[test]
+    fn short_panes_merge_tabs_instead_of_splitting_below_the_usable_height() {
+        let pane = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 399.0));
+
+        assert_eq!(
+            allowed_tab_drop_zone(pane, pos2(300.0, 398.0)),
+            DropZone::Center
+        );
+    }
+
+    #[test]
+    fn portrait_panes_fall_back_to_a_row_split_near_a_blocked_side_edge() {
+        let pane = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(399.0, 1000.0));
+
+        assert_eq!(
+            allowed_tab_drop_zone(pane, pos2(0.1, 999.0)),
+            DropZone::Bottom
+        );
+    }
+
+    #[test]
+    fn ultrawide_panes_fall_back_to_a_column_split_near_a_blocked_bottom_edge() {
+        let pane = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 399.0));
+
+        assert_eq!(
+            allowed_tab_drop_zone(pane, pos2(1.0, 398.9)),
+            DropZone::Left
+        );
+    }
+
+    #[test]
+    fn portrait_layouts_can_grow_to_eight_rows_when_space_allows() {
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 1600.0));
+        let mut layout = PaneLayout::default();
+        let mut rows = vec![PaneId(0)];
+        for _ in 0..3 {
+            let mut next = Vec::with_capacity(rows.len() * 2);
+            for pane in rows {
+                let rect = layout
+                    .rects(available)
+                    .into_iter()
+                    .find_map(|(id, rect)| (id == pane).then_some(rect))
+                    .unwrap();
+                let zone = allowed_tab_drop_zone(rect, rect.center_bottom() - Vec2::Y);
+                let added = layout.split(pane, zone).unwrap();
+                next.extend([pane, added]);
+            }
+            rows = next;
+        }
+
+        assert_eq!(
+            layout
+                .rects(available)
+                .into_iter()
+                .map(|(_, rect)| rect.height())
+                .collect::<Vec<_>>(),
+            vec![200.0; 8]
+        );
+    }
+
+    #[test]
+    fn ultrawide_layouts_can_grow_to_eight_columns_when_space_allows() {
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1600.0, 900.0));
+        let mut layout = PaneLayout::default();
+        let mut columns = vec![PaneId(0)];
+        for _ in 0..3 {
+            let mut next = Vec::with_capacity(columns.len() * 2);
+            for pane in columns {
+                let rect = layout
+                    .rects(available)
+                    .into_iter()
+                    .find_map(|(id, rect)| (id == pane).then_some(rect))
+                    .unwrap();
+                let zone = allowed_tab_drop_zone(rect, rect.right_center() - Vec2::X);
+                let added = layout.split(pane, zone).unwrap();
+                next.extend([pane, added]);
+            }
+            columns = next;
+        }
+
+        assert_eq!(
+            layout
+                .rects(available)
+                .into_iter()
+                .map(|(_, rect)| rect.width())
+                .collect::<Vec<_>>(),
+            vec![200.0; 8]
+        );
+    }
+
+    #[test]
+    fn dropping_a_tab_at_the_bottom_moves_it_into_a_new_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.rs", "second.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+
+        app.drop_tab(1, PaneId(0), DropZone::Bottom);
+
+        assert_eq!(
+            (
+                app.tabs[0].pane,
+                app.tabs[1].pane,
+                app.pane_layout.rects(Rect::EVERYTHING).len(),
+            ),
+            (PaneId(0), PaneId(1), 2)
+        );
+    }
+
+    #[test]
+    fn dropping_a_file_tree_path_opens_it_in_a_new_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(first),
+            create: false,
+        })
+        .unwrap();
+
+        app.drop_path(second.clone(), PaneId(0), DropZone::Right);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[1].buffer.path, second);
+        assert_eq!(app.tabs[1].pane, PaneId(1));
+    }
+
+    #[test]
+    fn drag_preview_restructures_without_committing_the_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.rs", "second.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+
+        let (preview, dragged) = app
+            .tab_drag_preview(
+                available,
+                &paths[1],
+                TabDrop {
+                    target: PaneId(0),
+                    zone: DropZone::Bottom,
+                    preview: Rect::NOTHING,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[1].0, dragged);
+        assert_eq!(app.pane_layout.rects(available).len(), 1);
+    }
+
+    #[test]
+    fn split_preview_does_not_render_duplicate_tab_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.rs", "second.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        let context = egui::Context::default();
+        disable_transient_egui_debug_overlays(&context);
+        let draw = |app: &mut EditorApp, events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(&mut app, Vec::new());
+        let tab = context
+            .read_response(Id::new(("file_tab", paths[1].display().to_string())))
+            .unwrap()
+            .rect
+            .center();
+        let editor = context.read_response(Id::new("editor")).unwrap().rect;
+        let target = pos2(editor.left() + 4.0, editor.center().y);
+        let _ = draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(tab),
+                Event::PointerButton {
+                    pos: tab,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(&mut app, vec![Event::PointerMoved(target)]);
+        let output = draw(&mut app, Vec::new());
+
+        assert!(!output.shapes.iter().any(|shape| has_id_clash(&shape.shape)));
+    }
+
+    #[test]
+    fn dragged_pane_preview_renders_the_file_contents() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("preview.rs");
+        fs::write(&path, "dragged_preview_contents_42\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(path.clone()),
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0))),
+                ..RawInput::default()
+            },
+            |root| {
+                app.draw_editor_pane(root, PaneId(99), false, Some(&path), true);
+            },
+        );
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "dragged_preview_contents_42"))
+        );
+    }
+
+    #[test]
+    fn moving_the_last_tab_out_of_a_pane_collapses_the_empty_split() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.rs", "second.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Bottom);
+
+        app.drop_tab(1, PaneId(0), DropZone::Center);
+
+        assert_eq!(app.pane_layout.rects(Rect::EVERYTHING).len(), 1);
+    }
+
+    #[test]
+    fn every_markdown_pane_has_its_own_preview_toggle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["first.md", "second.md"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "# Preview\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Bottom);
+        let context = egui::Context::default();
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!([PaneId(0), PaneId(1)].into_iter().all(|pane| {
+            context
+                .read_response(Id::new(("markdown_preview_toggle", pane.0)))
+                .is_some()
+        }));
+    }
 
     #[test]
     fn provider_selector_requires_two_available_providers() {
@@ -8739,6 +11061,22 @@ mod tests {
     #[test]
     fn graphical_launch_runs_in_the_current_process() {
         assert!(launch_in_current_process(false, false, false, false));
+    }
+
+    #[test]
+    fn dock_launch_without_a_path_shows_the_project_chooser() {
+        assert!(should_show_project_chooser(false, true));
+    }
+
+    #[test]
+    fn cli_or_explicit_path_launch_skips_the_project_chooser() {
+        assert_eq!(
+            (
+                should_show_project_chooser(false, false),
+                should_show_project_chooser(true, true),
+            ),
+            (false, false)
+        );
     }
 
     #[test]
@@ -11692,6 +14030,64 @@ mod tests {
     }
 
     #[test]
+    fn saved_window_geometry_is_loaded_for_the_next_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state/window.json");
+        let geometry = super::WindowGeometry {
+            position: Some((120, 80)),
+            size: (1440, 900),
+        };
+
+        super::save_window_geometry(&path, geometry).unwrap();
+        let attributes = super::load_window_geometry(&path)
+            .unwrap()
+            .apply(winit::window::Window::default_attributes());
+
+        assert_eq!(
+            (attributes.position, attributes.inner_size),
+            (
+                Some(winit::dpi::Position::Physical(
+                    winit::dpi::PhysicalPosition::new(120, 80)
+                )),
+                Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
+                    1440, 900
+                ))),
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_geometry_keeps_the_titlebar_inside_the_opening_display() {
+        let attributes = super::WindowGeometry {
+            position: Some((-98, -212)),
+            size: (5882, 2124),
+        }
+        .apply(winit::window::Window::default_attributes());
+
+        let attributes = super::fit_window_attributes_to_display(
+            attributes,
+            super::startup_display_bounds(super::DisplayBounds {
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(2048, 1280),
+                scale_factor: 1.0,
+            }),
+        );
+
+        assert_eq!(
+            (attributes.position, attributes.inner_size),
+            (
+                Some(winit::dpi::Position::Physical(
+                    winit::dpi::PhysicalPosition::new(0, 34)
+                )),
+                Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
+                    2048, 1246
+                ))),
+            )
+        );
+    }
+
+    #[test]
     fn rapid_resizes_keep_only_the_latest_surface_size() {
         let mut pending = None;
         let mut redraw_at = None;
@@ -12965,6 +15361,73 @@ mod tests {
         );
 
         assert_eq!(app.tabs[2].buffer.path, paths[0]);
+    }
+
+    #[test]
+    fn dragging_a_tab_into_the_editor_creates_a_split_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["a.rs", "b.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        let context = egui::Context::default();
+        let draw = |app: &mut EditorApp, events| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+        draw(&mut app, Vec::new());
+        let tab = context
+            .read_response(Id::new(("file_tab", paths[1].display().to_string())))
+            .unwrap()
+            .rect
+            .center();
+        let editor = context.read_response(Id::new("editor")).unwrap().rect;
+        let target = pos2(editor.center().x, editor.bottom() - 4.0);
+
+        draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(tab),
+                Event::PointerButton {
+                    pos: tab,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        draw(&mut app, vec![Event::PointerMoved(target)]);
+        draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: target,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+
+        assert_eq!(
+            (app.tabs[1].pane, app.pane_layout.rects(editor).len()),
+            (PaneId(1), 2)
+        );
     }
 
     #[test]

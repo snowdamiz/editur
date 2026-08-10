@@ -37,6 +37,9 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
             Ok(())
         }
         Command::Open(path) => {
+            if app::should_choose_project(path.is_some()) {
+                return app::choose_project(started);
+            }
             let cwd = env::current_dir()
                 .map_err(|error| format!("cannot determine current directory: {error}"))?;
             let target = resolve_target(&cwd, path.as_deref())?;

@@ -33,6 +33,7 @@ pub struct TreeSurface {
 pub struct TreeOutput {
     pub response: Response,
     pub clicked: Option<usize>,
+    pub drag_started: Option<usize>,
 }
 
 impl TreeSurface {
@@ -45,7 +46,7 @@ impl TreeSurface {
     ) -> TreeOutput {
         let (id, rect) = ui.allocate_space(ui.available_size());
         let content = rect;
-        let response = ui.interact(content, id.with("tree"), Sense::click());
+        let response = ui.interact(content, id.with("tree"), Sense::click_and_drag());
         let pointer = ui
             .input(|input| input.pointer.hover_pos())
             .filter(|pointer| content.contains(*pointer));
@@ -64,6 +65,15 @@ impl TreeSurface {
         self.clamp_scroll(rows.len(), rect.height());
         self.hovered = pointer.and_then(|pointer| self.row_at(pointer.y, rect, rows.len()));
         let clicked = response.clicked().then_some(self.hovered).flatten();
+        let drag_started = response
+            .drag_started()
+            .then(|| {
+                ui.input(|input| input.pointer.press_origin())
+                    .filter(|pointer| content.contains(*pointer))
+                    .and_then(|pointer| self.row_at(pointer.y, rect, rows.len()))
+            })
+            .flatten()
+            .filter(|index| !rows[*index].directory);
 
         let painter = ui.painter_at(rect);
         mark_retained(
@@ -218,7 +228,11 @@ impl TreeSurface {
             ui.ctx().request_repaint();
         }
 
-        TreeOutput { response, clicked }
+        TreeOutput {
+            response,
+            clicked,
+            drag_started,
+        }
     }
 
     pub fn visible_rows(&self, total: usize, viewport_height: f32) -> Range<usize> {
@@ -341,6 +355,67 @@ mod tests {
         );
 
         assert_eq!(surface.hovered, Some(0));
+    }
+
+    #[test]
+    fn file_rows_can_start_a_drag() {
+        let context = egui::Context::default();
+        let mut surface = TreeSurface::default();
+        let rows = ["main.rs", "lib.rs"].map(|name| TreeRow {
+            entry: TreeEntry {
+                name: OsString::from(name),
+                path: PathBuf::from(name),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: name.into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        });
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0));
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |ui| {
+                surface.show(ui, &rows, None, false);
+            },
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    Event::PointerMoved(pos2(100.0, 11.0)),
+                    Event::PointerButton {
+                        pos: pos2(100.0, 11.0),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                surface.show(ui, &rows, None, false);
+            },
+        );
+        let mut drag_started = None;
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(pos2(100.0, 37.0))],
+                ..RawInput::default()
+            },
+            |ui| {
+                drag_started = surface.show(ui, &rows, None, false).drag_started;
+            },
+        );
+
+        assert_eq!(surface.hovered, Some(1));
+        assert_eq!(drag_started, Some(0));
     }
 
     #[test]

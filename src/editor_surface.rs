@@ -59,6 +59,12 @@ pub struct EditorOutput {
     pub changed: bool,
 }
 
+pub(crate) struct EditorShowOptions {
+    pub request_focus: bool,
+    pub scroll_to_character: Option<usize>,
+    pub id: Id,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct DocumentMetrics {
     pub revision: u64,
@@ -159,10 +165,36 @@ impl EditorSurface {
         request_focus: bool,
         scroll_to_character: Option<usize>,
     ) -> EditorOutput {
+        self.show_document_with_options(
+            ui,
+            text,
+            highlighted,
+            document,
+            EditorShowOptions {
+                request_focus,
+                scroll_to_character,
+                id: Id::new("editor"),
+            },
+        )
+    }
+
+    pub(crate) fn show_document_with_options(
+        &mut self,
+        ui: &mut Ui,
+        text: &mut String,
+        highlighted: &LayoutJob,
+        document: DocumentMetrics,
+        options: EditorShowOptions,
+    ) -> EditorOutput {
+        let EditorShowOptions {
+            request_focus,
+            scroll_to_character,
+            id: editor_id,
+        } = options;
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
         let editor_rect = rect;
-        let mut response = ui.interact(editor_rect, Id::new("editor"), Sense::click_and_drag());
+        let mut response = ui.interact(editor_rect, editor_id, Sense::click_and_drag());
         if ui.input(|input| {
             input
                 .pointer
@@ -245,7 +277,7 @@ impl EditorSurface {
                     },
                 );
             });
-            changed = self.handle_events(ui, text);
+            changed = self.handle_events(ui, text, editor_id);
             if changed {
                 response.mark_changed();
                 ui.ctx().request_repaint();
@@ -284,7 +316,7 @@ impl EditorSurface {
         }
         if crate::scrollbar::show(
             ui,
-            Id::new("editor_scrollbar"),
+            editor_id.with("scrollbar"),
             rect,
             self.offsets.last().copied().unwrap_or(0.0),
             &mut self.scroll_y,
@@ -430,6 +462,8 @@ impl EditorSurface {
 
     fn paint(&self, ui: &Ui, rect: Rect, content: Rect, focused: bool, caret_visible: bool) {
         let painter = ui.painter_at(rect);
+        let horizontal_geometry = u64::from(content.left().to_bits())
+            ^ u64::from(content.width().to_bits()).rotate_left(32);
         mark_retained(
             &painter,
             rect,
@@ -457,7 +491,8 @@ impl EditorSurface {
             let selection_state = (selected.start < selected.end).then_some(
                 (selected.start as u64).rotate_left(17) ^ (selected.end as u64).rotate_left(31),
             );
-            let state = u64::from(y.to_bits())
+            let state = horizontal_geometry
+                ^ u64::from(y.to_bits())
                 ^ selection_state.unwrap_or(0)
                 ^ u64::from(index == cursor_line && focused);
             mark_retained(
@@ -510,7 +545,7 @@ impl EditorSurface {
                 &painter,
                 rect,
                 0x3000_0000_0000_0000,
-                self.cursor as u64 ^ u64::from(self.scroll_y.to_bits()),
+                self.cursor as u64 ^ u64::from(self.scroll_y.to_bits()) ^ horizontal_geometry,
             );
             if let Some(caret) = self.cursor_rect(content) {
                 painter.line_segment(
@@ -521,7 +556,7 @@ impl EditorSurface {
         }
     }
 
-    fn handle_events(&mut self, ui: &Ui, text: &mut String) -> bool {
+    fn handle_events(&mut self, ui: &Ui, text: &mut String, editor_id: Id) -> bool {
         let events = ui.input(|input| input.events.clone());
         let mut changed = false;
         for event in events {
@@ -539,7 +574,7 @@ impl EditorSurface {
                     pressed: true,
                     modifiers,
                     ..
-                } => changed |= self.handle_key(ui, text, key, modifiers),
+                } => changed |= self.handle_key(ui, text, key, modifiers, editor_id),
                 Event::Ime(egui::ImeEvent::Commit(value)) if !value.is_empty() => {
                     changed |= self.replace_selection(text, &value);
                 }
@@ -549,7 +584,14 @@ impl EditorSurface {
         changed
     }
 
-    fn handle_key(&mut self, ui: &Ui, text: &mut String, key: Key, modifiers: Modifiers) -> bool {
+    fn handle_key(
+        &mut self,
+        ui: &Ui,
+        text: &mut String,
+        key: Key,
+        modifiers: Modifiers,
+        editor_id: Id,
+    ) -> bool {
         if modifiers.command {
             match key {
                 Key::A => {
@@ -623,7 +665,7 @@ impl EditorSurface {
                 false
             }
             Key::Escape => {
-                ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+                ui.memory_mut(|memory| memory.surrender_focus(editor_id));
                 false
             }
             _ => false,
@@ -1301,6 +1343,49 @@ mod tests {
             deltas.map(|delta| (delta * 60.0).round()),
             [-240.0, 0.0, 240.0]
         );
+    }
+
+    #[test]
+    fn moving_the_editor_horizontally_invalidates_retained_line_geometry() {
+        let context = egui::Context::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "fn main() {}".to_owned();
+        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 300.0);
+        let mut draw = |left| {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(700.0, 300.0))),
+                    ..RawInput::default()
+                },
+                |root| {
+                    root.scope_builder(
+                        egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                            pos2(left, 0.0),
+                            Vec2::new(400.0, 300.0),
+                        )),
+                        |ui| {
+                            editor.show(ui, &mut text, &job, 1, false, None);
+                        },
+                    );
+                },
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .into_iter()
+                .find_map(|primitive| {
+                    crate::renderer::retained_paint(&primitive.primitive)
+                        .ok()
+                        .flatten()
+                        .filter(|paint| paint.key == 0x2000_0000_0000_0000)
+                })
+                .expect("retained first line")
+                .revision
+        };
+
+        let before = draw(0.0);
+        let shifted = draw(120.0);
+
+        assert_ne!(before, shifted);
     }
 
     #[test]
