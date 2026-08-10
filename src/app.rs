@@ -53,6 +53,7 @@ use crate::{
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
+    terminal::TerminalPanel,
     theme::{
         self, ACCENT, ACCENT_INK, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER,
         SURFACE_INPUT, SURFACE_RAISED, SURFACE_SELECTED, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY,
@@ -104,6 +105,9 @@ const PANE_TAB_HEIGHT: f32 = 30.0;
 const PANE_DIVIDER_HIT_WIDTH: f32 = 8.0;
 const MIN_EDITOR_PANE_WIDTH: f32 = 200.0;
 const MIN_EDITOR_PANE_HEIGHT: f32 = 200.0;
+const TERMINAL_DEFAULT_HEIGHT: f32 = 240.0;
+const TERMINAL_MIN_HEIGHT: f32 = 120.0;
+const WORKSPACE_MIN_HEIGHT: f32 = 160.0;
 const TITLEBAR_PAINT_KEY: u64 = 0xa000_0000_0000_0000;
 const TAB_DRAG_GHOST_PAINT_KEY: u64 = 0xb000_0000_0000_0000;
 
@@ -1283,6 +1287,20 @@ fn split_agentic_workspace(
     (Some(sessions), agent)
 }
 
+fn split_bottom_panel(
+    content: egui::Rect,
+    open: bool,
+    requested_height: f32,
+) -> (egui::Rect, Option<egui::Rect>) {
+    if !open {
+        return (content, None);
+    }
+    let max_height = (content.height() - WORKSPACE_MIN_HEIGHT).max(0.0);
+    let height = requested_height.max(TERMINAL_MIN_HEIGHT).min(max_height);
+    let split = content.bottom() - height;
+    (content.with_max_y(split), Some(content.with_min_y(split)))
+}
+
 fn split_editor_column(rect: egui::Rect, find_open: bool) -> (egui::Rect, Option<egui::Rect>) {
     let editor_top = (rect.top() + TITLEBAR_HEIGHT).min(rect.bottom());
     let findbar = find_open.then(|| {
@@ -1926,6 +1944,10 @@ fn file_tree_toggle_rect(titlebar: egui::Rect, _editor_header: egui::Rect) -> eg
         egui::pos2(controls_right + 17.0, titlebar.center().y),
         egui::vec2(34.0, titlebar.height()),
     )
+}
+
+fn terminal_toggle_rect(file_tree_button: egui::Rect) -> egui::Rect {
+    file_tree_button.translate(egui::vec2(file_tree_button.width(), 0.0))
 }
 
 fn agentic_toggle_rect(file_tree_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
@@ -2609,6 +2631,10 @@ pub struct EditorApp {
     sidebar: bool,
     sidebar_width: f32,
     sidebar_dragging: bool,
+    terminal_open: bool,
+    terminal_height: f32,
+    terminal_dragging: bool,
+    terminal: TerminalPanel,
     agentic_mode: bool,
     agent_sidebar: bool,
     agent_sidebar_width: f32,
@@ -2694,6 +2720,10 @@ impl EditorApp {
             sidebar: true,
             sidebar_width: 248.0,
             sidebar_dragging: false,
+            terminal_open: false,
+            terminal_height: TERMINAL_DEFAULT_HEIGHT,
+            terminal_dragging: false,
+            terminal: TerminalPanel::default(),
             agentic_mode: false,
             agent_sidebar: false,
             agent_sidebar_width: 440.0,
@@ -3011,6 +3041,11 @@ impl EditorApp {
             self.agent_sidebar,
             self.agent_sidebar_width,
         );
+        let workspace = egui::Rect::from_min_max(editor_column.left_top(), window.right_bottom());
+        let (workspace, terminal) =
+            split_bottom_panel(workspace, self.terminal_open, self.terminal_height);
+        let editor_column = editor_column.with_max_y(workspace.bottom());
+        let agent = agent.with_max_y(workspace.bottom());
         let (editor, findbar) = split_editor_column(editor_column, self.find_open);
         if let Some(sidebar) = sidebar {
             root.scope_builder(
@@ -3110,6 +3145,16 @@ impl EditorApp {
                 UiBuilder::new().id_salt("agent_sidebar").max_rect(agent),
                 |ui| self.draw_agent_sidebar(ui),
             );
+        }
+        if let Some(terminal) = terminal {
+            let output = self.terminal.show(root, terminal, &self.tree.root);
+            if output.empty {
+                self.terminal_open = false;
+            }
+            if let Some(error) = output.error {
+                self.show_error(error);
+            }
+            self.draw_terminal_resize(root, workspace, terminal);
         }
         self.draw_titlebar(
             root,
@@ -3261,7 +3306,9 @@ impl EditorApp {
     }
 
     fn draw_agentic_workspace(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        let (sessions, agent) = split_agentic_workspace(window, self.sidebar);
+        let (sessions, agent_column) = split_agentic_workspace(window, self.sidebar);
+        let (agent, terminal) =
+            split_bottom_panel(agent_column, self.terminal_open, self.terminal_height);
         if let Some(sessions) = sessions {
             root.scope_builder(
                 UiBuilder::new()
@@ -3283,6 +3330,16 @@ impl EditorApp {
                 self.draw_agent(ui, ui.max_rect());
             },
         );
+        if let Some(terminal) = terminal {
+            let output = self.terminal.show(root, terminal, &self.tree.root);
+            if output.empty {
+                self.terminal_open = false;
+            }
+            if let Some(error) = output.error {
+                self.show_error(error);
+            }
+            self.draw_terminal_resize(root, agent, terminal);
+        }
         self.draw_agentic_titlebar(
             root,
             window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom())),
@@ -3402,8 +3459,9 @@ impl EditorApp {
             egui::pos2(agent.right(), rect.bottom()),
         );
         let file_tree_button = file_tree_toggle_rect(rect, agent_header);
+        let terminal_button = terminal_toggle_rect(file_tree_button);
         let agentic_button =
-            agentic_toggle_rect(file_tree_button, sessions.map(|sessions| sessions.right()));
+            agentic_toggle_rect(terminal_button, sessions.map(|sessions| sessions.right()));
         #[cfg(target_os = "macos")]
         let controls_right = rect.right();
         #[cfg(not(target_os = "macos"))]
@@ -3437,6 +3495,9 @@ impl EditorApp {
         if self.draw_file_tree_toggle(ui, file_tree_button) {
             self.sidebar = !self.sidebar;
             self.sidebar_dragging = false;
+        }
+        if self.draw_terminal_toggle(ui, terminal_button) {
+            self.toggle_terminal(ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.set_agentic_mode(false, ui.ctx());
@@ -3595,8 +3656,9 @@ impl EditorApp {
         let editor_header =
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
+        let terminal_button = terminal_toggle_rect(file_tree_button);
         let agentic_button = agentic_toggle_rect(
-            file_tree_button,
+            terminal_button,
             self.sidebar.then_some(editor_header.left()),
         );
         #[cfg(target_os = "macos")]
@@ -3615,7 +3677,7 @@ impl EditorApp {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let first_tabs_left = file_tree_button.right().max(agentic_button.right()) + 4.0;
+        let first_tabs_left = terminal_button.right().max(agentic_button.right()) + 4.0;
         for (pane, pane_rect) in panes
             .iter()
             .copied()
@@ -3649,7 +3711,7 @@ impl EditorApp {
             }
         }
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = file_tree_button.right();
+        let sidebar_drag_left = terminal_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
         let sidebar_drag_right = (agentic_button.left() - 3.0).max(sidebar_drag_left);
@@ -3690,6 +3752,9 @@ impl EditorApp {
             self.sidebar = !self.sidebar;
             self.sidebar_dragging = false;
             ui.ctx().request_repaint();
+        }
+        if self.draw_terminal_toggle(ui, terminal_button) {
+            self.toggle_terminal(ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.set_agentic_mode(true, ui.ctx());
@@ -4084,6 +4149,103 @@ impl EditorApp {
         response.clicked()
     }
 
+    fn draw_terminal_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
+        let label = if self.terminal_open {
+            "Hide Terminal"
+        } else {
+            "Show Terminal"
+        };
+        let response = ui
+            .interact(button, Id::new("terminal_toggle"), Sense::click())
+            .on_hover_text(label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        let color = if response.hovered() || self.terminal_open {
+            TEXT_PRIMARY
+        } else {
+            TEXT_MUTED
+        };
+        let icon = egui::Rect::from_center_size(button.center(), egui::vec2(16.0, 13.0));
+        ui.painter().rect_stroke(
+            icon,
+            2.0,
+            egui::Stroke::new(1.2, color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(icon.left() + 3.0, icon.top() + 3.0),
+                egui::pos2(icon.left() + 6.0, icon.center().y),
+            ],
+            egui::Stroke::new(1.2, color),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(icon.left() + 6.0, icon.center().y),
+                egui::pos2(icon.left() + 3.0, icon.bottom() - 3.0),
+            ],
+            egui::Stroke::new(1.2, color),
+        );
+        ui.painter().hline(
+            (icon.left() + 8.0)..=(icon.right() - 2.5),
+            icon.bottom() - 3.0,
+            egui::Stroke::new(1.2, color),
+        );
+        response.clicked()
+    }
+
+    fn toggle_terminal(&mut self, ctx: &egui::Context) {
+        if self.terminal_open {
+            self.terminal.blur(ctx);
+            self.terminal_open = false;
+            self.terminal_dragging = false;
+        } else {
+            let root = self.tree.root.clone();
+            match self.terminal.open(&root, ctx) {
+                Ok(()) => self.terminal_open = true,
+                Err(error) => self.show_error(error),
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn draw_terminal_resize(&mut self, ui: &mut egui::Ui, main: egui::Rect, terminal: egui::Rect) {
+        let divider = egui::Rect::from_center_size(
+            egui::pos2(terminal.center().x, terminal.top()),
+            egui::vec2(terminal.width(), 7.0),
+        );
+        let pointer = ui.ctx().pointer_hover_pos();
+        let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
+        if hovered && ui.input(|input| input.pointer.primary_pressed()) {
+            self.terminal_dragging = true;
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.terminal_dragging = false;
+        }
+        if self.terminal_dragging
+            && let Some(pointer) = pointer
+        {
+            let total_height = terminal.bottom() - main.top();
+            let max_height = (total_height - WORKSPACE_MIN_HEIGHT).max(0.0);
+            let min_height = TERMINAL_MIN_HEIGHT.min(max_height);
+            self.terminal_height = (terminal.bottom() - pointer.y).clamp(min_height, max_height);
+            ui.ctx().request_repaint();
+        }
+        let active = hovered || self.terminal_dragging;
+        if active {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+        }
+        ui.painter().hline(
+            terminal.x_range(),
+            terminal.top(),
+            egui::Stroke::new(
+                if active { 2.0 } else { 1.0 },
+                if active { ACCENT } else { BORDER_STRONG },
+            ),
+        );
+    }
+
     fn draw_agentic_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
         let (label, tooltip) = if self.agentic_mode {
             ("IDE", "Switch to IDE")
@@ -4280,7 +4442,12 @@ impl EditorApp {
             self.tree_focused = false;
         }
         if close {
-            if let Some(index) = self.active_tab {
+            if self.terminal.focused(ctx) {
+                self.terminal.close_active();
+                if self.terminal.is_empty() {
+                    self.terminal_open = false;
+                }
+            } else if let Some(index) = self.active_tab {
                 self.request(PendingAction::CloseTab(index));
             } else {
                 self.request_close();
@@ -10052,8 +10219,8 @@ mod tests {
         presentation_job, provider_selector_visible, repaint_deadline,
         repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
         search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
-        slash_command_query, split_agent_sidebar, split_agentic_workspace, split_editor_column,
-        split_workspace, stable_tab_drop_zone,
+        slash_command_query, split_agent_sidebar, split_agentic_workspace, split_bottom_panel,
+        split_editor_column, split_workspace, stable_tab_drop_zone,
     };
     use crate::{
         agent::controller::{
@@ -10235,6 +10402,40 @@ mod tests {
             (header, content.top()),
             (titlebar.with_min_x(240.0), pane.top())
         );
+    }
+
+    #[test]
+    fn terminal_panel_uses_the_bottom_of_the_non_sidebar_workspace() {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (sidebar, editor, agent) = split_workspace(window, true, 240.0, true, 320.0);
+        let workspace = Rect::from_min_max(editor.left_top(), window.right_bottom());
+
+        let (main, terminal) = split_bottom_panel(workspace, true, 240.0);
+        let terminal = terminal.unwrap();
+        let editor = editor.with_max_y(main.bottom());
+        let agent = agent.with_max_y(main.bottom());
+
+        assert_eq!(main, workspace.with_max_y(460.0));
+        assert_eq!(terminal, workspace.with_min_y(460.0));
+        assert_eq!(sidebar.unwrap().bottom(), window.bottom());
+        assert_eq!(terminal.left(), editor.left());
+        assert_eq!(terminal.right(), agent.right());
+        assert_eq!(terminal.top(), agent.bottom());
+        assert_eq!(
+            split_bottom_panel(workspace, false, 240.0),
+            (workspace, None)
+        );
+    }
+
+    #[test]
+    fn terminal_panel_stays_beside_the_agentic_session_rail() {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (sessions, agent) = split_agentic_workspace(window, true);
+
+        let (_, terminal) = split_bottom_panel(agent, true, 240.0);
+
+        assert_eq!(terminal.unwrap().left(), sessions.unwrap().right());
+        assert_eq!(terminal.unwrap().right(), window.right());
     }
 
     #[test]

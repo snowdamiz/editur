@@ -12,6 +12,7 @@ pub mod renderer;
 mod scrollbar;
 pub mod search;
 pub mod syntax;
+mod terminal;
 mod theme;
 pub mod tree;
 pub mod tree_surface;
