@@ -37,7 +37,7 @@ use crate::{
         },
         state::{AgentState, TranscriptItem},
     },
-    buffer::Buffer,
+    buffer::{Buffer, LARGE_FILE_BYTES},
     components::{
         begin_dialog, chevron_icon_button, close_icon_button, dialog_actions, dialog_button,
         dialog_frame, dialog_window, icon_button, selectable_content_row, selectable_row,
@@ -49,9 +49,15 @@ use crate::{
         safe_save,
     },
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
+    lsp::{
+        Command as LspCommand, CompletionItem, Controller as LspController, DefinitionLocation,
+        HoverContent, PresetId, RequestTag, ServerCapabilities, ServerLaunch, ServerStatus,
+        catalog as lsp_catalog, preset_for_path,
+    },
     markdown,
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
+    settings::{self, ServerMode, ServerOverride, Settings},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
     terminal::TerminalPanel,
     theme::{
@@ -82,6 +88,8 @@ enum WindowAction {
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const TAB_WIDTH: f32 = 176.0;
 const FIND_BAR_HEIGHT: f32 = 38.0;
+const PANE_FOCUS_BORDER: Color32 = Color32::from_rgb(75, 101, 128);
+const WINDOW_CORNER_RADIUS: u8 = 10;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
@@ -101,6 +109,11 @@ const AGENTIC_SESSION_RAIL_WIDTH: f32 = 248.0;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
+const SIDEBAR_MIN_WIDTH: f32 = if cfg!(target_os = "macos") {
+    72.0 + 3.0 * 34.0 + AGENTIC_MODE_TOGGLE_WIDTH
+} else {
+    120.0
+};
 const PANE_TAB_HEIGHT: f32 = 30.0;
 const PANE_DIVIDER_HIT_WIDTH: f32 = 8.0;
 const MIN_EDITOR_PANE_WIDTH: f32 = 200.0;
@@ -1254,8 +1267,8 @@ fn split_workspace(
         0.0
     };
     let explorer_width = explorer_width
-        .max(120.0)
-        .min((content.width() - right_width - 160.0).max(120.0));
+        .max(SIDEBAR_MIN_WIDTH)
+        .min((content.width() - right_width - 160.0).max(SIDEBAR_MIN_WIDTH));
     let explorer = explorer_open
         .then(|| content.with_max_x((content.left() + explorer_width).min(content.right())));
     let agent = content.with_min_x((content.right() - right_width).max(content.left()));
@@ -1281,7 +1294,9 @@ fn split_agentic_workspace(
     if !sidebar_open {
         return (None, content);
     }
-    let rail_width = AGENTIC_SESSION_RAIL_WIDTH.min(content.width() * 0.36);
+    let rail_width = AGENTIC_SESSION_RAIL_WIDTH
+        .min(content.width() * 0.36)
+        .max(SIDEBAR_MIN_WIDTH.min(content.width()));
     let sessions = content.with_max_x(content.left() + rail_width);
     let agent = content.with_min_x(sessions.right());
     (Some(sessions), agent)
@@ -1301,25 +1316,42 @@ fn split_bottom_panel(
     (content.with_max_y(split), Some(content.with_min_y(split)))
 }
 
-fn split_editor_column(rect: egui::Rect, find_open: bool) -> (egui::Rect, Option<egui::Rect>) {
-    let editor_top = (rect.top() + TITLEBAR_HEIGHT).min(rect.bottom());
-    let findbar = find_open.then(|| {
-        egui::Rect::from_min_max(
-            egui::pos2(
-                rect.left(),
-                (rect.bottom() - FIND_BAR_HEIGHT).max(editor_top),
-            ),
-            rect.right_bottom(),
-        )
-    });
-    let editor = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), editor_top),
-        egui::pos2(
-            rect.right(),
-            findbar.map_or(rect.bottom(), |findbar| findbar.top()),
-        ),
-    );
-    (editor, findbar)
+fn editor_column_content(rect: egui::Rect) -> egui::Rect {
+    rect.with_min_y((rect.top() + TITLEBAR_HEIGHT).min(rect.bottom()))
+}
+
+fn split_pane_content(rect: egui::Rect, find_open: bool) -> (egui::Rect, Option<egui::Rect>) {
+    let findbar =
+        find_open.then(|| rect.with_min_y((rect.bottom() - FIND_BAR_HEIGHT).max(rect.top())));
+    (
+        rect.with_max_y(findbar.map_or(rect.bottom(), |bar| bar.top())),
+        findbar,
+    )
+}
+
+fn pane_focus_corner_radius(rect: egui::Rect, window: egui::Rect) -> egui::CornerRadius {
+    let left = (rect.left() - window.left()).abs() <= 0.5;
+    let right = (rect.right() - window.right()).abs() <= 0.5;
+    let top = (rect.top() - window.top()).abs() <= 0.5;
+    let bottom = (rect.bottom() - window.bottom()).abs() <= 0.5;
+    egui::CornerRadius {
+        nw: if left && top { WINDOW_CORNER_RADIUS } else { 0 },
+        ne: if right && top {
+            WINDOW_CORNER_RADIUS
+        } else {
+            0
+        },
+        sw: if left && bottom {
+            WINDOW_CORNER_RADIUS
+        } else {
+            0
+        },
+        se: if right && bottom {
+            WINDOW_CORNER_RADIUS
+        } else {
+            0
+        },
+    }
 }
 
 fn pane_header_and_content(
@@ -1946,6 +1978,10 @@ fn terminal_toggle_rect(file_tree_button: egui::Rect) -> egui::Rect {
     file_tree_button.translate(egui::vec2(file_tree_button.width(), 0.0))
 }
 
+fn settings_toggle_rect(terminal_button: egui::Rect) -> egui::Rect {
+    terminal_button.translate(egui::vec2(terminal_button.width(), 0.0))
+}
+
 fn agentic_toggle_rect(file_tree_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
     let right = sidebar_right
         .map(|right| {
@@ -2226,6 +2262,8 @@ struct HighlightCache {
     bracket_job: Option<LayoutJob>,
     galley_key: Option<GalleyKey>,
     presentation_revision: u64,
+    lsp_key: Option<(u64, u64)>,
+    lsp_job: LayoutJob,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2245,9 +2283,93 @@ struct FileTab {
     markdown_layout: Option<((u64, u32), Arc<egui::Galley>)>,
 }
 
+struct PaneFind {
+    open: bool,
+    query: String,
+    focus: bool,
+    matches: Vec<std::ops::Range<usize>>,
+    match_revision: u64,
+    match_query: String,
+    selected: usize,
+    scroll_to_match: bool,
+}
+
+impl Default for PaneFind {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            focus: false,
+            matches: Vec::new(),
+            match_revision: u64::MAX,
+            match_query: String::new(),
+            selected: 0,
+            scroll_to_match: false,
+        }
+    }
+}
+
 struct AgentComposerAttachment {
     file: PromptAttachment,
     thumbnail: Option<egui::TextureHandle>,
+}
+
+enum SettingsAction {
+    Back,
+    Enabled(bool),
+    Mode(PresetId, ServerMode),
+    Apply(PresetId, String, String),
+    Reset(PresetId),
+    Rescan,
+}
+
+struct LspDiagnosticsState {
+    revision: u64,
+    stale: bool,
+    generation: u64,
+    diagnostics: Vec<crate::lsp::Diagnostic>,
+}
+
+struct LspCaret {
+    tag: RequestTag,
+    rect: egui::Rect,
+    bounds: egui::Rect,
+}
+
+struct CompletionPopup {
+    tag: RequestTag,
+    items: Vec<CompletionItem>,
+    selected: usize,
+    anchor: egui::Rect,
+    bounds: egui::Rect,
+}
+
+struct HoverProbe {
+    tag: RequestTag,
+    pointer: egui::Pos2,
+    bounds: egui::Rect,
+    started: Instant,
+    requested: bool,
+}
+
+struct HoverPopup {
+    tag: RequestTag,
+    pointer: egui::Pos2,
+    bounds: egui::Rect,
+    content: HoverContent,
+    markdown: Option<LayoutJob>,
+}
+
+struct DefinitionChooser {
+    locations: Vec<DefinitionLocation>,
+    selected: usize,
+}
+
+enum LspFeatureSend {
+    Sent,
+    Retry,
+    Waiting,
+    Unsupported,
 }
 
 struct AgentFilePicker {
@@ -2614,14 +2736,7 @@ pub struct EditorApp {
     search_query: String,
     search_selected: usize,
     focus_search: bool,
-    find_open: bool,
-    find_query: String,
-    focus_find: bool,
-    find_matches: Vec<std::ops::Range<usize>>,
-    find_match_revision: u64,
-    find_match_query: String,
-    find_selected: usize,
-    scroll_to_find_match: bool,
+    pane_find: HashMap<PaneId, PaneFind>,
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     bracket_pair_key: Option<(u64, usize)>,
     sidebar: bool,
@@ -2662,6 +2777,237 @@ pub struct EditorApp {
     error: Option<String>,
     should_close: bool,
     window_action: Option<WindowAction>,
+    settings_open: bool,
+    settings_search: String,
+    settings: Settings,
+    settings_error: Option<String>,
+    settings_drafts: HashMap<PresetId, (String, String)>,
+    lsp_controllers: HashMap<PresetId, LspController>,
+    lsp_pending_controls: HashMap<PresetId, LspCommand>,
+    lsp_status: HashMap<PresetId, ServerStatus>,
+    lsp_detail: HashMap<PresetId, String>,
+    lsp_open: HashMap<PathBuf, (PresetId, u64)>,
+    lsp_pending_saves: HashSet<PathBuf>,
+    lsp_sync_needed: bool,
+    lsp_diagnostics: HashMap<PathBuf, LspDiagnosticsState>,
+    lsp_generation: u64,
+    lsp_scroll_to: Option<(PathBuf, usize)>,
+    lsp_caret: Option<LspCaret>,
+    lsp_completion: Option<CompletionPopup>,
+    lsp_hover_probe: Option<HoverProbe>,
+    lsp_hover: Option<HoverPopup>,
+    lsp_definitions: Option<DefinitionChooser>,
+    lsp_pending_completion: Option<(RequestTag, Option<String>)>,
+    lsp_pending_hover: Option<RequestTag>,
+    lsp_pending_definition: Option<RequestTag>,
+}
+
+fn settings_quiet_button(
+    ui: &mut egui::Ui,
+    id: impl egui::AsId,
+    label: &str,
+    icon_space: f32,
+) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), TEXT_SECONDARY);
+    let (_, rect) = ui.allocate_space(egui::vec2(
+        (galley.size().x + icon_space + 20.0).max(40.0),
+        40.0,
+    ));
+    let response = ui.interact(rect, Id::new(id), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let color = if response.hovered() {
+        TEXT_PRIMARY
+    } else {
+        TEXT_SECONDARY
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0 + icon_space, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        color,
+    );
+    response
+}
+
+fn settings_navigation_row(ui: &mut egui::Ui, id: impl egui::AsId, label: &str) -> egui::Response {
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
+    let response = ui.interact(rect, Id::new(id), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            true,
+            label,
+        )
+    });
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 1.0, rect.center().y),
+            egui::vec2(2.0, 18.0),
+        ),
+        1.0,
+        ACCENT,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        TEXT_PRIMARY,
+    );
+    response
+}
+
+fn settings_toggle_row(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            enabled,
+            "Enable language servers",
+        )
+    });
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        "Enable language servers",
+        FontId::proportional(13.0),
+        if response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            TEXT_SECONDARY
+        },
+    );
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y + 11.0),
+        Align2::LEFT_CENTER,
+        "Servers start only for supported open files.",
+        FontId::proportional(11.0),
+        TEXT_MUTED,
+    );
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 18.0, rect.center().y),
+        egui::vec2(36.0, 20.0),
+    );
+    ui.painter()
+        .rect_filled(track, 10.0, if enabled { ACCENT } else { BORDER_STRONG });
+    ui.painter().circle_filled(
+        egui::pos2(
+            if enabled {
+                track.right() - 9.0
+            } else {
+                track.left() + 9.0
+            },
+            track.center().y,
+        ),
+        7.0,
+        if enabled { ACCENT_INK } else { TEXT_SECONDARY },
+    );
+    response
+}
+
+fn settings_primary_button(ui: &mut egui::Ui, id: impl egui::AsId, label: &str) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), ACCENT_INK);
+    let (_, rect) = ui.allocate_space(egui::vec2((galley.size().x + 24.0).max(88.0), 40.0));
+    let response = ui.interact(rect, Id::new(id), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    ui.painter().rect_filled(
+        rect,
+        6.0,
+        if response.hovered() {
+            Color32::from_rgb(112, 222, 234)
+        } else {
+            ACCENT
+        },
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.5),
+        ACCENT_INK,
+    );
+    response
+}
+
+fn settings_mode_combo(
+    ui: &mut egui::Ui,
+    preset: PresetId,
+    mode: &mut ServerMode,
+) -> egui::Response {
+    let label = match mode {
+        ServerMode::Auto => "Auto",
+        ServerMode::Custom => "Custom",
+        ServerMode::Off => "Off",
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(11.0, 7.0);
+        ui.spacing_mut().interact_size.y = 34.0;
+        let visuals = &mut ui.style_mut().visuals.widgets;
+        visuals.inactive.weak_bg_fill = SURFACE_INPUT;
+        visuals.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER_SUBTLE);
+        visuals.hovered.weak_bg_fill = SURFACE_HOVER;
+        visuals.hovered.bg_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
+        visuals.active.weak_bg_fill = SURFACE_SELECTED;
+        visuals.active.bg_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
+        visuals.open.weak_bg_fill = SURFACE_SELECTED;
+        visuals.open.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        visuals.inactive.corner_radius = 6.into();
+        visuals.hovered.corner_radius = 6.into();
+        visuals.active.corner_radius = 6.into();
+        visuals.open.corner_radius = 6.into();
+        egui::ComboBox::from_id_salt(("server_mode", preset.as_str()))
+            .width(120.0)
+            .selected_text(RichText::new(label).color(TEXT_PRIMARY).size(12.5))
+            .icon(|ui, rect, visuals, open| {
+                let center = rect.center();
+                let direction = if open { -1.0 } else { 1.0 };
+                let tip = center + egui::vec2(0.0, 2.5 * direction);
+                let stroke = egui::Stroke::new(1.4, visuals.fg_stroke.color);
+                ui.painter()
+                    .line_segment([center + egui::vec2(-3.5, -2.0 * direction), tip], stroke);
+                ui.painter()
+                    .line_segment([tip, center + egui::vec2(3.5, -2.0 * direction)], stroke);
+            })
+            .popup_style(egui::style::StyleModifier::new(|style| {
+                style.spacing.item_spacing.y = 2.0;
+                style.visuals.window_fill = SURFACE_RAISED;
+                style.visuals.window_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
+                style.visuals.menu_corner_radius = 8.into();
+            }))
+            .show_ui(ui, |ui| {
+                for (candidate, label) in [
+                    (ServerMode::Auto, "Auto"),
+                    (ServerMode::Custom, "Custom"),
+                    (ServerMode::Off, "Off"),
+                ] {
+                    let row = selectable_row(ui, label, *mode == candidate, 34.0);
+                    ui.painter().text(
+                        egui::pos2(row.rect.left() + 9.0, row.rect.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(12.5),
+                        row.foreground,
+                    );
+                    if row.response.clicked() {
+                        *mode = candidate;
+                    }
+                }
+            })
+            .response
+    })
+    .inner
 }
 
 impl EditorApp {
@@ -2686,6 +3032,14 @@ impl EditorApp {
             .unwrap_or_default();
         let syntaxes = SyntaxManager::built_in()?;
         let search = SearchController::new(target.root.clone())?;
+        let (settings, settings_error) =
+            match data_dir().map(|directory| directory.join("settings.json")) {
+                Ok(path) => match settings::load(&path) {
+                    Ok(settings) => (settings, None),
+                    Err(error) => (Settings::default(), Some(error)),
+                },
+                Err(error) => (Settings::default(), Some(error)),
+            };
         Ok(Self {
             tabs,
             active_tab,
@@ -2703,14 +3057,7 @@ impl EditorApp {
             search_query: String::new(),
             search_selected: 0,
             focus_search: false,
-            find_open: false,
-            find_query: String::new(),
-            focus_find: false,
-            find_matches: Vec::new(),
-            find_match_revision: u64::MAX,
-            find_match_query: String::new(),
-            find_selected: 0,
-            scroll_to_find_match: false,
+            pane_find: HashMap::new(),
             bracket_pair: None,
             bracket_pair_key: None,
             sidebar: true,
@@ -2751,6 +3098,29 @@ impl EditorApp {
             error: None,
             should_close: false,
             window_action: None,
+            settings_open: false,
+            settings_search: String::new(),
+            settings,
+            settings_error,
+            settings_drafts: HashMap::new(),
+            lsp_controllers: HashMap::new(),
+            lsp_pending_controls: HashMap::new(),
+            lsp_status: HashMap::new(),
+            lsp_detail: HashMap::new(),
+            lsp_open: HashMap::new(),
+            lsp_pending_saves: HashSet::new(),
+            lsp_sync_needed: true,
+            lsp_diagnostics: HashMap::new(),
+            lsp_generation: 0,
+            lsp_scroll_to: None,
+            lsp_caret: None,
+            lsp_completion: None,
+            lsp_hover_probe: None,
+            lsp_hover: None,
+            lsp_definitions: None,
+            lsp_pending_completion: None,
+            lsp_pending_hover: None,
+            lsp_pending_definition: None,
         })
     }
 
@@ -2785,8 +3155,17 @@ impl EditorApp {
             .insert(self.active_pane, self.tabs[index].buffer.path.clone());
         self.tree.select(Some(self.tabs[index].buffer.path.clone()));
         if changed {
-            self.find_match_revision = u64::MAX;
-            self.scroll_to_find_match = self.find_open;
+            self.lsp_completion = None;
+            self.lsp_hover = None;
+            self.lsp_hover_probe = None;
+            self.lsp_definitions = None;
+            self.lsp_pending_completion = None;
+            self.lsp_pending_hover = None;
+            self.lsp_pending_definition = None;
+            if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                find.match_revision = u64::MAX;
+                find.scroll_to_match = find.open;
+            }
             self.bracket_pair = None;
             self.bracket_pair_key = None;
             self.cursor = self.tabs[index]
@@ -2811,6 +3190,7 @@ impl EditorApp {
             Ok(buffer) => {
                 self.tabs.push(FileTab::new(buffer, self.active_pane));
                 self.activate_tab(self.tabs.len() - 1);
+                self.lsp_sync_needed = true;
             }
             Err(error) => self.show_error(error),
         }
@@ -2822,6 +3202,7 @@ impl EditorApp {
         }
         let was_active = self.active_tab == Some(index);
         let removed = self.tabs.remove(index);
+        self.lsp_sync_needed = true;
         if self.active_tab.is_some_and(|active| active > index) {
             self.active_tab = self.active_tab.map(|active| active - 1);
         }
@@ -2836,6 +3217,7 @@ impl EditorApp {
         }
         if next_in_pane.is_none() {
             self.pane_layout.remove(removed.pane);
+            self.pane_find.remove(&removed.pane);
         }
         if was_active {
             self.active_tab = None;
@@ -2898,6 +3280,7 @@ impl EditorApp {
             } else {
                 self.pane_active_tabs.remove(&source);
                 self.pane_layout.remove(source);
+                self.pane_find.remove(&source);
             }
         }
         self.activate_tab(index);
@@ -2946,14 +3329,18 @@ impl EditorApp {
         let Some(index) = self.active_tab else {
             return true;
         };
-        let buffer = &mut self.tabs[index].buffer;
         let save_as = destination.is_some();
-        let path = destination.unwrap_or_else(|| buffer.path.clone());
-        let path_changed = path != buffer.path;
-        match safe_save(buffer, &path) {
+        let old_path = self.tabs[index].buffer.path.clone();
+        let path = destination.unwrap_or_else(|| old_path.clone());
+        let path_changed = path != old_path;
+        match safe_save(&mut self.tabs[index].buffer, &path) {
             Ok(()) => {
                 if path_changed {
                     self.tabs[index].highlight_cache.valid = false;
+                    self.lsp_sync_needed = true;
+                } else if self.lsp_open.contains_key(&path) {
+                    self.lsp_pending_saves.insert(path);
+                    self.lsp_sync_needed = true;
                 }
                 true
             }
@@ -3011,8 +3398,23 @@ impl EditorApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.shortcuts(&ctx);
-        if self.find_open {
-            self.refresh_find_matches();
+        self.poll_lsp(&ctx);
+        if self.lsp_sync_needed {
+            self.sync_lsp_documents(&ctx);
+        }
+        if self.settings_open {
+            self.draw_settings(root, root.max_rect());
+            self.draw_dialogs(&ctx);
+            self.draw_error(&ctx);
+            return;
+        }
+        let find_panes = self
+            .pane_find
+            .iter()
+            .filter_map(|(pane, find)| find.open.then_some(*pane))
+            .collect::<Vec<_>>();
+        for pane in find_panes {
+            self.refresh_find_matches(pane);
         }
         if self.search_open {
             self.search.poll(&self.search_query);
@@ -3042,13 +3444,14 @@ impl EditorApp {
             split_bottom_panel(workspace, self.terminal_open, self.terminal_height);
         let editor_column = editor_column.with_max_y(workspace.bottom());
         let agent = agent.with_max_y(workspace.bottom());
-        let (editor, findbar) = split_editor_column(editor_column, self.find_open);
+        let editor = editor_column_content(editor_column);
         if let Some(sidebar) = sidebar {
             root.scope_builder(
                 UiBuilder::new().id_salt("sidebar").max_rect(sidebar),
                 |ui| self.draw_sidebar(ui),
             );
         }
+        self.lsp_caret = None;
         let mut pane_rects = self.pane_layout.rects(editor);
         if self.update_tab_drag(&ctx, &pane_rects) {
             pane_rects = self.pane_layout.rects(editor);
@@ -3071,6 +3474,26 @@ impl EditorApp {
         let titlebar = window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom()));
         for (pane, rect) in pane_rects.iter().copied() {
             let (header, content) = pane_header_and_content(titlebar, editor, rect);
+            let pane_bounds = egui::Rect::from_min_max(header.left_top(), rect.right_bottom());
+            let pointer_interaction = ctx
+                .pointer_hover_pos()
+                .is_some_and(|pointer| pane_bounds.shrink(1.0).contains(pointer))
+                && ctx.input(|input| {
+                    input.pointer.any_pressed() || input.smooth_scroll_delta != egui::Vec2::ZERO
+                });
+            if pane != self.active_pane
+                && pointer_interaction
+                && let Some(index) = self
+                    .pane_active_tabs
+                    .get(&pane)
+                    .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            {
+                self.activate_tab(index);
+            }
+            let (content, findbar) = split_pane_content(
+                content,
+                self.pane_find.get(&pane).is_some_and(|find| find.open),
+            );
             if header.top() >= editor.top() - 0.5 {
                 root.scope_builder(
                     UiBuilder::new()
@@ -3100,7 +3523,14 @@ impl EditorApp {
                             .id_salt(("editor_pane_preview", pane.0))
                             .max_rect(content),
                         |ui| {
-                            self.draw_editor_pane(ui, pane, false, dragged_path.as_deref(), true);
+                            self.draw_editor_pane(
+                                ui,
+                                pane,
+                                editor,
+                                false,
+                                dragged_path.as_deref(),
+                                true,
+                            );
                         },
                     );
                 } else {
@@ -3124,17 +3554,24 @@ impl EditorApp {
                     .id_salt(("editor_pane", pane.0))
                     .max_rect(content),
                 |ui| {
-                    self.draw_editor_pane(ui, pane, single_pane, path_override.as_deref(), false);
+                    self.draw_editor_pane(
+                        ui,
+                        pane,
+                        editor,
+                        single_pane,
+                        path_override.as_deref(),
+                        false,
+                    );
                 },
             );
-        }
-        if let Some(findbar) = findbar {
-            root.scope_builder(
-                UiBuilder::new()
-                    .id_salt("file_search_bar")
-                    .max_rect(findbar),
-                |ui| self.draw_find(ui),
-            );
+            if let Some(findbar) = findbar {
+                root.scope_builder(
+                    UiBuilder::new()
+                        .id_salt(("file_search_bar", pane.0))
+                        .max_rect(findbar),
+                    |ui| self.draw_find(ui, pane),
+                );
+            }
         }
         if self.agent_sidebar {
             root.scope_builder(
@@ -3160,6 +3597,20 @@ impl EditorApp {
             agent_sidebar_at_frame_start,
             dragged_pane,
         );
+        if pane_rects.len() > 1
+            && let Some((_, rect)) = pane_rects
+                .iter()
+                .find(|(pane, _)| *pane == self.active_pane)
+        {
+            let (header, _) = pane_header_and_content(titlebar, editor, *rect);
+            let focus_rect = egui::Rect::from_min_max(header.left_top(), rect.right_bottom());
+            root.painter().rect_stroke(
+                focus_rect,
+                pane_focus_corner_radius(focus_rect, window),
+                egui::Stroke::new(1.0, PANE_FOCUS_BORDER),
+                egui::StrokeKind::Inside,
+            );
+        }
         let divider_stroke_width = ctx.input(|input| input.physical_pixel_size());
         if self.tab_drag.is_none() {
             for handle in self.pane_layout.split_handles(editor) {
@@ -3217,7 +3668,7 @@ impl EditorApp {
             if self.sidebar_dragging
                 && let Some(pointer) = pointer
             {
-                self.sidebar_width = (pointer.x - window.left()).clamp(120.0, 500.0);
+                self.sidebar_width = (pointer.x - window.left()).clamp(SIDEBAR_MIN_WIDTH, 500.0);
                 ctx.request_repaint();
             }
             if hovered || self.sidebar_dragging {
@@ -3296,6 +3747,10 @@ impl EditorApp {
             draw_tab_drag_ghost(&ctx, &drag_label(path));
             ctx.set_cursor_icon(CursorIcon::Grabbing);
         }
+        if self.lsp_sync_needed {
+            self.sync_lsp_documents(&ctx);
+        }
+        self.draw_lsp_popups(root);
         self.draw_search(root);
         self.draw_dialogs(&ctx);
         self.draw_error(&ctx);
@@ -3456,8 +3911,9 @@ impl EditorApp {
         );
         let file_tree_button = file_tree_toggle_rect(rect, agent_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
+        let settings_button = settings_toggle_rect(terminal_button);
         let agentic_button =
-            agentic_toggle_rect(terminal_button, sessions.map(|sessions| sessions.right()));
+            agentic_toggle_rect(settings_button, sessions.map(|sessions| sessions.right()));
         #[cfg(target_os = "macos")]
         let controls_right = rect.right();
         #[cfg(not(target_os = "macos"))]
@@ -3465,7 +3921,7 @@ impl EditorApp {
         let sidebar_drag_rect = egui::Rect::from_min_max(
             egui::pos2(
                 if cfg!(target_os = "macos") {
-                    file_tree_button.right()
+                    settings_button.right()
                 } else {
                     rect.left()
                 },
@@ -3475,7 +3931,7 @@ impl EditorApp {
         );
         let drag_rect = egui::Rect::from_min_max(
             egui::pos2(
-                agentic_button.right().max(file_tree_button.right()) + 4.0,
+                agentic_button.right().max(settings_button.right()) + 4.0,
                 rect.top(),
             ),
             egui::pos2(controls_right, rect.bottom()),
@@ -3494,6 +3950,9 @@ impl EditorApp {
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.toggle_terminal(ui.ctx());
+        }
+        if self.draw_settings_toggle(ui, settings_button) {
+            self.open_settings();
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.set_agentic_mode(false, ui.ctx());
@@ -3525,6 +3984,37 @@ impl EditorApp {
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
+        let diagnostic_counts = active
+            .and_then(|index| self.lsp_diagnostics.get(&self.tabs[index].buffer.path))
+            .map(|state| {
+                state
+                    .diagnostics
+                    .iter()
+                    .fold((0, 0), |(errors, warnings), diagnostic| {
+                        match diagnostic.severity {
+                            crate::lsp::DiagnosticSeverity::Error => (errors + 1, warnings),
+                            crate::lsp::DiagnosticSeverity::Warning => (errors, warnings + 1),
+                            _ => (errors, warnings),
+                        }
+                    })
+            })
+            .filter(|counts| *counts != (0, 0));
+        let diagnostic_rect = diagnostic_counts.map(|_| {
+            egui::Rect::from_min_max(
+                egui::pos2((controls_right - 86.0).max(tabs_left), rect.top()),
+                egui::pos2(controls_right, rect.bottom()),
+            )
+        });
+        if let (Some((errors, warnings)), Some(button)) = (diagnostic_counts, diagnostic_rect) {
+            ui.painter().text(
+                button.center(),
+                Align2::CENTER_CENTER,
+                format!("E {errors}   W {warnings}"),
+                FontId::proportional(11.0),
+                TEXT_SECONDARY,
+            );
+        }
+        let controls_right = diagnostic_rect.map_or(controls_right, |button| button.left());
         let markdown =
             active.is_some_and(|index| markdown::is_markdown(&self.tabs[index].buffer.path));
         let preview = active.is_some_and(|index| self.tabs[index].markdown_preview);
@@ -3653,8 +4143,9 @@ impl EditorApp {
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
+        let settings_button = settings_toggle_rect(terminal_button);
         let agentic_button = agentic_toggle_rect(
-            terminal_button,
+            settings_button,
             self.sidebar.then_some(editor_header.left()),
         );
         #[cfg(target_os = "macos")]
@@ -3673,7 +4164,7 @@ impl EditorApp {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let first_tabs_left = terminal_button.right().max(agentic_button.right()) + 4.0;
+        let first_tabs_left = settings_button.right().max(agentic_button.right()) + 4.0;
         for (pane, pane_rect) in panes
             .iter()
             .copied()
@@ -3707,7 +4198,7 @@ impl EditorApp {
             }
         }
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = terminal_button.right();
+        let sidebar_drag_left = settings_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
         let sidebar_drag_right = (agentic_button.left() - 3.0).max(sidebar_drag_left);
@@ -3751,6 +4242,9 @@ impl EditorApp {
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.toggle_terminal(ui.ctx());
+        }
+        if self.draw_settings_toggle(ui, settings_button) {
+            self.open_settings();
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.set_agentic_mode(true, ui.ctx());
@@ -3861,6 +4355,7 @@ impl EditorApp {
         &mut self,
         ui: &mut egui::Ui,
         pane: PaneId,
+        editor: egui::Rect,
         single_pane: bool,
         path_override: Option<&Path>,
         preview: bool,
@@ -3877,16 +4372,20 @@ impl EditorApp {
                 self.draw_editor(ui, pane, single_pane, path_override, preview);
             },
         );
-        ui.painter().vline(
-            rect.right() - 0.5,
-            rect.y_range(),
-            egui::Stroke::new(1.0, BORDER_STRONG),
-        );
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_STRONG),
-        );
+        if rect.right() + 0.5 < editor.right() {
+            ui.painter().vline(
+                rect.right() - 0.5,
+                rect.y_range(),
+                egui::Stroke::new(1.0, BORDER_STRONG),
+            );
+        }
+        if rect.bottom() + 0.5 < editor.bottom() {
+            ui.painter().hline(
+                rect.x_range(),
+                rect.bottom() - 0.5,
+                egui::Stroke::new(1.0, BORDER_STRONG),
+            );
+        }
     }
 
     fn draw_file_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect, pane: PaneId) {
@@ -4356,6 +4855,1140 @@ impl EditorApp {
         }
     }
 
+    fn draw_settings_toggle(&self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
+        let response = ui.interact(rect, Id::new("settings_toggle"), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open Settings")
+        });
+        let center = rect.center();
+        let color = if response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            TEXT_SECONDARY
+        };
+        ui.painter()
+            .circle_stroke(center, 5.5, egui::Stroke::new(1.5, color));
+        ui.painter()
+            .circle_stroke(center, 1.8, egui::Stroke::new(1.4, color));
+        for index in 0..8 {
+            let angle = index as f32 * std::f32::consts::FRAC_PI_4;
+            let direction = egui::vec2(angle.cos(), angle.sin());
+            ui.painter().line_segment(
+                [center + direction * 5.5, center + direction * 8.0],
+                egui::Stroke::new(1.8, color),
+            );
+        }
+        response.clicked()
+    }
+
+    fn draw_settings(&mut self, root: &mut egui::Ui, window: egui::Rect) {
+        root.painter().rect_filled(window, 0.0, CANVAS);
+        let rail_width = 270.0_f32.min((window.width() * 0.38).max(210.0));
+        let rail = egui::Rect::from_min_max(
+            window.left_top(),
+            egui::pos2(window.left() + rail_width, window.bottom()),
+        );
+        let content = egui::Rect::from_min_max(
+            egui::pos2(rail.right(), window.top()),
+            window.right_bottom(),
+        );
+        root.painter().rect_filled(rail, 0.0, SURFACE);
+        root.painter().vline(
+            rail.right(),
+            rail.y_range(),
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        let mut actions = Vec::new();
+        root.scope_builder(
+            UiBuilder::new()
+                .id_salt("settings_rail")
+                .max_rect(rail.shrink2(egui::vec2(20.0, 18.0))),
+            |ui| {
+                ui.set_width(ui.available_width());
+                let back = settings_quiet_button(ui, "settings_back", "Back to app", 16.0);
+                let arrow_center = egui::pos2(back.rect.left() + 11.0, back.rect.center().y);
+                let arrow_stroke = egui::Stroke::new(
+                    1.4,
+                    if back.hovered() {
+                        TEXT_PRIMARY
+                    } else {
+                        TEXT_SECONDARY
+                    },
+                );
+                ui.painter().line_segment(
+                    [
+                        arrow_center + egui::vec2(3.0, -4.0),
+                        arrow_center + egui::vec2(-1.0, 0.0),
+                    ],
+                    arrow_stroke,
+                );
+                ui.painter().line_segment(
+                    [
+                        arrow_center + egui::vec2(-1.0, 0.0),
+                        arrow_center + egui::vec2(3.0, 4.0),
+                    ],
+                    arrow_stroke,
+                );
+                if back.clicked() {
+                    actions.push(SettingsAction::Back);
+                }
+                ui.add_space(12.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.settings_search)
+                        .hint_text("Search settings…")
+                        .margin(egui::Margin::symmetric(10, 7))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(24.0);
+                ui.label(
+                    RichText::new("EDITOR")
+                        .size(10.0)
+                        .strong()
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+                settings_navigation_row(ui, "settings_language_servers", "Language Servers");
+            },
+        );
+        root.scope_builder(
+            UiBuilder::new()
+                .id_salt("settings_content")
+                .max_rect(content),
+            |ui| {
+                ScrollArea::vertical()
+                    .id_salt("settings_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let width = ui.available_width().min(780.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(((ui.available_width() - width) * 0.5).max(20.0));
+                            ui.vertical(|ui| {
+                                ui.set_width(width.min(ui.available_width()));
+                                ui.add_space(40.0);
+                                ui.label(
+                                    RichText::new("Language Servers")
+                                        .size(20.0)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.add_space(8.0);
+                                let query = self.settings_search.trim().to_ascii_lowercase();
+                                let show_general = query.is_empty()
+                                    || [
+                                        "general",
+                                        "enable language servers",
+                                        "start only for supported open files",
+                                    ]
+                                    .iter()
+                                    .any(|label| label.contains(&query));
+                                let show_servers = lsp_catalog()
+                                    .iter()
+                                    .any(|preset| settings_preset_matches(preset, &query));
+                                if show_general {
+                                    ui.label(
+                                        RichText::new("General")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.add_space(10.0);
+                                    egui::Frame::new()
+                                        .fill(SURFACE_RAISED)
+                                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                                        .corner_radius(10)
+                                        .inner_margin(egui::Margin::symmetric(18, 10))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            let enabled = self.settings.language_servers.enabled;
+                                            if settings_toggle_row(ui, enabled).clicked() {
+                                                actions.push(SettingsAction::Enabled(!enabled));
+                                            }
+                                        });
+                                }
+                                if show_servers {
+                                    if show_general {
+                                        ui.add_space(8.0);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_height(40.0);
+                                        ui.label(
+                                            RichText::new("Servers")
+                                                .size(13.0)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if settings_quiet_button(
+                                                    ui,
+                                                    "settings_rescan",
+                                                    "Rescan",
+                                                    0.0,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(SettingsAction::Rescan);
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(2.0);
+                                    egui::Frame::new()
+                                        .fill(SURFACE_RAISED)
+                                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                                        .corner_radius(10)
+                                        .inner_margin(egui::Margin::symmetric(18, 0))
+                                        .show(ui, |ui| self.draw_server_settings(ui, &mut actions));
+                                }
+                                if !show_general && !show_servers {
+                                    ui.label(
+                                        RichText::new("No matching settings").color(TEXT_MUTED),
+                                    );
+                                }
+                                if let Some(error) = &self.settings_error {
+                                    ui.add_space(12.0);
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 125, 125),
+                                        format!("Settings were not changed: {error}"),
+                                    );
+                                }
+                                ui.add_space(34.0);
+                            });
+                        });
+                    });
+            },
+        );
+        for action in actions {
+            self.apply_settings_action(action, root.ctx());
+        }
+        if self.lsp_sync_needed {
+            root.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn draw_server_settings(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        let query = self.settings_search.trim().to_ascii_lowercase();
+        let presets = lsp_catalog()
+            .iter()
+            .filter(|preset| settings_preset_matches(preset, &query))
+            .copied()
+            .collect::<Vec<_>>();
+        if presets.is_empty() {
+            ui.label(RichText::new("No matching language servers").color(TEXT_MUTED));
+            return;
+        }
+        for (row, preset) in presets.into_iter().enumerate() {
+            if row > 0 {
+                ui.separator();
+            }
+            let mut mode = self.server_mode(preset.id);
+            let (_, row_rect) = ui.allocate_space(egui::vec2(ui.available_width(), 64.0));
+            ui.painter().text(
+                egui::pos2(row_rect.left(), row_rect.center().y - 11.0),
+                Align2::LEFT_CENTER,
+                preset.language,
+                FontId::proportional(13.0),
+                TEXT_PRIMARY,
+            );
+            ui.painter().text(
+                egui::pos2(row_rect.left(), row_rect.center().y + 8.0),
+                Align2::LEFT_CENTER,
+                preset.name,
+                FontId::proportional(10.5),
+                TEXT_MUTED,
+            );
+            let controls = egui::Rect::from_min_max(
+                egui::pos2(row_rect.center().x, row_rect.top()),
+                row_rect.right_bottom(),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(controls), |ui| {
+                ui.set_width(ui.available_width());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    settings_mode_combo(ui, preset.id, &mut mode);
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(self.server_status_label(preset.id))
+                            .size(10.5)
+                            .color(TEXT_SECONDARY),
+                    );
+                });
+            });
+            if mode != self.server_mode(preset.id) {
+                actions.push(SettingsAction::Mode(preset.id, mode));
+            }
+            if mode == ServerMode::Custom {
+                let default = || {
+                    self.settings
+                        .language_servers
+                        .servers
+                        .get(preset.id.as_str())
+                        .and_then(|override_| {
+                            override_
+                                .command
+                                .clone()
+                                .map(|command| (command, override_.args.join("\n")))
+                        })
+                        .unwrap_or_else(|| (preset.command.to_owned(), preset.args.join("\n")))
+                };
+                let draft = self
+                    .settings_drafts
+                    .entry(preset.id)
+                    .or_insert_with(default);
+                ui.add_space(2.0);
+                ui.label(RichText::new("Executable").small().color(TEXT_SECONDARY));
+                ui.add(
+                    TextEdit::singleline(&mut draft.0)
+                        .hint_text("Executable path or command")
+                        .margin(egui::Margin::symmetric(9, 7))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("Arguments (one per line)")
+                        .small()
+                        .color(TEXT_SECONDARY),
+                );
+                ui.add(
+                    TextEdit::multiline(&mut draft.1)
+                        .hint_text("One argument per line")
+                        .margin(egui::Margin::symmetric(9, 7))
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if settings_primary_button(
+                        ui,
+                        ("settings_apply", preset.id.as_str()),
+                        "Apply and restart",
+                    )
+                    .clicked()
+                    {
+                        actions.push(SettingsAction::Apply(
+                            preset.id,
+                            draft.0.clone(),
+                            draft.1.clone(),
+                        ));
+                    }
+                    if settings_quiet_button(
+                        ui,
+                        ("settings_reset", preset.id.as_str()),
+                        "Reset to auto",
+                        0.0,
+                    )
+                    .clicked()
+                    {
+                        actions.push(SettingsAction::Reset(preset.id));
+                    }
+                });
+                ui.add_space(16.0);
+            }
+            let detail = match self.lsp_status.get(&preset.id) {
+                Some(ServerStatus::Failed(error)) => Some(
+                    self.lsp_detail
+                        .get(&preset.id)
+                        .map_or_else(|| error.clone(), |detail| format!("{error}\n{detail}")),
+                ),
+                _ => self.lsp_detail.get(&preset.id).cloned(),
+            };
+            if let Some(detail) = detail {
+                ui.add_space(5.0);
+                ui.colored_label(Color32::from_rgb(255, 125, 125), truncate_lines(&detail, 3));
+            }
+        }
+    }
+
+    fn server_mode(&self, preset: PresetId) -> ServerMode {
+        self.settings
+            .language_servers
+            .servers
+            .get(preset.as_str())
+            .map_or(ServerMode::Auto, |override_| override_.mode)
+    }
+
+    fn server_status_label(&self, preset: PresetId) -> &'static str {
+        match self.lsp_status.get(&preset) {
+            Some(ServerStatus::Starting) => "Starting",
+            Some(ServerStatus::Ready(_)) => "Ready",
+            Some(ServerStatus::NotFound) => "Not found",
+            Some(ServerStatus::Failed(_)) => "Failed",
+            Some(ServerStatus::Stopped) => "Stopped",
+            Some(ServerStatus::NotStarted) | None => "Not started",
+        }
+    }
+
+    fn apply_settings_action(&mut self, action: SettingsAction, ctx: &egui::Context) {
+        match action {
+            SettingsAction::Back => self.settings_open = false,
+            SettingsAction::Enabled(enabled) => {
+                let old = self.settings.clone();
+                self.settings.language_servers.enabled = enabled;
+                if !self.persist_settings() {
+                    self.settings = old;
+                    return;
+                }
+                self.lsp_sync_needed = true;
+                let presets = self.lsp_controllers.keys().copied().collect::<Vec<_>>();
+                for preset in presets {
+                    self.restart_lsp(preset);
+                }
+            }
+            SettingsAction::Mode(preset, mode) => {
+                let old = self.settings.clone();
+                match mode {
+                    ServerMode::Auto => {
+                        self.settings
+                            .language_servers
+                            .servers
+                            .remove(preset.as_str());
+                        self.settings_drafts.remove(&preset);
+                    }
+                    ServerMode::Off => {
+                        self.settings.language_servers.servers.insert(
+                            preset.as_str().into(),
+                            ServerOverride {
+                                mode,
+                                command: None,
+                                args: Vec::new(),
+                            },
+                        );
+                    }
+                    ServerMode::Custom => {
+                        let descriptor = lsp_catalog()
+                            .iter()
+                            .find(|candidate| candidate.id == preset)
+                            .unwrap();
+                        let command = descriptor.command.to_owned();
+                        let args = descriptor
+                            .args
+                            .iter()
+                            .map(|arg| (*arg).to_owned())
+                            .collect::<Vec<_>>();
+                        self.settings_drafts
+                            .insert(preset, (command.clone(), args.join("\n")));
+                        self.settings.language_servers.servers.insert(
+                            preset.as_str().into(),
+                            ServerOverride {
+                                mode,
+                                command: Some(command),
+                                args,
+                            },
+                        );
+                    }
+                }
+                if !self.persist_settings() {
+                    self.settings = old;
+                    return;
+                }
+                self.lsp_sync_needed = true;
+                self.restart_lsp(preset);
+            }
+            SettingsAction::Apply(preset, command, args) => {
+                let old = self.settings.clone();
+                self.settings.language_servers.servers.insert(
+                    preset.as_str().into(),
+                    ServerOverride {
+                        mode: ServerMode::Custom,
+                        command: Some(command),
+                        args: args.lines().map(str::to_owned).collect(),
+                    },
+                );
+                if !self.persist_settings() {
+                    self.settings = old;
+                    return;
+                }
+                self.lsp_sync_needed = true;
+                self.restart_lsp(preset);
+            }
+            SettingsAction::Reset(preset) => {
+                let old = self.settings.clone();
+                self.settings
+                    .language_servers
+                    .servers
+                    .remove(preset.as_str());
+                self.settings_drafts.remove(&preset);
+                if !self.persist_settings() {
+                    self.settings = old;
+                    return;
+                }
+                self.lsp_sync_needed = true;
+                self.restart_lsp(preset);
+            }
+            SettingsAction::Rescan => {
+                for preset in lsp_catalog() {
+                    self.ensure_lsp_controller(preset.id, ctx);
+                    self.send_lsp_control(preset.id, LspCommand::Rescan);
+                }
+            }
+        }
+    }
+
+    fn persist_settings(&mut self) -> bool {
+        if self.settings_error.is_some() {
+            return false;
+        }
+        let result = data_dir()
+            .and_then(|directory| settings::save(&directory.join("settings.json"), &self.settings));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.settings_error = Some(error);
+                false
+            }
+        }
+    }
+
+    fn server_launch(&self, preset: PresetId) -> ServerLaunch {
+        if !self.settings.language_servers.enabled {
+            return ServerLaunch::Off;
+        }
+        match self.settings.language_servers.servers.get(preset.as_str()) {
+            None => ServerLaunch::Auto,
+            Some(override_) if override_.mode == ServerMode::Off => ServerLaunch::Off,
+            Some(override_) if override_.mode == ServerMode::Custom => ServerLaunch::Custom {
+                command: override_.command.clone().unwrap_or_default(),
+                args: override_.args.clone(),
+            },
+            Some(_) => ServerLaunch::Auto,
+        }
+    }
+
+    #[cfg(test)]
+    fn ensure_lsp_controller(&mut self, _preset: PresetId, _ctx: &egui::Context) {}
+
+    #[cfg(not(test))]
+    fn ensure_lsp_controller(&mut self, preset: PresetId, ctx: &egui::Context) {
+        if self.lsp_controllers.contains_key(&preset) {
+            return;
+        }
+        let descriptor = lsp_catalog()
+            .iter()
+            .find(|candidate| candidate.id == preset)
+            .unwrap();
+        let launch = self.server_launch(preset);
+        let wake = ctx.clone();
+        self.lsp_controllers.insert(
+            preset,
+            LspController::start(
+                self.tree.root.clone(),
+                descriptor,
+                launch,
+                Arc::new(move || wake.request_repaint()),
+            ),
+        );
+    }
+
+    fn restart_lsp(&mut self, preset: PresetId) {
+        self.send_lsp_control(preset, LspCommand::Restart(self.server_launch(preset)));
+    }
+
+    fn send_lsp_control(&mut self, preset: PresetId, command: LspCommand) {
+        let sent = self
+            .lsp_controllers
+            .get(&preset)
+            .is_none_or(|controller| controller.send(command.clone()).is_ok());
+        if sent {
+            self.lsp_pending_controls.remove(&preset);
+        } else {
+            self.lsp_pending_controls.insert(preset, command);
+            self.lsp_sync_needed = true;
+        }
+    }
+
+    fn sync_lsp_documents(&mut self, ctx: &egui::Context) {
+        self.lsp_sync_needed = false;
+        for (preset, command) in self
+            .lsp_pending_controls
+            .iter()
+            .map(|(preset, command)| (*preset, command.clone()))
+            .collect::<Vec<_>>()
+        {
+            let sent = self
+                .lsp_controllers
+                .get(&preset)
+                .is_some_and(|controller| controller.send(command).is_ok());
+            if sent {
+                self.lsp_pending_controls.remove(&preset);
+            } else {
+                self.lsp_sync_needed = true;
+            }
+        }
+        let desired = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|tab| {
+                !tab.1.buffer.large_file_warning && tab.1.buffer.text.len() <= LARGE_FILE_BYTES
+            })
+            .filter_map(|(index, tab)| {
+                let (preset, language_id) = preset_for_path(&tab.buffer.path)?;
+                Some((
+                    index,
+                    tab.buffer.path.clone(),
+                    preset.id,
+                    language_id.to_owned(),
+                    tab.buffer.revision,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let desired_paths = desired
+            .iter()
+            .map(|(_, path, ..)| path.clone())
+            .collect::<HashSet<_>>();
+        let closed = self
+            .lsp_open
+            .keys()
+            .filter(|path| !desired_paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in closed {
+            let Some((preset, _)) = self.lsp_open.get(&path).copied() else {
+                continue;
+            };
+            if self
+                .lsp_controllers
+                .get(&preset)
+                .is_some_and(|controller| controller.send(LspCommand::Close(path.clone())).is_ok())
+            {
+                self.lsp_open.remove(&path);
+                self.lsp_pending_saves.remove(&path);
+                self.lsp_diagnostics.remove(&path);
+            } else {
+                self.lsp_sync_needed = true;
+            }
+        }
+        if !self.settings.language_servers.enabled {
+            return;
+        }
+        for (index, path, preset, language_id, revision) in desired {
+            if self.server_mode(preset) == ServerMode::Off {
+                continue;
+            }
+            if let Some((known_preset, known_revision)) = self.lsp_open.get_mut(&path) {
+                if *known_preset == preset
+                    && *known_revision != revision
+                    && let Some(controller) = self.lsp_controllers.get(&preset)
+                {
+                    if controller
+                        .send(LspCommand::Change {
+                            path: path.clone(),
+                            text: self.tabs[index].buffer.text.clone(),
+                            revision,
+                        })
+                        .is_ok()
+                    {
+                        *known_revision = revision;
+                    } else {
+                        self.lsp_sync_needed = true;
+                    }
+                }
+                continue;
+            }
+            self.ensure_lsp_controller(preset, ctx);
+            if let Some(controller) = self.lsp_controllers.get(&preset)
+                && controller
+                    .send(LspCommand::Open(crate::lsp::DocumentSnapshot {
+                        path: path.clone(),
+                        language_id,
+                        text: self.tabs[index].buffer.text.clone(),
+                        revision,
+                    }))
+                    .is_ok()
+            {
+                self.lsp_open.insert(path, (preset, revision));
+            } else {
+                self.lsp_sync_needed = true;
+            }
+        }
+        let saves = self.lsp_pending_saves.iter().cloned().collect::<Vec<_>>();
+        for path in saves {
+            let sent = self.lsp_open.get(&path).is_some_and(|(preset, _)| {
+                self.lsp_controllers.get(preset).is_some_and(|controller| {
+                    controller.send(LspCommand::Save(path.clone())).is_ok()
+                })
+            });
+            if sent || !desired_paths.contains(&path) {
+                self.lsp_pending_saves.remove(&path);
+            } else {
+                self.lsp_sync_needed = true;
+            }
+        }
+        self.send_pending_lsp_requests(ctx);
+        if self.lsp_sync_needed {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn send_pending_lsp_requests(&mut self, ctx: &egui::Context) {
+        if let Some((tag, trigger)) = self.lsp_pending_completion.clone() {
+            if !self.tag_matches_cursor(&tag) {
+                self.lsp_pending_completion = None;
+            } else {
+                match self.send_lsp_feature(
+                    &tag,
+                    |capabilities| capabilities.completion,
+                    LspCommand::Complete {
+                        tag: tag.clone(),
+                        trigger,
+                    },
+                ) {
+                    LspFeatureSend::Sent | LspFeatureSend::Unsupported => {
+                        self.lsp_pending_completion = None;
+                    }
+                    LspFeatureSend::Retry => {
+                        self.lsp_sync_needed = true;
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                    LspFeatureSend::Waiting => {}
+                }
+            }
+        }
+        if let Some(tag) = self.lsp_pending_hover.clone() {
+            let current = self
+                .lsp_hover_probe
+                .as_ref()
+                .is_some_and(|probe| probe.tag == tag);
+            if !current {
+                self.lsp_pending_hover = None;
+            } else {
+                match self.send_lsp_feature(
+                    &tag,
+                    |capabilities| capabilities.hover,
+                    LspCommand::Hover(tag.clone()),
+                ) {
+                    LspFeatureSend::Sent | LspFeatureSend::Unsupported => {
+                        self.lsp_pending_hover = None;
+                    }
+                    LspFeatureSend::Retry => {
+                        self.lsp_sync_needed = true;
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                    LspFeatureSend::Waiting => {}
+                }
+            }
+        }
+        if let Some(tag) = self.lsp_pending_definition.clone() {
+            if !self.tag_matches_cursor(&tag) {
+                self.lsp_pending_definition = None;
+            } else {
+                match self.send_lsp_feature(
+                    &tag,
+                    |capabilities| capabilities.definition,
+                    LspCommand::Definition(tag.clone()),
+                ) {
+                    LspFeatureSend::Sent | LspFeatureSend::Unsupported => {
+                        self.lsp_pending_definition = None;
+                    }
+                    LspFeatureSend::Retry => {
+                        self.lsp_sync_needed = true;
+                        ctx.request_repaint_after(Duration::from_millis(50));
+                    }
+                    LspFeatureSend::Waiting => {}
+                }
+            }
+        }
+    }
+
+    fn send_lsp_feature(
+        &self,
+        tag: &RequestTag,
+        supported: impl FnOnce(&ServerCapabilities) -> bool,
+        command: LspCommand,
+    ) -> LspFeatureSend {
+        let Some((preset, _)) = self.lsp_open.get(&tag.path) else {
+            return LspFeatureSend::Waiting;
+        };
+        let Some(status) = self.lsp_status.get(preset) else {
+            return LspFeatureSend::Waiting;
+        };
+        let ServerStatus::Ready(capabilities) = status else {
+            return if matches!(status, ServerStatus::NotStarted | ServerStatus::Starting) {
+                LspFeatureSend::Waiting
+            } else {
+                LspFeatureSend::Unsupported
+            };
+        };
+        if !supported(capabilities) {
+            return LspFeatureSend::Unsupported;
+        }
+        match self.lsp_controllers.get(preset) {
+            Some(controller) if controller.send(command).is_ok() => LspFeatureSend::Sent,
+            Some(_) => LspFeatureSend::Retry,
+            None => LspFeatureSend::Waiting,
+        }
+    }
+
+    fn active_request_tag(&self) -> Option<RequestTag> {
+        let tab = self.active_tab.and_then(|index| self.tabs.get(index))?;
+        Some(RequestTag {
+            path: tab.buffer.path.clone(),
+            revision: tab.buffer.revision,
+            cursor: tab.editor_surface.cursor(),
+        })
+    }
+
+    fn tag_matches_cursor(&self, tag: &RequestTag) -> bool {
+        self.active_request_tag().as_ref() == Some(tag)
+    }
+
+    fn poll_lsp(&mut self, ctx: &egui::Context) {
+        let cursor_context_changed = ctx.input(|input| {
+            input.pointer.any_click()
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Cut
+                            | egui::Event::Paste(_)
+                            | egui::Event::Text(_)
+                            | egui::Event::Ime(_)
+                            | egui::Event::Key { pressed: true, .. }
+                    )
+                })
+        });
+        let presets = self.lsp_controllers.keys().copied().collect::<Vec<_>>();
+        for preset in presets {
+            let events = self.lsp_controllers[&preset]
+                .events()
+                .try_iter()
+                .collect::<Vec<_>>();
+            for event in events {
+                match event {
+                    crate::lsp::Event::StateChanged(status) => {
+                        if matches!(status, ServerStatus::Ready(_)) {
+                            self.lsp_sync_needed = true;
+                            self.lsp_detail.remove(&preset);
+                        }
+                        if self.lsp_pending_completion.is_some()
+                            || self.lsp_pending_hover.is_some()
+                            || self.lsp_pending_definition.is_some()
+                        {
+                            self.lsp_sync_needed = true;
+                        }
+                        self.lsp_status.insert(preset, status);
+                    }
+                    crate::lsp::Event::ServerMessage(message) => {
+                        self.lsp_detail.insert(preset, message);
+                    }
+                    crate::lsp::Event::ProcessExited { error, stderr } => {
+                        self.lsp_status.insert(preset, ServerStatus::Failed(error));
+                        if !stderr.is_empty() {
+                            self.lsp_detail.insert(preset, stderr);
+                        }
+                        for (path, (owner, _)) in &self.lsp_open {
+                            if *owner == preset
+                                && let Some(diagnostics) = self.lsp_diagnostics.get_mut(path)
+                            {
+                                diagnostics.stale = true;
+                                self.lsp_generation = self.lsp_generation.wrapping_add(1);
+                                diagnostics.generation = self.lsp_generation;
+                            }
+                        }
+                        if self.lsp_completion.as_ref().is_some_and(|popup| {
+                            preset_for_path(&popup.tag.path)
+                                .is_some_and(|(owner, _)| owner.id == preset)
+                        }) {
+                            self.lsp_completion = None;
+                        }
+                        if self.lsp_hover.as_ref().is_some_and(|popup| {
+                            preset_for_path(&popup.tag.path)
+                                .is_some_and(|(owner, _)| owner.id == preset)
+                        }) {
+                            self.lsp_hover = None;
+                            self.lsp_hover_probe = None;
+                        }
+                    }
+                    crate::lsp::Event::Diagnostics {
+                        path,
+                        revision,
+                        diagnostics,
+                        ..
+                    } => {
+                        if self
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.buffer.path == path && tab.buffer.revision == revision)
+                        {
+                            self.lsp_generation = self.lsp_generation.wrapping_add(1);
+                            self.lsp_diagnostics.insert(
+                                path,
+                                LspDiagnosticsState {
+                                    revision,
+                                    stale: false,
+                                    generation: self.lsp_generation,
+                                    diagnostics,
+                                },
+                            );
+                        }
+                    }
+                    crate::lsp::Event::DiagnosticsStale(path) => {
+                        if let Some(diagnostics) = self.lsp_diagnostics.get_mut(&path) {
+                            diagnostics.stale = true;
+                            self.lsp_generation = self.lsp_generation.wrapping_add(1);
+                            diagnostics.generation = self.lsp_generation;
+                        }
+                    }
+                    crate::lsp::Event::Completion {
+                        tag,
+                        items,
+                        truncated,
+                    } => {
+                        if !cursor_context_changed
+                            && self.tag_matches_cursor(&tag)
+                            && let Some(caret) =
+                                self.lsp_caret.as_ref().filter(|caret| caret.tag == tag)
+                        {
+                            if truncated {
+                                self.lsp_detail.insert(
+                                    preset,
+                                    "Completion results were truncated to 500 items".into(),
+                                );
+                            }
+                            self.lsp_completion = (!items.is_empty()).then_some(CompletionPopup {
+                                tag,
+                                items,
+                                selected: 0,
+                                anchor: caret.rect,
+                                bounds: caret.bounds,
+                            });
+                        }
+                    }
+                    crate::lsp::Event::Hover { tag, content } => {
+                        if !cursor_context_changed
+                            && self
+                                .lsp_hover_probe
+                                .as_ref()
+                                .is_some_and(|probe| probe.tag == tag)
+                            && let Some(content) = content
+                        {
+                            let probe = self.lsp_hover_probe.as_ref().unwrap();
+                            let markdown = content.markdown.then(|| {
+                                markdown::compact_layout(&content.text, 400.0, |_, _| None)
+                            });
+                            self.lsp_hover = Some(HoverPopup {
+                                tag,
+                                pointer: probe.pointer,
+                                bounds: probe.bounds,
+                                content,
+                                markdown,
+                            });
+                        }
+                    }
+                    crate::lsp::Event::Definitions {
+                        tag,
+                        locations,
+                        truncated,
+                    } => {
+                        if !cursor_context_changed && self.tag_matches_cursor(&tag) {
+                            if truncated {
+                                self.lsp_detail.insert(
+                                    preset,
+                                    "Definition results were truncated to 200 locations".into(),
+                                );
+                            }
+                            match locations.len() {
+                                0 => {
+                                    self.show_error("No valid local definition was returned".into())
+                                }
+                                1 => self
+                                    .navigate_to_definition(locations.into_iter().next().unwrap()),
+                                _ => {
+                                    self.lsp_definitions = Some(DefinitionChooser {
+                                        locations,
+                                        selected: 0,
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_lsp_popups(&mut self, root: &mut egui::Ui) {
+        self.draw_lsp_hover(root);
+        self.draw_lsp_completion(root);
+        self.draw_lsp_definitions(root);
+    }
+
+    fn draw_lsp_completion(&mut self, root: &mut egui::Ui) {
+        let Some(popup) = self.lsp_completion.as_ref() else {
+            return;
+        };
+        let row_count = popup.items.len().min(12);
+        let start = popup
+            .selected
+            .saturating_sub(11)
+            .min(popup.items.len().saturating_sub(row_count));
+        let rows = popup.items[start..start + row_count]
+            .iter()
+            .enumerate()
+            .map(|(offset, item)| {
+                (
+                    start + offset,
+                    item.label.clone(),
+                    completion_kind_label(item.kind),
+                    item.detail.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let selected = popup.selected;
+        let width = 480.0_f32.min(popup.bounds.width().max(1.0));
+        let position = popup_position(
+            popup.anchor.left_bottom() + egui::vec2(0.0, 4.0),
+            egui::vec2(width, row_count as f32 * 34.0 + 12.0),
+            popup.bounds,
+        );
+        let mut clicked = None;
+        egui::Area::new(Id::new("lsp_completion"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .corner_radius(7)
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 12.0);
+                        for (index, label, kind, detail) in &rows {
+                            let response =
+                                selectable_content_row(ui, *index == selected, 22.0, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(label).monospace().color(TEXT_PRIMARY),
+                                        );
+                                        if let Some(kind) = kind {
+                                            ui.label(
+                                                RichText::new(*kind).small().color(TEXT_MUTED),
+                                            );
+                                        }
+                                        if let Some(detail) = detail {
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(detail)
+                                                            .small()
+                                                            .color(TEXT_SECONDARY),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+                            if response.clicked() {
+                                clicked = Some(*index);
+                            }
+                        }
+                    });
+            });
+        if let Some(index) = clicked {
+            if let Some(popup) = self.lsp_completion.as_mut() {
+                popup.selected = index;
+            }
+            self.accept_completion();
+        }
+    }
+
+    fn draw_lsp_hover(&self, root: &mut egui::Ui) {
+        if self.lsp_completion.is_some() {
+            return;
+        }
+        let Some(popup) = self.lsp_hover.as_ref() else {
+            return;
+        };
+        let width = 420.0_f32.min(popup.bounds.width().max(1.0));
+        let position = popup_position(
+            popup.pointer + egui::vec2(12.0, 16.0),
+            egui::vec2(width, 300.0_f32.min(popup.bounds.height())),
+            popup.bounds,
+        );
+        egui::Area::new(Id::new("lsp_hover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .corner_radius(7)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 20.0);
+                        ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                            if let Some(job) = &popup.markdown {
+                                ui.add(Label::new(job.clone()).wrap());
+                            } else {
+                                ui.label(&popup.content.text);
+                            }
+                        });
+                    });
+            });
+    }
+
+    fn draw_lsp_definitions(&mut self, root: &mut egui::Ui) {
+        let Some(chooser) = self.lsp_definitions.as_ref() else {
+            return;
+        };
+        let selected = chooser.selected;
+        let locations = chooser.locations.clone();
+        let screen = root.ctx().content_rect();
+        let size = egui::vec2(
+            620.0_f32.min(screen.width()),
+            420.0_f32.min(screen.height()),
+        );
+        let position = egui::pos2(screen.center().x - size.x / 2.0, screen.top() + 48.0);
+        let mut clicked = None;
+        egui::Area::new(Id::new("lsp_definitions"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(size.x - 24.0);
+                        ui.label(RichText::new("Go to definition").size(15.0).strong());
+                        ui.label(
+                            RichText::new("Up/Down navigate   Enter open   Esc close")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ScrollArea::vertical()
+                            .max_height(size.y - 72.0)
+                            .show(ui, |ui| {
+                                for (index, location) in locations.iter().enumerate() {
+                                    let label = format!(
+                                        "{}:{}:{}",
+                                        location.path.display(),
+                                        location.line + 1,
+                                        location.character + 1
+                                    );
+                                    let response =
+                                        selectable_content_row(ui, index == selected, 24.0, |ui| {
+                                            ui.label(
+                                                RichText::new(&label)
+                                                    .monospace()
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                        });
+                                    if response.clicked() {
+                                        clicked = Some(index);
+                                    }
+                                }
+                            });
+                    });
+            });
+        if let Some(index) = clicked {
+            self.lsp_definitions = None;
+            self.navigate_to_definition(locations[index].clone());
+        }
+    }
+
     fn draw_error(&mut self, ctx: &egui::Context) {
         let Some(error) = self.error.clone() else {
             return;
@@ -4378,6 +6011,42 @@ impl EditorApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        let toggle_settings =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(Key::Comma));
+        if self.settings_open {
+            if toggle_settings || ctx.input(|input| input.key_pressed(Key::Escape)) {
+                self.settings_open = false;
+            }
+            return;
+        }
+        if toggle_settings {
+            self.open_settings();
+            self.focus_editor = false;
+            self.tree_focused = false;
+            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+            return;
+        }
+        if self.handle_lsp_popup_keys(ctx) {
+            return;
+        }
+        let completion =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::Space));
+        if completion && let Some(tag) = self.active_request_tag() {
+            self.lsp_completion = None;
+            self.lsp_hover = None;
+            self.lsp_pending_completion = Some((tag, None));
+            self.lsp_sync_needed = true;
+        }
+        let definition = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::F12));
+        if definition && let Some(tag) = self.active_request_tag() {
+            self.lsp_pending_definition = Some(tag);
+            self.lsp_definitions = None;
+            self.lsp_sync_needed = true;
+        }
+        if ctx.input(|input| input.key_pressed(Key::F8)) {
+            let forward = !ctx.input(|input| input.modifiers.shift);
+            self.navigate_diagnostic(forward);
+        }
         let (save, save_quit, project_search, find, sidebar, tree, editor, close) =
             ctx.input(|input| {
                 let command = input.modifiers.command;
@@ -4402,21 +6071,29 @@ impl EditorApp {
             self.save(None);
         }
         if project_search {
+            self.lsp_completion = None;
+            self.lsp_hover = None;
+            self.lsp_definitions = None;
             self.search_open = true;
-            self.find_open = false;
+            if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                find.open = false;
+            }
             self.focus_search = true;
             self.focus_editor = false;
             self.tree_focused = false;
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
         }
         if find {
+            self.lsp_completion = None;
+            self.lsp_hover = None;
             if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
                 tab.markdown_preview = false;
             }
-            self.find_open = true;
             self.search_open = false;
-            self.focus_find = true;
-            self.scroll_to_find_match = !self.find_matches.is_empty();
+            let find = self.pane_find.entry(self.active_pane).or_default();
+            find.open = true;
+            find.focus = true;
+            find.scroll_to_match = !find.matches.is_empty();
             self.focus_editor = false;
             self.tree_focused = false;
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
@@ -4451,22 +6128,232 @@ impl EditorApp {
         }
     }
 
-    fn refresh_find_matches(&mut self) {
+    fn handle_lsp_popup_keys(&mut self, ctx: &egui::Context) -> bool {
+        if self.lsp_definitions.is_some() {
+            let down =
+                ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
+            let up = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+            let enter = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter));
+            let escape =
+                ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape));
+            let chooser = self.lsp_definitions.as_mut().unwrap();
+            if down {
+                chooser.selected = (chooser.selected + 1).min(chooser.locations.len() - 1);
+            } else if up {
+                chooser.selected = chooser.selected.saturating_sub(1);
+            }
+            if enter {
+                let location = chooser.locations[chooser.selected].clone();
+                self.lsp_definitions = None;
+                self.navigate_to_definition(location);
+            } else if escape {
+                self.lsp_definitions = None;
+            }
+            return down || up || enter || escape;
+        }
+        if self.lsp_completion.is_some() {
+            let down =
+                ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
+            let up = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::ArrowUp));
+            let enter = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter));
+            let tab = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Tab));
+            let escape =
+                ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape));
+            let popup = self.lsp_completion.as_mut().unwrap();
+            if down {
+                popup.selected = (popup.selected + 1).min(popup.items.len() - 1);
+            } else if up {
+                popup.selected = popup.selected.saturating_sub(1);
+            }
+            if enter || tab {
+                self.accept_completion();
+            } else if escape {
+                self.lsp_completion = None;
+            }
+            return down || up || enter || tab || escape;
+        }
+        if self.lsp_hover.is_some()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            self.lsp_hover = None;
+            self.lsp_hover_probe = None;
+            return true;
+        }
+        false
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.lsp_completion = None;
+        self.lsp_hover = None;
+        self.lsp_hover_probe = None;
+        self.lsp_definitions = None;
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(popup) = self.lsp_completion.take() else {
+            return;
+        };
+        if !self.tag_matches_cursor(&popup.tag) {
+            return;
+        }
+        let Some(item) = popup.items.get(popup.selected) else {
+            return;
+        };
         let Some(index) = self.active_tab else {
-            self.find_matches.clear();
-            self.find_selected = 0;
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        let (range, replacement) = if let Some(edit) = &item.edit {
+            if edit.range.end > tab.buffer.text.len()
+                || !tab.buffer.text.is_char_boundary(edit.range.start)
+                || !tab.buffer.text.is_char_boundary(edit.range.end)
+            {
+                return;
+            }
+            (
+                tab.buffer.text[..edit.range.start].chars().count()
+                    ..tab.buffer.text[..edit.range.end].chars().count(),
+                edit.new_text.as_str(),
+            )
+        } else {
+            (
+                completion_word_range(&tab.buffer.text, popup.tag.cursor),
+                item.insert_text.as_str(),
+            )
+        };
+        tab.editor_surface.set_selection(range.start, range.end);
+        if tab
+            .editor_surface
+            .replace_selection(&mut tab.buffer.text, replacement)
+        {
+            tab.buffer.mark_changed();
+            tab.highlight_cache.valid = false;
+            self.cursor = tab.buffer.line_column(tab.editor_surface.cursor());
+            self.lsp_sync_needed = true;
+            self.lsp_hover = None;
+            self.lsp_hover_probe = None;
+            self.lsp_caret = None;
+        }
+    }
+
+    fn navigate_diagnostic(&mut self, forward: bool) {
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let path = self.tabs[index].buffer.path.clone();
+        let Some(state) = self.lsp_diagnostics.get(&path) else {
+            return;
+        };
+        if state.diagnostics.is_empty() {
+            return;
+        }
+        let cursor = self.tabs[index]
+            .buffer
+            .byte_index(self.tabs[index].editor_surface.cursor());
+        let target = if forward {
+            state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start > cursor)
+                .min_by_key(|diagnostic| diagnostic.range.start)
+                .or_else(|| {
+                    state
+                        .diagnostics
+                        .iter()
+                        .min_by_key(|diagnostic| diagnostic.range.start)
+                })
+        } else {
+            state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.range.start < cursor)
+                .max_by_key(|diagnostic| diagnostic.range.start)
+                .or_else(|| {
+                    state
+                        .diagnostics
+                        .iter()
+                        .max_by_key(|diagnostic| diagnostic.range.start)
+                })
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let character = self.tabs[index].buffer.text[..target.range.start]
+            .chars()
+            .count();
+        self.tabs[index]
+            .editor_surface
+            .set_selection(character, character);
+        self.lsp_scroll_to = Some((path, character));
+        self.focus_editor = true;
+        self.tree_focused = false;
+    }
+
+    fn navigate_to_definition(&mut self, location: DefinitionLocation) {
+        if (location.end_line, location.end_character) < (location.line, location.character) {
+            self.show_error("Language server returned a reversed definition range".into());
+            return;
+        }
+        match fs::metadata(&location.path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                self.show_error(format!(
+                    "Definition target is not a file: {}",
+                    location.path.display()
+                ));
+                return;
+            }
+            Err(error) => {
+                self.show_error(format!(
+                    "Cannot open definition {}: {error}",
+                    location.path.display()
+                ));
+                return;
+            }
+        }
+        self.open_tab(location.path.clone(), false);
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.buffer.path == location.path)
+        else {
+            return;
+        };
+        let byte = crate::lsp::byte_for_position(
+            &self.tabs[index].buffer.text,
+            lsp_types::Position::new(location.line, location.character),
+        );
+        let character = self.tabs[index].buffer.text[..byte].chars().count();
+        self.tabs[index]
+            .editor_surface
+            .set_selection(character, character);
+        self.activate_tab(index);
+        self.lsp_scroll_to = Some((location.path, character));
+    }
+
+    fn refresh_find_matches(&mut self, pane: PaneId) {
+        let index = self
+            .pane_active_tabs
+            .get(&pane)
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
+        let Some(find) = self.pane_find.get_mut(&pane) else {
+            return;
+        };
+        let Some(index) = index else {
+            find.matches.clear();
+            find.selected = 0;
             return;
         };
         let buffer = &self.tabs[index].buffer;
-        if self.find_match_revision == buffer.revision && self.find_match_query == self.find_query {
+        if find.match_revision == buffer.revision && find.match_query == find.query {
             return;
         }
-        self.find_matches = match_spans(&buffer.text, &self.find_query);
-        self.find_match_revision = buffer.revision;
-        self.find_match_query.clone_from(&self.find_query);
-        self.find_selected = self
-            .find_selected
-            .min(self.find_matches.len().saturating_sub(1));
+        find.matches = match_spans(&buffer.text, &find.query);
+        find.match_revision = buffer.revision;
+        find.match_query.clone_from(&find.query);
+        find.selected = find.selected.min(find.matches.len().saturating_sub(1));
         self.tabs[index].highlight_cache.find_valid = false;
     }
 
@@ -4655,12 +6542,24 @@ impl EditorApp {
             match reconcile_buffer(&mut tab.buffer) {
                 Ok(ReconcileOutcome::Unchanged) => {}
                 Ok(ReconcileOutcome::Reloaded) => {
+                    if let Some((_, revision)) = self.lsp_open.get_mut(&tab.buffer.path) {
+                        *revision = u64::MAX;
+                    }
+                    if let Some(diagnostics) = self.lsp_diagnostics.get_mut(&tab.buffer.path) {
+                        self.lsp_generation = self.lsp_generation.wrapping_add(1);
+                        diagnostics.stale = true;
+                        diagnostics.generation = self.lsp_generation;
+                    }
                     let cursor = tab.editor_surface.cursor();
                     tab.editor_surface = EditorSurface::default();
                     tab.editor_surface.set_selection(cursor, cursor);
                     tab.highlight_cache = HighlightCache::default();
                     tab.markdown_layout = None;
                     active_reloaded |= self.active_tab == Some(index);
+                    self.lsp_sync_needed = true;
+                    self.lsp_completion = None;
+                    self.lsp_hover = None;
+                    self.lsp_hover_probe = None;
                 }
                 Ok(ReconcileOutcome::Conflict) => {
                     conflict.get_or_insert(index);
@@ -4670,7 +6569,9 @@ impl EditorApp {
             };
         }
         if active_reloaded {
-            self.find_match_revision = u64::MAX;
+            self.pane_find
+                .values_mut()
+                .for_each(|find| find.match_revision = u64::MAX);
             self.bracket_pair = None;
             self.bracket_pair_key = None;
         }
@@ -6992,26 +8893,28 @@ impl EditorApp {
         }
     }
 
-    fn draw_find(&mut self, ui: &mut egui::Ui) {
-        if !self.find_open {
+    fn draw_find(&mut self, ui: &mut egui::Ui, pane: PaneId) {
+        if !self.pane_find.get(&pane).is_some_and(|find| find.open) {
             return;
         }
         let ctx = ui.ctx().clone();
-        let query_focused = ctx.memory(|memory| memory.has_focus(Id::new("file_search_query")));
+        let query_id = Id::new(("file_search_query", pane.0));
+        let query_focused = ctx.memory(|memory| memory.has_focus(query_id));
         let (enter, backwards, mut close) = ctx.input(|input| {
             (
                 query_focused && input.key_pressed(Key::Enter),
                 input.modifiers.shift,
-                input.key_pressed(Key::Escape),
+                pane == self.active_pane && input.key_pressed(Key::Escape),
             )
         });
         let mut query_changed = false;
         let mut previous = false;
         let mut next = false;
-        let count = if self.find_matches.is_empty() {
-            "0 / 0".to_owned()
-        } else {
-            format!("{} / {}", self.find_selected + 1, self.find_matches.len())
+        let count = match self.pane_find.get(&pane) {
+            Some(find) if !find.matches.is_empty() => {
+                format!("{} / {}", find.selected + 1, find.matches.len())
+            }
+            _ => "0 / 0".to_owned(),
         };
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, SURFACE);
@@ -7033,10 +8936,11 @@ impl EditorApp {
                     .corner_radius(4)
                     .show(ui, |ui| {
                         ui.set_width((input_width - 12.0).max(28.0));
+                        let find = self.pane_find.get_mut(&pane).expect("open pane find");
                         ui.add_sized(
                             egui::vec2(ui.available_width(), 20.0),
-                            TextEdit::singleline(&mut self.find_query)
-                                .id(Id::new("file_search_query"))
+                            TextEdit::singleline(&mut find.query)
+                                .id(query_id)
                                 .font(FontId::proportional(13.0))
                                 .hint_text("Find in current file…")
                                 .frame(egui::Frame::NONE),
@@ -7049,34 +8953,49 @@ impl EditorApp {
                 previous = chevron_icon_button(ui, true, "Previous match (Shift+Enter)").clicked();
                 next = chevron_icon_button(ui, false, "Next match (Enter)").clicked();
                 close |= close_icon_button(ui).clicked();
-                if self.focus_find {
+                let find = self.pane_find.get_mut(&pane).expect("open pane find");
+                if find.focus {
                     response.request_focus();
-                    self.focus_find = false;
+                    find.focus = false;
                 }
                 query_changed = response.changed();
             },
         );
         if query_changed {
-            self.find_selected = 0;
-            self.find_match_revision = u64::MAX;
-            self.refresh_find_matches();
-            self.scroll_to_find_match = !self.find_matches.is_empty();
+            let find = self.pane_find.get_mut(&pane).expect("open pane find");
+            find.selected = 0;
+            find.match_revision = u64::MAX;
+            self.refresh_find_matches(pane);
+            let find = self.pane_find.get_mut(&pane).expect("open pane find");
+            find.scroll_to_match = !find.matches.is_empty();
             ctx.request_repaint();
-        } else if (enter || previous || next) && !self.find_matches.is_empty() {
-            self.find_selected = next_find_match(
-                self.find_selected,
-                self.find_matches.len(),
+        } else if (enter || previous || next)
+            && self
+                .pane_find
+                .get(&pane)
+                .is_some_and(|find| !find.matches.is_empty())
+        {
+            let find = self.pane_find.get_mut(&pane).expect("open pane find");
+            find.selected = next_find_match(
+                find.selected,
+                find.matches.len(),
                 previous || (enter && backwards),
             );
-            if let Some(index) = self.active_tab {
+            find.scroll_to_match = true;
+            if let Some(index) = self
+                .pane_active_tabs
+                .get(&pane)
+                .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+            {
                 self.tabs[index].highlight_cache.find_valid = false;
             }
-            self.scroll_to_find_match = true;
             ctx.request_repaint();
         }
         if close {
-            self.find_open = false;
-            self.focus_editor = self.active_tab.is_some();
+            self.pane_find.get_mut(&pane).expect("open pane find").open = false;
+            if pane == self.active_pane {
+                self.focus_editor = self.active_tab.is_some();
+            }
         }
     }
 
@@ -7426,18 +9345,25 @@ impl EditorApp {
             );
             return;
         }
-        let find_open = self.find_open && active_pane;
-        let find_query = &self.find_query;
-        let find_matches = &self.find_matches;
-        let find_selected = self.find_selected;
+        let find = self.pane_find.get(&pane).filter(|find| find.open);
+        let find_open = find.is_some();
+        let find_query = find.map_or("", |find| find.query.as_str());
+        let find_matches = find.map_or(&[][..], |find| find.matches.as_slice());
+        let find_selected = find.map_or(0, |find| find.selected);
+        let scroll_to_find_match = find.is_some_and(|find| find.scroll_to_match);
         let bracket_pair = active_pane.then(|| self.bracket_pair.clone()).flatten();
-        let scroll_character = (self.scroll_to_find_match && active_pane)
+        let scroll_character = scroll_to_find_match
             .then(|| find_matches.get(find_selected).cloned())
             .flatten()
             .map(|span| {
                 active_tab.map_or(0, |index| {
                     self.tabs[index].buffer.text[..span.start].chars().count()
                 })
+            })
+            .or_else(|| {
+                let (path, character) = self.lsp_scroll_to.as_ref()?;
+                let index = active_tab?;
+                (active_pane && self.tabs[index].buffer.path == *path).then_some(*character)
             });
         let Some(index) = active_tab else {
             ui.painter()
@@ -7447,6 +9373,30 @@ impl EditorApp {
             });
             return;
         };
+        let diagnostics = self
+            .lsp_diagnostics
+            .get(&self.tabs[index].buffer.path)
+            .filter(|diagnostics| diagnostics.revision == self.tabs[index].buffer.revision);
+        let line_markers = diagnostics
+            .map(|state| {
+                state
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.range.is_empty())
+                    .map(|diagnostic| {
+                        let color = diagnostic_color(diagnostic.severity);
+                        (
+                            diagnostic.line as usize,
+                            if state.stale {
+                                color.gamma_multiply(0.55)
+                            } else {
+                                color
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let FileTab {
             buffer,
             editor_surface,
@@ -7495,12 +9445,12 @@ impl EditorApp {
         let job = if find_open && !find_matches.is_empty() {
             if !cache.find_valid
                 || cache.find_revision != revision
-                || cache.find_query != *find_query
+                || cache.find_query != find_query
                 || cache.find_selected != find_selected
             {
                 cache.find_job = find_highlighted_job(&cache.job, find_matches, find_selected);
                 cache.find_revision = revision;
-                cache.find_query.clone_from(find_query);
+                cache.find_query = find_query.to_owned();
                 cache.find_selected = find_selected;
                 cache.find_valid = true;
             }
@@ -7512,7 +9462,7 @@ impl EditorApp {
             revision,
             syntax: syntax_name,
             find: (find_open && !find_matches.is_empty())
-                .then(|| (find_query.clone(), find_selected)),
+                .then(|| (find_query.to_owned(), find_selected)),
             bracket_pair: bracket_pair.clone(),
         };
         if cache.galley_key.as_ref() != Some(&galley_key) {
@@ -7523,6 +9473,17 @@ impl EditorApp {
                 .map(|pair| bracket_highlighted_job(job, pair));
         }
         let job = presentation_job(job, cache.bracket_job.as_ref());
+        let job = if let Some(diagnostics) = diagnostics {
+            let key = (cache.presentation_revision, diagnostics.generation);
+            if cache.lsp_key != Some(key) {
+                cache.lsp_job =
+                    diagnostic_highlighted_job(job, &diagnostics.diagnostics, diagnostics.stale);
+                cache.lsp_key = Some(key);
+            }
+            &cache.lsp_job
+        } else {
+            job
+        };
         let document = DocumentMetrics {
             revision: cache.presentation_revision,
             line_count: buffer.line_count(),
@@ -7544,14 +9505,73 @@ impl EditorApp {
                 request_focus: active_pane && self.focus_editor,
                 scroll_to_character: scroll_character,
                 id: editor_id,
+                line_markers: &line_markers,
             },
         );
+        let mut diagnostic_at_pointer = false;
+        if let Some(character) = output.hovered_character
+            && let Some(state) = diagnostics
+        {
+            let byte = buffer.byte_index(character);
+            if let Some(diagnostic) = state.diagnostics.iter().find(|diagnostic| {
+                if diagnostic.range.is_empty() {
+                    diagnostic.range.start == byte
+                } else {
+                    diagnostic.range.contains(&byte)
+                }
+            }) && let Some(pointer) = ui.ctx().pointer_hover_pos()
+            {
+                diagnostic_at_pointer = true;
+                let severity = match diagnostic.severity {
+                    crate::lsp::DiagnosticSeverity::Error => "Error",
+                    crate::lsp::DiagnosticSeverity::Warning => "Warning",
+                    crate::lsp::DiagnosticSeverity::Information => "Information",
+                    crate::lsp::DiagnosticSeverity::Hint => "Hint",
+                };
+                let details = [diagnostic.source.as_deref(), diagnostic.code.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                egui::Area::new(Id::new(("diagnostic_hover", &buffer.path)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pointer + egui::vec2(12.0, 16.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(SURFACE_RAISED)
+                            .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                            .corner_radius(7)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_max_width(420.0);
+                                ui.label(
+                                    RichText::new(if details.is_empty() {
+                                        severity.to_owned()
+                                    } else {
+                                        format!("{severity} · {details}")
+                                    })
+                                    .strong()
+                                    .color(diagnostic_color(diagnostic.severity)),
+                                );
+                                ui.label(&diagnostic.message);
+                            });
+                    });
+            }
+        }
         let activate_pane = !active_pane
             && (output.response.has_focus()
                 || output.response.clicked()
                 || output.response.drag_started());
-        if active_pane && self.scroll_to_find_match {
-            self.scroll_to_find_match = false;
+        if scroll_to_find_match && let Some(find) = self.pane_find.get_mut(&pane) {
+            find.scroll_to_match = false;
+        }
+        if active_pane
+            && self
+                .lsp_scroll_to
+                .as_ref()
+                .is_some_and(|(path, _)| *path == buffer.path)
+        {
+            self.lsp_scroll_to = None;
         }
         if active_pane {
             self.focus_editor = false;
@@ -7562,8 +9582,125 @@ impl EditorApp {
         if output.changed {
             buffer.mark_changed();
             cache.valid = false;
+            self.lsp_sync_needed = true;
+            self.lsp_completion = None;
+            self.lsp_hover = None;
+            self.lsp_hover_probe = None;
+            self.lsp_pending_hover = None;
+            if let Some(trigger) = output.last_inserted.map(|character| character.to_string())
+                && preset_for_path(&buffer.path).is_some_and(|(preset, _)| {
+                    matches!(
+                        self.lsp_status.get(&preset.id),
+                        Some(ServerStatus::Ready(capabilities))
+                            if capabilities.completion
+                                && capabilities.completion_triggers.contains(&trigger)
+                    )
+                })
+            {
+                self.lsp_pending_completion = Some((
+                    RequestTag {
+                        path: buffer.path.clone(),
+                        revision: buffer.revision,
+                        cursor: output.cursor,
+                    },
+                    Some(trigger),
+                ));
+            }
         }
         if active_pane {
+            if let Some(rect) = output.caret_rect {
+                let caret = LspCaret {
+                    tag: RequestTag {
+                        path: buffer.path.clone(),
+                        revision: buffer.revision,
+                        cursor: output.cursor,
+                    },
+                    rect,
+                    bounds: ui.max_rect(),
+                };
+                if self
+                    .lsp_completion
+                    .as_ref()
+                    .is_some_and(|popup| popup.tag != caret.tag)
+                {
+                    self.lsp_completion = None;
+                }
+                self.lsp_caret = Some(caret);
+            }
+            if output.response.clicked() && ui.input(|input| input.modifiers.command) {
+                self.lsp_pending_definition = Some(RequestTag {
+                    path: buffer.path.clone(),
+                    revision: buffer.revision,
+                    cursor: output.cursor,
+                });
+                self.lsp_definitions = None;
+                self.lsp_sync_needed = true;
+            }
+            if output.response.clicked() {
+                self.lsp_completion = None;
+            }
+            let pointer_interrupted = output.changed
+                || output.scrolled
+                || output.response.clicked()
+                || output.response.dragged()
+                || ui.input(|input| {
+                    input.pointer.any_click()
+                        || input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+                });
+            let hover_supported = preset_for_path(&buffer.path).is_some_and(|(preset, _)| {
+                matches!(
+                    self.lsp_status.get(&preset.id),
+                    Some(ServerStatus::Ready(capabilities)) if capabilities.hover
+                )
+            });
+            if pointer_interrupted || !hover_supported || diagnostic_at_pointer {
+                self.lsp_hover_probe = None;
+                self.lsp_hover = None;
+                self.lsp_pending_hover = None;
+            } else if let (Some(character), Some(pointer)) =
+                (output.hovered_character, ui.ctx().pointer_hover_pos())
+            {
+                let tag = RequestTag {
+                    path: buffer.path.clone(),
+                    revision: buffer.revision,
+                    cursor: character,
+                };
+                let same = self.lsp_hover_probe.as_ref().is_some_and(|probe| {
+                    probe.tag == tag && probe.pointer.distance(pointer) <= 0.5
+                });
+                if !same {
+                    self.lsp_hover_probe = Some(HoverProbe {
+                        tag,
+                        pointer,
+                        bounds: ui.max_rect(),
+                        started: Instant::now(),
+                        requested: false,
+                    });
+                    self.lsp_hover = None;
+                    self.lsp_pending_hover = None;
+                    ui.ctx().request_repaint_after(Duration::from_millis(400));
+                } else if let Some(probe) = self.lsp_hover_probe.as_mut()
+                    && !probe.requested
+                {
+                    let elapsed = probe.started.elapsed();
+                    if elapsed >= Duration::from_millis(400) {
+                        probe.requested = true;
+                        self.lsp_pending_hover = Some(probe.tag.clone());
+                        self.lsp_sync_needed = true;
+                        ui.ctx().request_repaint();
+                    } else {
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_millis(400) - elapsed);
+                    }
+                }
+            } else {
+                self.lsp_hover_probe = None;
+                self.lsp_hover = None;
+                self.lsp_pending_hover = None;
+            }
             self.cursor = buffer.line_column(output.cursor);
             let bracket_pair_key = (buffer.revision, output.cursor);
             if self.bracket_pair_key != Some(bracket_pair_key) {
@@ -8431,11 +10568,8 @@ impl ApplicationHandler<()> for ProjectChooserShell {
                 return;
             }
         };
-        let attributes = if let Some(display) = opening_display(event_loop, &attributes) {
-            fit_window_attributes_to_display(attributes, display)
-        } else {
-            attributes
-        };
+        let display = opening_display(event_loop, attributes.position);
+        let attributes = fit_startup_window_attributes(attributes, display, false);
         let window_started = Instant::now();
         #[cfg(target_os = "macos")]
         let window = create_macos_window_without_native_title(
@@ -8853,11 +10987,18 @@ fn startup_display_bounds(display: DisplayBounds) -> DisplayBounds {
 }
 
 impl WindowGeometry {
-    fn apply(self, attributes: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
-        let attributes =
-            attributes.with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1));
+    fn apply(
+        self,
+        attributes: winit::window::WindowAttributes,
+        scale_factor: f64,
+    ) -> winit::window::WindowAttributes {
+        let size =
+            winit::dpi::PhysicalSize::new(self.size.0, self.size.1).to_logical::<f64>(scale_factor);
+        let attributes = attributes.with_inner_size(size);
         if let Some((x, y)) = self.position {
-            attributes.with_position(winit::dpi::PhysicalPosition::new(x, y))
+            attributes.with_position(
+                winit::dpi::PhysicalPosition::new(x, y).to_logical::<f64>(scale_factor),
+            )
         } else {
             attributes
         }
@@ -8905,16 +11046,29 @@ fn fit_window_attributes_to_display(
     attributes
 }
 
+fn fit_startup_window_attributes(
+    attributes: winit::window::WindowAttributes,
+    display: Option<DisplayBounds>,
+    restored: bool,
+) -> winit::window::WindowAttributes {
+    if restored {
+        attributes
+    } else if let Some(display) = display {
+        fit_window_attributes_to_display(attributes, display)
+    } else {
+        attributes
+    }
+}
+
 fn opening_display(
     event_loop: &ActiveEventLoop,
-    attributes: &winit::window::WindowAttributes,
+    requested: Option<winit::dpi::Position>,
 ) -> Option<DisplayBounds> {
     let bounds = |monitor: winit::monitor::MonitorHandle| DisplayBounds {
         position: monitor.position(),
         size: monitor.size(),
         scale_factor: monitor.scale_factor(),
     };
-    let requested = attributes.position;
     requested
         .and_then(|position| {
             event_loop.available_monitors().find_map(|monitor| {
@@ -9179,15 +11333,21 @@ impl ApplicationHandler<InstanceEvent> for Shell {
         let geometry = data_dir()
             .ok()
             .and_then(|directory| load_window_geometry(&directory.join(WINDOW_GEOMETRY_FILE)));
+        let restored = geometry.is_some();
+        let display = opening_display(
+            event_loop,
+            geometry
+                .and_then(|geometry| geometry.position)
+                .map(|(x, y)| winit::dpi::PhysicalPosition::new(x, y).into()),
+        );
         let attributes = match geometry {
-            Some(geometry) => geometry.apply(attributes),
+            Some(geometry) => geometry.apply(
+                attributes,
+                display.map_or(1.0, |display| display.scale_factor),
+            ),
             None => attributes,
         };
-        let attributes = if let Some(display) = opening_display(event_loop, &attributes) {
-            fit_window_attributes_to_display(attributes, display)
-        } else {
-            attributes
-        };
+        let attributes = fit_startup_window_attributes(attributes, display, restored);
         #[cfg(target_os = "macos")]
         let attributes = attributes.with_transparent(true);
         let window_started = Instant::now();
@@ -9534,6 +11694,61 @@ fn activate_macos_application() {
             let _: () = msg_send![application, activateIgnoringOtherApps: objc::runtime::YES];
         }
     }
+}
+
+fn completion_word_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
+    let characters = text.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let mut start = cursor;
+    while start > 0 && (characters[start - 1].is_alphanumeric() || characters[start - 1] == '_') {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < characters.len() && (characters[end].is_alphanumeric() || characters[end] == '_') {
+        end += 1;
+    }
+    start..end
+}
+
+fn completion_kind_label(kind: Option<i32>) -> Option<&'static str> {
+    Some(match kind? {
+        1 => "Text",
+        2 => "Method",
+        3 => "Function",
+        4 => "Constructor",
+        5 => "Field",
+        6 => "Variable",
+        7 => "Class",
+        8 => "Interface",
+        9 => "Module",
+        10 => "Property",
+        11 => "Unit",
+        12 => "Value",
+        13 => "Enum",
+        14 => "Keyword",
+        16 => "Color",
+        17 => "File",
+        18 => "Reference",
+        19 => "Folder",
+        20 => "Enum member",
+        21 => "Constant",
+        22 => "Struct",
+        23 => "Event",
+        24 => "Operator",
+        25 => "Type parameter",
+        _ => return None,
+    })
+}
+
+fn popup_position(desired: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        desired
+            .x
+            .clamp(bounds.left(), (bounds.right() - size.x).max(bounds.left())),
+        desired
+            .y
+            .clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top())),
+    )
 }
 
 fn application_icon_rgba() -> (&'static [u8], u32, u32) {
@@ -10172,6 +12387,139 @@ fn bracket_highlighted_job(
     highlighted
 }
 
+fn diagnostic_highlighted_job(
+    base: &LayoutJob,
+    diagnostics: &[crate::lsp::Diagnostic],
+    stale: bool,
+) -> LayoutJob {
+    let mut events = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            !diagnostic.range.is_empty()
+                && diagnostic.range.end <= base.text.len()
+                && base.text.is_char_boundary(diagnostic.range.start)
+                && base.text.is_char_boundary(diagnostic.range.end)
+        })
+        .flat_map(|diagnostic| {
+            [
+                (diagnostic.range.start, true, diagnostic.severity),
+                (diagnostic.range.end, false, diagnostic.severity),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        return base.clone();
+    }
+    events.sort_unstable_by_key(|event| event.0);
+    let mut active = [0_usize; 4];
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < events.len() {
+        let position = events[index].0;
+        if cursor < position
+            && let Some(severity) = active_diagnostic_severity(active)
+        {
+            spans.push((cursor..position, severity));
+        }
+        while index < events.len() && events[index].0 == position {
+            let slot = diagnostic_severity_index(events[index].2);
+            if events[index].1 {
+                active[slot] += 1;
+            } else {
+                active[slot] = active[slot].saturating_sub(1);
+            }
+            index += 1;
+        }
+        cursor = position;
+    }
+
+    let mut highlighted = base.clone();
+    highlighted.text.clear();
+    highlighted.sections.clear();
+    let mut span_index = 0;
+    for section in &base.sections {
+        let section_start = section.byte_range.start.0;
+        let section_end = section.byte_range.end.0;
+        while span_index < spans.len() && spans[span_index].0.end <= section_start {
+            span_index += 1;
+        }
+        let mut current_span = span_index;
+        let mut section_cursor = section_start;
+        let mut leading_space = section.leading_space;
+        while current_span < spans.len() && spans[current_span].0.start < section_end {
+            let start = spans[current_span].0.start.max(section_start);
+            let end = spans[current_span].0.end.min(section_end);
+            if section_cursor < start {
+                highlighted.append(
+                    &base.text[section_cursor..start],
+                    leading_space,
+                    section.format.clone(),
+                );
+                leading_space = 0.0;
+            }
+            if start < end {
+                let mut format = section.format.clone();
+                let color = diagnostic_color(spans[current_span].1);
+                format.underline = egui::Stroke::new(
+                    1.2,
+                    if stale {
+                        color.gamma_multiply(0.55)
+                    } else {
+                        color
+                    },
+                );
+                highlighted.append(&base.text[start..end], leading_space, format);
+                leading_space = 0.0;
+                section_cursor = end;
+            }
+            current_span += 1;
+        }
+        if section_cursor < section_end {
+            highlighted.append(
+                &base.text[section_cursor..section_end],
+                leading_space,
+                section.format.clone(),
+            );
+        }
+        while span_index < spans.len() && spans[span_index].0.end <= section_end {
+            span_index += 1;
+        }
+    }
+    highlighted
+}
+
+const fn diagnostic_severity_index(severity: crate::lsp::DiagnosticSeverity) -> usize {
+    match severity {
+        crate::lsp::DiagnosticSeverity::Error => 0,
+        crate::lsp::DiagnosticSeverity::Warning => 1,
+        crate::lsp::DiagnosticSeverity::Information => 2,
+        crate::lsp::DiagnosticSeverity::Hint => 3,
+    }
+}
+
+fn active_diagnostic_severity(active: [usize; 4]) -> Option<crate::lsp::DiagnosticSeverity> {
+    [
+        crate::lsp::DiagnosticSeverity::Error,
+        crate::lsp::DiagnosticSeverity::Warning,
+        crate::lsp::DiagnosticSeverity::Information,
+        crate::lsp::DiagnosticSeverity::Hint,
+    ]
+    .into_iter()
+    .zip(active)
+    .find_map(|(severity, count)| (count > 0).then_some(severity))
+}
+
+fn diagnostic_color(severity: crate::lsp::DiagnosticSeverity) -> Color32 {
+    match severity {
+        crate::lsp::DiagnosticSeverity::Error => Color32::from_rgb(235, 91, 91),
+        crate::lsp::DiagnosticSeverity::Warning => Color32::from_rgb(224, 174, 76),
+        crate::lsp::DiagnosticSeverity::Information | crate::lsp::DiagnosticSeverity::Hint => {
+            Color32::from_rgb(104, 155, 207)
+        }
+    }
+}
+
 fn presentation_job<'a>(
     base: &'a LayoutJob,
     bracket_overlay: Option<&'a LayoutJob>,
@@ -10198,26 +12546,46 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     spans
 }
 
+fn truncate_lines(value: &str, lines: usize) -> String {
+    value.lines().take(lines).collect::<Vec<_>>().join("\n")
+}
+
+fn settings_preset_matches(preset: &crate::lsp::Preset, query: &str) -> bool {
+    query.is_empty()
+        || preset.language.to_ascii_lowercase().contains(query)
+        || preset.name.to_ascii_lowercase().contains(query)
+        || preset.id.as_str().contains(query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, DropZone, EDITOR_BACKGROUND,
-        EditorApp, PANE_TAB_HEIGHT, PaneId, PaneLayout, PendingAction, RESIZE_SETTLE_DELAY,
-        TAB_DRAG_GHOST_PAINT_KEY, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState,
-        agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
-        agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
-        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, CompletionPopup, DropZone,
+        EDITOR_BACKGROUND, EditorApp, PANE_FOCUS_BORDER, PANE_TAB_HEIGHT, PaneId, PaneLayout,
+        PendingAction, RESIZE_SETTLE_DELAY, TAB_DRAG_GHOST_PAINT_KEY, TITLEBAR_HEIGHT,
+        TITLEBAR_PAINT_KEY, TabDrop, TreeState, WINDOW_CORNER_RADIUS, agent_collapsing_header,
+        agent_composer_content, agent_composer_height, agent_diff_preview, agent_markdown_galley,
+        agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
+        agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agent_transcript_fade_mesh, allowed_tab_drop_zone, build_agent_diff, cached_agent_diff,
-        defer_resize, disable_transient_egui_debug_overlays, draw_agent_diff,
-        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
-        find_highlighted_job, install_repaint_wake, launch_in_current_process, match_bracket_pair,
-        match_spans, model_display_name, next_find_match, pane_header_and_content, plain_text_job,
+        completion_word_range, defer_resize, diagnostic_highlighted_job,
+        disable_transient_egui_debug_overlays, draw_agent_diff, draw_provider_selector_identity,
+        draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_column_content, find_highlighted_job,
+        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
+        model_display_name, next_find_match, pane_header_and_content, plain_text_job,
         presentation_job, provider_selector_visible, repaint_deadline,
         repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
         search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
         slash_command_query, split_agent_sidebar, split_agentic_workspace, split_bottom_panel,
-        split_editor_column, split_workspace, stable_tab_drop_zone,
+        split_pane_content, split_workspace, stable_tab_drop_zone,
     };
+
+    #[test]
+    fn completion_replaces_the_word_around_the_cursor() {
+        assert_eq!(completion_word_range("let pri_value = 1", 7), 4..13);
+        assert_eq!(completion_word_range("café", 4), 0..4);
+        assert_eq!(completion_word_range("value.", 6), 6..6);
+    }
     use crate::{
         agent::controller::{
             AuthChoice, AuthKind, CommandChoice, ConfigChoice, ConfigValue, ConfigValueChoice,
@@ -10227,12 +12595,277 @@ mod tests {
         agent::state::{PermissionCard, TranscriptItem},
         buffer::Buffer,
         file_io::OpenTarget,
+        lsp::{CompletionItem, DefinitionLocation, Diagnostic, DiagnosticSeverity, RequestTag},
+        settings::Settings,
         syntax::{Highlighter, SyntaxManager},
         theme::{
-            ACCENT, ACCENT_INK, CANVAS, SURFACE, SURFACE_INPUT, SURFACE_RAISED, SURFACE_SELECTED,
-            TEXT_PRIMARY, TEXT_SECONDARY,
+            ACCENT, ACCENT_INK, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT, SURFACE_RAISED,
+            SURFACE_SELECTED, TEXT_PRIMARY, TEXT_SECONDARY,
         },
     };
+
+    #[test]
+    fn completion_enter_is_consumed_and_the_edit_is_one_undo_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.txt");
+        fs::write(&file, "pri").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file.clone()),
+            create: false,
+        })
+        .unwrap();
+        app.tabs[0].editor_surface.set_selection(3, 3);
+        app.lsp_completion = Some(CompletionPopup {
+            tag: RequestTag {
+                path: file,
+                revision: 0,
+                cursor: 3,
+            },
+            items: vec![CompletionItem {
+                label: "print".into(),
+                kind: Some(3),
+                detail: None,
+                insert_text: "print".into(),
+                edit: None,
+            }],
+            selected: 0,
+            anchor: Rect::NOTHING,
+            bounds: Rect::EVERYTHING,
+        });
+        let context = egui::Context::default();
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |_root| assert!(app.handle_lsp_popup_keys(&context)),
+        );
+
+        assert_eq!(app.tabs[0].buffer.text, "print");
+        assert!(app.tabs[0].buffer.dirty);
+        let tab = &mut app.tabs[0];
+        assert!(tab.editor_surface.undo(&mut tab.buffer.text));
+        assert_eq!(tab.buffer.text, "pri");
+    }
+
+    #[test]
+    fn diagnostics_preserve_existing_presentation_backgrounds() {
+        let base = plain_text_job("alpha", 200.0);
+        let find = find_highlighted_job(&base, std::slice::from_ref(&(0..5)), 0);
+        let shown = diagnostic_highlighted_job(
+            &find,
+            &[Diagnostic {
+                range: 1..3,
+                line: 0,
+                severity: DiagnosticSeverity::Error,
+                source: None,
+                code: None,
+                message: "error".into(),
+            }],
+            false,
+        );
+
+        assert!(shown.sections.iter().any(|section| {
+            section.format.background != Color32::TRANSPARENT
+                && section.format.underline != egui::Stroke::NONE
+        }));
+        let underlined = shown
+            .sections
+            .iter()
+            .filter(|section| section.format.underline != egui::Stroke::NONE)
+            .map(|section| section.byte_range.start.0..section.byte_range.end.0)
+            .collect::<Vec<_>>();
+        assert_eq!(underlined.len(), 1);
+        assert_eq!(underlined[0], 1..3);
+    }
+
+    #[test]
+    fn one_definition_opens_the_file_and_clamps_its_utf16_position() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current.txt");
+        let target = temp.path().join("target.rs");
+        fs::write(&current, "current").unwrap();
+        fs::write(&target, "a💡b\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(current),
+            create: false,
+        })
+        .unwrap();
+
+        app.navigate_to_definition(DefinitionLocation {
+            path: target.clone(),
+            line: 0,
+            character: 3,
+            end_line: 0,
+            end_character: 4,
+        });
+
+        let tab = &app.tabs[app.active_tab.unwrap()];
+        assert_eq!(tab.buffer.path, target);
+        assert_eq!(tab.editor_surface.cursor(), 2);
+    }
+
+    #[test]
+    fn settings_search_filters_unmatched_sections_and_server_rows() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("README.md");
+        fs::write(&file, "keep me").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file),
+            create: false,
+        })
+        .unwrap();
+        app.settings = Settings::default();
+        app.settings_error = None;
+        app.settings_open = true;
+        app.settings_search = "rust".into();
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Rust"))
+        );
+        assert!(!output.shapes.iter().any(|shape| {
+            contains_text(&shape.shape, "Enable language servers")
+                || contains_text(&shape.shape, "TypeScript / JavaScript")
+        }));
+    }
+
+    #[test]
+    fn settings_navigation_has_no_button_backgrounds() {
+        fn collect(shape: &Shape, labels: &mut Vec<Rect>, fills: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                Shape::Text(text)
+                    if text.pos.x < 270.0
+                        && matches!(
+                            text.galley.text(),
+                            "←  Back to app" | "Back to app" | "Language Servers"
+                        ) =>
+                {
+                    labels.push(text.visual_bounding_rect());
+                }
+                Shape::Rect(rect)
+                    if matches!(rect.fill, SURFACE_INPUT | SURFACE_SELECTED | SURFACE_HOVER) =>
+                {
+                    fills.push((rect.rect, rect.fill));
+                }
+                Shape::Vec(shapes) => {
+                    shapes
+                        .iter()
+                        .for_each(|shape| collect(shape, labels, fills));
+                }
+                _ => {}
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.settings_open = true;
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let (mut labels, mut fills) = (Vec::new(), Vec::new());
+        output
+            .shapes
+            .iter()
+            .for_each(|shape| collect(&shape.shape, &mut labels, &mut fills));
+
+        assert_eq!(labels.len(), 2);
+        assert!(
+            labels
+                .iter()
+                .all(|label| { fills.iter().all(|(fill, _)| !fill.contains_rect(*label)) })
+        );
+    }
+
+    #[test]
+    fn settings_server_labels_align_with_their_mode_control() {
+        fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(text.visual_bounding_rect())
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+                _ => None,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.settings_open = true;
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let find = |expected| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| text_rect(&shape.shape, expected))
+                .expect(expected)
+        };
+        let language = find("Rust");
+        let server = find("rust-analyzer");
+        let mode = find("Auto");
+        let label_center = (language.top() + server.bottom()) * 0.5;
+
+        assert!(
+            (label_center - mode.center().y).abs() < 1.0,
+            "label center {label_center}, mode center {}",
+            mode.center().y
+        );
+    }
 
     #[test]
     fn dragging_a_tab_down_previews_a_horizontal_split() {
@@ -10720,7 +13353,8 @@ mod tests {
                 ..RawInput::default()
             },
             |root| {
-                app.draw_editor_pane(root, PaneId(99), false, Some(&path), true);
+                let editor = root.max_rect();
+                app.draw_editor_pane(root, PaneId(99), editor, false, Some(&path), true);
             },
         );
 
@@ -11314,6 +13948,85 @@ mod tests {
             inactive.map(|icon| icon.0 - button.center())
         );
         assert_eq!(active.map(|icon| icon.1), [TEXT_PRIMARY; 2]);
+    }
+
+    #[test]
+    fn settings_toggle_sits_next_to_terminal_toggle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let terminal = context
+            .read_response(Id::new("terminal_toggle"))
+            .expect("terminal toggle")
+            .rect;
+        let settings = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings toggle")
+            .rect;
+        assert_eq!(settings.left(), terminal.right());
+        assert_eq!(settings.size(), terminal.size());
+    }
+
+    #[test]
+    fn settings_toggle_hover_brightens_the_icon_without_a_background() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let button = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings toggle")
+            .rect;
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(button.center())],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(!output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Rect(rect) => rect.rect == button && rect.fill == SURFACE_HOVER,
+            _ => false,
+        }));
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::LineSegment { points, stroke } => {
+                stroke.color == TEXT_PRIMARY && points.iter().all(|point| button.contains(*point))
+            }
+            _ => false,
+        }));
     }
 
     #[test]
@@ -11971,10 +14684,9 @@ mod tests {
     fn editor_column_fills_the_window_without_a_statusbar() {
         let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let (explorer, editor_column, agent) = split_workspace(window, true, 240.0, true, 340.0);
-        let (editor, findbar) = split_editor_column(editor_column, false);
+        let editor = editor_column_content(editor_column);
 
         let explorer = explorer.unwrap();
-        assert!(findbar.is_none());
         assert_eq!(explorer.y_range(), window.y_range());
         assert_eq!(agent.y_range(), window.y_range());
         assert_eq!(editor.top(), window.top() + TITLEBAR_HEIGHT);
@@ -11982,18 +14694,18 @@ mod tests {
     }
 
     #[test]
-    fn in_file_find_bar_uses_the_bottom_of_the_editor_column_only_while_open() {
-        let column = Rect::from_min_size(pos2(240.0, 0.0), Vec2::new(760.0, 700.0));
+    fn in_file_find_bar_uses_only_the_bottom_of_its_pane() {
+        let pane = Rect::from_min_size(pos2(620.0, 34.0), Vec2::new(380.0, 666.0));
 
-        let (editor, findbar) = split_editor_column(column, true);
+        let (editor, findbar) = split_pane_content(pane, true);
         let findbar = findbar.expect("open find bar");
-        assert_eq!(findbar.x_range(), column.x_range());
+        assert_eq!(findbar.x_range(), pane.x_range());
         assert_eq!(editor.bottom(), findbar.top());
-        assert_eq!(findbar.bottom(), column.bottom());
+        assert_eq!(findbar.bottom(), pane.bottom());
 
-        let (editor, findbar) = split_editor_column(column, false);
+        let (editor, findbar) = split_pane_content(pane, false);
         assert!(findbar.is_none());
-        assert_eq!(editor.bottom(), column.bottom());
+        assert_eq!(editor, pane);
     }
 
     #[test]
@@ -14227,7 +16939,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_window_geometry_is_loaded_for_the_next_launch() {
+    fn saved_window_geometry_uses_the_opening_display_scale() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state/window.json");
         let geometry = super::WindowGeometry {
@@ -14238,16 +16950,16 @@ mod tests {
         super::save_window_geometry(&path, geometry).unwrap();
         let attributes = super::load_window_geometry(&path)
             .unwrap()
-            .apply(winit::window::Window::default_attributes());
+            .apply(winit::window::Window::default_attributes(), 2.0);
 
         assert_eq!(
             (attributes.position, attributes.inner_size),
             (
-                Some(winit::dpi::Position::Physical(
-                    winit::dpi::PhysicalPosition::new(120, 80)
+                Some(winit::dpi::Position::Logical(
+                    winit::dpi::LogicalPosition::new(60.0, 40.0)
                 )),
-                Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
-                    1440, 900
+                Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                    720.0, 450.0
                 ))),
             )
         );
@@ -14255,30 +16967,31 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn startup_geometry_keeps_the_titlebar_inside_the_opening_display() {
+    fn saved_startup_geometry_is_not_adjusted_for_the_opening_display() {
         let attributes = super::WindowGeometry {
-            position: Some((-98, -212)),
-            size: (5882, 2124),
+            position: Some((120, 20)),
+            size: (1440, 1260),
         }
-        .apply(winit::window::Window::default_attributes());
+        .apply(winit::window::Window::default_attributes(), 1.0);
 
-        let attributes = super::fit_window_attributes_to_display(
+        let attributes = super::fit_startup_window_attributes(
             attributes,
-            super::startup_display_bounds(super::DisplayBounds {
+            Some(super::startup_display_bounds(super::DisplayBounds {
                 position: winit::dpi::PhysicalPosition::new(0, 0),
                 size: winit::dpi::PhysicalSize::new(2048, 1280),
                 scale_factor: 1.0,
-            }),
+            })),
+            true,
         );
 
         assert_eq!(
             (attributes.position, attributes.inner_size),
             (
-                Some(winit::dpi::Position::Physical(
-                    winit::dpi::PhysicalPosition::new(0, 34)
+                Some(winit::dpi::Position::Logical(
+                    winit::dpi::LogicalPosition::new(120.0, 20.0)
                 )),
-                Some(winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(
-                    2048, 1246
+                Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                    1440.0, 1260.0
                 ))),
             )
         );
@@ -14550,7 +17263,7 @@ mod tests {
 
     #[test]
     fn unoccupied_titlebar_regions_start_a_window_drag() {
-        for start in [pos2(150.0, 17.0), pos2(400.0, 17.0), pos2(600.0, 17.0)] {
+        for start in [pos2(400.0, 17.0), pos2(600.0, 17.0)] {
             let temp = tempfile::tempdir().unwrap();
             let mut app = EditorApp::new(OpenTarget {
                 root: temp.path().canonicalize().unwrap(),
@@ -14629,6 +17342,76 @@ mod tests {
         draw(vec![Event::PointerMoved(pos2(320.0, 100.0))]);
 
         assert_eq!(app.sidebar_width, 320.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_tree_sidebar_cannot_shrink_past_its_titlebar_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let draw = |app: &mut EditorApp, events| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+
+        draw(&mut app, Vec::new());
+        draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(pos2(249.0, 100.0)),
+                Event::PointerButton {
+                    pos: pos2(249.0, 100.0),
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        draw(&mut app, vec![Event::PointerMoved(pos2(100.0, 100.0))]);
+        draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: pos2(100.0, 100.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, Vec::new());
+
+        let settings = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings toggle")
+            .rect;
+        let agentic = context
+            .read_response(Id::new("agentic_mode_toggle"))
+            .expect("agentic mode toggle")
+            .rect;
+
+        assert!(
+            settings.right() <= app.sidebar_width,
+            "settings={settings:?}, agentic={agentic:?}, width={}",
+            app.sidebar_width
+        );
+        assert!(agentic.left() >= settings.right());
+        assert!(
+            agentic.right() <= app.sidebar_width,
+            "settings={settings:?}, agentic={agentic:?}, width={}",
+            app.sidebar_width
+        );
     }
 
     #[test]
@@ -14735,10 +17518,13 @@ mod tests {
 
         let _ = context.run_ui(input, |root| app.ui(root));
 
-        assert!(app.find_open);
+        assert!(app.pane_find.get(&PaneId(0)).is_some_and(|find| find.open));
         assert!(!app.search_open);
         assert!(!app.sidebar);
-        assert!(context.memory(|memory| memory.has_focus(Id::new("file_search_query"))));
+        assert!(
+            context
+                .memory(|memory| { memory.has_focus(Id::new(("file_search_query", PaneId(0).0))) })
+        );
 
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -14749,9 +17535,9 @@ mod tests {
             ..RawInput::default()
         };
         let _ = context.run_ui(input, |root| app.ui(root));
-        assert_eq!(app.find_query, "needle");
-        assert_eq!(app.find_matches.len(), 1);
-        assert_eq!(app.find_matches[0], 0..6);
+        let find = app.pane_find.get(&PaneId(0)).unwrap();
+        assert_eq!(find.query, "needle");
+        assert_eq!(find.matches.as_slice(), std::slice::from_ref(&(0..6)));
 
         let command_shift = Modifiers {
             command: true,
@@ -14776,8 +17562,316 @@ mod tests {
         let _ = context.run_ui(input, |root| app.ui(root));
 
         assert!(app.search_open);
-        assert!(!app.find_open);
+        assert!(!app.pane_find.get(&PaneId(0)).is_some_and(|find| find.open));
         assert!(context.memory(|memory| memory.has_focus(Id::new("project_search_query"))));
+    }
+
+    #[test]
+    fn command_f_opens_find_inside_the_active_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["left.rs", "right.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "needle\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.sidebar = false;
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Right);
+        let context = egui::Context::default();
+        let command = Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                modifiers: command,
+                events: vec![Event::Key {
+                    key: Key::F,
+                    physical_key: Some(Key::F),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let query = context
+            .read_response(Id::new(("file_search_query", PaneId(1).0)))
+            .expect("find query in the active pane");
+        assert!(query.rect.left() >= 500.0);
+    }
+
+    #[test]
+    fn escape_closes_find_in_the_active_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.rs");
+        fs::write(&file, "needle\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file),
+            create: false,
+        })
+        .unwrap();
+        app.sidebar = false;
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+        let command = Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                modifiers: command,
+                events: vec![Event::Key {
+                    key: Key::F,
+                    physical_key: Some(Key::F),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::Key {
+                    key: Key::Escape,
+                    physical_key: Some(Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(!app.pane_find.get(&PaneId(0)).is_some_and(|find| find.open));
+    }
+
+    #[test]
+    fn each_pane_keeps_its_own_find_footer_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["left.rs", "right.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "needle\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.sidebar = false;
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Right);
+        let context = egui::Context::default();
+        let command = Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        };
+        let draw = |app: &mut EditorApp| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Default::default(),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    modifiers: command,
+                    events: vec![Event::Key {
+                        key: Key::F,
+                        physical_key: Some(Key::F),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: command,
+                    }],
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(&mut app);
+        app.activate_tab(0);
+        let output = draw(&mut app);
+        fn find_hints(shape: &Shape) -> usize {
+            match shape {
+                Shape::Text(text) if text.galley.text() == "Find in current file…" => 1,
+                Shape::Vec(shapes) => shapes.iter().map(find_hints).sum(),
+                _ => 0,
+            }
+        }
+
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .map(|shape| find_hints(&shape.shape))
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn single_editor_pane_has_no_focus_outline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("only.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        for file in [None, Some(file)] {
+            let mut app = EditorApp::new(OpenTarget {
+                root: root.clone(),
+                file,
+                create: false,
+            })
+            .unwrap();
+            app.sidebar = false;
+            let output = egui::Context::default().run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Default::default(),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+
+            assert!(!output.shapes.iter().any(|shape| match &shape.shape {
+                Shape::Rect(rect) => rect.stroke.color == PANE_FOCUS_BORDER,
+                _ => false,
+            }));
+        }
+    }
+
+    #[test]
+    fn editor_pane_does_not_paint_over_the_window_right_or_bottom_border() {
+        fn paints_outer_editor_edge(shape: &Shape, window: Rect) -> bool {
+            match shape {
+                Shape::LineSegment { points, stroke } if stroke.color == super::BORDER_STRONG => {
+                    points
+                        .iter()
+                        .all(|point| (point.x - (window.right() - 0.5)).abs() < 0.01)
+                        || points
+                            .iter()
+                            .all(|point| (point.y - (window.bottom() - 0.5)).abs() < 0.01)
+                }
+                Shape::Vec(shapes) => shapes
+                    .iter()
+                    .any(|shape| paints_outer_editor_edge(shape, window)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(window),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| paints_outer_editor_edge(&shape.shape, window))
+        );
+    }
+
+    #[test]
+    fn scrolling_an_inactive_pane_focuses_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = ["left.rs", "right.rs"].map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "one\ntwo\nthree\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.sidebar = false;
+        app.open_tab(paths[1].clone(), false);
+        app.drop_tab(1, PaneId(0), DropZone::Right);
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+        let draw = |app: &mut EditorApp, events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(&mut app, Vec::new());
+        let output = draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(pos2(250.0, 300.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, -1.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+
+        assert_eq!(app.active_pane, PaneId(0));
+        let focus = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Rect(rect)
+                    if rect.stroke.color == PANE_FOCUS_BORDER && rect.stroke.width == 1.0 =>
+                {
+                    Some(rect)
+                }
+                _ => None,
+            })
+            .expect("focused pane outline");
+        assert_eq!(
+            focus.corner_radius,
+            egui::CornerRadius {
+                nw: WINDOW_CORNER_RADIUS,
+                ne: 0,
+                sw: WINDOW_CORNER_RADIUS,
+                se: 0,
+            }
+        );
     }
 
     #[test]
@@ -15033,6 +18127,45 @@ mod tests {
                 .iter()
                 .any(|shape| has_background(&shape.shape, agent))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn agentic_session_sidebar_keeps_titlebar_controls_inside_at_minimum_window_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(520.0, 700.0));
+        let context = egui::Context::default();
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let sessions = split_agentic_workspace(screen, true)
+            .0
+            .expect("agentic session sidebar");
+        let settings = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings toggle")
+            .rect;
+        let mode = context
+            .read_response(Id::new("agentic_mode_toggle"))
+            .expect("agentic mode toggle")
+            .rect;
+
+        assert!(settings.right() <= sessions.right());
+        assert!(mode.left() >= settings.right());
+        assert!(mode.right() <= sessions.right());
     }
 
     #[test]

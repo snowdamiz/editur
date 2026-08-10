@@ -1,0 +1,14 @@
+{
+  "recordedAtUnixSeconds": 1786398256,
+  "os": "macos",
+  "arch": "aarch64",
+  "preset": "clangd",
+  "serverVersion": "Apple clangd version 21.0.0 (clang-2100.1.1.101)",
+  "diagnostics": true,
+  "completion": true,
+  "completionUndo": "manual UI check required",
+  "hover": true,
+  "definition": true,
+  "customRestartDisableReenable": "protocol passed; manual UI check required",
+  "descendantFreeShutdown": "process sample passed; manual UI check required"
+}

@@ -32,6 +32,22 @@ Measured 2026-08-06 on the same Apple M4 reference machine. The comparison used 
 
 Normal startup constructs only the Agent titlebar toggle: it performs no sidecar lookup, ACP initialization, network request, child-process launch, or agent repaint polling. Agent events wake egui immediately and are drained 64 at a time; while a turn is active, open-file reconciliation requests a frame at 500 ms intervals. A native input-to-present trace during authenticated streaming remains part of the release smoke test.
 
+## Language-server integration
+
+Measured 2026-08-10 on the same Apple M4 reference machine. Run `cargo run --release --locked --example benchmark_lsp` for the bounded settings-load and 1 MiB synchronization scan.
+
+| Metric | Baseline / result | LSP build / target | Status |
+| --- | ---: | ---: | --- |
+| Missing settings-file load, median / p95 | No prior settings load | 1.96 / 2.21 µs / ≤2 ms startup regression | Pass |
+| 1 MiB incremental change scan, median / p95 | — | 669.79 µs / 1.04 ms / <16 ms typing budget | Pass |
+| Change synchronization delay | — | 50 ms / 50–100 ms | Pass |
+| Stripped arm64 binary | 11,108,768 bytes | 12,872,976 bytes (+1,764,208) / <30 MiB | Pass |
+| Idle with unsupported `README.md` | Existing caret/render cadence | No LSP controller, child, or periodic LSP repaint | Pass by construction |
+
+The pinned `lsp-types 0.97.0` addition introduced two lockfile packages (`lsp-types` and `fluent-uri`); its first incremental dependency check completed in 6.34 seconds. A supported document retains one last-sent UTF-8 snapshot. Unsupported and >5 MiB documents create no controller. Controller events wake the UI; only the 400 ms hover deadline and a full bounded command queue schedule an LSP retry frame.
+
+The project build directory reached about 18.5 GiB during development. Only this project's `target/debug/incremental` artifacts were cleared; after the verified release build, `target` was 4.9 GiB. All five native macOS arm64 protocol smokes are recorded under `release/lsp-smoke/`; the real-server UI checks and native Linux and Windows matrices remain release-approval requirements.
+
 The multi-provider refactor keeps that unopened path unchanged: catalog availability, persisted selection, bundle parsing, installation checks, and provisioning begin only when Agent is opened. CI verifies the exact Codex `1.1.14` adapter and private Node.js `22.22.0` runtime by deterministically packaging, extracting, and executing its version probe; networked authentication and paid prompts remain manual release checks.
 
 The pinned package is Cursor Agent `2026.07.23-e383d2b`. A direct managed-command spike negotiated stable protocol v1 and advertised load-session, HTTP/SSE MCP, image prompt, session-list, and `cursor_login` authentication capabilities. Starting it with its supported `--disable-auto-update` option left the executable and entrypoint hashes unchanged. Deterministic tests cover streaming, split tool updates and supplied diffs, same-session follow-ups, exact allow/reject decisions, cancellation, unknown notifications, malformed stdout, bounded stderr, unexpected exit, and descendant-free shutdown without credentials or network access. Windows release tests additionally put the wrapper and a fake descendant in the same kill-on-close job object and verify that closing the job releases the descendant's marker socket.

@@ -84,6 +84,14 @@ Prompts, relevant project code, tool results, and conversation context may be se
 
 Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
 
+## Language servers
+
+Editur uses language servers already installed by the user; it never downloads a server or makes an LSP network request. Open the in-window Settings page with the titlebar gear or `Cmd/Ctrl+,`, then leave a preset on Auto, choose a custom executable plus one argument per line, or turn it Off. The initial presets are rust-analyzer for Rust, TypeScript Language Server for TypeScript/JavaScript, Pyright for Python, gopls for Go, and clangd for C/C++.
+
+Supported language servers provide diagnostics, plain-text completion, hover documentation, and go to definition. Use `Ctrl+Space` for completion, `F8`/`Shift+F8` for next/previous diagnostics, and `F12` or command-click for definitions. Hover documentation appears after the pointer rests over source text. Files above 5 MiB and unsupported file types do not start a server. Editur does not apply server workspace edits, commands, snippets, formatting, rename, or code actions.
+
+Servers run lazily per project and preset, receive only open document text, and stop when their last document closes. `Not found` means the executable is absent from Editur's inherited `PATH`; install it through the language's normal tooling or select an absolute custom path. `Rescan` repeats discovery but installs nothing.
+
 ## Continuous releases
 
 Push the commit to the dedicated delivery branch:
@@ -100,4 +108,4 @@ Syntax highlighting is fully built in and selected automatically from the file n
 
 `EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan, and [LSP_PLAN.md](LSP_PLAN.md) for the planned language-server support and Settings UI.
+See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan, [LSP_PLAN.md](LSP_PLAN.md) for the language-server contract and Settings UI, and [KEYBINDINGS_PLAN.md](KEYBINDINGS_PLAN.md) for configurable VS Code, Vim, and custom keyboard profiles.

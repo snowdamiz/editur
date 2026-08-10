@@ -13,6 +13,19 @@ pub struct WindowsJob {
 }
 
 #[cfg(windows)]
+impl WindowsJob {
+    pub(crate) fn assign_child(&self, child: &std::process::Child) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::{Foundation::HANDLE, System::JobObjects::AssignProcessToJobObject};
+
+        unsafe {
+            AssignProcessToJobObject(*self._handle, HANDLE(child.as_raw_handle()))
+                .map_err(|error| format!("cannot contain child process tree: {error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
 #[doc(hidden)]
 pub fn new_windows_job() -> Result<(String, WindowsJob), String> {
     use std::os::windows::ffi::OsStrExt;

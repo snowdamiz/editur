@@ -1,0 +1,14 @@
+{
+  "recordedAtUnixSeconds": 1786398256,
+  "os": "macos",
+  "arch": "aarch64",
+  "preset": "pyright",
+  "serverVersion": "pyright 1.1.411",
+  "diagnostics": true,
+  "completion": true,
+  "completionUndo": "manual UI check required",
+  "hover": true,
+  "definition": true,
+  "customRestartDisableReenable": "protocol passed; manual UI check required",
+  "descendantFreeShutdown": "process sample passed; manual UI check required"
+}

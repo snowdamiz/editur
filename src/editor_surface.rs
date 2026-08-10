@@ -57,12 +57,17 @@ pub struct EditorOutput {
     pub response: Response,
     pub cursor: usize,
     pub changed: bool,
+    pub caret_rect: Option<Rect>,
+    pub hovered_character: Option<usize>,
+    pub last_inserted: Option<char>,
+    pub scrolled: bool,
 }
 
-pub(crate) struct EditorShowOptions {
+pub(crate) struct EditorShowOptions<'a> {
     pub request_focus: bool,
     pub scroll_to_character: Option<usize>,
     pub id: Id,
+    pub line_markers: &'a [(usize, Color32)],
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +179,7 @@ impl EditorSurface {
                 request_focus,
                 scroll_to_character,
                 id: Id::new("editor"),
+                line_markers: &[],
             },
         )
     }
@@ -190,6 +196,7 @@ impl EditorSurface {
             request_focus,
             scroll_to_character,
             id: editor_id,
+            line_markers,
         } = options;
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
@@ -264,6 +271,7 @@ impl EditorSurface {
         }
 
         let mut changed = false;
+        let mut last_inserted = None;
         let cursor_before_events = self.cursor;
         if response.has_focus() {
             ui.memory_mut(|memory| {
@@ -277,7 +285,7 @@ impl EditorSurface {
                     },
                 );
             });
-            changed = self.handle_events(ui, text, editor_id);
+            (changed, last_inserted) = self.handle_events(ui, text, editor_id);
             if changed {
                 response.mark_changed();
                 ui.ctx().request_repaint();
@@ -310,7 +318,7 @@ impl EditorSurface {
             ui.ctx()
                 .request_repaint_after(Duration::from_secs_f64(until_next));
         }
-        self.paint(ui, rect, content, focused, caret_visible);
+        self.paint(ui, rect, content, focused, caret_visible, line_markers);
         if focused {
             self.update_ime(ui, rect, content);
         }
@@ -331,6 +339,13 @@ impl EditorSurface {
             response,
             cursor: self.cursor,
             changed,
+            caret_rect: self.cursor_rect(content),
+            hovered_character: ui
+                .input(|input| input.pointer.hover_pos())
+                .filter(|pointer| editor_rect.contains(*pointer))
+                .map(|pointer| self.character_at(pointer, content)),
+            last_inserted,
+            scrolled: scrolling,
         }
     }
 
@@ -460,7 +475,15 @@ impl EditorSurface {
         }
     }
 
-    fn paint(&self, ui: &Ui, rect: Rect, content: Rect, focused: bool, caret_visible: bool) {
+    fn paint(
+        &self,
+        ui: &Ui,
+        rect: Rect,
+        content: Rect,
+        focused: bool,
+        caret_visible: bool,
+        line_markers: &[(usize, Color32)],
+    ) {
         let painter = ui.painter_at(rect);
         let horizontal_geometry = u64::from(content.left().to_bits())
             ^ u64::from(content.width().to_bits()).rotate_left(32);
@@ -521,6 +544,13 @@ impl EditorSurface {
                     TEXT_DISABLED,
                 );
             }
+            if let Some((_, color)) = line_markers.iter().find(|(line, _)| *line == index) {
+                painter.circle_filled(
+                    egui::pos2(content.left() - 4.0, y + LINE_HEIGHT * 0.5),
+                    2.5,
+                    *color,
+                );
+            }
             let mut galley = Arc::clone(base_galley);
             if selected.start < selected.end {
                 let relative = CCursorRange::two(
@@ -556,9 +586,10 @@ impl EditorSurface {
         }
     }
 
-    fn handle_events(&mut self, ui: &Ui, text: &mut String, editor_id: Id) -> bool {
+    fn handle_events(&mut self, ui: &Ui, text: &mut String, editor_id: Id) -> (bool, Option<char>) {
         let events = ui.input(|input| input.events.clone());
         let mut changed = false;
+        let mut last_inserted = None;
         for event in events {
             match event {
                 Event::Copy => self.copy(ui, text),
@@ -568,6 +599,7 @@ impl EditorSurface {
                 }
                 Event::Paste(value) | Event::Text(value) if !value.is_empty() => {
                     changed |= self.replace_selection(text, &value);
+                    last_inserted = value.chars().last();
                 }
                 Event::Key {
                     key,
@@ -577,11 +609,12 @@ impl EditorSurface {
                 } => changed |= self.handle_key(ui, text, key, modifiers, editor_id),
                 Event::Ime(egui::ImeEvent::Commit(value)) if !value.is_empty() => {
                     changed |= self.replace_selection(text, &value);
+                    last_inserted = value.chars().last();
                 }
                 _ => {}
             }
         }
-        changed
+        (changed, last_inserted)
     }
 
     fn handle_key(

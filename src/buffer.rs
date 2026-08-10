@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+pub const LARGE_FILE_BYTES: usize = 5 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LineEnding {
     Lf,
@@ -37,7 +39,7 @@ impl Buffer {
         if bytes.contains(&0) {
             return Err(format!("{} appears to be a binary file", path.display()));
         }
-        let large_file_warning = bytes.len() > 5 * 1024 * 1024;
+        let large_file_warning = bytes.len() > LARGE_FILE_BYTES;
         let text = String::from_utf8(bytes)
             .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
         let line_ending = if text.contains("\r\n") {

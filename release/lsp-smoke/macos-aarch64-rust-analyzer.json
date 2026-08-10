@@ -1,0 +1,14 @@
+{
+  "recordedAtUnixSeconds": 1786398247,
+  "os": "macos",
+  "arch": "aarch64",
+  "preset": "rust-analyzer",
+  "serverVersion": "rust-analyzer 0.3.2989-standalone (12c3381f0b 2026-07-26)",
+  "diagnostics": true,
+  "completion": true,
+  "completionUndo": "manual UI check required",
+  "hover": true,
+  "definition": true,
+  "customRestartDisableReenable": "protocol passed; manual UI check required",
+  "descendantFreeShutdown": "protocol and native Editur exit passed"
+}

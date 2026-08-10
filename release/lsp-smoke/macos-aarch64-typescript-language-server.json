@@ -1,0 +1,14 @@
+{
+  "recordedAtUnixSeconds": 1786398256,
+  "os": "macos",
+  "arch": "aarch64",
+  "preset": "typescript-language-server",
+  "serverVersion": "5.3.0",
+  "diagnostics": true,
+  "completion": true,
+  "completionUndo": "manual UI check required",
+  "hover": true,
+  "definition": true,
+  "customRestartDisableReenable": "protocol passed; manual UI check required",
+  "descendantFreeShutdown": "process sample passed; manual UI check required"
+}

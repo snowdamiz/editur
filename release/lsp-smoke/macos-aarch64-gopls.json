@@ -1,0 +1,14 @@
+{
+  "recordedAtUnixSeconds": 1786398259,
+  "os": "macos",
+  "arch": "aarch64",
+  "preset": "gopls",
+  "serverVersion": "golang.org/x/tools/gopls v0.23.0",
+  "diagnostics": true,
+  "completion": true,
+  "completionUndo": "manual UI check required",
+  "hover": true,
+  "definition": true,
+  "customRestartDisableReenable": "protocol passed; manual UI check required",
+  "descendantFreeShutdown": "process sample passed; manual UI check required"
+}
