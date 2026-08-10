@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -23,7 +24,7 @@ use agent_client_protocol::{Agent, ConnectionTo, Result, Stdio};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
-struct CodexFixture {
+struct CompatibilityFixture {
     initialize: InitializeResponse,
     new_session: NewSessionResponse,
 }
@@ -63,6 +64,9 @@ fn main() {
     if run_descendant_child() {
         return;
     }
+    if run_claude_login_fixture() {
+        return;
+    }
     #[cfg(windows)]
     if run_windows_job_fixture() {
         return;
@@ -70,11 +74,13 @@ fn main() {
     let mut authentication_required = false;
     let mut terminal_auth = false;
     let mut codex_auth = false;
+    let mut claude_auth = false;
+    let mut claude_auth_file = None;
     let mut sessions_supported = false;
     let mut stale_session = false;
     let mut address_file = None;
     let mut descendant_file = None;
-    let mut codex_fixture = None;
+    let mut compatibility_fixture = None;
     let mut arguments = std::env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
@@ -87,15 +93,20 @@ fn main() {
                 authentication_required = true;
                 codex_auth = true;
             }
+            Some("--claude-auth") => {
+                authentication_required = true;
+                claude_auth = true;
+                claude_auth_file = Some(arguments.next().expect("Claude auth marker path"));
+            }
             Some("--sessions") => sessions_supported = true,
             Some("--stale-session") => stale_session = true,
-            Some("--codex-fixture") => {
-                let path = arguments.next().expect("Codex fixture path");
-                codex_fixture = Some(
+            Some("--codex-fixture" | "--claude-fixture") => {
+                let path = arguments.next().expect("compatibility fixture path");
+                compatibility_fixture = Some(
                     serde_json::from_slice(
-                        &std::fs::read(path).expect("read Codex compatibility fixture"),
+                        &std::fs::read(path).expect("read ACP compatibility fixture"),
                     )
-                    .expect("parse Codex compatibility fixture"),
+                    .expect("parse ACP compatibility fixture"),
                 );
             }
             Some("--descendant") => {
@@ -122,15 +133,38 @@ fn main() {
         authentication_required,
         terminal_auth,
         codex_auth,
+        (claude_auth, claude_auth_file),
         sessions_supported,
         stale_session,
-        codex_fixture,
+        compatibility_fixture,
     ));
     drop(listener);
     if let Err(error) = result {
         eprintln!("fake ACP agent: {error}");
         std::process::exit(1);
     }
+}
+
+fn run_claude_login_fixture() -> bool {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if !arguments.windows(4).any(|arguments| {
+        arguments
+            == [
+                std::ffi::OsStr::new("--cli"),
+                std::ffi::OsStr::new("auth"),
+                std::ffi::OsStr::new("login"),
+                std::ffi::OsStr::new("--claudeai"),
+            ]
+    }) {
+        return false;
+    }
+    let marker = arguments
+        .windows(2)
+        .find(|arguments| arguments[0] == "--claude-auth")
+        .map(|arguments| &arguments[1])
+        .expect("Claude auth marker argument");
+    std::fs::write(marker, b"authenticated").expect("write Claude auth marker");
+    true
 }
 
 fn run_descendant_child() -> bool {
@@ -185,14 +219,16 @@ async fn run(
     authentication_required: bool,
     terminal_auth: bool,
     codex_auth: bool,
+    (claude_auth, claude_auth_file): (bool, Option<std::ffi::OsString>),
     sessions_supported: bool,
     stale_session: bool,
-    codex_fixture: Option<CodexFixture>,
+    compatibility_fixture: Option<CompatibilityFixture>,
 ) -> Result<()> {
-    let codex_fixture = codex_fixture.map(Arc::new);
-    let sessions_supported = sessions_supported || codex_fixture.is_some();
+    let compatibility_fixture = compatibility_fixture.map(Arc::new);
+    let sessions_supported = sessions_supported || compatibility_fixture.is_some();
     let prompts = Arc::new(AtomicUsize::new(0));
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
+    let claude_auth_file = claude_auth_file.map(PathBuf::from).map(Arc::new);
     let boolean_config_options = Arc::new(AtomicBool::new(false));
     let (cancel_tx, cancel_rx) = async_channel::unbounded();
     Agent
@@ -201,7 +237,7 @@ async fn run(
         .on_receive_request(
             {
                 let boolean_config_options = Arc::clone(&boolean_config_options);
-                let codex_fixture = codex_fixture.clone();
+                let compatibility_fixture = compatibility_fixture.clone();
                 async move |request: InitializeRequest, responder, _connection| {
                     boolean_config_options.store(
                         request
@@ -213,7 +249,7 @@ async fn run(
                             .is_some(),
                         Ordering::Release,
                     );
-                    if let Some(fixture) = &codex_fixture {
+                    if let Some(fixture) = &compatibility_fixture {
                         return responder.respond(fixture.initialize.clone());
                     }
                     let mut capabilities = AgentCapabilities::new().prompt_capabilities(
@@ -246,6 +282,24 @@ async fn run(
                                         .description("Use ChatGPT to authenticate"),
                                 ),
                             ]
+                        } else if claude_auth {
+                            if request.client_capabilities.auth.terminal {
+                                vec![AuthMethod::Terminal(
+                                    AuthMethodTerminal::new(
+                                        "claude-ai-login",
+                                        "Claude Subscription",
+                                    )
+                                    .description("Use Claude subscription")
+                                    .args(vec![
+                                        "--cli".into(),
+                                        "auth".into(),
+                                        "login".into(),
+                                        "--claudeai".into(),
+                                    ]),
+                                )]
+                            } else {
+                                Vec::new()
+                            }
                         } else {
                             vec![if terminal_auth {
                                 AuthMethod::Terminal(
@@ -284,10 +338,13 @@ async fn run(
         .on_receive_request(
             {
                 let authenticated = Arc::clone(&authenticated);
+                let claude_auth_file = claude_auth_file.clone();
                 let boolean_config_options = Arc::clone(&boolean_config_options);
-                let codex_fixture = codex_fixture.clone();
+                let compatibility_fixture = compatibility_fixture.clone();
                 async move |request: NewSessionRequest, responder, _connection| {
-                    if !authenticated.load(Ordering::Acquire) {
+                    if !authenticated.load(Ordering::Acquire)
+                        && !claude_auth_file.as_ref().is_some_and(|path| path.exists())
+                    {
                         return responder.respond_with_result(Err(
                             agent_client_protocol::Error::auth_required(),
                         ));
@@ -296,7 +353,7 @@ async fn run(
                     return responder
                         .respond_with_result(Err(agent_client_protocol::Error::invalid_params()));
                 }
-                if let Some(fixture) = &codex_fixture {
+                if let Some(fixture) = &compatibility_fixture {
                     return responder.respond(fixture.new_session.clone());
                 }
                 responder.respond(
@@ -320,13 +377,13 @@ async fn run(
         )
         .on_receive_request(
             {
-            let has_codex_fixture = codex_fixture.is_some();
+            let has_compatibility_fixture = compatibility_fixture.is_some();
             async move |request: ListSessionsRequest, responder, _connection| {
                 assert!(
                     sessions_supported
                         && request.cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
                 );
-                if has_codex_fixture {
+                if has_compatibility_fixture {
                     return responder.respond(ListSessionsResponse::new(Vec::new()));
                 }
                 let cwd = request.cwd.expect("validated cwd");

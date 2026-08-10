@@ -1,7 +1,12 @@
 use std::path::Path;
 
-use egui::{Color32, FontId, Stroke, TextFormat, text::LayoutJob};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use egui::{
+    Color32, FontId, Stroke, TextFormat,
+    text::{LayoutJob, LayoutSection},
+};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+use crate::theme::{ACCENT, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY};
 
 pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension()
@@ -27,11 +32,20 @@ struct List {
 }
 
 pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
+    layout_with_code_highlighting(source, wrap_width, |_, _| None)
+}
+
+fn layout_with_code_highlighting(
+    source: &str,
+    wrap_width: f32,
+    mut highlight_code: impl FnMut(Option<&str>, &str) -> Option<LayoutJob>,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let mut style = Style::default();
     let mut lists = Vec::<List>::new();
     let mut table_cell = 0;
+    let mut code_block = None;
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
 
@@ -44,7 +58,14 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
                     append(&mut job, "│ ", &style, false);
                     style.quote += 1;
                 }
-                Tag::CodeBlock(_) => style.code_block += 1,
+                Tag::CodeBlock(kind) => {
+                    style.code_block += 1;
+                    let language = match kind {
+                        CodeBlockKind::Indented => None,
+                        CodeBlockKind::Fenced(language) => Some(language.to_string()),
+                    };
+                    code_block = Some((language, job.text.len(), job.sections.len()));
+                }
                 Tag::List(first) => lists.push(List { next: first }),
                 Tag::Item => {
                     ensure_newlines(&mut job, 1);
@@ -94,6 +115,23 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
                 }
                 TagEnd::CodeBlock => {
                     style.code_block = style.code_block.saturating_sub(1);
+                    if let Some((language, start, section_start)) = code_block.take()
+                        && let Some(highlighted) =
+                            highlight_code(language.as_deref(), &job.text[start..])
+                    {
+                        job.sections.truncate(section_start);
+                        job.sections
+                            .extend(highlighted.sections.into_iter().map(|section| {
+                                let mut format = section.format;
+                                format.background = crate::theme::SURFACE_SELECTED;
+                                LayoutSection {
+                                    leading_space: section.leading_space,
+                                    byte_range: (start + section.byte_range.start.0).into()
+                                        ..(start + section.byte_range.end.0).into(),
+                                    format,
+                                }
+                            }));
+                    }
                     ensure_newlines(&mut job, 2);
                 }
                 TagEnd::List(_) => {
@@ -140,8 +178,27 @@ pub(crate) fn layout(source: &str, wrap_width: f32) -> LayoutJob {
     job
 }
 
-pub(crate) fn compact_layout(source: &str, wrap_width: f32) -> LayoutJob {
-    let mut job = layout(source, wrap_width);
+pub(crate) fn compact_layout(
+    source: &str,
+    wrap_width: f32,
+    highlight_code: impl FnMut(Option<&str>, &str) -> Option<LayoutJob>,
+) -> LayoutJob {
+    compact(layout_with_code_highlighting(
+        source,
+        wrap_width,
+        highlight_code,
+    ))
+}
+
+fn compact(mut job: LayoutJob) -> LayoutJob {
+    if job.text.ends_with('\n') {
+        job.text.pop();
+        for section in &mut job.sections {
+            section.byte_range.end.0 = section.byte_range.end.0.min(job.text.len());
+        }
+        job.sections
+            .retain(|section| !section.byte_range.is_empty());
+    }
     for section in &mut job.sections {
         section.format.font_id.size = (section.format.font_id.size * 0.93).min(18.5);
         section.format.line_height = section
@@ -163,13 +220,13 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
     });
     let code = inline_code || style.code_block > 0;
     let color = if style.link > 0 {
-        Color32::from_rgb(105, 213, 230)
+        ACCENT
     } else if style.strong > 0 || style.heading.is_some() {
-        Color32::from_rgb(238, 240, 246)
+        TEXT_PRIMARY
     } else if style.quote > 0 {
-        Color32::from_rgb(170, 177, 193)
+        TEXT_MUTED
     } else {
-        Color32::from_rgb(210, 214, 224)
+        TEXT_SECONDARY
     };
     job.append(
         text,
@@ -182,7 +239,7 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
             },
             color,
             background: if code {
-                Color32::from_rgb(38, 38, 42)
+                crate::theme::SURFACE_SELECTED
             } else {
                 Color32::TRANSPARENT
             },
@@ -275,10 +332,17 @@ mod tests {
 
     #[test]
     fn compact_agent_markdown_keeps_body_copy_comfortably_readable() {
-        let job = compact_layout("Body copy", 320.0);
+        let job = compact_layout("Body copy", 320.0, |_, _| None);
         let body_size = job.sections[0].format.font_id.size;
 
         assert!(body_size > 12.8, "compact body text was {body_size}px");
+    }
+
+    #[test]
+    fn compact_agent_markdown_does_not_reserve_a_trailing_blank_line() {
+        let job = compact_layout("Response", 320.0, |_, _| None);
+
+        assert_eq!(job.text, "Response");
     }
 
     #[test]

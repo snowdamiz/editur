@@ -18,7 +18,11 @@ use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::provider::{ProviderExtensions, ProviderId, descriptor};
+pub use super::provider::{AuthChoice, AuthKind};
+use super::provider::{
+    ProviderExtensions, ProviderId, authentication_required_choices, descriptor,
+    normalize_auth_methods, visible_diagnostics,
+};
 
 const EVENT_CAPACITY: usize = 512;
 const COMMAND_CAPACITY: usize = 64;
@@ -160,30 +164,11 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
     Provisioning { downloaded: u64, total: Option<u64> },
-    Switching { provider: String },
     Starting,
     Ready,
     AuthenticationRequired(Vec<AuthChoice>),
     Failed(String),
     Disconnected,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthChoice {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub kind: AuthKind,
-    pub setup: Option<String>,
-    pub can_authenticate: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthKind {
-    Agent,
-    Terminal,
-    Environment,
-    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,6 +463,8 @@ pub enum Command {
     Shutdown,
     #[doc(hidden)]
     TransportFailed(String),
+    #[doc(hidden)]
+    TerminalAuthFinished(Result<(), String>),
 }
 
 pub struct AgentController {
@@ -488,28 +475,27 @@ pub struct AgentController {
 
 impl AgentController {
     pub fn start(provider: ProviderId, project_root: PathBuf) -> Self {
-        let history = session_history_path(provider, &project_root);
         Self::start_launch(
             provider,
+            managed_session_startup(provider, &project_root, None),
             project_root,
             Launch::Managed,
             Arc::new(|| {}),
-            history,
         )
     }
 
     pub fn start_with_wake(
         provider: ProviderId,
         project_root: PathBuf,
+        preferred_session: Option<String>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        let history = session_history_path(provider, &project_root);
         Self::start_launch(
             provider,
+            managed_session_startup(provider, &project_root, preferred_session),
             project_root,
             Launch::Managed,
             Arc::new(wake),
-            history,
         )
     }
 
@@ -531,24 +517,54 @@ impl AgentController {
         )));
         Self::start_launch(
             provider,
+            SessionStartup {
+                history,
+                active_session: None,
+                preferred_session: None,
+            },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
             Arc::new(|| {}),
-            history,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_process_resuming(
+        project_root: PathBuf,
+        command: PathBuf,
+        args: Vec<String>,
+        preferred_session: String,
+    ) -> Self {
+        let history = Some(project_root.join(".editur-test-hidden-sessions-cursor.json"));
+        Self::start_launch(
+            ProviderId::Cursor,
+            SessionStartup {
+                history,
+                active_session: None,
+                preferred_session: Some(preferred_session),
+            },
+            project_root,
+            Launch::Process(AcpAgentConfig::new(command).args(args)),
+            Arc::new(|| {}),
         )
     }
 
     fn start_launch(
         provider: ProviderId,
+        session_startup: SessionStartup,
         project_root: PathBuf,
         launch: Launch,
         wake: Arc<dyn Fn() + Send + Sync>,
-        history: Option<PathBuf>,
     ) -> Self {
         let (command_tx, command_rx) = async_channel::bounded(COMMAND_CAPACITY);
         let debug_commands = command_tx.clone();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(EVENT_CAPACITY);
-        let event_tx = EventSender { event_tx, wake };
+        let event_tx = EventSender {
+            provider,
+            event_tx,
+            wake,
+            active_session: session_startup.active_session.clone(),
+        };
         let worker = thread::Builder::new()
             .name("editur-agent".into())
             .spawn(move || {
@@ -559,7 +575,7 @@ impl AgentController {
                     command_rx,
                     debug_commands,
                     event_tx,
-                    history,
+                    session_startup,
                 )
             })
             .expect("failed to start Editur agent controller thread");
@@ -610,10 +626,18 @@ enum Launch {
     Process(AcpAgentConfig),
 }
 
+struct SessionStartup {
+    history: Option<PathBuf>,
+    active_session: Option<PathBuf>,
+    preferred_session: Option<String>,
+}
+
 #[derive(Clone)]
 struct EventSender {
+    provider: ProviderId,
     event_tx: SyncSender<Event>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    active_session: Option<PathBuf>,
 }
 
 fn run_thread(
@@ -623,8 +647,9 @@ fn run_thread(
     commands: async_channel::Receiver<Command>,
     debug_commands: async_channel::Sender<Command>,
     events: EventSender,
-    history: Option<PathBuf>,
+    session_startup: SessionStartup,
 ) {
+    let system_terminal = matches!(launch, Launch::Managed);
     let (config, _managed_tree) = match launch {
         Launch::Managed => match managed_config(provider, &project_root, &events) {
             Ok(config) => (config.0, Some(config.1)),
@@ -642,6 +667,8 @@ fn run_thread(
     let diagnostics = Arc::new(Mutex::new(String::new()));
     let debug_diagnostics = Arc::clone(&diagnostics);
     let protocol_debug = std::env::var("EDITUR_LOG").as_deref() == Ok("debug");
+    let auth_config = config.clone();
+    let internal_commands = debug_commands.clone();
     let agent = AcpAgent::new(config).with_debug(move |line, direction| {
         if direction == LineDirection::Stderr {
             append_bounded(&debug_diagnostics, line, MAX_DIAGNOSTIC_BYTES);
@@ -667,13 +694,13 @@ fn run_thread(
     });
     let shutdown = Arc::new(AtomicBool::new(false));
     let result = async_io::block_on(run_connection(
-        agent,
+        (agent, auth_config, system_terminal, internal_commands),
         provider,
         project_root,
         commands,
         events.clone(),
         Arc::clone(&shutdown),
-        history,
+        session_startup,
     ));
     if shutdown.load(Ordering::Acquire) {
         send_event(
@@ -686,11 +713,12 @@ fn run_thread(
             .map(|text| text.clone())
             .unwrap_or_default();
         let error = connection_error(&error, &raw_diagnostics);
-        let diagnostics = if provider == ProviderId::Codex && !raw_diagnostics.is_empty() {
-            "Codex stderr suppressed to protect authentication and protocol data.".into()
+        let error = if provider == ProviderId::Claude {
+            acp_error(provider, "connection failed", &error)
         } else {
-            raw_diagnostics
+            error
         };
+        let diagnostics = visible_diagnostics(provider, raw_diagnostics);
         send_event(&events, Event::ProcessExited { error, diagnostics });
     }
 }
@@ -719,6 +747,155 @@ fn connection_error(error: &agent_client_protocol::Error, diagnostics: &str) -> 
         message = prefix.to_owned();
     }
     message
+}
+
+fn acp_error(provider: ProviderId, action: &str, error: &impl std::fmt::Display) -> String {
+    if provider == ProviderId::Claude {
+        format!("Claude {action}")
+    } else {
+        format!("{action}: {error}")
+    }
+}
+
+fn terminal_auth_config(agent: &AcpAgentConfig, method: &AuthMethodTerminal) -> AcpAgentConfig {
+    AcpAgentConfig::new(agent.command())
+        .args(agent.arguments())
+        .args(&method.args)
+        .envs(
+            agent
+                .environment()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+        .envs(
+            method
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+}
+
+fn launch_terminal_auth(
+    config: &AcpAgentConfig,
+    project_root: &Path,
+    system_terminal: bool,
+) -> Result<(), String> {
+    if !system_terminal {
+        return run_terminal_auth(config, project_root);
+    }
+    launch_system_terminal_auth(config, project_root)
+}
+
+fn run_terminal_auth(config: &AcpAgentConfig, project_root: &Path) -> Result<(), String> {
+    let status = std::process::Command::new(config.command())
+        .args(config.arguments())
+        .envs(config.environment())
+        .current_dir(project_root)
+        .status()
+        .map_err(|error| format!("cannot start Claude CLI authentication: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("Claude CLI authentication exited with {status}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_system_terminal_auth(config: &AcpAgentConfig, project_root: &Path) -> Result<(), String> {
+    if !config.environment().is_empty() {
+        return Err("Claude terminal authentication supplied unsupported environment data".into());
+    }
+    let command = std::iter::once(config.command().as_os_str())
+        .chain(config.arguments().iter().map(std::ffi::OsStr::new))
+        .map(shell_quote)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(" ");
+    let command = format!("cd {} && {command}", shell_quote(project_root.as_os_str())?);
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\nset authTab to do script {}\nrepeat while busy of authTab\ndelay 0.2\nend repeat\nend tell",
+        apple_script_string(&command)
+    );
+    let status = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .status()
+        .map_err(|error| format!("cannot open Claude authentication terminal: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "cannot open Claude authentication terminal".into())
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &std::ffi::OsStr) -> Result<String, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| "Claude authentication command is not valid UTF-8".to_owned())?;
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+}
+
+#[cfg(target_os = "linux")]
+fn launch_system_terminal_auth(config: &AcpAgentConfig, project_root: &Path) -> Result<(), String> {
+    for (terminal, prefix) in [
+        ("x-terminal-emulator", &["-e"][..]),
+        ("gnome-terminal", &["--wait", "--"][..]),
+        ("konsole", &["-e"][..]),
+    ] {
+        match std::process::Command::new(terminal)
+            .args(prefix)
+            .arg(config.command())
+            .args(config.arguments())
+            .envs(config.environment())
+            .current_dir(project_root)
+            .spawn()
+        {
+            Ok(mut child) => {
+                let status = child.wait().map_err(|error| {
+                    format!("cannot wait for Claude CLI authentication: {error}")
+                })?;
+                return status
+                    .success()
+                    .then_some(())
+                    .ok_or_else(|| format!("Claude CLI authentication exited with {status}"));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot open Claude authentication terminal: {error}"
+                ));
+            }
+        }
+    }
+    Err("cannot open Claude authentication terminal: no supported terminal was found".into())
+}
+
+#[cfg(windows)]
+fn launch_system_terminal_auth(config: &AcpAgentConfig, project_root: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    let status = std::process::Command::new(config.command())
+        .args(config.arguments())
+        .envs(config.environment())
+        .current_dir(project_root)
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .status()
+        .map_err(|error| format!("cannot open Claude authentication terminal: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("Claude CLI authentication exited with {status}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn launch_system_terminal_auth(
+    _config: &AcpAgentConfig,
+    _project_root: &Path,
+) -> Result<(), String> {
+    Err("Claude terminal authentication is unsupported on this operating system".into())
 }
 
 fn managed_config(
@@ -769,13 +946,18 @@ fn protect_managed_process(
 }
 
 async fn run_connection(
-    agent: AcpAgent,
+    (agent, auth_config, system_terminal, internal_commands): (
+        AcpAgent,
+        AcpAgentConfig,
+        bool,
+        async_channel::Sender<Command>,
+    ),
     provider: ProviderId,
     project_root: PathBuf,
     commands: async_channel::Receiver<Command>,
     events: EventSender,
     shutdown: Arc<AtomicBool>,
-    history: Option<PathBuf>,
+    session_startup: SessionStartup,
 ) -> agent_client_protocol::Result<()> {
     let extensions = descriptor(provider).extensions;
     let active = Arc::new(AtomicBool::new(false));
@@ -783,7 +965,8 @@ async fn run_connection(
     let permissions = Arc::new(Mutex::new(HashMap::new()));
     let interactions = Arc::new(Mutex::new(HashMap::new()));
     let next_permission = Arc::new(AtomicU64::new(1));
-    let mut hidden_sessions = HiddenSessions::load(history);
+    let mut hidden_sessions = HiddenSessions::load(session_startup.history);
+    let preferred_session = session_startup.preferred_session;
     agent_client_protocol::Client
         .builder()
         .name("editur")
@@ -957,17 +1140,21 @@ async fn run_connection(
             let interactions = Arc::clone(&interactions);
             let shutdown = Arc::clone(&shutdown);
             async move {
+                let client_capabilities = ClientCapabilities::new().session(
+                    ClientSessionCapabilities::new().config_options(
+                        SessionConfigOptionsCapabilities::new()
+                            .boolean(BooleanConfigOptionCapabilities::new()),
+                    ),
+                );
+                let client_capabilities = if provider == ProviderId::Claude {
+                    client_capabilities.auth(AuthCapabilities::new().terminal(true))
+                } else {
+                    client_capabilities
+                };
                 let initialized = connection
                     .send_request(
                         InitializeRequest::new(ProtocolVersion::V1)
-                            .client_capabilities(
-                                ClientCapabilities::new().session(
-                                    ClientSessionCapabilities::new().config_options(
-                                        SessionConfigOptionsCapabilities::new()
-                                            .boolean(BooleanConfigOptionCapabilities::new()),
-                                    ),
-                                ),
-                            )
+                            .client_capabilities(client_capabilities)
                             .client_info(Implementation::new("editur", env!("CARGO_PKG_VERSION"))),
                     )
                     .block_task()
@@ -984,67 +1171,7 @@ async fn run_connection(
                         .prompt_capabilities
                         .embedded_context,
                 };
-                let auth = initialized
-                    .auth_methods
-                    .iter()
-                    .take(MAX_CHOICES)
-                    .map(|method| {
-                        let codex_api_key = provider == ProviderId::Codex
-                            && method.id().0.as_ref() == "api-key";
-                        let (kind, setup, can_authenticate) = match method {
-                            AuthMethod::Agent(_) if codex_api_key => {
-                                let names = ["CODEX_API_KEY", "OPENAI_API_KEY"];
-                                (
-                                    AuthKind::Environment,
-                                    Some(format!("variables: {}", names.join(", "))),
-                                    names.iter().any(|name| {
-                                        std::env::var_os(name)
-                                            .is_some_and(|value| !value.is_empty())
-                                    }),
-                                )
-                            }
-                            AuthMethod::Agent(_) => (AuthKind::Agent, None, true),
-                            AuthMethod::Terminal(terminal) => {
-                                let mut details = Vec::new();
-                                if !terminal.args.is_empty() {
-                                    details.push(format!("arguments: {}", terminal.args.join(" ")));
-                                }
-                                if !terminal.env.is_empty() {
-                                    let mut names = terminal.env.keys().cloned().collect::<Vec<_>>();
-                                    names.sort();
-                                    details.push(format!("environment: {}", names.join(", ")));
-                                }
-                                (
-                                    AuthKind::Terminal,
-                                    (!details.is_empty()).then(|| details.join("; ")),
-                                    false,
-                                )
-                            }
-                            AuthMethod::EnvVar(environment) => {
-                                let names = environment
-                                    .vars
-                                    .iter()
-                                    .map(|variable| variable.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                (
-                                    AuthKind::Environment,
-                                    (!names.is_empty()).then(|| format!("variables: {names}")),
-                                    false,
-                                )
-                            }
-                            _ => (AuthKind::Unsupported, None, false),
-                        };
-                        AuthChoice {
-                            id: method.id().0.to_string(),
-                            name: method.name().to_owned(),
-                            description: method.description().map(str::to_owned),
-                            kind,
-                            setup,
-                            can_authenticate,
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                let mut auth = normalize_auth_methods(provider, &initialized.auth_methods);
                 let supports_history = initialized.agent_capabilities.load_session
                     && initialized
                         .agent_capabilities
@@ -1064,11 +1191,16 @@ async fn run_connection(
                     &events,
                     supports_history,
                     &hidden_sessions.ids,
+                    preferred_session.as_deref(),
                 )
                 .await
                 {
                     Ok((session_id, sessions)) => (Some(session_id), sessions),
-                    Err(_) if !auth.is_empty() => {
+                    Err(error) => {
+                        auth = authentication_required_choices(provider, auth);
+                        if auth.is_empty() {
+                            return Err(error);
+                        }
                         send_event(
                             &events,
                             Event::ConnectionChanged(ConnectionState::AuthenticationRequired(
@@ -1077,8 +1209,8 @@ async fn run_connection(
                         );
                         (None, Vec::new())
                     }
-                    Err(error) => return Err(error),
                 };
+                let mut terminal_auth_in_progress = false;
                 while let Ok(command) = commands.recv().await {
                     match command {
                         Command::Connect => {}
@@ -1101,6 +1233,50 @@ async fn run_connection(
                                 );
                                 continue;
                             }
+                            if let Some(AuthMethod::Terminal(terminal)) = initialized
+                                .auth_methods
+                                .iter()
+                                .find(|candidate| candidate.id().0.as_ref() == method_id)
+                            {
+                                if terminal_auth_in_progress {
+                                    continue;
+                                }
+                                terminal_auth_in_progress = true;
+                                send_event(
+                                    &events,
+                                    Event::ConnectionChanged(ConnectionState::Starting),
+                                );
+                                let config = terminal_auth_config(&auth_config, terminal);
+                                let project_root = project_root.clone();
+                                let internal_commands = internal_commands.clone();
+                                if let Err(error) = thread::Builder::new()
+                                    .name("editur-agent-auth".into())
+                                    .spawn(move || {
+                                        let result = launch_terminal_auth(
+                                            &config,
+                                            &project_root,
+                                            system_terminal,
+                                        );
+                                        let _ = internal_commands
+                                            .send_blocking(Command::TerminalAuthFinished(result));
+                                    })
+                                {
+                                    terminal_auth_in_progress = false;
+                                    send_event(
+                                        &events,
+                                        Event::Error(format!(
+                                            "cannot start Claude CLI authentication: {error}"
+                                        )),
+                                    );
+                                    send_event(
+                                        &events,
+                                        Event::ConnectionChanged(
+                                            ConnectionState::AuthenticationRequired(auth.clone()),
+                                        ),
+                                    );
+                                }
+                                continue;
+                            }
                             let authenticated = connection
                                 .send_request(AuthenticateRequest::new(method.id.clone()))
                                 .block_task()
@@ -1108,7 +1284,11 @@ async fn run_connection(
                             if let Err(error) = authenticated {
                                 send_event(
                                     &events,
-                                    Event::Error(format!("authentication failed: {error}")),
+                                    Event::Error(acp_error(
+                                        provider,
+                                        "authentication failed",
+                                        &error,
+                                    )),
                                 );
                                 continue;
                             }
@@ -1118,6 +1298,7 @@ async fn run_connection(
                                 &events,
                                 supports_history,
                                 &hidden_sessions.ids,
+                                preferred_session.as_deref(),
                             )
                             .await
                             {
@@ -1128,7 +1309,11 @@ async fn run_connection(
                                 Err(error) => {
                                     send_event(
                                         &events,
-                                        Event::Error(format!("cannot start session: {error}")),
+                                        Event::Error(acp_error(
+                                            provider,
+                                            "cannot start session",
+                                            &error,
+                                        )),
                                     );
                                     send_event(
                                         &events,
@@ -1162,7 +1347,11 @@ async fn run_connection(
                                     }
                                     Err(error) => send_event(
                                         &events,
-                                        Event::Error(format!("cannot start session: {error}")),
+                                        Event::Error(acp_error(
+                                            provider,
+                                            "cannot start session",
+                                            &error,
+                                        )),
                                     ),
                                 }
                             }
@@ -1180,7 +1369,11 @@ async fn run_connection(
                                     Ok(listed) => sessions = listed,
                                     Err(error) => send_event(
                                         &events,
-                                        Event::Error(format!("cannot list sessions: {error}")),
+                                        Event::Error(acp_error(
+                                            provider,
+                                            "cannot list sessions",
+                                            &error,
+                                        )),
                                     ),
                                 }
                             }
@@ -1229,7 +1422,11 @@ async fn run_connection(
                                     } else {
                                         send_event(
                                             &events,
-                                            Event::Error(format!("cannot load session: {error}")),
+                                            Event::Error(acp_error(
+                                                provider,
+                                                "cannot load session",
+                                                &error,
+                                            )),
                                         );
                                     }
                                     send_event(
@@ -1252,7 +1449,11 @@ async fn run_connection(
                                 Ok(_) => send_event(&events, Event::ModeChanged(mode_id)),
                                 Err(error) => send_event(
                                     &events,
-                                    Event::Error(format!("cannot set session mode: {error}")),
+                                    Event::Error(acp_error(
+                                        provider,
+                                        "cannot set session mode",
+                                        &error,
+                                    )),
                                 ),
                             }
                         }
@@ -1284,7 +1485,11 @@ async fn run_connection(
                                 ),
                                 Err(error) => send_event(
                                     &events,
-                                    Event::Error(format!("cannot set session option: {error}")),
+                                    Event::Error(acp_error(
+                                        provider,
+                                        "cannot set session option",
+                                        &error,
+                                    )),
                                 ),
                             }
                         }
@@ -1371,6 +1576,53 @@ async fn run_connection(
                                 agent_client_protocol::Error::invalid_request().data(message)
                             );
                         }
+                        Command::TerminalAuthFinished(result) => {
+                            if !terminal_auth_in_progress {
+                                continue;
+                            }
+                            terminal_auth_in_progress = false;
+                            if let Err(error) = result {
+                                send_event(&events, Event::Error(error));
+                                send_event(
+                                    &events,
+                                    Event::ConnectionChanged(
+                                        ConnectionState::AuthenticationRequired(auth.clone()),
+                                    ),
+                                );
+                                continue;
+                            }
+                            match start_session(
+                                &connection,
+                                &project_root,
+                                &events,
+                                supports_history,
+                                &hidden_sessions.ids,
+                                preferred_session.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok((session, listed)) => {
+                                    session_id = Some(session);
+                                    sessions = listed;
+                                }
+                                Err(error) => {
+                                    send_event(
+                                        &events,
+                                        Event::Error(acp_error(
+                                            provider,
+                                            "cannot start session after authentication",
+                                            &error,
+                                        )),
+                                    );
+                                    send_event(
+                                        &events,
+                                        Event::ConnectionChanged(
+                                            ConnectionState::AuthenticationRequired(auth.clone()),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 shutdown.store(true, Ordering::Release);
@@ -1433,7 +1685,11 @@ fn send_prompt(
                 Err(error) => {
                     send_event(
                         &events_for_result,
-                        Event::Error(format!("agent turn failed: {error}")),
+                        Event::Error(acp_error(
+                            events_for_result.provider,
+                            "agent turn failed",
+                            &error,
+                        )),
                     );
                     false
                 }
@@ -1590,6 +1846,7 @@ async fn start_session(
     events: &EventSender,
     supports_history: bool,
     hidden_sessions: &HashSet<String>,
+    preferred_session: Option<&str>,
 ) -> agent_client_protocol::Result<(SessionId, Vec<SessionChoice>)> {
     let sessions = if supports_history {
         list_sessions(connection, project_root, events, hidden_sessions)
@@ -1598,7 +1855,9 @@ async fn start_session(
     } else {
         Vec::new()
     };
-    if let Some(session) = sessions.first()
+    if let Some(session) = preferred_session
+        .and_then(|id| sessions.iter().find(|session| session.id == id))
+        .or_else(|| sessions.first())
         && let Ok(session_id) = load_session(connection, project_root, session, events).await
     {
         return Ok((session_id, sessions));
@@ -1708,6 +1967,24 @@ fn session_history_path(provider: ProviderId, project_root: &std::path::Path) ->
         .map(|directory| session_history_path_in(&directory, provider, project_root))
 }
 
+fn managed_session_startup(
+    provider: ProviderId,
+    project_root: &Path,
+    preferred_session: Option<String>,
+) -> SessionStartup {
+    let history = session_history_path(provider, project_root);
+    let active_session = crate::data_dir()
+        .ok()
+        .map(|directory| active_session_path_in(&directory, provider, project_root));
+    let preferred_session =
+        preferred_session.or_else(|| active_session.as_deref().and_then(load_active_session));
+    SessionStartup {
+        history,
+        active_session,
+        preferred_session,
+    }
+}
+
 fn session_history_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
     let digest = Sha256::digest(project_root.as_os_str().as_encoded_bytes());
     let mut name = String::with_capacity(digest.len() * 2 + 5);
@@ -1734,6 +2011,28 @@ fn session_history_path_in(data_dir: &Path, provider: ProviderId, project_root: 
         }
     }
     destination
+}
+
+fn active_session_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
+    let history = session_history_path_in(data_dir, provider, project_root);
+    super::provision::provider_root(data_dir, provider)
+        .join("active-session")
+        .join(
+            history
+                .file_name()
+                .expect("session history has a file name"),
+        )
+}
+
+fn load_active_session(path: &Path) -> Option<String> {
+    HiddenSessions::load(Some(path.to_path_buf()))
+        .ids
+        .into_iter()
+        .next()
+}
+
+fn save_active_session(path: &Path, id: &str) -> Result<(), String> {
+    save_hidden_sessions(path, &HashSet::from([id.to_owned()]))
 }
 
 fn save_hidden_sessions(path: &std::path::Path, ids: &HashSet<String>) -> Result<(), String> {
@@ -2602,6 +2901,9 @@ fn protocol_label(message: &serde_json::Value) -> Option<String> {
 }
 
 fn send_event(events: &EventSender, event: Event) {
+    if let (Event::ActiveSessionChanged(id), Some(path)) = (&event, &events.active_session) {
+        let _ = save_active_session(path, id);
+    }
     let _ = events.event_tx.send(event);
     (events.wake)();
 }
@@ -2616,8 +2918,10 @@ mod tests {
         normalize_update(
             update,
             &EventSender {
+                provider: ProviderId::Cursor,
                 event_tx,
                 wake: Arc::new(|| {}),
+                active_session: None,
             },
         );
         event_rx.recv().expect("update should be visible")
@@ -2636,8 +2940,11 @@ mod tests {
         std::fs::write(&legacy, br#"["cursor-session"]"#).unwrap();
 
         let cursor = session_history_path_in(data.path(), ProviderId::Cursor, project);
+        let claude = session_history_path_in(data.path(), ProviderId::Claude, project);
 
         assert_ne!(cursor, codex);
+        assert_ne!(claude, cursor);
+        assert_ne!(claude, codex);
         assert_eq!(
             std::fs::read_to_string(&cursor).unwrap(),
             r#"["cursor-session"]"#
@@ -2655,6 +2962,42 @@ mod tests {
             r#"["cursor-session"]"#
         );
         assert!(legacy.exists());
+    }
+
+    #[test]
+    fn active_session_is_restored_per_provider_and_project() {
+        let data = tempfile::tempdir().unwrap();
+        let project = Path::new("/work/project");
+        let cursor = active_session_path_in(data.path(), ProviderId::Cursor, project);
+        let codex = active_session_path_in(data.path(), ProviderId::Codex, project);
+
+        save_active_session(&cursor, "cursor-session").unwrap();
+        save_active_session(&codex, "codex-session").unwrap();
+
+        assert_eq!(
+            load_active_session(&cursor).as_deref(),
+            Some("cursor-session")
+        );
+        assert_eq!(
+            load_active_session(&codex).as_deref(),
+            Some("codex-session")
+        );
+        assert_ne!(cursor, codex);
+        assert_ne!(
+            cursor,
+            active_session_path_in(data.path(), ProviderId::Cursor, Path::new("/work/other"))
+        );
+    }
+
+    #[test]
+    fn claude_acp_errors_never_copy_provider_payloads() {
+        let secret = "super-secret-provider-payload";
+
+        assert_eq!(
+            acp_error(ProviderId::Claude, "turn failed", &secret),
+            "Claude turn failed"
+        );
+        assert!(acp_error(ProviderId::Cursor, "turn failed", &secret).contains(secret));
     }
 
     #[test]
@@ -2767,8 +3110,10 @@ mod tests {
     fn cursor_extension_notifications_stay_structured() {
         let (event_tx, event_rx) = mpsc::sync_channel(4);
         let events = EventSender {
+            provider: ProviderId::Cursor,
             event_tx,
             wake: Arc::new(|| {}),
+            active_session: None,
         };
 
         normalize_cursor_notification(
@@ -2834,8 +3179,10 @@ mod tests {
             }]),
             &pending,
             &EventSender {
+                provider: ProviderId::Cursor,
                 event_tx,
                 wake: Arc::new(|| {}),
+                active_session: None,
             },
         );
         assert_eq!(
@@ -2886,8 +3233,10 @@ mod tests {
             InteractionResponse::PlanAccepted,
             &pending,
             &EventSender {
+                provider: ProviderId::Cursor,
                 event_tx,
                 wake: Arc::new(|| {}),
+                active_session: None,
             },
         );
         assert_eq!(
@@ -2926,5 +3275,48 @@ mod tests {
             protocol_label(&message).as_deref(),
             Some("session/update (future_update)")
         );
+    }
+
+    #[test]
+    fn terminal_auth_reuses_the_agent_command_and_appends_the_method_contract() {
+        let agent = AcpAgentConfig::new("/managed/editur")
+            .args(["--agent-process", "claude", "/project"])
+            .env("BASE", "one");
+        let method = AuthMethodTerminal::new("claude-ai-login", "Claude Subscription")
+            .args(vec![
+                "--cli".into(),
+                "auth".into(),
+                "login".into(),
+                "--claudeai".into(),
+            ])
+            .env(HashMap::from([("AUTH".into(), "two".into())]));
+
+        let login = terminal_auth_config(&agent, &method);
+
+        assert_eq!(login.command(), Path::new("/managed/editur"));
+        assert_eq!(
+            login.arguments(),
+            [
+                "--agent-process",
+                "claude",
+                "/project",
+                "--cli",
+                "auth",
+                "login",
+                "--claudeai",
+            ]
+        );
+        assert_eq!(login.environment()["BASE"], "one");
+        assert_eq!(login.environment()["AUTH"], "two");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_auth_shell_arguments_cannot_inject_commands() {
+        assert_eq!(
+            shell_quote(std::ffi::OsStr::new("it's; complicated")).unwrap(),
+            "'it'\\''s; complicated'"
+        );
+        assert_eq!(apple_script_string("a \\\" b"), "\"a \\\\\\\" b\"");
     }
 }

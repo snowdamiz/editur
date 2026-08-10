@@ -1,0 +1,126 @@
+{
+  "initialize": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.66.0"
+    },
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        }
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "authMethods": [],
+    "_meta": {
+      "steering": {
+        "supported": true
+      },
+      "goal": {
+        "version": 1,
+        "controlMethod": "_session/goal",
+        "actions": ["set", "clear"]
+      },
+      "claudeCode": {
+        "ignoredByEditur": true
+      }
+    }
+  },
+  "new_session": {
+    "sessionId": "claude-fixture-session",
+    "modes": {
+      "currentModeId": "default",
+      "availableModes": [
+        {
+          "id": "default",
+          "name": "Manual",
+          "description": "Prompt for operations that require permission"
+        },
+        {
+          "id": "plan",
+          "name": "Plan Mode",
+          "description": "Plan without executing tools"
+        }
+      ]
+    },
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "default",
+        "options": [
+          { "value": "default", "name": "Manual" },
+          { "value": "plan", "name": "Plan Mode" }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": "claude-fixture",
+        "options": [
+          { "value": "claude-fixture", "name": "Claude fixture" }
+        ]
+      },
+      {
+        "id": "effort",
+        "name": "Effort",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "medium",
+        "options": [
+          { "value": "low", "name": "Low" },
+          { "value": "medium", "name": "Medium" },
+          { "value": "high", "name": "High" }
+        ]
+      },
+      {
+        "id": "fast",
+        "name": "Fast mode",
+        "category": "model_config",
+        "type": "boolean",
+        "currentValue": false
+      },
+      {
+        "id": "agent",
+        "name": "Agent",
+        "type": "select",
+        "currentValue": "default",
+        "options": [
+          { "value": "default", "name": "Default" }
+        ]
+      }
+    ],
+    "_meta": {
+      "claudeCode": {
+        "ignoredByEditur": true
+      }
+    }
+  }
+}

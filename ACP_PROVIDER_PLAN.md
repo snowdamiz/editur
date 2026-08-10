@@ -8,6 +8,8 @@ This plan is for the engineer implementing the next stage. After reading it, the
 
 The Codex proof-provider work is specified separately in [CODEX_ACP_PLAN.md](CODEX_ACP_PLAN.md).
 
+The Claude third-provider work is specified separately in [CLAUDE_ACP_PLAN.md](CLAUDE_ACP_PLAN.md).
+
 In this document, **provider** means an ACP-compatible agent process such as Cursor, Codex, or Claude. It does not mean the model selected inside that agent.
 
 ## 2. Product contract

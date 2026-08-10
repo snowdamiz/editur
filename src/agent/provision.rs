@@ -6,6 +6,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "network")]
@@ -13,7 +14,7 @@ use ureq::ResponseExt;
 
 const MAX_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 2_048;
+const MAX_ARCHIVE_ENTRIES: usize = 8_192;
 const VERIFICATION_RECEIPT: &str = ".editur-verified.json";
 const EMBEDDED_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/agent-sidecar.json"));
 
@@ -48,6 +49,8 @@ pub struct Distribution {
     pub args: Vec<String>,
     #[serde(default)]
     pub version_probes: Vec<VersionProbe>,
+    #[serde(default)]
+    pub package_probes: Vec<PackageProbe>,
     pub archive_format: ArchiveFormat,
 }
 
@@ -58,6 +61,15 @@ pub struct VersionProbe {
     #[serde(default)]
     pub args: Vec<String>,
     pub expected: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageProbe {
+    pub path: String,
+    pub name: String,
+    pub version: String,
+    pub integrity: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -88,6 +100,8 @@ pub struct SidecarManifest {
     pub args: Vec<String>,
     #[serde(default)]
     pub version_probes: Vec<VersionProbe>,
+    #[serde(default)]
+    pub package_probes: Vec<PackageProbe>,
     pub entries: Vec<ManagedEntry>,
     pub license_url: String,
     pub terms_url: String,
@@ -175,6 +189,7 @@ impl SidecarManifest {
             return Err("ACP provider manifest entrypoint is not a declared file".into());
         }
         validate_version_probes(&self.version_probes, &self.entries)?;
+        validate_package_probes(&self.package_probes, &self.entries)?;
         validate_provider_policy(self, provider)?;
         Ok(())
     }
@@ -233,11 +248,43 @@ impl SidecarManifest {
             entrypoint: distribution.entrypoint.clone(),
             args: distribution.args.clone(),
             version_probes: distribution.version_probes.clone(),
+            package_probes: distribution.package_probes.clone(),
             entries,
             license_url: descriptor(provider).license_url.into(),
             terms_url: descriptor(provider).terms_url.into(),
         })
     }
+}
+
+fn validate_package_probes(
+    probes: &[PackageProbe],
+    entries: &[ManagedEntry],
+) -> Result<(), String> {
+    let mut paths = HashSet::with_capacity(probes.len());
+    for probe in probes {
+        validate_relative_path(&probe.path)?;
+        if !paths.insert(probe.path.as_str())
+            || !entries
+                .iter()
+                .any(|entry| entry.path == probe.path && entry.kind == EntryKind::File)
+        {
+            return Err("ACP provider package probe is not a unique declared file".into());
+        }
+        validate_version(&probe.version)?;
+        let digest = probe.integrity.strip_prefix("sha512-").and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        });
+        if probe.name.is_empty()
+            || probe.name.len() > 256
+            || probe.name.chars().any(char::is_control)
+            || digest.as_ref().is_none_or(|digest| digest.len() != 64)
+        {
+            return Err("ACP provider package probe is invalid".into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_version_probes(
@@ -360,16 +407,28 @@ fn validate_provider_policy(
     } else {
         "runtime/bin/node"
     };
-    if provider == ProviderId::Codex
-        && manifest.version_probes != codex_version_probes(expected_node)
-    {
-        return Err("Codex manifest has unexpected or missing pinned version probes".into());
+    match provider {
+        ProviderId::Codex if manifest.version_probes != codex_version_probes(expected_node) => {
+            return Err("Codex manifest has unexpected or missing pinned version probes".into());
+        }
+        ProviderId::Claude if manifest.version_probes != claude_version_probes(expected_node) => {
+            return Err("Claude manifest has unexpected or missing pinned version probes".into());
+        }
+        ProviderId::Claude
+            if claude_package_probes(&manifest.os, &manifest.architecture)
+                .is_none_or(|probes| manifest.package_probes != probes) =>
+        {
+            return Err("Claude manifest has unexpected or missing pinned package probes".into());
+        }
+        _ => {}
     }
     validate_provider_host(manifest, provider)?;
     let valid = match provider {
         ProviderId::Cursor => {
             manifest.version == "2026.07.23-e383d2b"
                 && manifest.args == ["--disable-auto-update", "acp"]
+                && manifest.version_probes.is_empty()
+                && manifest.package_probes.is_empty()
                 && if cfg!(windows) {
                     manifest.command == "dist-package/node.exe"
                         && manifest.entrypoint.as_deref() == Some("dist-package/index.js")
@@ -383,8 +442,20 @@ fn validate_provider_policy(
                 && manifest.command == expected_node
                 && manifest.entrypoint.as_deref() == Some("package/dist/index.js")
                 && manifest.args.is_empty()
+                && manifest.version_probes == codex_version_probes(expected_node)
+                && manifest.package_probes.is_empty()
         }
-        ProviderId::Claude => false,
+        ProviderId::Claude => {
+            manifest.version == "0.66.0"
+                && manifest.archive_format == ArchiveFormat::Zip
+                && manifest.command == expected_node
+                && manifest.entrypoint.as_deref() == Some("package/dist/index.js")
+                && manifest.args.is_empty()
+                && manifest.version_probes == claude_version_probes(expected_node)
+                && claude_package_probes(&manifest.os, &manifest.architecture)
+                    .is_some_and(|probes| manifest.package_probes == probes)
+                && claude_archive_layout_is_target_scoped(manifest)
+        }
     };
     valid.then_some(()).ok_or_else(|| {
         format!(
@@ -392,6 +463,115 @@ fn validate_provider_policy(
             metadata.display_name
         )
     })
+}
+
+const CLAUDE_SDK_VERSION: &str = "0.3.220";
+const CLAUDE_SDK_INTEGRITY: &str = "sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA==";
+
+fn claude_version_probes(node: &str) -> Vec<VersionProbe> {
+    vec![
+        VersionProbe {
+            command: node.into(),
+            args: vec!["package/dist/index.js".into(), "--version".into()],
+            expected: "0.66.0".into(),
+        },
+        VersionProbe {
+            command: node.into(),
+            args: vec![
+                "package/dist/index.js".into(),
+                "--cli".into(),
+                "--version".into(),
+            ],
+            expected: "2.1.220 (Claude Code)".into(),
+        },
+    ]
+}
+
+fn claude_native_package(os: &str, architecture: &str) -> Option<(&'static str, &'static str)> {
+    match (os, architecture) {
+        ("macos", "aarch64") => Some((
+            "@anthropic-ai/claude-agent-sdk-darwin-arm64",
+            "sha512-7VxlbEosK7DODiOnsjoVd0DSJzbnaPrM2jelMHI0y8zx1UnLS3WC6EFUXbvy74F2sXqEznh2tzn7EKWInaRN6Q==",
+        )),
+        ("macos", "x86_64") => Some((
+            "@anthropic-ai/claude-agent-sdk-darwin-x64",
+            "sha512-X9RwDsSmbF6ultKZroaip+DL8WRgC64gHbrAwrRlAFSPNZV7zmJyP2ur8rW7KrxqmtuehdMMkw8+SAC/6hD2PA==",
+        )),
+        ("linux", "x86_64") => Some((
+            "@anthropic-ai/claude-agent-sdk-linux-x64",
+            "sha512-tkTJFnpR9VifvWX2fmkCAPkT6+8Wk/gVu8B5jsVekKZPiZoWRHmMXO30BnZn+f0TZhgYP+82PSX3S8crH1kn+w==",
+        )),
+        ("windows", "x86_64") => Some((
+            "@anthropic-ai/claude-agent-sdk-win32-x64",
+            "sha512-MuOuXhbr66HlGaWXD2f3w0k2PsvmnbkwcUZ0dAe2poFLdl72GC2dapwwOBefxm9QmoNqk9+jmv/dSKGOVWyvLw==",
+        )),
+        _ => None,
+    }
+}
+
+fn claude_package_probes(os: &str, architecture: &str) -> Option<Vec<PackageProbe>> {
+    let (native, integrity) = claude_native_package(os, architecture)?;
+    Some(vec![
+        PackageProbe {
+            path: "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json".into(),
+            name: "@anthropic-ai/claude-agent-sdk".into(),
+            version: CLAUDE_SDK_VERSION.into(),
+            integrity: CLAUDE_SDK_INTEGRITY.into(),
+        },
+        PackageProbe {
+            path: format!("package/node_modules/{native}/package.json"),
+            name: native.into(),
+            version: CLAUDE_SDK_VERSION.into(),
+            integrity: integrity.into(),
+        },
+    ])
+}
+
+fn claude_archive_layout_is_target_scoped(manifest: &SidecarManifest) -> bool {
+    let Some((native, _)) = claude_native_package(&manifest.os, &manifest.architecture) else {
+        return false;
+    };
+    let native_root = format!("package/node_modules/{native}/");
+    let native_binary = format!(
+        "{native_root}{}",
+        if manifest.os == "windows" {
+            "claude.exe"
+        } else {
+            "claude"
+        }
+    );
+    let required_files = [
+        "package/package.json",
+        "package/README.md",
+        "package/LICENSE",
+        "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+        "package/node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md",
+        "package/node_modules/@anthropic-ai/claude-agent-sdk/README.md",
+        "runtime/LICENSE",
+    ];
+    required_files.iter().all(|path| {
+        manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path == *path && entry.kind == EntryKind::File)
+    }) && ["package.json", "LICENSE.md", "README.md"]
+        .iter()
+        .all(|name| {
+            let path = format!("{native_root}{name}");
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == path && entry.kind == EntryKind::File)
+        })
+        && manifest.entries.iter().any(|entry| {
+            entry.path == native_binary && entry.kind == EntryKind::File && entry.executable
+        })
+        && manifest.entries.iter().all(|entry| {
+            !entry
+                .path
+                .starts_with("package/node_modules/@anthropic-ai/claude-agent-sdk-")
+                || entry.path.starts_with(&native_root)
+        })
 }
 
 fn codex_version_probes(node: &str) -> Vec<VersionProbe> {
@@ -421,12 +601,15 @@ fn validate_provider_host(manifest: &SidecarManifest, provider: ProviderId) -> R
         {
             return Err("Cursor archive URL must use https://downloads.cursor.com".into());
         }
-        ProviderId::Codex
+        ProviderId::Codex | ProviderId::Claude
             if !manifest.archive_url.starts_with(
                 "https://github.com/snowdamiz/editur/releases/download/provider-v1/",
             ) =>
         {
-            return Err("Codex archive URL must use Editur's pinned provider release".into());
+            return Err(format!(
+                "{} archive URL must use Editur's pinned provider release",
+                descriptor(provider).display_name
+            ));
         }
         _ => {}
     }
@@ -659,8 +842,8 @@ pub fn ensure(
         });
     }
     #[cfg(debug_assertions)]
-    if provider == ProviderId::Codex
-        && let Some(path) = std::env::var_os("EDITUR_CODEX_ARCHIVE")
+    if let Some(environment) = development_archive_environment(provider)
+        && let Some(path) = std::env::var_os(environment)
     {
         return provision_from_development_archive(manifest, data_dir, Path::new(&path));
     }
@@ -726,15 +909,27 @@ pub fn ensure(
 }
 
 #[cfg(debug_assertions)]
+const fn development_archive_environment(provider: ProviderId) -> Option<&'static str> {
+    match provider {
+        ProviderId::Cursor => None,
+        ProviderId::Codex => Some("EDITUR_CODEX_ARCHIVE"),
+        ProviderId::Claude => Some("EDITUR_CLAUDE_ARCHIVE"),
+    }
+}
+
+#[cfg(debug_assertions)]
 fn provision_from_development_archive(
     manifest: &SidecarManifest,
     data_dir: &Path,
     path: &Path,
 ) -> Result<InstalledSidecar, String> {
+    let display_name = descriptor(manifest.provider()?).display_name;
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect development Codex archive: {error}"))?;
+        .map_err(|error| format!("cannot inspect development {display_name} archive: {error}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err("development Codex archive is not a regular file".into());
+        return Err(format!(
+            "development {display_name} archive is not a regular file"
+        ));
     }
     let limit = manifest
         .max_compressed_bytes
@@ -743,7 +938,7 @@ fn provision_from_development_archive(
     let mut bytes = Vec::new();
     fs::File::open(path)
         .and_then(|file| file.take(limit).read_to_end(&mut bytes))
-        .map_err(|error| format!("cannot read development Codex archive: {error}"))?;
+        .map_err(|error| format!("cannot read development {display_name} archive: {error}"))?;
     provision_from_bytes(manifest, data_dir, &bytes)
 }
 
@@ -777,10 +972,8 @@ pub fn provision_from_bytes(
                         root.join(argument)
                     }
                 }));
-                if manifest.provider()? == ProviderId::Codex {
-                    for name in ["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"] {
-                        process.env_remove(name);
-                    }
+                for name in super::provider::removed_environment(manifest.provider()?) {
+                    process.env_remove(name);
                 }
                 let output = process.current_dir(root).output().map_err(|error| {
                     format!("cannot validate ACP provider version probe: {error}")
@@ -882,6 +1075,7 @@ fn provision_from_bytes_locked(
     {
         return Err(format!("{display_name} entrypoint is missing"));
     }
+    verify_package_metadata(manifest, staging.path())?;
     validate(
         &staged_command,
         staged_entrypoint.as_deref(),
@@ -1033,6 +1227,26 @@ fn verify_installed(manifest: &SidecarManifest, version_dir: &Path) -> Result<()
                     entry.path
                 ));
             }
+        }
+    }
+    verify_package_metadata(manifest, version_dir)
+}
+
+fn verify_package_metadata(manifest: &SidecarManifest, version_dir: &Path) -> Result<(), String> {
+    for probe in &manifest.package_probes {
+        let package: serde_json::Value = serde_json::from_slice(
+            &fs::read(version_dir.join(&probe.path))
+                .map_err(|error| format!("cannot inspect {}: {error}", probe.path))?,
+        )
+        .map_err(|error| format!("invalid package metadata {}: {error}", probe.path))?;
+        if package.get("name").and_then(serde_json::Value::as_str) != Some(probe.name.as_str())
+            || package.get("version").and_then(serde_json::Value::as_str)
+                != Some(probe.version.as_str())
+        {
+            return Err(format!(
+                "managed ACP provider package metadata does not match {} {}",
+                probe.name, probe.version
+            ));
         }
     }
     Ok(())
@@ -1472,10 +1686,9 @@ fn valid_archive_uri(provider: ProviderId, uri: &ureq::http::Uri) -> bool {
         authority.port_u16().is_none_or(|port| port == 443)
             && match provider {
                 ProviderId::Cursor => host == "downloads.cursor.com",
-                ProviderId::Codex => {
+                ProviderId::Codex | ProviderId::Claude => {
                     host == "github.com" || host == "release-assets.githubusercontent.com"
                 }
-                ProviderId::Claude => false,
             }
     })
 }
@@ -1558,12 +1771,15 @@ fn validate_release_distribution(
         {
             return Err("Cursor archive URL must use https://downloads.cursor.com".into());
         }
-        ProviderId::Codex
+        ProviderId::Codex | ProviderId::Claude
             if !distribution.archive_url.starts_with(
                 "https://github.com/snowdamiz/editur/releases/download/provider-v1/",
             ) =>
         {
-            return Err("Codex archive URL must use Editur's pinned provider release".into());
+            return Err(format!(
+                "{} archive URL must use Editur's pinned provider release",
+                descriptor(provider).display_name
+            ));
         }
         _ => {}
     }
@@ -1576,6 +1792,8 @@ fn validate_release_distribution(
         ProviderId::Cursor => {
             version == "2026.07.23-e383d2b"
                 && distribution.args == ["--disable-auto-update", "acp"]
+                && distribution.version_probes.is_empty()
+                && distribution.package_probes.is_empty()
                 && if distribution.os == "windows" {
                     distribution.command == "dist-package/node.exe"
                         && distribution.entrypoint.as_deref() == Some("dist-package/index.js")
@@ -1591,8 +1809,18 @@ fn validate_release_distribution(
                 && distribution.entrypoint.as_deref() == Some("package/dist/index.js")
                 && distribution.args.is_empty()
                 && distribution.version_probes == codex_version_probes(expected_node)
+                && distribution.package_probes.is_empty()
         }
-        ProviderId::Claude => false,
+        ProviderId::Claude => {
+            version == "0.66.0"
+                && distribution.archive_format == ArchiveFormat::Zip
+                && distribution.command == expected_node
+                && distribution.entrypoint.as_deref() == Some("package/dist/index.js")
+                && distribution.args.is_empty()
+                && distribution.version_probes == claude_version_probes(expected_node)
+                && claude_package_probes(&distribution.os, &distribution.architecture)
+                    .is_some_and(|probes| distribution.package_probes == probes)
+        }
     };
     valid.then_some(()).ok_or_else(|| {
         format!(
@@ -1609,10 +1837,11 @@ mod tests {
     #[cfg(unix)]
     use super::provision_from_bytes;
     use super::{
-        ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, ProviderId, ReleaseSpec,
-        SidecarManifest, VersionProbe, cleanup_obsolete_versions, embedded_manifest, ensure,
-        extract_archive, installed, provision_from_bytes_with, provision_from_development_archive,
-        verify_archive, verify_installed,
+        ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, PackageProbe, ProviderId,
+        ReleaseSpec, SidecarManifest, VersionProbe, cleanup_obsolete_versions,
+        development_archive_environment, embedded_manifest, ensure, extract_archive, installed,
+        provision_from_bytes_with, provision_from_development_archive, verify_archive,
+        verify_installed, verify_package_metadata,
     };
     #[cfg(feature = "network")]
     use super::{valid_archive_uri, valid_cursor_archive_uri};
@@ -1636,6 +1865,7 @@ mod tests {
             entrypoint: None,
             args: vec!["acp".into()],
             version_probes: Vec::new(),
+            package_probes: Vec::new(),
             entries: Vec::new(),
             license_url: "https://cursor.com/terms-of-service".into(),
             terms_url: "https://cursor.com/terms-of-service".into(),
@@ -1713,6 +1943,29 @@ mod tests {
         assert!(error.contains("downloads.cursor.com"), "{error}");
     }
 
+    #[test]
+    fn claude_release_spec_pins_every_supported_native_package() {
+        let spec =
+            ReleaseSpec::parse(include_bytes!("../../assets/agent/claude-release.json")).unwrap();
+
+        assert_eq!(spec.provider(), ProviderId::Claude);
+        assert_eq!(spec.distributions.len(), 4);
+        for target in [
+            ("macos", "aarch64"),
+            ("macos", "x86_64"),
+            ("linux", "x86_64"),
+            ("windows", "x86_64"),
+        ] {
+            assert_eq!(
+                spec.select(target.0, target.1)
+                    .unwrap()
+                    .package_probes
+                    .len(),
+                2
+            );
+        }
+    }
+
     #[cfg(feature = "network")]
     #[test]
     fn redirect_validation_keeps_the_exact_cursor_host() {
@@ -1731,19 +1984,21 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
-    fn codex_redirects_accept_only_the_pinned_release_hosts() {
-        for url in [
-            "https://github.com/snowdamiz/editur/releases/download/provider-v1/codex.zip",
-            "https://release-assets.githubusercontent.com/private/codex.zip",
-        ] {
-            assert!(valid_archive_uri(ProviderId::Codex, &url.parse().unwrap()));
-        }
-        for url in [
-            "https://downloads.cursor.com/codex.zip",
-            "https://github.com.evil.example/codex.zip",
-            "http://github.com/snowdamiz/editur/codex.zip",
-        ] {
-            assert!(!valid_archive_uri(ProviderId::Codex, &url.parse().unwrap()));
+    fn managed_provider_redirects_accept_only_the_pinned_release_hosts() {
+        for provider in [ProviderId::Codex, ProviderId::Claude] {
+            for url in [
+                "https://github.com/snowdamiz/editur/releases/download/provider-v1/provider.zip",
+                "https://release-assets.githubusercontent.com/private/provider.zip",
+            ] {
+                assert!(valid_archive_uri(provider, &url.parse().unwrap()));
+            }
+            for url in [
+                "https://downloads.cursor.com/provider.zip",
+                "https://github.com.evil.example/provider.zip",
+                "http://github.com/snowdamiz/editur/provider.zip",
+            ] {
+                assert!(!valid_archive_uri(provider, &url.parse().unwrap()));
+            }
         }
     }
 
@@ -1775,6 +2030,28 @@ mod tests {
         }];
 
         verify_installed(&manifest, temp.path()).unwrap();
+    }
+
+    #[test]
+    fn installed_package_metadata_must_match_the_pinned_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("package")).unwrap();
+        std::fs::write(
+            temp.path().join("package/package.json"),
+            br#"{"name":"expected","version":"1.2.3"}"#,
+        )
+        .unwrap();
+        let mut manifest = manifest();
+        manifest.package_probes = vec![PackageProbe {
+            path: "package/package.json".into(),
+            name: "expected".into(),
+            version: "1.2.3".into(),
+            integrity: "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".into(),
+        }];
+
+        verify_package_metadata(&manifest, temp.path()).unwrap();
+        manifest.package_probes[0].version = "9.9.9".into();
+        assert!(verify_package_metadata(&manifest, temp.path()).is_err());
     }
 
     #[test]
@@ -2239,6 +2516,19 @@ mod tests {
     }
 
     #[test]
+    fn debug_development_archives_cover_both_lazy_providers() {
+        assert_eq!(
+            development_archive_environment(ProviderId::Codex),
+            Some("EDITUR_CODEX_ARCHIVE")
+        );
+        assert_eq!(
+            development_archive_environment(ProviderId::Claude),
+            Some("EDITUR_CLAUDE_ARCHIVE")
+        );
+        assert_eq!(development_archive_environment(ProviderId::Cursor), None);
+    }
+
+    #[test]
     fn an_already_verified_version_is_an_idempotent_no_op() {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive
@@ -2520,6 +2810,20 @@ mod tests {
             crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Codex)
                 .terms_url
                 .into();
+        let mut claude = codex.clone();
+        claude.agent = "claude".into();
+        claude.version = "0.66.0".into();
+        claude.archive_url =
+            "https://github.com/snowdamiz/editur/releases/download/provider-v1/claude.zip".into();
+        claude.args.clear();
+        claude.license_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Claude)
+                .license_url
+                .into();
+        claude.terms_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Claude)
+                .terms_url
+                .into();
 
         let temp = tempfile::tempdir().unwrap();
         let installed_cursor =
@@ -2527,6 +2831,9 @@ mod tests {
                 .unwrap();
         let installed_codex =
             provision_from_bytes_with(&codex, temp.path(), &codex_bytes, |_, _, _| Ok(())).unwrap();
+        let installed_claude =
+            provision_from_bytes_with(&claude, temp.path(), &codex_bytes, |_, _, _| Ok(()))
+                .unwrap();
 
         assert!(
             installed_cursor
@@ -2539,6 +2846,11 @@ mod tests {
                 .starts_with(temp.path().join("agents/codex"))
         );
         assert!(
+            installed_claude
+                .command
+                .starts_with(temp.path().join("agents/claude"))
+        );
+        assert!(
             installed_cursor
                 .command
                 .parent()
@@ -2554,6 +2866,25 @@ mod tests {
                 .ancestors()
                 .any(|path| path.join(".editur-verified.json").is_file())
         );
+        assert!(
+            installed_claude
+                .command
+                .parent()
+                .unwrap()
+                .ancestors()
+                .any(|path| path.join(".editur-verified.json").is_file())
+        );
+        assert_eq!(
+            ["cursor", "codex", "claude"].map(|provider| {
+                std::fs::read_to_string(temp.path().join("agents").join(provider).join("active"))
+                    .unwrap()
+            }),
+            [
+                "2026.07.23-e383d2b".to_owned(),
+                "1.1.14".to_owned(),
+                "0.66.0".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -2561,26 +2892,62 @@ mod tests {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive
             .start_file(
-                "dist-package/agent",
+                if cfg!(windows) {
+                    "runtime/node.exe"
+                } else {
+                    "runtime/bin/node"
+                },
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+        archive.write_all(b"node").unwrap();
+        archive
+            .start_file(
+                "package/dist/index.js",
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-        archive.write_all(b"agent").unwrap();
+        archive.write_all(b"adapter").unwrap();
         let bytes = archive.finish().unwrap().into_inner();
         let mut manifest = manifest();
+        manifest.agent = "claude".into();
+        manifest.version = "0.66.0".into();
+        manifest.archive_url =
+            "https://github.com/snowdamiz/editur/releases/download/provider-v1/claude.zip".into();
         manifest.archive_format = ArchiveFormat::Zip;
         manifest.archive_size_bytes = bytes.len() as u64;
         manifest.max_compressed_bytes = bytes.len() as u64;
-        manifest.max_extracted_bytes = 5;
-        manifest.max_entries = 1;
+        manifest.max_extracted_bytes = 11;
+        manifest.max_entries = 2;
         manifest.archive_sha256 = crate::agent::provision::sha256_hex(&bytes);
-        manifest.entries = vec![ManagedEntry {
-            path: "dist-package/agent".into(),
+        manifest.command = if cfg!(windows) {
+            "runtime/node.exe".into()
+        } else {
+            "runtime/bin/node".into()
+        };
+        manifest.entrypoint = Some("package/dist/index.js".into());
+        manifest.args.clear();
+        manifest.entries = [
+            (manifest.command.as_str(), b"node".as_slice(), true),
+            ("package/dist/index.js", b"adapter".as_slice(), false),
+        ]
+        .into_iter()
+        .map(|(path, contents, executable)| ManagedEntry {
+            path: path.into(),
             kind: EntryKind::File,
-            size: 5,
-            sha256: Some(crate::agent::provision::sha256_hex(b"agent")),
-            executable: true,
-        }];
+            size: contents.len() as u64,
+            sha256: Some(crate::agent::provision::sha256_hex(contents)),
+            executable,
+        })
+        .collect();
+        manifest.license_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Claude)
+                .license_url
+                .into();
+        manifest.terms_url =
+            crate::agent::provider::descriptor(crate::agent::provider::ProviderId::Claude)
+                .terms_url
+                .into();
         let temp = tempfile::tempdir().unwrap();
         let installed =
             provision_from_bytes_with(&manifest, temp.path(), &bytes, |_, _, _| Ok(())).unwrap();
@@ -2595,7 +2962,12 @@ mod tests {
 
         assert_eq!(
             (std::fs::read(&installed.command).unwrap(), validated.get()),
-            (b"agent".to_vec(), true)
+            (b"node".to_vec(), true)
+        );
+        assert!(
+            installed
+                .command
+                .starts_with(temp.path().join("agents/claude"))
         );
     }
 

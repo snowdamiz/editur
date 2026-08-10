@@ -6,13 +6,16 @@ use egui::{
 };
 use std::{ops::Range, sync::Arc, time::Duration};
 
-use crate::renderer::mark_retained;
+use crate::{
+    renderer::mark_retained,
+    theme::{ACCENT, BORDER_STRONG, SURFACE, TEXT_DISABLED},
+};
 
 const LINE_HEIGHT: f32 = 18.0;
 const TEXT_LEFT_PADDING: f32 = 8.0;
 const TEXT_TOP_PADDING: f32 = 6.0;
 const CARET_BLINK_INTERVAL: f64 = 0.7;
-pub(crate) const EDITOR_BACKGROUND: Color32 = Color32::from_rgb(24, 24, 26);
+pub(crate) const EDITOR_BACKGROUND: Color32 = SURFACE;
 
 struct RetainedLine {
     job: LayoutJob,
@@ -414,7 +417,7 @@ impl EditorSurface {
                     fonts.layout_no_wrap(
                         (index + 1).to_string(),
                         FontId::monospace(12.0),
-                        Color32::from_rgb(100, 106, 123),
+                        TEXT_DISABLED,
                     )
                 }));
             }
@@ -439,7 +442,7 @@ impl EditorSurface {
                 egui::pos2(content.left(), rect.top()),
                 egui::pos2(content.left(), rect.bottom()),
             ],
-            Stroke::new(1.0, Color32::from_rgb(53, 53, 59)),
+            Stroke::new(1.0, BORDER_STRONG),
         );
         let selection = self.selection();
         let cursor_line = self.line_for_character(self.cursor);
@@ -480,7 +483,7 @@ impl EditorSurface {
                         y + (LINE_HEIGHT - number.size().y) * 0.5,
                     ),
                     Arc::clone(number),
-                    Color32::from_rgb(100, 106, 123),
+                    TEXT_DISABLED,
                 );
             }
             let mut galley = Arc::clone(base_galley);
@@ -512,7 +515,7 @@ impl EditorSurface {
             if let Some(caret) = self.cursor_rect(content) {
                 painter.line_segment(
                     [caret.left_top(), caret.left_bottom()],
-                    Stroke::new(1.5, Color32::from_rgb(185, 205, 235)),
+                    Stroke::new(1.5, ACCENT),
                 );
             }
         }
@@ -925,7 +928,9 @@ fn byte_index(text: &str, character: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job};
+    use super::{
+        ACCENT, EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job,
+    };
     use egui::{
         Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2,
         pos2, text::LayoutJob,
@@ -936,10 +941,9 @@ mod tests {
         primitives
             .iter()
             .any(|primitive| match &primitive.primitive {
-                egui::epaint::Primitive::Mesh(mesh) => mesh
-                    .vertices
-                    .iter()
-                    .any(|vertex| vertex.color == Color32::from_rgb(185, 205, 235)),
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    mesh.vertices.iter().any(|vertex| vertex.color == ACCENT)
+                }
                 egui::epaint::Primitive::Callback(_) => false,
             })
     }

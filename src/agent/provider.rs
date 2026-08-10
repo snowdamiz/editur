@@ -6,10 +6,10 @@ use std::{
     str::FromStr,
 };
 
+use agent_client_protocol::schema::v1::AuthMethod;
 use serde::{Deserialize, Serialize};
 
 const PREFERENCE_FILE: &str = "agent-provider.json";
-const TERMS_FILE: &str = "agent-provider-terms.json";
 const MAX_PREFERENCE_BYTES: u64 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -58,13 +58,32 @@ pub enum InstallPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderIcon {
     CursorMark,
-    Glyph(&'static str),
+    OpenAiMark,
+    AnthropicMark,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderExtensions {
     None,
     Cursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthChoice {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: AuthKind,
+    pub setup: Option<String>,
+    pub can_authenticate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthKind {
+    Agent,
+    Terminal,
+    Environment,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,10 +94,33 @@ pub struct ProviderDescriptor {
     pub description: &'static str,
     pub license_url: &'static str,
     pub terms_url: &'static str,
+    pub terms_notice: &'static str,
+    pub legal_links: &'static [ProviderLink],
     pub install_policy: InstallPolicy,
     pub extensions: ProviderExtensions,
     pub unavailable_reason: Option<&'static str>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLink {
+    pub label: &'static str,
+    pub url: &'static str,
+}
+
+const CLAUDE_LEGAL_LINKS: &[ProviderLink] = &[
+    ProviderLink {
+        label: "Legal and credential guidance",
+        url: "https://code.claude.com/docs/en/legal-and-compliance",
+    },
+    ProviderLink {
+        label: "Data usage policy",
+        url: "https://code.claude.com/docs/en/data-usage",
+    },
+    ProviderLink {
+        label: "Privacy policy",
+        url: "https://www.anthropic.com/legal/privacy",
+    },
+];
 
 const CATALOG: [ProviderDescriptor; 3] = [
     ProviderDescriptor {
@@ -88,6 +130,8 @@ const CATALOG: [ProviderDescriptor; 3] = [
         description: "Cursor's ACP coding agent",
         license_url: "https://cursor.com/terms-of-service",
         terms_url: "https://cursor.com/terms-of-service",
+        terms_notice: "Editur will download and run a pinned Cursor package in Editur's private application-data directory.",
+        legal_links: &[],
         install_policy: InstallPolicy::Bundled,
         extensions: ProviderExtensions::Cursor,
         unavailable_reason: None,
@@ -95,10 +139,12 @@ const CATALOG: [ProviderDescriptor; 3] = [
     ProviderDescriptor {
         id: ProviderId::Codex,
         display_name: "Codex",
-        icon: ProviderIcon::Glyph("◎"),
+        icon: ProviderIcon::OpenAiMark,
         description: "OpenAI Codex through the canonical ACP adapter",
         license_url: "https://github.com/agentclientprotocol/codex-acp/blob/v1.1.14/LICENSE",
         terms_url: "https://openai.com/policies/terms-of-use/",
+        terms_notice: "Editur will download and run a pinned Codex package in Editur's private application-data directory.",
+        legal_links: &[],
         install_policy: InstallPolicy::Lazy,
         extensions: ProviderExtensions::None,
         unavailable_reason: None,
@@ -106,13 +152,15 @@ const CATALOG: [ProviderDescriptor; 3] = [
     ProviderDescriptor {
         id: ProviderId::Claude,
         display_name: "Claude",
-        icon: ProviderIcon::Glyph("✦"),
+        icon: ProviderIcon::AnthropicMark,
         description: "Anthropic Claude through the canonical ACP adapter",
         license_url: "https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.66.0/LICENSE",
-        terms_url: "https://www.anthropic.com/legal/consumer-terms",
+        terms_url: "https://www.anthropic.com/legal/commercial-terms",
+        terms_notice: "Editur will download and run a pinned Claude package in Editur's private application-data directory. The canonical Apache-2.0 adapter is bundled with Anthropic's proprietary Claude Agent SDK and native binary, which are governed by Anthropic's commercial terms.",
+        legal_links: CLAUDE_LEGAL_LINKS,
         install_policy: InstallPolicy::Lazy,
         extensions: ProviderExtensions::None,
-        unavailable_reason: Some("Unavailable: distribution and licensing review incomplete"),
+        unavailable_reason: None,
     },
 ];
 
@@ -125,6 +173,103 @@ pub fn descriptor(id: ProviderId) -> &'static ProviderDescriptor {
         .iter()
         .find(|provider| provider.id == id)
         .expect("every ProviderId has a catalog entry")
+}
+
+pub(crate) fn normalize_auth_methods(
+    provider: ProviderId,
+    methods: &[AuthMethod],
+) -> Vec<AuthChoice> {
+    methods
+        .iter()
+        .take(128)
+        .map(|method| {
+            let codex_api_key =
+                provider == ProviderId::Codex && method.id().0.as_ref() == "api-key";
+            let (kind, setup, can_authenticate) = match method {
+                AuthMethod::Agent(_) if codex_api_key => {
+                    let names = ["CODEX_API_KEY", "OPENAI_API_KEY"];
+                    (
+                        AuthKind::Environment,
+                        Some(format!("variables: {}", names.join(", "))),
+                        names.iter().any(|name| {
+                            std::env::var_os(name).is_some_and(|value| !value.is_empty())
+                        }),
+                    )
+                }
+                AuthMethod::Agent(_) => (AuthKind::Agent, None, true),
+                AuthMethod::Terminal(terminal) => {
+                    let mut details = Vec::new();
+                    if !terminal.args.is_empty() {
+                        details.push(format!("arguments: {}", terminal.args.join(" ")));
+                    }
+                    if !terminal.env.is_empty() {
+                        let mut names = terminal.env.keys().cloned().collect::<Vec<_>>();
+                        names.sort();
+                        details.push(format!("environment: {}", names.join(", ")));
+                    }
+                    (
+                        AuthKind::Terminal,
+                        (!details.is_empty()).then(|| details.join("; ")),
+                        provider == ProviderId::Claude && terminal.env.is_empty(),
+                    )
+                }
+                AuthMethod::EnvVar(environment) => {
+                    let names = environment
+                        .vars
+                        .iter()
+                        .map(|variable| variable.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        AuthKind::Environment,
+                        (!names.is_empty()).then(|| format!("variables: {names}")),
+                        false,
+                    )
+                }
+                _ => (AuthKind::Unsupported, None, false),
+            };
+            AuthChoice {
+                id: method.id().0.to_string(),
+                name: method.name().to_owned(),
+                description: method.description().map(str::to_owned),
+                kind,
+                setup,
+                can_authenticate,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn authentication_required_choices(
+    provider: ProviderId,
+    choices: Vec<AuthChoice>,
+) -> Vec<AuthChoice> {
+    if provider != ProviderId::Claude || !choices.is_empty() {
+        return choices;
+    }
+    vec![AuthChoice {
+        id: "anthropic-environment".into(),
+        name: "Anthropic API or commercial cloud credentials".into(),
+        description: Some(
+            "Configure credentials outside Editur, then retry the Claude provider.".into(),
+        ),
+        kind: AuthKind::Environment,
+        setup: Some(
+            "variables: ANTHROPIC_API_KEY or supported commercial cloud credentials".into(),
+        ),
+        can_authenticate: false,
+    }]
+}
+
+pub(crate) fn visible_diagnostics(provider: ProviderId, raw: String) -> String {
+    if provider == ProviderId::Cursor || raw.is_empty() {
+        raw
+    } else {
+        format!(
+            "{} stderr suppressed to protect authentication and protocol data.",
+            descriptor(provider).display_name
+        )
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -144,14 +289,6 @@ pub fn prepare(
     data_dir: &Path,
     progress: impl FnMut(super::provision::DownloadProgress),
 ) -> Result<PreparedAgent, String> {
-    if descriptor(provider).install_policy == InstallPolicy::Lazy
-        && !terms_accepted(data_dir, provider)
-    {
-        return Err(format!(
-            "accept the {} terms before installation",
-            descriptor(provider).display_name
-        ));
-    }
     let bundle = super::provision::embedded_bundle()?;
     let installed = super::provision::ensure(bundle.manifest(provider)?, data_dir, progress)?;
     Ok(prepare_installed(provider, installed, data_dir))
@@ -179,13 +316,22 @@ pub fn prepare_installed(
         command: installed.command,
         args: installed.args,
         env,
-        remove_env: if provider == ProviderId::Codex {
-            vec!["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"]
-        } else {
-            Vec::new()
-        },
+        remove_env: removed_environment(provider).to_vec(),
         version: installed.version,
         extensions: metadata.extensions,
+    }
+}
+
+pub(crate) const fn removed_environment(provider: ProviderId) -> &'static [&'static str] {
+    match provider {
+        ProviderId::Cursor => &[],
+        ProviderId::Codex => &["APP_SERVER_LOGS", "CODEX_PATH", "NODE_OPTIONS", "NODE_PATH"],
+        ProviderId::Claude => &[
+            "CLAUDE_CODE_EXECUTABLE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+        ],
     }
 }
 
@@ -208,30 +354,6 @@ pub fn save_selected(data_dir: &Path, provider: ProviderId) -> Result<(), String
     let bytes = serde_json::to_vec(&Preference { provider })
         .map_err(|error| format!("cannot encode selected ACP provider: {error}"))?;
     write_atomic(data_dir, PREFERENCE_FILE, &bytes, "selected ACP provider")
-}
-
-#[derive(Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AcceptedTerms {
-    providers: Vec<ProviderId>,
-}
-
-pub fn terms_accepted(data_dir: &Path, provider: ProviderId) -> bool {
-    read_small_file(&data_dir.join(TERMS_FILE))
-        .and_then(|bytes| serde_json::from_slice::<AcceptedTerms>(&bytes).ok())
-        .is_some_and(|accepted| accepted.providers.contains(&provider))
-}
-
-pub fn accept_terms(data_dir: &Path, provider: ProviderId) -> Result<(), String> {
-    let mut accepted = read_small_file(&data_dir.join(TERMS_FILE))
-        .and_then(|bytes| serde_json::from_slice::<AcceptedTerms>(&bytes).ok())
-        .unwrap_or_default();
-    if !accepted.providers.contains(&provider) {
-        accepted.providers.push(provider);
-    }
-    let bytes = serde_json::to_vec(&accepted)
-        .map_err(|error| format!("cannot encode accepted ACP provider terms: {error}"))?;
-    write_atomic(data_dir, TERMS_FILE, &bytes, "accepted ACP provider terms")
 }
 
 fn read_small_file(path: &Path) -> Option<Vec<u8>> {

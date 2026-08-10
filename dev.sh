@@ -17,11 +17,16 @@ esac
 
 cursor_manifest="target/editur-dev/cursor-agent-$agent_os-$agent_arch.json"
 codex_manifest="target/editur-dev/codex-agent-$agent_os-$agent_arch.json"
+claude_manifest="target/editur-dev/claude-agent-$agent_os-$agent_arch.json"
 provider_bundle="target/editur-dev/agent-bundle-$agent_os-$agent_arch.json"
 codex_commit=5faefec5d55ded33c54b68ffec93def4f6c547f5
 codex_source="target/editur-dev/codex-acp-$codex_commit"
 codex_stage="target/editur-dev/codex-stage-$agent_os-$agent_arch"
 codex_archive="$script_dir/target/editur-dev/editur-provider-codex-$agent_os-$agent_arch.zip"
+claude_commit=6b405138fc82be947964612fac04e56654827b66
+claude_source="target/editur-dev/claude-agent-acp-$claude_commit"
+claude_stage="target/editur-dev/claude-stage-$agent_os-$agent_arch"
+claude_archive="$script_dir/target/editur-dev/editur-provider-claude-$agent_os-$agent_arch.zip"
 binary="target/editur-dev/bin/editur"
 if [ ! -s "$cursor_manifest" ] || [ assets/agent/cursor-release.json -nt "$cursor_manifest" ]; then
   printf '%s\n' 'Generating the pinned Cursor Agent development manifest…'
@@ -101,8 +106,45 @@ if [ ! -s "$codex_manifest" ] \
   cargo run --locked --example build_agent_manifest -- \
     assets/agent/codex-release.json "$agent_os" "$agent_arch" "$codex_manifest" "$codex_archive"
 fi
+
+if [ ! -s "$claude_archive" ] \
+  || [ assets/agent/claude-release.json -nt "$claude_archive" ] \
+  || [ examples/package_provider_runtime.rs -nt "$claude_archive" ] \
+  || [ examples/verify_claude_source.rs -nt "$claude_archive" ]; then
+  if [ ! -d "$claude_source/.git" ]; then
+    printf '%s\n' 'Fetching the pinned Claude ACP adapter…'
+    git init -q "$claude_source"
+    git -C "$claude_source" remote add origin https://github.com/agentclientprotocol/claude-agent-acp.git
+    git -C "$claude_source" fetch --depth 1 origin "$claude_commit"
+    git -C "$claude_source" checkout -q --detach FETCH_HEAD
+  fi
+  if [ "$(git -C "$claude_source" rev-parse HEAD)" != "$claude_commit" ]; then
+    printf '%s\n' 'editur: cached Claude ACP source does not match the release pin' >&2
+    exit 1
+  fi
+  printf '%s\n' 'Building the pinned Claude ACP development package…'
+  PATH="$script_dir/$node_root/bin:$PATH" npm --prefix "$claude_source" ci --ignore-scripts
+  PATH="$script_dir/$node_root/bin:$PATH" npm --prefix "$claude_source" run build
+  PATH="$script_dir/$node_root/bin:$PATH" npm --prefix "$claude_source" prune --omit=dev --ignore-scripts
+  PATH="$script_dir/$node_root/bin:$PATH" cargo run --locked --example verify_claude_source -- "$claude_source"
+  mkdir -p "$claude_stage/package/node_modules" "$claude_stage/runtime/bin"
+  cp -R "$claude_source/dist" "$claude_stage/package/"
+  cp "$claude_source/package.json" "$claude_source/README.md" "$claude_source/LICENSE" "$claude_stage/package/"
+  cp -R "$claude_source/node_modules/"* "$claude_stage/package/node_modules/"
+  cp "$node_root/bin/node" "$claude_stage/runtime/bin/node"
+  cp "$node_root/LICENSE" "$claude_stage/runtime/LICENSE"
+  cargo run --locked --example package_provider_runtime -- "$claude_stage" "$claude_archive.new"
+  mv "$claude_archive.new" "$claude_archive"
+fi
+
+if [ ! -s "$claude_manifest" ] \
+  || [ assets/agent/claude-release.json -nt "$claude_manifest" ] \
+  || [ "$claude_archive" -nt "$claude_manifest" ]; then
+  cargo run --locked --example build_agent_manifest -- \
+    assets/agent/claude-release.json "$agent_os" "$agent_arch" "$claude_manifest" "$claude_archive"
+fi
 cargo run --locked --example build_provider_bundle -- \
-  "$provider_bundle" "$cursor_manifest" "$codex_manifest"
+  "$provider_bundle" "$cursor_manifest" "$codex_manifest" "$claude_manifest"
 
 EDITUR_PROVIDER_BUNDLE="$provider_bundle" cargo build --locked --bin editur
 target/debug/editur --quit-running
@@ -120,4 +162,4 @@ mv "$binary.new" "$binary"
 if [ "$#" -eq 0 ]; then
   set -- .
 fi
-EDITUR_CODEX_ARCHIVE="$codex_archive" exec "$binary" "$@"
+EDITUR_CODEX_ARCHIVE="$codex_archive" EDITUR_CLAUDE_ARCHIVE="$claude_archive" exec "$binary" "$@"

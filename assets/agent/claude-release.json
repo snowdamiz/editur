@@ -1,0 +1,146 @@
+{
+  "provider": "claude",
+  "version": "0.66.0",
+  "distributions": [
+    {
+      "os": "macos",
+      "architecture": "aarch64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-claude-macos-aarch64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "args": [],
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "0.66.0"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--cli", "--version"],
+          "expected": "2.1.220 (Claude Code)"
+        }
+      ],
+      "package_probes": [
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk",
+          "version": "0.3.220",
+          "integrity": "sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA=="
+        },
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk-darwin-arm64",
+          "version": "0.3.220",
+          "integrity": "sha512-7VxlbEosK7DODiOnsjoVd0DSJzbnaPrM2jelMHI0y8zx1UnLS3WC6EFUXbvy74F2sXqEznh2tzn7EKWInaRN6Q=="
+        }
+      ],
+      "archive_format": "zip"
+    },
+    {
+      "os": "macos",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-claude-macos-x86_64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "args": [],
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "0.66.0"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--cli", "--version"],
+          "expected": "2.1.220 (Claude Code)"
+        }
+      ],
+      "package_probes": [
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk",
+          "version": "0.3.220",
+          "integrity": "sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA=="
+        },
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk-darwin-x64/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk-darwin-x64",
+          "version": "0.3.220",
+          "integrity": "sha512-X9RwDsSmbF6ultKZroaip+DL8WRgC64gHbrAwrRlAFSPNZV7zmJyP2ur8rW7KrxqmtuehdMMkw8+SAC/6hD2PA=="
+        }
+      ],
+      "archive_format": "zip"
+    },
+    {
+      "os": "linux",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-claude-linux-x86_64.zip",
+      "command": "runtime/bin/node",
+      "entrypoint": "package/dist/index.js",
+      "args": [],
+      "version_probes": [
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "0.66.0"
+        },
+        {
+          "command": "runtime/bin/node",
+          "args": ["package/dist/index.js", "--cli", "--version"],
+          "expected": "2.1.220 (Claude Code)"
+        }
+      ],
+      "package_probes": [
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk",
+          "version": "0.3.220",
+          "integrity": "sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA=="
+        },
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk-linux-x64",
+          "version": "0.3.220",
+          "integrity": "sha512-tkTJFnpR9VifvWX2fmkCAPkT6+8Wk/gVu8B5jsVekKZPiZoWRHmMXO30BnZn+f0TZhgYP+82PSX3S8crH1kn+w=="
+        }
+      ],
+      "archive_format": "zip"
+    },
+    {
+      "os": "windows",
+      "architecture": "x86_64",
+      "archive_url": "https://github.com/snowdamiz/editur/releases/download/provider-v1/editur-provider-claude-windows-x86_64.zip",
+      "command": "runtime/node.exe",
+      "entrypoint": "package/dist/index.js",
+      "args": [],
+      "version_probes": [
+        {
+          "command": "runtime/node.exe",
+          "args": ["package/dist/index.js", "--version"],
+          "expected": "0.66.0"
+        },
+        {
+          "command": "runtime/node.exe",
+          "args": ["package/dist/index.js", "--cli", "--version"],
+          "expected": "2.1.220 (Claude Code)"
+        }
+      ],
+      "package_probes": [
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk",
+          "version": "0.3.220",
+          "integrity": "sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA=="
+        },
+        {
+          "path": "package/node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/package.json",
+          "name": "@anthropic-ai/claude-agent-sdk-win32-x64",
+          "version": "0.3.220",
+          "integrity": "sha512-MuOuXhbr66HlGaWXD2f3w0k2PsvmnbkwcUZ0dAe2poFLdl72GC2dapwwOBefxm9QmoNqk9+jmv/dSKGOVWyvLw=="
+        }
+      ],
+      "archive_format": "zip"
+    }
+  ]
+}

@@ -86,7 +86,7 @@ fn is_executable(path: &Path, _name: &str) -> io::Result<bool> {
 
 #[cfg(not(unix))]
 fn is_executable(_path: &Path, name: &str) -> io::Result<bool> {
-    Ok(name == "runtime/node.exe" || name.ends_with("/codex.exe"))
+    Ok(name == "runtime/node.exe" || name.ends_with("/codex.exe") || name.ends_with("/claude.exe"))
 }
 
 #[cfg(test)]

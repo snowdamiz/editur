@@ -109,16 +109,6 @@ impl Default for AgentState {
 }
 
 impl AgentState {
-    pub fn reset_for_provider_switch(&mut self) {
-        let prompt = std::mem::take(&mut self.prompt);
-        *self = Self::default();
-        self.prompt = prompt;
-    }
-
-    pub fn can_switch_provider(&self) -> bool {
-        !self.active && !self.waiting_permission()
-    }
-
     pub fn can_send(&self, buffer_saved: bool) -> bool {
         buffer_saved && self.session_ready && !self.active && !self.prompt.trim().is_empty()
     }

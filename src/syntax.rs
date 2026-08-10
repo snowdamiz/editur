@@ -51,6 +51,12 @@ impl SyntaxManager {
             .unwrap_or_else(|| self.set.find_syntax_plain_text())
     }
 
+    pub fn detect_token(&self, token: &str) -> &SyntaxReference {
+        self.set
+            .find_syntax_by_token(token)
+            .unwrap_or_else(|| self.plain_text())
+    }
+
     pub fn set(&self) -> &SyntaxSet {
         &self.set
     }

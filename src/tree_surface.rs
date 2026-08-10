@@ -1,8 +1,14 @@
 use egui::{Color32, FontId, Rect, Response, Sense, Stroke, Ui};
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use crate::renderer::mark_retained;
-use crate::tree::TreeEntry;
+use crate::{
+    renderer::mark_retained,
+    theme::{
+        ACCENT, CANVAS, SURFACE_HOVER, SURFACE_SELECTED, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY,
+        TEXT_SECONDARY,
+    },
+    tree::TreeEntry,
+};
 
 const ROW_HEIGHT: f32 = 26.0;
 
@@ -66,7 +72,7 @@ impl TreeSurface {
             0x4000_0000_0000_0000,
             u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
         );
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 22));
+        painter.rect_filled(rect, 0.0, CANVAS);
         for index in self.visible_rows(rows.len(), rect.height()) {
             let row = &rows[index];
             let top = rect.top() + index as f32 * ROW_HEIGHT - self.scroll_y;
@@ -75,9 +81,9 @@ impl TreeSurface {
                 egui::vec2((content.width() - 8.0).max(0.0), ROW_HEIGHT - 2.0),
             );
             let fill = if selected == Some(index) {
-                Color32::from_rgb(30, 57, 66)
+                SURFACE_SELECTED
             } else if self.hovered == Some(index) {
-                Color32::from_rgb(29, 29, 32)
+                SURFACE_HOVER
             } else {
                 Color32::TRANSPARENT
             };
@@ -94,30 +100,16 @@ impl TreeSurface {
                 revision,
             );
             painter.rect_filled(row_rect, 4.0, fill);
-            if selected == Some(index) {
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        egui::pos2(rect.left(), row_rect.top() + 3.0),
-                        egui::vec2(2.0, row_rect.height() - 6.0),
-                    ),
-                    1.0,
-                    Color32::from_rgb(86, 207, 225),
-                );
-            }
             for depth in 0..row.depth {
                 let x = rect.left() + 13.0 + depth as f32 * 16.0;
-                painter.vline(
-                    x,
-                    row_rect.y_range(),
-                    Stroke::new(1.0, Color32::from_rgb(35, 35, 39)),
-                );
+                painter.vline(x, row_rect.y_range(), Stroke::new(1.0, SURFACE_HOVER));
             }
             let marker_center = egui::pos2(
                 rect.left() + 13.0 + row.depth as f32 * 16.0,
                 row_rect.center().y,
             );
             if row.directory {
-                let stroke = Stroke::new(1.2, Color32::from_rgb(128, 139, 155));
+                let stroke = Stroke::new(1.2, TEXT_MUTED);
                 if row.expanded {
                     painter.line_segment(
                         [
@@ -151,11 +143,7 @@ impl TreeSurface {
                 }
             }
             let icon_left = marker_center.x + 8.0;
-            let icon_color = if row.directory {
-                Color32::from_rgb(103, 196, 208)
-            } else {
-                Color32::from_rgb(105, 114, 130)
-            };
+            let icon_color = if row.directory { ACCENT } else { TEXT_DISABLED };
             if row.directory {
                 let center_y = marker_center.y + 1.0;
                 painter.rect_filled(
@@ -204,9 +192,9 @@ impl TreeSurface {
                         row.label.clone(),
                         FontId::proportional(if row.directory { 13.5 } else { 13.0 }),
                         if row.directory {
-                            Color32::from_rgb(213, 218, 227)
+                            TEXT_PRIMARY
                         } else {
-                            Color32::from_rgb(174, 181, 194)
+                            TEXT_SECONDARY
                         },
                     )
                 })
@@ -266,9 +254,9 @@ impl TreeSurface {
 
 #[cfg(test)]
 mod tests {
-    use super::{TreeRow, TreeSurface};
-    use crate::{renderer::retained_paint, tree::TreeEntry};
-    use egui::{Color32, Event, RawInput, Rect, Shape, Vec2, pos2};
+    use super::{TEXT_MUTED, TreeRow, TreeSurface};
+    use crate::{renderer::retained_paint, theme::ACCENT, tree::TreeEntry};
+    use egui::{Event, RawInput, Rect, Shape, Vec2, pos2};
     use std::{ffi::OsString, path::PathBuf};
 
     #[test]
@@ -381,8 +369,8 @@ mod tests {
                 surface.show(ui, &rows, None, false);
             },
         );
-        let folder_color = Color32::from_rgb(103, 196, 208);
-        let chevron_color = Color32::from_rgb(128, 139, 155);
+        let folder_color = ACCENT;
+        let chevron_color = TEXT_MUTED;
         let mut folder_top = f32::INFINITY;
         let mut folder_bottom = f32::NEG_INFINITY;
         let mut chevron_top = f32::INFINITY;

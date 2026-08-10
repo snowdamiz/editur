@@ -30,7 +30,8 @@ fn image_prompt_reaches_the_agent_as_an_acp_image_block() {
     let project = tempfile::tempdir().unwrap();
     let image_path = project.path().join("reference.png");
     std::fs::write(&image_path, [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]).unwrap();
-    let controller = AgentController::start_process(
+    let controller = AgentController::start_process_for(
+        ProviderId::Claude,
         project.path().to_path_buf(),
         env!("CARGO_BIN_EXE_editur-fake-agent").into(),
         Vec::new(),
@@ -220,6 +221,58 @@ fn codex_api_key_auth_is_environment_owned_and_chatgpt_stays_agent_owned() {
 }
 
 #[test]
+fn claude_subscription_auth_uses_the_adapters_terminal_login() {
+    let project = tempfile::tempdir().unwrap();
+    let auth_marker = project.path().join("claude-authenticated");
+    let controller = AgentController::start_process_for(
+        ProviderId::Claude,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--claude-auth".into(),
+            auth_marker.to_string_lossy().into_owned(),
+        ],
+    );
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::ConnectionChanged(ConnectionState::AuthenticationRequired(_))
+        )
+    });
+    let methods = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ConnectionChanged(ConnectionState::AuthenticationRequired(methods)) => {
+                Some(methods)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    assert!(matches!(methods.as_slice(), [method]
+        if method.id == "claude-ai-login"
+            && method.name == "Claude Subscription"
+            && method.kind == AuthKind::Terminal
+            && method.setup.as_deref() == Some("arguments: --cli auth login --claudeai")
+            && method.can_authenticate));
+
+    controller
+        .send(Command::Authenticate("claude-ai-login".into()))
+        .unwrap();
+    let completed = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    assert!(auth_marker.is_file());
+    assert!(
+        !completed
+            .iter()
+            .any(|event| matches!(event, Event::Error(_)))
+    );
+}
+
+#[test]
 fn history_and_cursor_only_controls_are_capability_events() {
     for (provider, args, expected_history, expected_allow_all) in [
         (ProviderId::Cursor, vec!["--sessions".into()], true, true),
@@ -285,6 +338,67 @@ fn pinned_codex_fixture_drives_history_and_standard_session_controls() {
 }
 
 #[test]
+fn pinned_claude_fixture_drives_shared_history_attachments_and_session_controls() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-agent-acp-0.66.0.json");
+    let fixture_text = std::fs::read_to_string(&fixture).unwrap();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "accountId",
+        "organizationId",
+        "apiKey",
+        "sk-ant-",
+    ] {
+        assert!(!fixture_text.contains(forbidden));
+    }
+    let project = tempfile::tempdir().unwrap();
+    let image_path = project.path().join("fixture.png");
+    std::fs::write(&image_path, [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]).unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Claude,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--claude-fixture".into(),
+            fixture.to_string_lossy().into_owned(),
+        ],
+    );
+
+    let ready = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    assert!(ready.iter().any(|event| matches!(
+        event,
+        Event::Capabilities {
+            history: true,
+            allow_run_everything: false
+        }
+    )));
+    assert!(ready.iter().any(|event| matches!(
+        event,
+        Event::SessionReady { config_options, .. }
+            if config_options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>()
+                == ["mode", "model", "effort", "fast", "agent"]
+    )));
+
+    controller
+        .send(Command::PromptWithAttachments {
+            text: "image".into(),
+            attachments: vec![PromptAttachment::from_path(&image_path).unwrap()],
+        })
+        .unwrap();
+    let prompt = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(
+        prompt
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "image/png:16"))
+    );
+}
+
+#[test]
 fn reconnecting_restores_the_newest_project_session() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(
@@ -334,6 +448,27 @@ fn reconnecting_restores_the_newest_project_session() {
     assert!(follow_up.iter().any(|event| matches!(
         event,
         Event::AssistantDelta(text) if text == "first "
+    )));
+}
+
+#[test]
+fn reconnecting_can_restore_the_providers_active_session() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_resuming(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+        "older-session".into(),
+    );
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "older-session"),
+    );
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::AssistantDelta(text) if text == "older reply"
     )));
 }
 
@@ -783,50 +918,7 @@ fn cursor_extension_notifications_reach_structured_tool_cards() {
 
 #[test]
 fn cursor_extensions_are_ignored_for_a_non_cursor_provider() {
-    let project = tempfile::tempdir().unwrap();
-    let controller = AgentController::start_process_for(
-        ProviderId::Codex,
-        project.path().to_path_buf(),
-        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
-        Vec::new(),
-    );
-    receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::SessionReady { .. })
-    });
-
-    controller
-        .send(Command::Prompt("cursor-question".into()))
-        .unwrap();
-    let question = receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::TurnFinished { .. })
-    });
-    assert!(
-        !question
-            .iter()
-            .any(|event| { matches!(event, Event::InteractionRequested(_) | Event::Error(_)) })
-    );
-    assert!(
-        question
-            .iter()
-            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "cancelled"))
-    );
-
-    controller
-        .send(Command::Prompt("cursor-notification".into()))
-        .unwrap();
-    let notification = receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::TurnFinished { .. })
-    });
-    assert!(
-        !notification
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallUpdated(_)))
-    );
-}
-
-#[test]
-fn standard_acp_behavior_is_shared_by_two_provider_ids() {
-    for provider in [ProviderId::Cursor, ProviderId::Codex] {
+    for provider in [ProviderId::Codex, ProviderId::Claude] {
         let project = tempfile::tempdir().unwrap();
         let controller = AgentController::start_process_for(
             provider,
@@ -837,6 +929,74 @@ fn standard_acp_behavior_is_shared_by_two_provider_ids() {
         receive_until(&controller, Duration::from_secs(5), |event| {
             matches!(event, Event::SessionReady { .. })
         });
+
+        controller
+            .send(Command::Prompt("cursor-question".into()))
+            .unwrap();
+        let question = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            !question
+                .iter()
+                .any(|event| { matches!(event, Event::InteractionRequested(_) | Event::Error(_)) })
+        );
+        assert!(
+            question
+                .iter()
+                .any(|event| matches!(event, Event::AssistantDelta(text) if text == "cancelled"))
+        );
+
+        controller
+            .send(Command::Prompt("cursor-notification".into()))
+            .unwrap();
+        let notification = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            !notification
+                .iter()
+                .any(|event| matches!(event, Event::ToolCallUpdated(_)))
+        );
+    }
+}
+
+#[test]
+fn standard_acp_behavior_is_shared_by_all_provider_ids() {
+    for provider in [ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude] {
+        let project = tempfile::tempdir().unwrap();
+        let controller = AgentController::start_process_for(
+            provider,
+            project.path().to_path_buf(),
+            env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+            Vec::new(),
+        );
+        receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::SessionReady { .. })
+        });
+
+        controller.send(Command::Prompt("first".into())).unwrap();
+        let first = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            first
+                .iter()
+                .any(|event| matches!(event, Event::AssistantDelta(text) if text == "first "))
+        );
+
+        controller
+            .send(Command::Prompt("follow-up".into()))
+            .unwrap();
+        let follow_up = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            follow_up
+                .iter()
+                .any(|event| matches!(event, Event::AssistantDelta(text) if text == "second "))
+        );
+
         controller.send(Command::Prompt("tool".into())).unwrap();
         let events = receive_until(&controller, Duration::from_secs(5), |event| {
             matches!(event, Event::TurnFinished { .. })
@@ -845,6 +1005,50 @@ fn standard_acp_behavior_is_shared_by_two_provider_ids() {
             event,
             Event::ToolCallUpdated(tool) if tool.id == "fake-edit"
         )));
+
+        controller
+            .send(Command::Prompt("permission".into()))
+            .unwrap();
+        let permission = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::PermissionRequested(_))
+        })
+        .into_iter()
+        .find_map(|event| match event {
+            Event::PermissionRequested(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+        controller
+            .send(Command::DecidePermission {
+                request_id: permission.request_id,
+                option_id: "allow_once".into(),
+            })
+            .unwrap();
+        let decided = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            decided
+                .iter()
+                .any(|event| matches!(event, Event::AssistantDelta(text) if text == "allow_once"))
+        );
+
+        controller.send(Command::Prompt("wait".into())).unwrap();
+        receive_until(
+            &controller,
+            Duration::from_secs(5),
+            |event| matches!(event, Event::UserMessage(text) if text == "wait"),
+        );
+        controller.send(Command::Cancel).unwrap();
+        let cancelled = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::TurnFinished { .. })
+        });
+        assert!(
+            cancelled
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { cancelled: true }))
+        );
+
         controller.send(Command::Shutdown).unwrap();
         receive_until(&controller, Duration::from_secs(5), |event| {
             matches!(
@@ -994,6 +1198,38 @@ fn codex_stderr_never_copies_provider_payloads_into_events() {
 }
 
 #[test]
+fn claude_stderr_never_copies_provider_payloads_into_events() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Claude,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("exit-secret".into()))
+        .unwrap();
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::ProcessExited { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .all(|event| { !format!("{event:?}").contains("super-secret-test-value") })
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProcessExited { diagnostics, .. }
+            if diagnostics == "Claude stderr suppressed to protect authentication and protocol data."
+    )));
+}
+
+#[test]
 fn malformed_agent_stdout_becomes_a_connection_error() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(
@@ -1060,7 +1296,8 @@ fn clean_shutdown_waits_for_the_fake_process_to_exit() {
 fn unix_shutdown_terminates_the_descendant_tree() {
     let project = tempfile::tempdir().unwrap();
     let address_file = project.path().join("descendant-address");
-    let controller = AgentController::start_process(
+    let controller = AgentController::start_process_for(
+        ProviderId::Claude,
         project.path().to_path_buf(),
         env!("CARGO_BIN_EXE_editur-fake-agent").into(),
         vec![

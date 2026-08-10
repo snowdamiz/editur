@@ -8,7 +8,7 @@ pub enum Command {
     Open(Option<PathBuf>),
     Resident(PathBuf),
     QuitRunning,
-    AgentProcess(ProviderId, PathBuf),
+    AgentProcess(ProviderId, PathBuf, Vec<OsString>),
     AgentProvision(ProviderId),
     Update,
     #[cfg(windows)]
@@ -51,10 +51,7 @@ where
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| "missing internal agent process target".to_owned())?;
-        if args.next().is_some() {
-            return Err("too many internal process arguments".into());
-        }
-        return Ok(Command::AgentProcess(provider, target));
+        return Ok(Command::AgentProcess(provider, target, args.collect()));
     }
 
     if first == "--provision-agent" {
@@ -148,7 +145,27 @@ mod tests {
             parse(&["--agent-process", "codex", "/tmp/project"]),
             Ok(Command::AgentProcess(
                 crate::agent::provider::ProviderId::Codex,
-                PathBuf::from("/tmp/project")
+                PathBuf::from("/tmp/project"),
+                Vec::new(),
+            ))
+        );
+        assert_eq!(
+            parse(&[
+                "--agent-process",
+                "claude",
+                "/tmp/project",
+                "--cli",
+                "auth",
+                "login",
+                "--claudeai",
+            ]),
+            Ok(Command::AgentProcess(
+                crate::agent::provider::ProviderId::Claude,
+                PathBuf::from("/tmp/project"),
+                ["--cli", "auth", "login", "--claudeai"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
             ))
         );
         assert!(parse(&["--agent-process"]).is_err());

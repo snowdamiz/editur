@@ -5,7 +5,7 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, mpsc::Receiver},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -25,18 +25,22 @@ use winit::{
 use crate::{
     agent::{
         controller::{
-            AgentController, AuthKind, Command as AgentCommand, ConfigValue, ConnectionState,
-            ContentRole, DisplayContent, Event as AgentEvent, InteractionKind, InteractionResponse,
-            MAX_PROMPT_ATTACHMENT_TOTAL_BYTES, MAX_PROMPT_ATTACHMENTS, PromptAttachment,
-            QuestionAnswer, SessionChoice, ToolOutput,
+            AgentController, AuthKind, Command as AgentCommand, ConfigChoice, ConfigValue,
+            ConnectionState, ContentRole, DisplayContent, Event as AgentEvent, InteractionKind,
+            InteractionResponse, MAX_PROMPT_ATTACHMENT_TOTAL_BYTES, MAX_PROMPT_ATTACHMENTS,
+            PromptAttachment, QuestionAnswer, SessionChoice, ToolOutput,
         },
         provider::{
-            InstallPolicy, ProviderDescriptor, ProviderIcon, ProviderId,
-            catalog as provider_catalog, descriptor as provider_descriptor,
+            ProviderDescriptor, ProviderIcon, ProviderId, catalog as provider_catalog,
+            descriptor as provider_descriptor,
         },
         state::{AgentState, TranscriptItem},
     },
     buffer::Buffer,
+    components::{
+        begin_dialog, chevron_icon_button, close_icon_button, dialog_actions, dialog_button,
+        dialog_frame, dialog_window, icon_button, selectable_content_row, selectable_row,
+    },
     data_dir,
     editor_surface::{DocumentMetrics, EDITOR_BACKGROUND, EditorSurface},
     file_io::{OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, safe_save},
@@ -45,6 +49,11 @@ use crate::{
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
+    theme::{
+        self, ACCENT, ACCENT_INK, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER,
+        SURFACE_INPUT, SURFACE_RAISED, SURFACE_SELECTED, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY,
+        TEXT_SECONDARY,
+    },
     tree::{TreeEntry, read_directory},
     tree_surface::{TreeRow, TreeSurface},
 };
@@ -73,9 +82,9 @@ const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
 const AGENT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
 const AGENT_MENU_WIDTH: f32 = 240.0;
-const AGENT_PROVIDER_MENU_WIDTH: f32 = 320.0;
+const AGENT_PROVIDER_MENU_WIDTH: f32 = 240.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
-const AGENT_PROVIDER_ROW_HEIGHT: f32 = 58.0;
+const AGENT_PROVIDER_ROW_HEIGHT: f32 = 44.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
 const AGENT_FOLLOW_THRESHOLD: f32 = 48.0;
@@ -85,6 +94,7 @@ const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
 const AGENTIC_SESSION_RAIL_WIDTH: f32 = 248.0;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
+const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
 const TITLEBAR_PAINT_KEY: u64 = 0xa000_0000_0000_0000;
 
@@ -468,39 +478,33 @@ fn tool_contains_diff(tool: &crate::agent::controller::ToolActivity) -> bool {
 
 fn agent_tool_status(status: Option<&str>) -> (&'static str, Color32) {
     match status.unwrap_or_default() {
-        "Completed" => ("Done", Color32::from_rgb(105, 210, 157)),
-        "InProgress" | "Pending" => ("Running", Color32::from_rgb(93, 204, 225)),
+        "Completed" => ("Completed", Color32::from_rgb(105, 210, 157)),
+        "InProgress" | "Pending" => ("Running", ACCENT),
         "Failed" => ("Failed", Color32::from_rgb(238, 132, 139)),
-        _ => ("", Color32::from_rgb(145, 153, 168)),
+        _ => ("", TEXT_MUTED),
     }
 }
 
 fn paint_agent_disclosure(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
     let center = response.rect.center() + egui::vec2(0.0, 1.0);
     let rotation = egui::emath::Rot2::from_angle(openness * std::f32::consts::FRAC_PI_2);
-    let points = [
-        egui::vec2(-2.0, -3.0),
-        egui::vec2(-2.0, 3.0),
-        egui::vec2(2.5, 0.0),
-    ]
-    .into_iter()
-    .map(|point| center + rotation * point)
-    .collect();
-    ui.painter().add(egui::Shape::convex_polygon(
-        points,
-        ui.style().interact(response).fg_stroke.color,
-        egui::Stroke::NONE,
-    ));
+    let tip = center + rotation * egui::vec2(2.0, 0.0);
+    let stroke = egui::Stroke::new(1.5, ui.style().interact(response).fg_stroke.color);
+    for point in [egui::vec2(-2.0, -3.5), egui::vec2(-2.0, 3.5)] {
+        ui.painter()
+            .line_segment([center + rotation * point, tip], stroke);
+    }
 }
 
 fn paint_cursor_mark(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let center = rect.center();
-    let top = center + egui::vec2(0.0, -7.0);
-    let upper_right = center + egui::vec2(6.1, -3.5);
-    let lower_right = center + egui::vec2(6.1, 3.5);
-    let bottom = center + egui::vec2(0.0, 7.0);
-    let lower_left = center + egui::vec2(-6.1, 3.5);
-    let upper_left = center + egui::vec2(-6.1, -3.5);
+    let scale = rect.width().min(rect.height()) / 15.0;
+    let top = center + egui::vec2(0.0, -7.0 * scale);
+    let upper_right = center + egui::vec2(6.1 * scale, -3.5 * scale);
+    let lower_right = center + egui::vec2(6.1 * scale, 3.5 * scale);
+    let bottom = center + egui::vec2(0.0, 7.0 * scale);
+    let lower_left = center + egui::vec2(-6.1 * scale, 3.5 * scale);
+    let upper_left = center + egui::vec2(-6.1 * scale, -3.5 * scale);
     for points in [
         vec![top, upper_right, upper_left],
         vec![upper_right, lower_right, bottom],
@@ -522,14 +526,44 @@ fn paint_provider_icon(
 ) {
     match icon {
         ProviderIcon::CursorMark => paint_cursor_mark(painter, rect, color),
-        ProviderIcon::Glyph(glyph) => {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                glyph,
-                FontId::proportional(14.0),
-                color,
-            );
+        ProviderIcon::OpenAiMark | ProviderIcon::AnthropicMark => {
+            let (cache_key, name, bytes) = match icon {
+                ProviderIcon::OpenAiMark => (
+                    "provider_openai_texture",
+                    "OpenAI logo",
+                    &include_bytes!("../assets/icons/provider-openai.png")[..],
+                ),
+                ProviderIcon::AnthropicMark => (
+                    "provider_anthropic_texture",
+                    "Anthropic logo",
+                    &include_bytes!("../assets/icons/provider-anthropic.png")[..],
+                ),
+                ProviderIcon::CursorMark => unreachable!(),
+            };
+            let ctx = painter.ctx();
+            let cache_id = Id::new(cache_key);
+            let texture = ctx.data_mut(|data| data.get_temp::<egui::TextureHandle>(cache_id));
+            let texture = texture.or_else(|| {
+                let pixels = image::load_from_memory(bytes).ok()?.into_rgba8();
+                let size = [pixels.width() as usize, pixels.height() as usize];
+                let texture = ctx.load_texture(
+                    name,
+                    egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw()),
+                    egui::TextureOptions::LINEAR,
+                );
+                ctx.data_mut(|data| data.insert_temp(cache_id, texture.clone()));
+                Some(texture)
+            });
+            if let Some(texture) = texture {
+                let side = rect.width().min(rect.height());
+                let rect = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+                painter.image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    color,
+                );
+            }
         }
     }
 }
@@ -538,21 +572,16 @@ fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
     let provider = provider_descriptor(provider);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 18.0), Sense::hover());
-        paint_provider_icon(
-            ui.painter(),
-            rect,
-            provider.icon,
-            Color32::from_rgb(238, 240, 246),
-        );
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(17.0, 20.0), Sense::hover());
+        paint_provider_icon(ui.painter(), rect, provider.icon, TEXT_PRIMARY);
         ui.label(
             RichText::new(provider.display_name)
                 .size(13.0)
                 .strong()
-                .color(Color32::from_rgb(238, 240, 246)),
+                .color(TEXT_PRIMARY),
         );
     });
-    ui.add_space(2.0);
+    ui.add_space(5.0);
 }
 
 fn draw_provider_selector_identity(
@@ -564,9 +593,9 @@ fn draw_provider_selector_identity(
     let response = ui
         .add_enabled_ui(enabled, |ui| {
             let text_color = if ui.is_enabled() {
-                Color32::from_rgb(238, 240, 246)
+                TEXT_PRIMARY
             } else {
-                Color32::from_rgb(122, 126, 136)
+                TEXT_DISABLED
             };
             let galley = ui.painter().layout_no_wrap(
                 provider.display_name.to_owned(),
@@ -574,15 +603,15 @@ fn draw_provider_selector_identity(
                 text_color,
             );
             let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(32.0 + galley.size().x, 20.0), Sense::click());
+                ui.allocate_exact_size(egui::vec2(41.0 + galley.size().x, 20.0), Sense::click());
             if response.hovered() || response.is_pointer_button_down_on() {
                 ui.painter().rect_filled(
                     rect.expand2(egui::vec2(4.0, 2.0)),
                     5.0,
                     if response.is_pointer_button_down_on() {
-                        Color32::from_rgb(37, 44, 49)
+                        SURFACE_SELECTED
                     } else {
-                        Color32::from_rgb(31, 36, 40)
+                        SURFACE_HOVER
                     },
                 );
             }
@@ -594,12 +623,12 @@ fn draw_provider_selector_identity(
             let text_pos = egui::pos2(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5);
             let text_right = text_pos.x + galley.size().x;
             ui.painter().galley(text_pos, galley, text_color);
-            let tip = egui::pos2(text_right + 7.0, rect.center().y + 1.5);
-            let stroke = egui::Stroke::new(1.3, text_color);
+            let tip = egui::pos2(text_right + 14.0, rect.center().y + 1.5);
+            let stroke = egui::Stroke::new(1.5, text_color);
             ui.painter()
-                .line_segment([tip + egui::vec2(-3.0, -2.5), tip], stroke);
+                .line_segment([tip + egui::vec2(-4.0, -3.5), tip], stroke);
             ui.painter()
-                .line_segment([tip, tip + egui::vec2(3.0, -2.5)], stroke);
+                .line_segment([tip, tip + egui::vec2(4.0, -3.5)], stroke);
             response
         })
         .inner;
@@ -617,15 +646,173 @@ struct AgentMarkdownCache {
     galley: Option<Arc<egui::Galley>>,
 }
 
-fn agent_markdown_galley(ui: &mut egui::Ui, id: Id, source: &str, width: f32) -> Arc<egui::Galley> {
+#[derive(Clone, Default)]
+struct AgentCodeCache {
+    source: String,
+    path: PathBuf,
+    width: u32,
+    galley: Option<Arc<egui::Galley>>,
+}
+
+#[derive(Clone)]
+struct AgentSyntaxLines {
+    job: LayoutJob,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Default)]
+struct AgentSyntaxLinesCache {
+    source: String,
+    path: PathBuf,
+    lines: Option<Arc<AgentSyntaxLines>>,
+}
+
+fn agent_syntax_lines(
+    ui: &mut egui::Ui,
+    id: Id,
+    path: &Path,
+    source: &str,
+    highlighter: &Highlighter,
+    syntaxes: &SyntaxManager,
+) -> Arc<AgentSyntaxLines> {
+    let stale = ui.data_mut(|data| {
+        let cache = data.get_temp_mut_or_default::<AgentSyntaxLinesCache>(id);
+        cache.lines.is_none() || cache.path != path || cache.source != source
+    });
+    if stale {
+        let syntax = syntaxes.detect(path, false);
+        let job = highlighter
+            .highlight_job(source, syntax, syntaxes.set(), f32::INFINITY)
+            .unwrap_or_else(|_| plain_text_job(source, f32::INFINITY));
+        let mut offset = 0;
+        let ranges = source
+            .split_inclusive('\n')
+            .map(|line| {
+                let start = offset;
+                offset += line.len();
+                let end = offset
+                    - usize::from(line.ends_with('\n'))
+                    - usize::from(line.ends_with("\r\n"));
+                start..end
+            })
+            .collect();
+        let lines = Arc::new(AgentSyntaxLines { job, ranges });
+        ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentSyntaxLinesCache>(id);
+            cache.source.clear();
+            cache.source.push_str(source);
+            cache.path = path.to_path_buf();
+            cache.lines = Some(lines);
+        });
+    }
+    ui.data_mut(|data| {
+        Arc::clone(
+            data.get_temp_mut_or_default::<AgentSyntaxLinesCache>(id)
+                .lines
+                .as_ref()
+                .expect("agent syntax lines were cached"),
+        )
+    })
+}
+
+fn append_agent_syntax_line(
+    target: &mut LayoutJob,
+    highlighted: &AgentSyntaxLines,
+    line_number: usize,
+    fallback: &str,
+) {
+    let Some(range) = highlighted.ranges.get(line_number.saturating_sub(1)) else {
+        target.append(
+            fallback,
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(12.0),
+                color: TEXT_SECONDARY,
+                ..TextFormat::default()
+            },
+        );
+        return;
+    };
+    for section in &highlighted.job.sections {
+        let start = section.byte_range.start.0.max(range.start);
+        let end = section.byte_range.end.0.min(range.end);
+        if start < end {
+            let mut format = section.format.clone();
+            format.font_id.size = 12.0;
+            target.append(&highlighted.job.text[start..end], 0.0, format);
+        }
+    }
+}
+
+fn agent_code_galley(
+    ui: &mut egui::Ui,
+    id: Id,
+    path: &Path,
+    source: &str,
+    width: f32,
+    highlighter: &Highlighter,
+    syntaxes: &SyntaxManager,
+) -> Arc<egui::Galley> {
+    let width_key = width.round().to_bits();
+    let stale = ui.data_mut(|data| {
+        let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
+        cache.galley.is_none()
+            || cache.width != width_key
+            || cache.path != path
+            || cache.source != source
+    });
+    if stale {
+        let syntax = syntaxes.detect(path, false);
+        let mut job = highlighter
+            .highlight_job(source, syntax, syntaxes.set(), width)
+            .unwrap_or_else(|_| plain_text_job(source, width));
+        job.wrap.break_anywhere = true;
+        for section in &mut job.sections {
+            section.format.font_id.size = 12.5;
+        }
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
+            cache.source.clear();
+            cache.source.push_str(source);
+            cache.path = path.to_path_buf();
+            cache.width = width_key;
+            cache.galley = Some(galley);
+        });
+    }
+    ui.data_mut(|data| {
+        Arc::clone(
+            data.get_temp_mut_or_default::<AgentCodeCache>(id)
+                .galley
+                .as_ref()
+                .expect("agent code was cached"),
+        )
+    })
+}
+
+fn agent_markdown_galley(
+    ui: &mut egui::Ui,
+    id: Id,
+    source: &str,
+    width: f32,
+    highlighter: &Highlighter,
+    syntaxes: &SyntaxManager,
+) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
     let stale = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
         cache.galley.is_none() || cache.width != width_key || cache.source != source
     });
     if stale {
-        let galley =
-            ui.fonts_mut(|fonts| fonts.layout_job(markdown::compact_layout(source, width)));
+        let job = markdown::compact_layout(source, width, |language, code| {
+            let syntax = language
+                .map(|language| syntaxes.detect_token(language))
+                .unwrap_or_else(|| syntaxes.plain_text());
+            highlighter
+                .highlight_job(code, syntax, syntaxes.set(), width)
+                .ok()
+        });
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
         ui.data_mut(|data| {
             let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
             cache.source.clear();
@@ -642,6 +829,95 @@ fn agent_markdown_galley(ui: &mut egui::Ui, id: Id, source: &str, width: f32) ->
                 .expect("agent Markdown was cached"),
         )
     })
+}
+
+fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui::Response {
+    let Some((action, path)) = title.split_once(' ').filter(|(action, path)| {
+        !path.is_empty()
+            && (action.eq_ignore_ascii_case("Read") || action.eq_ignore_ascii_case("Edit"))
+    }) else {
+        return ui
+            .allocate_ui_with_layout(
+                egui::vec2(width, 24.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_width(width);
+                    ui.add(
+                        Label::new(RichText::new(title).size(13.5).color(TEXT_PRIMARY))
+                            .truncate()
+                            .sense(Sense::click()),
+                    )
+                },
+            )
+            .inner;
+    };
+
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), title)
+    });
+    let font = FontId::proportional(13.5);
+    let action = ui
+        .painter()
+        .layout_no_wrap(format!("{action} "), font.clone(), TEXT_PRIMARY);
+    let path = ui
+        .painter()
+        .layout_no_wrap(path.to_owned(), font, TEXT_PRIMARY);
+    let y = rect.center().y - action.size().y * 0.5;
+    ui.painter().with_clip_rect(rect).galley(
+        egui::pos2(rect.left(), y),
+        action.clone(),
+        TEXT_PRIMARY,
+    );
+    let path_left = (rect.left() + action.size().x).min(rect.right());
+    let path_rect =
+        egui::Rect::from_min_max(egui::pos2(path_left, rect.top()), rect.right_bottom());
+    let overflow = (path.size().x - path_rect.width()).max(0.0);
+    let animation_id = id.with("path_marquee");
+    if response.hovered() && overflow > 0.0 {
+        let now = ui.input(|input| input.time);
+        let started = ui.data_mut(|data| {
+            data.get_temp::<f64>(animation_id).unwrap_or_else(|| {
+                data.insert_temp(animation_id, now);
+                now
+            })
+        });
+        let pause = 0.6;
+        let travel = f64::from(overflow) / 24.0;
+        let phase = (now - started).rem_euclid(pause + travel + 0.8);
+        let offset = if phase < pause {
+            0.0
+        } else if phase < pause + travel {
+            ((phase - pause) * 24.0) as f32
+        } else {
+            overflow
+        };
+        ui.painter().with_clip_rect(path_rect).galley(
+            egui::pos2(path_rect.left() - offset, y),
+            path,
+            TEXT_PRIMARY,
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+    } else {
+        ui.data_mut(|data| data.remove::<f64>(animation_id));
+        let path = egui::WidgetText::from(
+            RichText::new(path.text())
+                .font(FontId::proportional(13.5))
+                .color(TEXT_PRIMARY),
+        )
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            path_rect.width(),
+            egui::FontSelection::Default,
+        );
+        ui.painter().with_clip_rect(path_rect).galley(
+            egui::pos2(path_rect.left(), y),
+            path,
+            TEXT_PRIMARY,
+        );
+    }
+    response
 }
 
 fn agent_collapsing_header(
@@ -666,8 +942,8 @@ fn agent_collapsing_header(
         .filter(|title| !title.is_empty())
         .unwrap_or("Tool activity");
     let frame = egui::Frame::new()
-        .fill(Color32::from_rgb(25, 26, 29))
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(42, 44, 50)))
+        .fill(SURFACE_RAISED)
+        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
         .corner_radius(5);
     let content_width = (width - frame.total_margin().sum().x).max(0.0);
     frame.show(ui, |ui| {
@@ -682,11 +958,18 @@ fn agent_collapsing_header(
             })
             .show(ui, |ui| {
                 let (label, color) = agent_tool_status(status);
+                let completed = status == Some("Completed");
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.spacing_mut().icon_width = 24.0;
                     state.show_toggle_button(ui, paint_agent_disclosure);
-                    let status_width = if label.is_empty() { 0.0 } else { 52.0 };
+                    let status_width = if completed {
+                        24.0
+                    } else if label.is_empty() {
+                        0.0
+                    } else {
+                        52.0
+                    };
                     let status_spacing = if label.is_empty() {
                         0.0
                     } else {
@@ -694,29 +977,39 @@ fn agent_collapsing_header(
                     };
                     let title_width =
                         (ui.available_width() - status_width - status_spacing).max(0.0);
-                    let response = ui
-                        .allocate_ui_with_layout(
-                            egui::vec2(title_width, 24.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.set_width(title_width);
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(title_line)
-                                            .size(13.5)
-                                            .color(Color32::from_rgb(211, 216, 226)),
-                                    )
-                                    .truncate()
-                                    .sense(Sense::click()),
-                                )
-                            },
-                        )
-                        .inner
-                        .on_hover_text(title);
+                    let response =
+                        agent_tool_title(ui, id, title_line, title_width).on_hover_text(title);
                     if response.clicked() {
                         state.toggle(ui);
                     }
-                    if !label.is_empty() {
+                    if completed {
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Label,
+                                ui.is_enabled(),
+                                label,
+                            )
+                        });
+                        let center = rect.center();
+                        let stroke = egui::Stroke::new(1.3, color);
+                        ui.painter().circle_stroke(center, 7.0, stroke);
+                        ui.painter().line_segment(
+                            [
+                                center + egui::vec2(-3.0, 0.0),
+                                center + egui::vec2(-1.0, 2.0),
+                            ],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                center + egui::vec2(-1.0, 2.0),
+                                center + egui::vec2(3.5, -2.5),
+                            ],
+                            stroke,
+                        );
+                    } else if !label.is_empty() {
                         ui.add_sized(
                             egui::vec2(status_width, 24.0),
                             Label::new(RichText::new(label).size(11.5).color(color)),
@@ -729,7 +1022,7 @@ fn agent_collapsing_header(
             ui.painter().hline(
                 ui.available_rect_before_wrap().x_range(),
                 ui.cursor().top(),
-                egui::Stroke::new(1.0, Color32::from_rgb(43, 45, 51)),
+                egui::Stroke::new(1.0, BORDER_SUBTLE),
             );
             if default_open {
                 add_body(ui);
@@ -747,8 +1040,27 @@ fn agent_collapsing_header(
     });
 }
 
-fn draw_agent_diff(ui: &mut egui::Ui, id: Id, path: &Path, old_text: Option<&str>, new_text: &str) {
+fn draw_agent_diff(
+    ui: &mut egui::Ui,
+    id: Id,
+    path: &Path,
+    old_text: Option<&str>,
+    new_text: &str,
+    highlighter: &Highlighter,
+    syntaxes: &SyntaxManager,
+) {
     let diff = cached_agent_diff(ui, id, old_text, new_text);
+    let old_syntax = old_text.map(|text| {
+        agent_syntax_lines(ui, id.with("old_syntax"), path, text, highlighter, syntaxes)
+    });
+    let new_syntax = agent_syntax_lines(
+        ui,
+        id.with("new_syntax"),
+        path,
+        new_text,
+        highlighter,
+        syntaxes,
+    );
     let expanded_id = id.with("expanded");
     let expanded = ui.data(|data| data.get_temp::<bool>(expanded_id).unwrap_or(false));
     let lines = (!expanded)
@@ -761,150 +1073,159 @@ fn draw_agent_diff(ui: &mut egui::Ui, id: Id, path: &Path, old_text: Option<&str
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
     ui.set_width(ui.available_width());
-    egui::Frame::new()
-        .fill(Color32::from_rgb(24, 26, 30))
-        .show(ui, |ui| {
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+    egui::Frame::new().fill(SURFACE_INPUT).show(ui, |ui| {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(file_name.as_ref())
+                            .size(13.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    )
+                    .on_hover_text(path.display().to_string());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(file_name.as_ref())
-                                .size(13.5)
-                                .strong()
-                                .color(Color32::from_rgb(225, 229, 237)),
-                        )
-                        .on_hover_text(path.display().to_string());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("+{}  −{}", diff.added, diff.removed))
-                                    .monospace()
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(160, 170, 184)),
-                            );
-                            ui.label(
-                                RichText::new(if old_text.is_some() {
-                                    "MODIFIED"
-                                } else {
-                                    "NEW FILE"
-                                })
-                                .size(10.5)
-                                .strong()
-                                .color(Color32::from_rgb(100, 201, 220)),
-                            );
-                        });
+                            RichText::new(format!("+{}  −{}", diff.added, diff.removed))
+                                .monospace()
+                                .size(11.5)
+                                .color(TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new(if old_text.is_some() {
+                                "MODIFIED"
+                            } else {
+                                "NEW FILE"
+                            })
+                            .size(10.5)
+                            .strong()
+                            .color(ACCENT),
+                        );
                     });
                 });
-            ui.painter().hline(
-                ui.available_rect_before_wrap().x_range(),
-                ui.cursor().top(),
-                egui::Stroke::new(1.0, Color32::from_rgb(45, 49, 57)),
-            );
-            let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
-            let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
-            let longest = lines
-                .iter()
-                .map(|line| line.text.chars().count())
-                .max()
-                .unwrap_or(0);
-            let content_width = ui.available_width();
-            let desired_width =
-                content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
-            ScrollArea::horizontal()
-                .id_salt(id)
-                .max_width(content_width)
-                .auto_shrink([false, true])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-                .show(ui, |ui| {
-                    ui.set_width(desired_width);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for line in lines {
-                        let fill = match line.kind {
-                            AgentDiffKind::Added => Color32::from_rgb(24, 48, 38),
-                            AgentDiffKind::Removed => Color32::from_rgb(55, 31, 37),
-                            AgentDiffKind::Omitted => Color32::from_rgb(27, 31, 37),
-                            AgentDiffKind::Context => Color32::TRANSPARENT,
-                        };
-                        egui::Frame::new()
-                            .fill(fill)
-                            .inner_margin(egui::Margin::symmetric(9, 3))
-                            .show(ui, |ui| {
-                                ui.set_min_width(desired_width - 18.0);
-                                if line.kind == AgentDiffKind::Omitted {
-                                    ui.label(
-                                        RichText::new(format!("⋯  {} lines hidden", line.omitted))
-                                            .monospace()
-                                            .size(11.5)
-                                            .color(Color32::from_rgb(132, 142, 157)),
-                                    );
-                                    return;
-                                }
-                                let old_number = line.old_number.map_or_else(
-                                    || " ".repeat(old_digits),
-                                    |number| format!("{number:>old_digits$}"),
+            });
+        ui.painter().hline(
+            ui.available_rect_before_wrap().x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, BORDER_STRONG),
+        );
+        let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
+        let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
+        let longest = lines
+            .iter()
+            .map(|line| line.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        let content_width = ui.available_width();
+        let desired_width =
+            content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
+        ScrollArea::horizontal()
+            .id_salt(id)
+            .max_width(content_width)
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| {
+                ui.set_width(desired_width);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for line in lines {
+                    let fill = match line.kind {
+                        AgentDiffKind::Added => Color32::from_rgb(24, 48, 38),
+                        AgentDiffKind::Removed => Color32::from_rgb(55, 31, 37),
+                        AgentDiffKind::Omitted => SURFACE_RAISED,
+                        AgentDiffKind::Context => Color32::TRANSPARENT,
+                    };
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(9, 3))
+                        .show(ui, |ui| {
+                            ui.set_min_width(desired_width - 18.0);
+                            if line.kind == AgentDiffKind::Omitted {
+                                ui.label(
+                                    RichText::new(format!("⋯  {} lines hidden", line.omitted))
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(TEXT_MUTED),
                                 );
-                                let new_number = line.new_number.map_or_else(
-                                    || " ".repeat(new_digits),
-                                    |number| format!("{number:>new_digits$}"),
+                                return;
+                            }
+                            let old_number = line.old_number.map_or_else(
+                                || " ".repeat(old_digits),
+                                |number| format!("{number:>old_digits$}"),
+                            );
+                            let new_number = line.new_number.map_or_else(
+                                || " ".repeat(new_digits),
+                                |number| format!("{number:>new_digits$}"),
+                            );
+                            let (sign, color) = match line.kind {
+                                AgentDiffKind::Added => ("+", Color32::from_rgb(143, 224, 177)),
+                                AgentDiffKind::Removed => ("−", Color32::from_rgb(239, 157, 164)),
+                                AgentDiffKind::Context => (" ", TEXT_SECONDARY),
+                                AgentDiffKind::Omitted => unreachable!(),
+                            };
+                            let mut job = LayoutJob::default();
+                            job.append(
+                                &format!("{old_number} {new_number}  "),
+                                0.0,
+                                TextFormat {
+                                    font_id: FontId::monospace(12.0),
+                                    color: TEXT_DISABLED,
+                                    ..TextFormat::default()
+                                },
+                            );
+                            job.append(
+                                &format!("{sign} "),
+                                0.0,
+                                TextFormat {
+                                    font_id: FontId::monospace(12.0),
+                                    color,
+                                    ..TextFormat::default()
+                                },
+                            );
+                            let highlighted = match line.kind {
+                                AgentDiffKind::Removed => old_syntax.as_deref(),
+                                AgentDiffKind::Added | AgentDiffKind::Context => Some(&*new_syntax),
+                                AgentDiffKind::Omitted => unreachable!(),
+                            };
+                            let line_number = match line.kind {
+                                AgentDiffKind::Removed => line.old_number,
+                                AgentDiffKind::Added | AgentDiffKind::Context => line.new_number,
+                                AgentDiffKind::Omitted => None,
+                            };
+                            if let (Some(highlighted), Some(line_number)) =
+                                (highlighted, line_number)
+                            {
+                                append_agent_syntax_line(
+                                    &mut job,
+                                    highlighted,
+                                    line_number,
+                                    &line.text,
                                 );
-                                let (sign, color) = match line.kind {
-                                    AgentDiffKind::Added => ("+", Color32::from_rgb(143, 224, 177)),
-                                    AgentDiffKind::Removed => {
-                                        ("−", Color32::from_rgb(239, 157, 164))
-                                    }
-                                    AgentDiffKind::Context => {
-                                        (" ", Color32::from_rgb(198, 204, 215))
-                                    }
-                                    AgentDiffKind::Omitted => unreachable!(),
-                                };
-                                let mut job = LayoutJob::default();
-                                job.append(
-                                    &format!("{old_number} {new_number}  "),
-                                    0.0,
-                                    TextFormat {
-                                        font_id: FontId::monospace(12.0),
-                                        color: Color32::from_rgb(111, 121, 137),
-                                        ..TextFormat::default()
-                                    },
-                                );
-                                job.append(
-                                    &format!("{sign} {}", line.text),
-                                    0.0,
-                                    TextFormat {
-                                        font_id: FontId::monospace(12.0),
-                                        color,
-                                        ..TextFormat::default()
-                                    },
-                                );
-                                ui.add(
-                                    Label::new(job)
-                                        .wrap_mode(egui::TextWrapMode::Extend)
-                                        .selectable(true),
-                                );
-                            });
-                    }
-                });
-            if can_toggle {
-                let label = if expanded {
-                    "Collapse diff".to_owned()
-                } else {
-                    format!("Show all {} lines", diff.lines.len())
-                };
-                let toggle = ui.add_sized(
-                    egui::vec2(ui.available_width(), 40.0),
-                    egui::Button::new(
-                        RichText::new(label)
-                            .size(11.5)
-                            .color(Color32::from_rgb(111, 194, 211)),
-                    )
-                    .frame(false),
-                );
-                if toggle.clicked() {
-                    ui.data_mut(|data| data.insert_temp(expanded_id, !expanded));
-                    ui.ctx().request_repaint();
+                            }
+                            ui.add(
+                                Label::new(job)
+                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                    .selectable(true),
+                            );
+                        });
                 }
+            });
+        if can_toggle {
+            let label = if expanded {
+                "Collapse diff".to_owned()
+            } else {
+                format!("Show all {} lines", diff.lines.len())
+            };
+            let toggle = ui.add_sized(
+                egui::vec2(ui.available_width(), 40.0),
+                egui::Button::new(RichText::new(label).size(11.5).color(ACCENT)).frame(false),
+            );
+            if toggle.clicked() {
+                ui.data_mut(|data| data.insert_temp(expanded_id, !expanded));
+                ui.ctx().request_repaint();
             }
-        });
+        }
+    });
 }
 
 fn split_workspace(
@@ -1067,9 +1388,9 @@ fn draw_sidebar_toggle_icon(
     let icon_center = button.center();
     let icon = egui::Rect::from_center_size(icon_center, egui::vec2(16.0, 13.0));
     let icon_color = if response.hovered() || open {
-        Color32::from_rgb(218, 224, 235)
+        TEXT_PRIMARY
     } else {
-        Color32::from_rgb(155, 163, 177)
+        TEXT_MUTED
     };
     ui.painter().rect_stroke(
         icon,
@@ -1093,11 +1414,8 @@ fn draw_sidebar_toggle_icon(
         } else {
             egui::Rect::from_min_max(icon.left_top(), egui::pos2(divider_x, icon.bottom()))
         };
-        ui.painter().rect_filled(
-            selected,
-            1.0,
-            Color32::from_rgba_unmultiplied(218, 224, 235, 55),
-        );
+        ui.painter()
+            .rect_filled(selected, 1.0, Color32::from_white_alpha(28));
     }
     icon_center
 }
@@ -1208,27 +1526,6 @@ enum AgentMenu {
     Permissions,
     Mode,
     Config(String),
-}
-
-struct ProviderTransition {
-    target: ProviderId,
-    shutdown: Receiver<()>,
-}
-
-fn shutdown_agent_in_background(
-    controller: impl Send + 'static,
-    wake: impl FnOnce() + Send + 'static,
-) -> Result<Receiver<()>, String> {
-    let (done, shutdown) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("editur-agent-shutdown".into())
-        .spawn(move || {
-            drop(controller);
-            let _ = done.send(());
-            wake();
-        })
-        .map_err(|error| format!("cannot stop the previous ACP provider: {error}"))?;
-    Ok(shutdown)
 }
 
 struct TreeState {
@@ -1465,8 +1762,7 @@ fn agent_attachment_tile(
         )
     } else {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        ui.painter()
-            .rect_filled(rect, 7.0, Color32::from_rgb(37, 43, 49));
+        ui.painter().rect_filled(rect, 7.0, SURFACE_SELECTED);
         let extension = attachment
             .file
             .path()
@@ -1479,7 +1775,7 @@ fn agent_attachment_tile(
             Align2::CENTER_CENTER,
             extension.chars().take(5).collect::<String>(),
             FontId::proportional(9.5),
-            Color32::from_rgb(132, 205, 220),
+            TEXT_SECONDARY,
         );
         response
     };
@@ -1492,7 +1788,7 @@ fn agent_attachment_tile(
     let close = response.rect.right_top() + egui::vec2(-8.0, 8.0);
     ui.painter()
         .circle_filled(close, 6.5, Color32::from_black_alpha(185));
-    let stroke = egui::Stroke::new(1.2, Color32::from_rgb(225, 230, 237));
+    let stroke = egui::Stroke::new(1.2, TEXT_PRIMARY);
     ui.painter().line_segment(
         [close + egui::vec2(-2.0, -2.0), close + egui::vec2(2.0, 2.0)],
         stroke,
@@ -1508,9 +1804,9 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
     let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 36.0));
     let response = ui.interact(rect, id.with(&entry.path), Sense::click());
     let fill = if selected {
-        Color32::from_rgb(30, 57, 66)
+        SURFACE_SELECTED
     } else if response.hovered() {
-        Color32::from_rgb(29, 31, 35)
+        SURFACE_INPUT
     } else {
         Color32::TRANSPARENT
     };
@@ -1522,14 +1818,14 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
                 egui::vec2(2.0, rect.height() - 10.0),
             ),
             1.0,
-            Color32::from_rgb(86, 207, 225),
+            ACCENT,
         );
     }
     let icon_left = rect.left() + 12.0;
     let icon_color = if entry.is_dir {
-        Color32::from_rgb(103, 196, 208)
+        TEXT_SECONDARY
     } else {
-        Color32::from_rgb(105, 114, 130)
+        TEXT_DISABLED
     };
     if entry.is_dir {
         ui.painter().rect_filled(
@@ -1581,7 +1877,7 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
             Align2::LEFT_CENTER,
             entry.name.to_string_lossy(),
             FontId::proportional(13.0),
-            Color32::from_rgb(211, 216, 226),
+            TEXT_PRIMARY,
         );
     let metadata_right = rect.right() - if entry.is_dir || selected { 36.0 } else { 12.0 };
     ui.painter().text(
@@ -1589,11 +1885,11 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
         Align2::RIGHT_CENTER,
         metadata,
         FontId::proportional(10.5),
-        Color32::from_rgb(111, 121, 137),
+        TEXT_DISABLED,
     );
     if entry.is_dir {
         let center = egui::pos2(rect.right() - 14.0, rect.center().y);
-        let stroke = egui::Stroke::new(1.1, Color32::from_rgb(128, 139, 155));
+        let stroke = egui::Stroke::new(1.1, TEXT_MUTED);
         ui.painter().line_segment(
             [
                 center + egui::vec2(-2.0, -3.5),
@@ -1610,9 +1906,8 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
         );
     } else if selected {
         let center = egui::pos2(rect.right() - 16.0, rect.center().y);
-        ui.painter()
-            .circle_filled(center, 8.0, Color32::from_rgb(86, 207, 225));
-        let stroke = egui::Stroke::new(1.4, Color32::from_rgb(15, 43, 49));
+        ui.painter().circle_filled(center, 8.0, ACCENT);
+        let stroke = egui::Stroke::new(1.4, ACCENT_INK);
         ui.painter().line_segment(
             [
                 center + egui::vec2(-3.5, 0.0),
@@ -1651,9 +1946,9 @@ fn agent_file_picker_location_row(
             rect,
             5.0,
             if selected {
-                Color32::from_rgb(29, 53, 61)
+                SURFACE_SELECTED
             } else {
-                Color32::from_rgb(29, 30, 34)
+                SURFACE_HOVER
             },
         );
     }
@@ -1664,18 +1959,14 @@ fn agent_file_picker_location_row(
                 egui::vec2(2.0, rect.height() - 16.0),
             ),
             1.0,
-            Color32::from_rgb(86, 207, 225),
+            ACCENT,
         );
     }
     let folder = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 12.0, rect.center().y - 4.0),
         egui::vec2(13.0, 9.0),
     );
-    let icon_color = if selected {
-        Color32::from_rgb(103, 211, 226)
-    } else {
-        Color32::from_rgb(117, 128, 144)
-    };
+    let icon_color = if selected { ACCENT } else { TEXT_MUTED };
     ui.painter().rect_stroke(
         folder,
         1.5,
@@ -1695,39 +1986,12 @@ fn agent_file_picker_location_row(
         label,
         FontId::proportional(12.5),
         if selected {
-            Color32::from_rgb(224, 231, 237)
+            TEXT_PRIMARY
         } else {
-            Color32::from_rgb(174, 181, 194)
+            TEXT_SECONDARY
         },
     );
     response
-}
-
-fn agent_file_picker_icon_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    paint: impl FnOnce(&egui::Painter, egui::Rect, Color32),
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_white_alpha(12));
-    }
-    paint(
-        ui.painter(),
-        rect,
-        if !ui.is_enabled() {
-            Color32::from_rgb(77, 84, 96)
-        } else if response.hovered() {
-            Color32::from_rgb(220, 225, 234)
-        } else {
-            Color32::from_rgb(146, 155, 171)
-        },
-    );
-    response.on_hover_text(label)
 }
 
 impl FileTab {
@@ -1783,13 +2047,11 @@ pub struct EditorApp {
     agent_run_everything: Option<bool>,
     selected_provider: ProviderId,
     available_providers: Vec<ProviderId>,
+    provider_agents: HashMap<ProviderId, AgentState>,
     provider_menu_anchor: Option<egui::Rect>,
-    pending_provider_confirmation: Option<ProviderId>,
-    pending_provider_terms: Option<ProviderId>,
-    provider_transition: Option<ProviderTransition>,
     scrollbar_activity: crate::scrollbar::Activity,
     agent: AgentState,
-    agent_controller: Option<AgentController>,
+    agent_controllers: HashMap<ProviderId, AgentController>,
     pending_agent_prompt: bool,
     focus_editor: bool,
     tree_focused: bool,
@@ -1859,13 +2121,11 @@ impl EditorApp {
             agent_run_everything: None,
             selected_provider: ProviderId::Cursor,
             available_providers: Vec::new(),
+            provider_agents: HashMap::new(),
             provider_menu_anchor: None,
-            pending_provider_confirmation: None,
-            pending_provider_terms: None,
-            provider_transition: None,
             scrollbar_activity: crate::scrollbar::Activity::default(),
             agent: AgentState::default(),
-            agent_controller: None,
+            agent_controllers: HashMap::new(),
             pending_agent_prompt: false,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
@@ -2077,7 +2337,7 @@ impl EditorApp {
     }
 
     pub fn ui(&mut self, root: &mut egui::Ui) {
-        root.style_mut().animation_time = 0.0;
+        theme::apply_to(root.style_mut());
         self.scrollbar_activity.style_egui(root);
         let ctx = root.ctx().clone();
         self.poll_agent(&ctx);
@@ -2178,11 +2438,7 @@ impl EditorApp {
                 [divider.center_top(), divider.center_bottom()],
                 egui::Stroke::new(
                     divider_stroke_width,
-                    if active {
-                        Color32::from_rgb(86, 207, 225)
-                    } else {
-                        Color32::from_rgb(53, 53, 59)
-                    },
+                    if active { ACCENT } else { BORDER_STRONG },
                 ),
             );
         }
@@ -2221,11 +2477,7 @@ impl EditorApp {
                 [divider.center_top(), divider.center_bottom()],
                 egui::Stroke::new(
                     divider_stroke_width,
-                    if active {
-                        Color32::from_rgb(86, 207, 225)
-                    } else {
-                        Color32::from_rgb(53, 53, 59)
-                    },
+                    if active { ACCENT } else { BORDER_STRONG },
                 ),
             );
         }
@@ -2246,7 +2498,7 @@ impl EditorApp {
             root.painter().vline(
                 sessions.right(),
                 sessions.y_range(),
-                egui::Stroke::new(1.0, Color32::from_rgb(48, 48, 53)),
+                egui::Stroke::new(1.0, BORDER_SUBTLE),
             );
         }
         root.scope_builder(
@@ -2267,8 +2519,7 @@ impl EditorApp {
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 22));
+        ui.painter().rect_filled(rect, 0.0, CANVAS);
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
             egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
@@ -2279,7 +2530,6 @@ impl EditorApp {
             .file_name()
             .unwrap_or(self.tree.root.as_os_str())
             .to_string_lossy();
-        let mut new_session = false;
         let mut session_load = None;
         let mut session_remove = None;
         ui.scope_builder(
@@ -2290,17 +2540,8 @@ impl EditorApp {
             |ui| {
                 ui.set_width(content.width());
                 if provider_selector_visible(&self.available_providers) {
-                    let switchable =
-                        self.agent.can_switch_provider() && self.provider_transition.is_none();
                     let response =
-                        draw_provider_selector_identity(ui, self.selected_provider, switchable);
-                    let response = if switchable {
-                        response
-                    } else {
-                        response.on_hover_text(
-                            "Stop or answer the current request before switching providers.",
-                        )
-                    };
+                        draw_provider_selector_identity(ui, self.selected_provider, true);
                     self.provider_menu_anchor = Some(response.rect);
                     if response.clicked() {
                         let menu = AgentMenu::Providers;
@@ -2310,16 +2551,7 @@ impl EditorApp {
                     draw_provider_identity(ui, self.selected_provider);
                     self.provider_menu_anchor = None;
                 }
-                ui.add_space(8.0);
-                new_session = ui
-                    .add_enabled_ui(self.agent.session_ready, agentic_new_session_button)
-                    .inner
-                    .on_hover_text(format!(
-                        "Start a new {} Agent session",
-                        provider_descriptor(self.selected_provider).display_name
-                    ))
-                    .clicked();
-                ui.add_space(16.0);
+                ui.add_space(10.0);
                 ScrollArea::vertical()
                     .id_salt("agentic_session_list")
                     .auto_shrink([false, false])
@@ -2366,16 +2598,13 @@ impl EditorApp {
                     });
             },
         );
-        if new_session && let Some(controller) = &self.agent_controller {
-            let _ = controller.send(AgentCommand::NewSession);
-        }
         if let Some(session_id) = session_load
-            && let Some(controller) = &self.agent_controller
+            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
             let _ = controller.send(AgentCommand::LoadSession(session_id));
         }
         if let Some(session_id) = session_remove
-            && let Some(controller) = &self.agent_controller
+            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
             let _ = controller.send(AgentCommand::RemoveSession(session_id));
         }
@@ -2460,12 +2689,11 @@ impl EditorApp {
         );
         let editor_header =
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
-        ui.painter()
-            .rect_filled(editor_header, 0.0, Color32::from_rgb(24, 24, 26));
+        ui.painter().rect_filled(editor_header, 0.0, SURFACE);
         ui.painter().hline(
             editor_header.x_range(),
             editor_header.bottom() - 0.5,
-            egui::Stroke::new(1.0, Color32::from_rgb(42, 42, 47)),
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
         );
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         let agentic_button = agentic_toggle_rect(
@@ -2511,7 +2739,7 @@ impl EditorApp {
                 ui.painter().rect_filled(
                     button.shrink2(egui::vec2(3.0, 3.0)),
                     4.0,
-                    Color32::from_rgb(38, 38, 42),
+                    SURFACE_SELECTED,
                 );
             }
             ui.painter().text(
@@ -2523,7 +2751,7 @@ impl EditorApp {
                     "Preview"
                 },
                 FontId::proportional(12.0),
-                Color32::from_rgb(174, 181, 194),
+                TEXT_SECONDARY,
             );
             if response.clicked() {
                 self.markdown_preview = !self.markdown_preview;
@@ -2680,24 +2908,24 @@ impl EditorApp {
                                     tab,
                                     0.0,
                                     if dragging {
-                                        Color32::from_rgb(39, 39, 43)
+                                        SURFACE_SELECTED
                                     } else if selected {
-                                        Color32::from_rgb(31, 31, 34)
+                                        SURFACE_INPUT
                                     } else {
-                                        Color32::from_rgb(26, 26, 29)
+                                        SURFACE
                                     },
                                 );
                             }
                             ui.painter().vline(
                                 tab.right() - 0.5,
                                 tab.y_range().shrink(5.0),
-                                egui::Stroke::new(1.0, Color32::from_rgb(44, 44, 49)),
+                                egui::Stroke::new(1.0, BORDER_SUBTLE),
                             );
                             if selected {
                                 ui.painter().hline(
                                     tab.x_range(),
                                     tab.bottom() - 1.0,
-                                    egui::Stroke::new(2.0, Color32::from_rgb(86, 207, 225)),
+                                    egui::Stroke::new(2.0, ACCENT),
                                 );
                             }
                             let close_rect = egui::Rect::from_center_size(
@@ -2708,11 +2936,7 @@ impl EditorApp {
                                 egui::pos2(tab.left() + 12.0, tab.top()),
                                 egui::pos2(close_rect.left() - 8.0, tab.bottom()),
                             );
-                            let text_color = if selected {
-                                Color32::from_rgb(224, 228, 236)
-                            } else {
-                                Color32::from_rgb(145, 151, 164)
-                            };
+                            let text_color = if selected { TEXT_PRIMARY } else { TEXT_MUTED };
                             let galley = egui::WidgetText::from(
                                 RichText::new(label)
                                     .font(FontId::proportional(12.0))
@@ -2758,9 +2982,9 @@ impl EditorApp {
                                     "×",
                                     FontId::proportional(14.0),
                                     if close_response.hovered() {
-                                        Color32::from_rgb(224, 228, 236)
+                                        TEXT_PRIMARY
                                     } else {
-                                        Color32::from_rgb(174, 181, 194)
+                                        TEXT_SECONDARY
                                     },
                                 );
                             }
@@ -2853,21 +3077,14 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
         });
-        if response.hovered() {
-            ui.painter().rect_filled(
-                button.shrink2(egui::vec2(3.0, 4.0)),
-                4.0,
-                Color32::from_rgb(38, 38, 42),
-            );
-        }
         let color = if response.hovered() {
-            Color32::from_rgb(218, 224, 235)
+            TEXT_PRIMARY
         } else {
-            Color32::from_rgb(174, 181, 194)
+            TEXT_SECONDARY
         };
         ui.painter().text(
-            button.center() - egui::vec2(5.0, 0.0),
-            Align2::CENTER_CENTER,
+            egui::pos2(button.right() - 12.0, button.center().y),
+            Align2::RIGHT_CENTER,
             label,
             FontId::proportional(12.0),
             color,
@@ -2881,7 +3098,7 @@ impl EditorApp {
         self.agent_menu_popup = None;
         self.agent_file_picker = None;
         if enabled {
-            if let Some(controller) = &self.agent_controller {
+            if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
                 let _ = controller.send(AgentCommand::RefreshSessions);
             } else {
                 self.open_agent(ctx);
@@ -2950,12 +3167,12 @@ impl EditorApp {
                     if index == 2 {
                         Color32::from_rgb(196, 43, 28)
                     } else {
-                        Color32::from_rgb(45, 45, 50)
+                        BORDER_SUBTLE
                     },
                 );
             }
             let center = button.center();
-            let color = Color32::from_rgb(205, 208, 218);
+            let color = TEXT_SECONDARY;
             match index {
                 0 => {
                     ui.painter().hline(
@@ -2999,16 +3216,16 @@ impl EditorApp {
         let Some(error) = self.error.clone() else {
             return;
         };
-        egui::Window::new("Error")
-            .id(Id::new("error_banner"))
+        dialog_window(ctx, "Error", "error_banner")
             .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 42.0))
-            .collapsible(false)
-            .resizable(false)
             .show(ctx, |ui| {
+                begin_dialog(ui, "Error");
                 ui.colored_label(Color32::from_rgb(255, 125, 125), error);
-                if ui.button("Dismiss").clicked() {
-                    self.error = None;
-                }
+                dialog_actions(ui, |ui| {
+                    if ui.add(dialog_button("Dismiss", true)).clicked() {
+                        self.error = None;
+                    }
+                });
             });
     }
 
@@ -3101,8 +3318,7 @@ impl EditorApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.painter()
-            .rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(20, 20, 22));
+        ui.painter().rect_filled(ui.max_rect(), 0.0, CANVAS);
         #[cfg(target_os = "macos")]
         ui.add_space(TITLEBAR_HEIGHT);
         self.draw_tree(ui);
@@ -3110,33 +3326,12 @@ impl EditorApp {
 
     fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(20, 20, 22));
+        ui.painter().rect_filled(rect, 0.0, CANVAS);
         self.draw_agent(ui, rect);
     }
 
     fn open_agent(&mut self, ctx: &egui::Context) {
-        self.ensure_provider_catalog();
-        if provider_descriptor(self.selected_provider).install_policy == InstallPolicy::Lazy {
-            match data_dir() {
-                Ok(directory)
-                    if !crate::agent::provider::terms_accepted(
-                        &directory,
-                        self.selected_provider,
-                    ) =>
-                {
-                    self.pending_provider_terms = Some(self.selected_provider);
-                    return;
-                }
-                Err(error) => {
-                    self.show_error(error);
-                    return;
-                }
-                _ => {}
-            }
-        }
-        let wake = ctx.clone();
-        self.start_agent(move || wake.request_repaint());
+        self.warm_providers(ctx);
     }
 
     fn ensure_provider_catalog(&mut self) {
@@ -3151,68 +3346,56 @@ impl EditorApp {
         });
     }
 
-    fn start_agent(&mut self, wake: impl Fn() + Send + Sync + 'static) {
-        if self.agent_controller.is_some() {
+    fn warm_providers(&mut self, ctx: &egui::Context) {
+        self.ensure_provider_catalog();
+        for provider in self.available_providers.clone() {
+            self.start_provider(provider, ctx);
+        }
+    }
+
+    fn start_provider(&mut self, provider: ProviderId, ctx: &egui::Context) {
+        if self.agent_controllers.contains_key(&provider) {
             return;
         }
-        self.agent.session_ready = false;
-        self.agent.active = false;
-        self.agent.connection = ConnectionState::Starting;
-        self.agent_run_everything = None;
-        self.agent_controller = Some(AgentController::start_with_wake(
-            self.selected_provider,
-            self.tree.root.clone(),
-            wake,
-        ));
+        let state = if provider == self.selected_provider {
+            &mut self.agent
+        } else {
+            self.provider_agents.entry(provider).or_default()
+        };
+        state.session_ready = false;
+        state.active = false;
+        state.connection = ConnectionState::Starting;
+        let preferred_session = state.session_id.clone();
+        let wake = ctx.clone();
+        self.agent_controllers.insert(
+            provider,
+            AgentController::start_with_wake(
+                provider,
+                self.tree.root.clone(),
+                preferred_session,
+                move || wake.request_repaint(),
+            ),
+        );
     }
 
     fn reconnect_agent(&mut self, ctx: &egui::Context) {
-        self.begin_provider_transition(self.selected_provider, ctx);
+        if let Some(controller) = self.agent_controllers.remove(&self.selected_provider) {
+            drop(controller);
+        }
+        let provider = self.selected_provider;
+        self.start_provider(provider, ctx);
     }
 
     fn request_provider_switch(&mut self, target: ProviderId, ctx: &egui::Context) {
-        if target == self.selected_provider
-            || !self.available_providers.contains(&target)
-            || !self.agent.can_switch_provider()
-        {
+        if target == self.selected_provider || !self.available_providers.contains(&target) {
             return;
         }
-        if self.agent.transcript.is_empty() {
-            self.request_provider_terms_or_transition(target, ctx);
-        } else {
-            self.pending_provider_confirmation = Some(target);
-        }
-    }
-
-    fn request_provider_terms_or_transition(&mut self, target: ProviderId, ctx: &egui::Context) {
-        let provider = provider_descriptor(target);
-        if provider.install_policy == InstallPolicy::Bundled {
-            self.begin_provider_transition(target, ctx);
-            return;
-        }
-        match data_dir() {
-            Ok(directory) if crate::agent::provider::terms_accepted(&directory, target) => {
-                self.begin_provider_transition(target, ctx);
-            }
-            Ok(_) => self.pending_provider_terms = Some(target),
-            Err(error) => self.show_error(error),
-        }
-    }
-
-    fn begin_provider_transition(&mut self, target: ProviderId, ctx: &egui::Context) {
-        if self.provider_transition.is_some() || !self.agent.can_switch_provider() {
-            return;
-        }
-        self.selected_provider = target;
+        self.select_provider_state(target);
         if let Ok(directory) = data_dir()
             && let Err(error) = crate::agent::provider::save_selected(&directory, target)
         {
             self.show_error(error);
         }
-        self.agent.reset_for_provider_switch();
-        self.agent.connection = ConnectionState::Switching {
-            provider: provider_descriptor(target).display_name.to_owned(),
-        };
         self.agent_menu = None;
         self.agent_menu_popup = None;
         self.agent_prompt_history_index = None;
@@ -3220,76 +3403,68 @@ impl EditorApp {
         self.agent_follow_transcript = true;
         self.agent_file_picker = None;
         self.agent_run_everything = None;
-        self.pending_provider_confirmation = None;
-        self.pending_provider_terms = None;
-        let Some(controller) = self.agent_controller.take() else {
-            let wake = ctx.clone();
-            self.start_agent(move || wake.request_repaint());
+        self.start_provider(target, ctx);
+    }
+
+    fn select_provider_state(&mut self, target: ProviderId) {
+        if target == self.selected_provider {
             return;
-        };
-        let wake = ctx.clone();
-        match shutdown_agent_in_background(controller, move || wake.request_repaint()) {
-            Ok(shutdown) => {
-                self.provider_transition = Some(ProviderTransition { target, shutdown })
-            }
-            Err(error) => {
-                self.agent.connection = ConnectionState::Failed(error);
-            }
         }
+        let draft = std::mem::take(&mut self.agent.prompt);
+        let mut next = self.provider_agents.remove(&target).unwrap_or_default();
+        next.prompt = draft;
+        let previous = std::mem::replace(&mut self.agent, next);
+        self.provider_agents
+            .insert(self.selected_provider, previous);
+        self.selected_provider = target;
     }
 
     fn poll_agent(&mut self, ctx: &egui::Context) {
-        let transition_ready = self.provider_transition.as_ref().is_some_and(|transition| {
-            !matches!(
-                transition.shutdown.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            )
-        });
-        if transition_ready {
-            let transition = self.provider_transition.take().unwrap();
-            debug_assert_eq!(transition.target, self.selected_provider);
-            let wake = ctx.clone();
-            self.start_agent(move || wake.request_repaint());
-        }
         let mut events = Vec::new();
-        if let Some(controller) = &self.agent_controller {
+        for (&provider, controller) in &self.agent_controllers {
             for _ in 0..64 {
                 let Ok(event) = controller.events().try_recv() else {
                     break;
                 };
-                events.push(event);
+                events.push((provider, event));
             }
         }
-        if events.len() == 64 {
+        if events.len() >= 64 {
             ctx.request_repaint();
         }
-        for event in events {
-            if matches!(
-                event,
-                AgentEvent::SessionReady { .. } | AgentEvent::SessionLoaded { .. }
-            ) {
+        for (provider, event) in events {
+            let selected = provider == self.selected_provider;
+            if selected
+                && matches!(
+                    event,
+                    AgentEvent::SessionReady { .. } | AgentEvent::SessionLoaded { .. }
+                )
+            {
                 self.agent_follow_transcript = true;
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
                 self.agent_attachments.clear();
                 self.agent_file_picker = None;
             }
-            if matches!(event, AgentEvent::UserMessage(_)) {
+            if selected && matches!(event, AgentEvent::UserMessage(_)) {
                 self.agent_attachments.clear();
             }
-            if self.agent.allow_run_everything
+            if selected
+                && self.agent.allow_run_everything
                 && let AgentEvent::CommandsUpdated(commands) = &event
                 && let Some(enabled) = run_everything_state(commands)
             {
                 self.agent_run_everything = Some(enabled);
             }
-            if matches!(
-                &event,
-                AgentEvent::Capabilities {
-                    allow_run_everything: false,
-                    ..
-                }
-            ) {
+            if selected
+                && matches!(
+                    &event,
+                    AgentEvent::Capabilities {
+                        allow_run_everything: false,
+                        ..
+                    }
+                )
+            {
                 self.agent_run_everything = None;
             }
             let reconcile_path = match &event {
@@ -3302,12 +3477,19 @@ impl EditorApp {
             let turn_finished = matches!(event, AgentEvent::TurnFinished { .. });
             let refresh_project =
                 turn_finished || matches!(event, AgentEvent::ProcessExited { .. });
-            self.agent.apply(event);
+            if selected {
+                self.agent.apply(event);
+            } else {
+                self.provider_agents
+                    .entry(provider)
+                    .or_default()
+                    .apply(event);
+            }
             if reconcile_path || turn_finished {
                 self.reconcile_open_buffer();
             }
             if refresh_project {
-                self.refresh_after_agent();
+                self.refresh_after_agent(provider);
             }
         }
     }
@@ -3350,8 +3532,18 @@ impl EditorApp {
         }
     }
 
-    fn refresh_after_agent(&mut self) {
-        let changed = std::mem::take(&mut self.agent.changed_paths);
+    fn refresh_after_agent(&mut self, provider: ProviderId) {
+        let changed = if provider == self.selected_provider {
+            std::mem::take(&mut self.agent.changed_paths)
+        } else {
+            std::mem::take(
+                &mut self
+                    .provider_agents
+                    .entry(provider)
+                    .or_default()
+                    .changed_paths,
+            )
+        };
         let directories = if changed.is_empty() {
             self.tree.children.keys().cloned().collect::<HashSet<_>>()
         } else {
@@ -3402,7 +3594,7 @@ impl EditorApp {
     }
 
     fn send_agent_prompt(&mut self) {
-        let Some(controller) = &self.agent_controller else {
+        let Some(controller) = self.agent_controllers.get(&self.selected_provider) else {
             return;
         };
         let prompt = self.agent.prompt.trim().to_owned();
@@ -3594,11 +3786,11 @@ impl EditorApp {
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
-        painter.rect_filled(header, 0.0, Color32::from_rgb(24, 24, 26));
+        painter.rect_filled(header, 0.0, SURFACE);
         painter.hline(
             header.x_range(),
             header.bottom() - 0.5,
-            egui::Stroke::new(1.0, Color32::from_rgb(42, 42, 47)),
+            egui::Stroke::new(1.0, BORDER_SUBTLE),
         );
         let project_title = self
             .tree
@@ -3624,7 +3816,6 @@ impl EditorApp {
             header.left() + 14.0
         };
         if !self.agentic_mode && provider_selector_visible(&self.available_providers) {
-            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
             let provider_rect = egui::Rect::from_min_max(
                 egui::pos2(header.left() + 10.0, header.top() + 3.0),
                 egui::pos2(
@@ -3639,14 +3830,7 @@ impl EditorApp {
                     .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
                     let response =
-                        draw_provider_selector_identity(ui, self.selected_provider, switchable);
-                    let response = if switchable {
-                        response
-                    } else {
-                        response.on_hover_text(
-                            "Stop or answer the current request before switching providers.",
-                        )
-                    };
+                        draw_provider_selector_identity(ui, self.selected_provider, true);
                     self.provider_menu_anchor = Some(response.rect);
                     if response.clicked() {
                         let menu = AgentMenu::Providers;
@@ -3654,6 +3838,11 @@ impl EditorApp {
                         provider_menu_toggled = true;
                     }
                 },
+            );
+            painter.vline(
+                header.left() + 100.0,
+                (header.center().y - 7.0)..=(header.center().y + 7.0),
+                egui::Stroke::new(1.0, BORDER_STRONG),
             );
             title_x = header.left() + 112.0;
         } else if !self.agentic_mode {
@@ -3664,7 +3853,7 @@ impl EditorApp {
             Align2::LEFT_CENTER,
             title,
             FontId::proportional(13.0),
-            Color32::from_rgb(223, 227, 235),
+            TEXT_PRIMARY,
         );
         let agent_button = agent_toggle_rect(header);
         if !self.agentic_mode && self.draw_agent_toggle(ui, agent_button) {
@@ -3687,9 +3876,9 @@ impl EditorApp {
                 )
             });
             let icon_color = if response.hovered() {
-                Color32::from_rgb(224, 228, 236)
+                TEXT_PRIMARY
             } else {
-                Color32::from_rgb(172, 180, 194)
+                TEXT_SECONDARY
             };
             painter.hline(
                 (button.center().x - 5.0)..=(button.center().x + 5.0),
@@ -3716,9 +3905,9 @@ impl EditorApp {
                 )
             });
             let icon_color = if response.hovered() {
-                Color32::from_rgb(224, 228, 236)
+                TEXT_PRIMARY
             } else {
-                Color32::from_rgb(172, 180, 194)
+                TEXT_SECONDARY
             };
             let icon_center = button.center() + egui::vec2(3.0, 0.0);
             painter.circle_stroke(icon_center, 6.0, egui::Stroke::new(1.3, icon_color));
@@ -3735,7 +3924,7 @@ impl EditorApp {
                 self.agent_menu = (self.agent_menu.as_ref() != Some(&menu)).then_some(menu.clone());
                 session_menu_toggled = true;
                 if self.agent_menu.is_some()
-                    && let Some(controller) = &self.agent_controller
+                    && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
                 {
                     let _ = controller.send(AgentCommand::RefreshSessions);
                 }
@@ -3776,7 +3965,7 @@ impl EditorApp {
                         ))
                             .size(15.0)
                             .strong()
-                            .color(Color32::from_rgb(224, 228, 236)),
+                            .color(TEXT_PRIMARY),
                     );
                     let total = total
                         .map_or_else(|| "?".into(), |value| (value / 1_048_576).to_string());
@@ -3785,14 +3974,7 @@ impl EditorApp {
                             "Downloading {} / {total} MiB…",
                             downloaded / 1_048_576
                         ))
-                        .color(Color32::from_rgb(132, 141, 156)),
-                    );
-                }
-                ConnectionState::Switching { provider } => {
-                    ui.label(
-                        RichText::new(format!("Switching to {provider}…"))
-                            .size(14.0)
-                            .color(Color32::from_rgb(174, 181, 194)),
+                        .color(TEXT_MUTED),
                     );
                 }
                 ConnectionState::Starting => {
@@ -3802,13 +3984,17 @@ impl EditorApp {
                             provider_descriptor(self.selected_provider).display_name
                         ))
                             .size(14.0)
-                            .color(Color32::from_rgb(174, 181, 194)),
+                            .color(TEXT_SECONDARY),
                     );
                 }
                 ConnectionState::AuthenticationRequired(methods) => {
+                    let environment_only = !methods.is_empty()
+                        && methods.iter().all(|method| {
+                            method.kind == AuthKind::Environment && !method.can_authenticate
+                        });
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(27, 27, 30))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(45, 45, 50)))
+                        .fill(SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::same(14))
                         .corner_radius(7)
                         .show(ui, |ui| {
@@ -3820,16 +4006,21 @@ impl EditorApp {
                                 ))
                                     .size(15.0)
                                     .strong()
-                                    .color(Color32::from_rgb(226, 230, 238)),
+                                    .color(TEXT_PRIMARY),
                             );
                             ui.add_space(3.0);
                             ui.add(
                                 Label::new(
-                                    RichText::new(format!(
-                                        "Sign in with your {} account to start an Agent session in this project.",
-                                        provider_descriptor(self.selected_provider).display_name
-                                    ))
-                                    .color(Color32::from_rgb(142, 150, 164)),
+                                    RichText::new(if environment_only {
+                                        "Configure API or supported commercial cloud credentials outside Editur, then retry this provider."
+                                            .to_owned()
+                                    } else {
+                                        format!(
+                                            "Sign in with your {} account to start an Agent session in this project.",
+                                            provider_descriptor(self.selected_provider).display_name
+                                        )
+                                    })
+                                    .color(TEXT_MUTED),
                                 )
                                 .wrap(),
                             );
@@ -3843,9 +4034,9 @@ impl EditorApp {
                                             &method.name
                                         })
                                             .strong()
-                                            .color(Color32::from_rgb(10, 27, 31)),
+                                            .color(ACCENT_INK),
                                     )
-                                    .fill(Color32::from_rgb(94, 210, 224))
+                                    .fill(ACCENT)
                                     .stroke(egui::Stroke::NONE)
                                     .corner_radius(5)
                                     .min_size(egui::vec2(ui.available_width(), 30.0));
@@ -3864,7 +4055,7 @@ impl EditorApp {
                                 let setup = match method.kind {
                                     AuthKind::Agent => None,
                                     AuthKind::Terminal => Some(
-                                        "Complete this sign-in in a terminal, then try again.",
+                                        "Complete the provider-owned sign-in in the terminal. Editur connects automatically when it finishes.",
                                     ),
                                     AuthKind::Environment => Some(
                                         "Set the required environment credentials before launching Editur again.",
@@ -3882,6 +4073,9 @@ impl EditorApp {
                                             .wrap(),
                                     );
                                 }
+                            }
+                            if environment_only && ui.button("Retry").clicked() {
+                                reconnect = true;
                             }
                         });
                 }
@@ -3942,17 +4136,17 @@ impl EditorApp {
                             ui.painter().rect_filled(
                                 mark,
                                 14.0,
-                                Color32::from_rgb(30, 57, 66),
+                                SURFACE_SELECTED,
                             );
                             ui.painter().rect_stroke(
                                 mark,
                                 14.0,
-                                egui::Stroke::new(1.0, Color32::from_rgb(47, 78, 88)),
+                                egui::Stroke::new(1.0, BORDER_STRONG),
                                 egui::StrokeKind::Inside,
                             );
                             let center = mark.center();
                             let stroke =
-                                egui::Stroke::new(1.8, Color32::from_rgb(103, 196, 208));
+                                egui::Stroke::new(1.8, ACCENT);
                             ui.painter().line_segment(
                                 [
                                     center + egui::vec2(-8.0, -5.0),
@@ -3980,7 +4174,7 @@ impl EditorApp {
                                 "Start a task".to_owned()
                             })
                             .size(if self.agentic_mode { 24.0 } else { 18.0 })
-                            .color(Color32::from_rgb(210, 215, 225));
+                            .color(TEXT_SECONDARY);
                         ui.label(if self.agentic_mode {
                             heading
                         } else {
@@ -3993,7 +4187,7 @@ impl EditorApp {
                                     "Describe a task, ask a question, or review changes.",
                                 )
                                 .size(13.0)
-                                .color(Color32::from_rgb(105, 114, 129)),
+                                .color(TEXT_DISABLED),
                             );
                         } else {
                             ui.add_space(3.0);
@@ -4006,7 +4200,7 @@ impl EditorApp {
                                         ),
                                     )
                                     .size(13.5)
-                                    .color(Color32::from_rgb(112, 121, 136)),
+                                    .color(TEXT_DISABLED),
                                 )
                                 .wrap(),
                             );
@@ -4051,13 +4245,13 @@ impl EditorApp {
                                             RichText::new("YOU")
                                                 .size(11.5)
                                                 .strong()
-                                                .color(Color32::from_rgb(146, 157, 174)),
+                                                .color(TEXT_MUTED),
                                         );
                                         egui::Frame::new()
-                                            .fill(Color32::from_rgb(31, 37, 44))
+                                            .fill(SURFACE_INPUT)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                Color32::from_rgb(49, 59, 68),
+                                                BORDER_STRONG,
                                             ))
                                             .inner_margin(egui::Margin::same(12))
                                             .corner_radius(8)
@@ -4074,12 +4268,15 @@ impl EditorApp {
                                             Id::new(("agent_markdown", item_index)),
                                             text,
                                             width,
+                                            &self.highlighter,
+                                            &self.syntaxes,
                                         );
                                         ui.add(Label::new(galley).wrap());
                                     }
                                     TranscriptItem::Thought(text) => {
                                         egui::CollapsingHeader::new("Thinking")
                                             .id_salt(("thought", item_index))
+                                            .icon(paint_agent_disclosure)
                                             .show(ui, |ui| {
                                                 ui.add(
                                                     Label::new(
@@ -4107,6 +4304,7 @@ impl EditorApp {
                                         egui::CollapsingHeader::new("Plan")
                                             .id_salt(("plan", item_index))
                                             .default_open(true)
+                                            .icon(paint_agent_disclosure)
                                             .show(ui, |ui| {
                                                 for item in plan {
                                                     ui.add(
@@ -4122,6 +4320,13 @@ impl EditorApp {
                                     TranscriptItem::Tool(tool) => {
                                         let title =
                                             tool.title.as_deref().unwrap_or("Tool activity");
+                                        let title_includes_paths = title
+                                            .split_whitespace()
+                                            .next()
+                                            .is_some_and(|action| {
+                                                action.eq_ignore_ascii_case("Read")
+                                                    || action.eq_ignore_ascii_case("Edit")
+                                            });
                                         let contains_diff = tool_contains_diff(tool);
                                         agent_collapsing_header(
                                             ui,
@@ -4131,15 +4336,19 @@ impl EditorApp {
                                             transcript_width,
                                             contains_diff,
                                             |ui| {
-                                                for path in &tool.paths {
-                                                    ui.add(
-                                                        Label::new(
-                                                            RichText::new(path.display().to_string())
+                                                if !title_includes_paths {
+                                                    for path in &tool.paths {
+                                                        ui.add(
+                                                            Label::new(
+                                                                RichText::new(
+                                                                    path.display().to_string(),
+                                                                )
                                                                 .monospace()
                                                                 .size(12.5),
-                                                        )
-                                                        .truncate(),
-                                                    );
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    }
                                                 }
                                                 if let Some(detail) = &tool.detail {
                                                     for (content_index, content) in
@@ -4147,7 +4356,35 @@ impl EditorApp {
                                                     {
                                                         match content {
                                                             ToolOutput::Text(text) => {
-                                                                ui.add(Label::new(text).wrap());
+                                                                if let Some(path) = tool
+                                                                    .paths
+                                                                    .get(content_index)
+                                                                    .or_else(|| tool.paths.first())
+                                                                {
+                                                                    let width = ui.available_width();
+                                                                    let galley = agent_code_galley(
+                                                                        ui,
+                                                                        Id::new((
+                                                                            "agent_tool_code",
+                                                                            &tool.id,
+                                                                            content_index,
+                                                                        )),
+                                                                        path,
+                                                                        text,
+                                                                        width,
+                                                                        &self.highlighter,
+                                                                        &self.syntaxes,
+                                                                    );
+                                                                    ui.add(
+                                                                        Label::new(galley)
+                                                                            .wrap()
+                                                                            .selectable(true),
+                                                                    );
+                                                                } else {
+                                                                    ui.add(
+                                                                        Label::new(text).wrap(),
+                                                                    );
+                                                                }
                                                             }
                                                             ToolOutput::Content(content) => {
                                                                 draw_agent_content(ui, content);
@@ -4167,6 +4404,8 @@ impl EditorApp {
                                                                     path,
                                                                     old_text.as_deref(),
                                                                     new_text,
+                                                                    &self.highlighter,
+                                                                    &self.syntaxes,
                                                                 );
                                                             }
                                                             ToolOutput::Terminal(id) => {
@@ -4299,10 +4538,10 @@ impl EditorApp {
                                                 _ => (selected.name.as_str(), Color32::GRAY),
                                             };
                                             egui::Frame::new()
-                                                .fill(Color32::from_rgb(28, 28, 31))
+                                            .fill(SURFACE_RAISED)
                                                 .stroke(egui::Stroke::new(
                                                     1.0,
-                                                    Color32::from_rgb(48, 48, 53),
+                                                    BORDER_SUBTLE,
                                                 ))
                                                 .inner_margin(egui::Margin::same(8))
                                                 .corner_radius(7)
@@ -4359,9 +4598,9 @@ impl EditorApp {
                                                                     Color32::from_rgb(225, 190, 195),
                                                                 ),
                                                                 _ => (
-                                                                    Color32::from_rgb(43, 43, 48),
-                                                                    Color32::from_rgb(67, 67, 74),
-                                                                    Color32::from_rgb(230, 230, 234),
+                                                                    SURFACE_SELECTED,
+                                                                    BORDER_STRONG,
+                                                                    TEXT_PRIMARY,
                                                                 ),
                                                             };
                                                         let response = ui
@@ -4397,10 +4636,10 @@ impl EditorApp {
                                     }
                                     TranscriptItem::Interaction(card) => {
                                         egui::Frame::new()
-                                            .fill(Color32::from_rgb(31, 35, 42))
+                                            .fill(SURFACE_INPUT)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                Color32::from_rgb(56, 68, 82),
+                                                BORDER_STRONG,
                                             ))
                                             .inner_margin(egui::Margin::same(10))
                                             .corner_radius(7)
@@ -4413,7 +4652,7 @@ impl EditorApp {
                                                     } => {
                                                         ui.label(
                                                             RichText::new(title).strong().color(
-                                                                Color32::from_rgb(176, 216, 233),
+                                                                TEXT_PRIMARY,
                                                             ),
                                                         );
                                                         for question in questions {
@@ -4514,9 +4753,7 @@ impl EditorApp {
                                                                     .unwrap_or("Proposed plan"),
                                                             )
                                                             .strong()
-                                                            .color(Color32::from_rgb(
-                                                                176, 216, 233,
-                                                            )),
+                                                            .color(TEXT_PRIMARY),
                                                         );
                                                         if let Some(overview) = &plan.overview {
                                                             ui.add(
@@ -4633,7 +4870,7 @@ impl EditorApp {
                         if self.agentic_mode {
                             EDITOR_BACKGROUND
                         } else {
-                            Color32::from_rgb(20, 20, 22)
+                            CANVAS
                         },
                     )));
                     if !self.agent_follow_transcript {
@@ -4648,16 +4885,16 @@ impl EditorApp {
                             .put(
                                 button,
                                 egui::Button::new("")
-                                .fill(Color32::from_rgb(40, 43, 49))
+                                .fill(SURFACE_SELECTED)
                                 .stroke(egui::Stroke::new(
                                     1.0,
-                                    Color32::from_rgb(65, 70, 80),
+                                    BORDER_STRONG,
                                 ))
                                 .corner_radius(6),
                             )
                             .on_hover_text("Jump to latest");
                         let center = jump.rect.center();
-                        let stroke = egui::Stroke::new(1.5, Color32::from_rgb(190, 198, 211));
+                        let stroke = egui::Stroke::new(1.5, TEXT_SECONDARY);
                         ui.painter().line_segment(
                             [
                                 egui::pos2(center.x - 4.0, center.y - 2.0),
@@ -4738,24 +4975,23 @@ impl EditorApp {
                     spread: 0,
                     color: Color32::from_black_alpha(80),
                 }
-                .as_shape(panel, 14),
+                .as_shape(panel, AGENTIC_COMPOSER_RADIUS),
             );
             ui.painter()
-                .rect_filled(panel, 14.0, Color32::from_rgb(27, 31, 35));
+                .rect_filled(panel, AGENTIC_COMPOSER_RADIUS, SURFACE_RAISED);
             ui.painter().rect_stroke(
                 panel,
-                14.0,
-                egui::Stroke::new(1.0, Color32::from_rgb(49, 59, 68)),
+                AGENTIC_COMPOSER_RADIUS,
+                egui::Stroke::new(1.0, BORDER_STRONG),
                 egui::StrokeKind::Inside,
             );
             panel
         } else {
-            ui.painter()
-                .rect_filled(composer, 0.0, Color32::from_rgb(24, 24, 27));
+            ui.painter().rect_filled(composer, 0.0, SURFACE);
             ui.painter().hline(
                 composer.x_range(),
                 composer.top() + 0.5,
-                egui::Stroke::new(1.0, Color32::from_rgb(48, 48, 54)),
+                egui::Stroke::new(1.0, BORDER_SUBTLE),
             );
             composer
         };
@@ -4797,16 +5033,8 @@ impl EditorApp {
                     .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add(
-                        egui::Spinner::new()
-                            .size(12.0)
-                            .color(Color32::from_rgb(91, 196, 216)),
-                    );
-                    ui.label(
-                        RichText::new("Working")
-                            .size(11.5)
-                            .color(Color32::from_rgb(151, 164, 181)),
-                    );
+                    ui.add(egui::Spinner::new().size(12.0).color(ACCENT));
+                    ui.label(RichText::new("Working").size(11.5).color(TEXT_MUTED));
                 },
             );
         }
@@ -4855,7 +5083,10 @@ impl EditorApp {
             }
         }
         let footer = egui::Rect::from_min_max(
-            egui::pos2(composer_content.left(), composer_content.bottom() - 30.0),
+            egui::pos2(
+                composer_panel.left() + 3.0,
+                composer_content.bottom() - 30.0,
+            ),
             composer_content.right_bottom(),
         );
         let input_rect = egui::Rect::from_min_max(
@@ -4973,19 +5204,15 @@ impl EditorApp {
                 .max_rect(footer)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 10.0;
                 let attach = ui
                     .add_enabled(
                         composer_enabled,
-                        egui::Button::new(
-                            RichText::new("+")
-                                .size(20.0)
-                                .color(Color32::from_rgb(166, 178, 194)),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(6)
-                        .min_size(egui::vec2(32.0, 30.0)),
+                        egui::Button::new(RichText::new("+").size(20.0).color(TEXT_SECONDARY))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6)
+                            .min_size(egui::vec2(32.0, 30.0)),
                     )
                     .on_hover_text("Attach files");
                 open_file_picker = attach.clicked();
@@ -5027,6 +5254,10 @@ impl EditorApp {
                             menu_anchor = Some(selector.rect);
                         }
                     }
+                    let has_thinking_config = self.agent.config_options.iter().any(|option| {
+                        matches!(&option.value, ConfigValue::Select(_))
+                            && is_thinking_config(&option.id, &option.name)
+                    });
                     for option in &self.agent.config_options {
                         match &option.value {
                             ConfigValue::Select(current) => {
@@ -5050,6 +5281,14 @@ impl EditorApp {
                                             }
                                         },
                                     );
+                                let current_name = if is_thinking_config(&option.id, &option.name)
+                                    && fast_mode_config(&self.agent.config_options)
+                                        .is_some_and(|(_, enabled)| enabled)
+                                {
+                                    Cow::Owned(format!("{current_name} · Fast"))
+                                } else {
+                                    current_name
+                                };
                                 let menu = AgentMenu::Config(option.id.clone());
                                 let selector = agent_selector_button(
                                     ui,
@@ -5066,6 +5305,12 @@ impl EditorApp {
                                 }
                             }
                             ConfigValue::Boolean(current) => {
+                                if has_thinking_config
+                                    && fast_mode_config(&self.agent.config_options)
+                                        .is_some_and(|(fast, _)| fast.id == option.id)
+                                {
+                                    continue;
+                                }
                                 let selected =
                                     ui.selectable_label(*current, &option.name).on_hover_text(
                                         option.description.as_deref().unwrap_or(&option.name),
@@ -5095,7 +5340,7 @@ impl EditorApp {
                         let response = ui
                             .add(
                                 egui::Button::new("")
-                                    .fill(Color32::from_rgb(65, 65, 72))
+                                    .fill(BORDER_STRONG)
                                     .corner_radius(6)
                                     .min_size(egui::vec2(32.0, 30.0)),
                             )
@@ -5106,7 +5351,7 @@ impl EditorApp {
                                 egui::vec2(8.0, 8.0),
                             ),
                             1.5,
-                            Color32::from_rgb(230, 232, 237),
+                            TEXT_PRIMARY,
                         );
                         cancel = response.clicked();
                     } else {
@@ -5152,16 +5397,20 @@ impl EditorApp {
             },
         );
         if self.agent_drop_hovered {
-            let radius = if self.agentic_mode { 14.0 } else { 0.0 };
+            let radius = if self.agentic_mode {
+                AGENTIC_COMPOSER_RADIUS
+            } else {
+                0
+            };
             ui.painter().rect_filled(
                 composer_panel,
                 radius,
-                Color32::from_rgba_unmultiplied(32, 74, 84, 236),
+                Color32::from_rgba_unmultiplied(39, 39, 43, 236),
             );
             ui.painter().rect_stroke(
                 composer_panel.shrink(1.0),
                 radius,
-                egui::Stroke::new(1.5, Color32::from_rgb(91, 196, 216)),
+                egui::Stroke::new(1.5, ACCENT),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
@@ -5169,7 +5418,7 @@ impl EditorApp {
                 Align2::CENTER_CENTER,
                 "Drop files to attach",
                 FontId::proportional(14.0),
-                Color32::from_rgb(226, 241, 244),
+                TEXT_PRIMARY,
             );
         }
 
@@ -5197,7 +5446,13 @@ impl EditorApp {
                     .config_options
                     .iter()
                     .find(|option| option.id == *id)
-                    .map(|option| option.options.len()),
+                    .map(|option| {
+                        option.options.len()
+                            + usize::from(
+                                is_thinking_config(&option.id, &option.name)
+                                    && fast_mode_config(&self.agent.config_options).is_some(),
+                            )
+                    }),
             };
             if let Some(item_count) = item_count {
                 if self.agent_menu.as_ref() != Some(menu) {
@@ -5251,19 +5506,20 @@ impl EditorApp {
                         .layout(Layout::top_down(Align::LEFT)),
                     |ui| {
                         ui.set_clip_rect(ui.ctx().content_rect());
-                        ui.painter().add(egui::Shadow {
-                            offset: [0, 6],
-                            blur: 18,
-                            spread: 0,
-                            color: Color32::from_black_alpha(110),
-                        }
-                        .as_shape(popup, 11));
-                        ui.painter()
-                            .rect_filled(popup, 11.0, Color32::from_rgb(26, 27, 31));
+                        ui.painter().add(
+                            egui::Shadow {
+                                offset: [0, 6],
+                                blur: 18,
+                                spread: 0,
+                                color: Color32::from_black_alpha(110),
+                            }
+                            .as_shape(popup, 11),
+                        );
+                        ui.painter().rect_filled(popup, 11.0, SURFACE_RAISED);
                         ui.painter().rect_stroke(
                             popup,
                             11.0,
-                            egui::Stroke::new(1.0, Color32::from_rgb(52, 55, 62)),
+                            egui::Stroke::new(1.0, BORDER_STRONG),
                             egui::StrokeKind::Inside,
                         );
                         ui.scope_builder(
@@ -5283,206 +5539,200 @@ impl EditorApp {
                                         ui.spacing_mut().interact_size.y = row_height;
                                         ui.spacing_mut().item_spacing.y = 0.0;
                                         match menu {
-                                        AgentMenu::Providers => {
-                                            let switchable = self.agent.can_switch_provider()
-                                                && self.provider_transition.is_none();
-                                            for provider in provider_catalog() {
-                                                let packaged = self
-                                                    .available_providers
-                                                    .contains(&provider.id);
-                                                let reason = provider.unavailable_reason.or_else(|| {
-                                                    (!packaged).then_some("Unavailable in this build")
-                                                });
-                                                let response = ui
-                                                    .add_enabled_ui(
-                                                        packaged && reason.is_none() && switchable,
-                                                        |ui| {
-                                                            provider_menu_option(
-                                                                ui,
-                                                                provider,
-                                                                packaged,
-                                                                self.selected_provider == provider.id,
+                                            AgentMenu::Providers => {
+                                                for provider in provider_catalog() {
+                                                    let packaged = self
+                                                        .available_providers
+                                                        .contains(&provider.id);
+                                                    let reason =
+                                                        provider.unavailable_reason.or_else(|| {
+                                                            (!packaged).then_some(
+                                                                "Unavailable in this build",
                                                             )
-                                                        },
-                                                    )
-                                                    .inner
-                                                    .on_hover_text(reason.unwrap_or(if switchable {
-                                                        provider.description
-                                                    } else {
-                                                        "Stop or answer the current request before switching providers."
-                                                    }));
-                                                if response.clicked() {
-                                                    provider_change = Some(provider.id);
-                                                    selected = true;
+                                                        });
+                                                    let response = ui
+                                                        .add_enabled_ui(
+                                                            packaged && reason.is_none(),
+                                                            |ui| {
+                                                                provider_menu_option(
+                                                                    ui,
+                                                                    provider,
+                                                                    packaged,
+                                                                    self.selected_provider
+                                                                        == provider.id,
+                                                                )
+                                                            },
+                                                        )
+                                                        .inner;
+                                                    if response.clicked() {
+                                                        provider_change = Some(provider.id);
+                                                        selected = true;
+                                                    }
                                                 }
                                             }
-                                        }
-                                        AgentMenu::Sessions => {
-                                            if let Some(sessions) = &self.agent.sessions {
-                                                if sessions.is_empty() {
+                                            AgentMenu::Sessions => {
+                                                if let Some(sessions) = &self.agent.sessions {
+                                                    if sessions.is_empty() {
+                                                        ui.add_sized(
+                                                            [
+                                                                ui.available_width(),
+                                                                AGENT_SESSION_ROW_HEIGHT,
+                                                            ],
+                                                            Label::new(
+                                                                RichText::new(
+                                                                    "No previous sessions",
+                                                                )
+                                                                .weak(),
+                                                            ),
+                                                        );
+                                                    }
+                                                    for session in sessions {
+                                                        let (open, remove) = agent_session_row(
+                                                            ui, session, false, false,
+                                                        );
+                                                        if open {
+                                                            session_load = Some(session.id.clone());
+                                                            selected = true;
+                                                        }
+                                                        if remove {
+                                                            session_remove =
+                                                                Some(session.id.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            AgentMenu::Commands(query) => {
+                                                let mut matches = 0;
+                                                for command in &self.agent.commands {
+                                                    if !command_matches(&command.name, query) {
+                                                        continue;
+                                                    }
+                                                    matches += 1;
+                                                    let label =
+                                                        command.input_hint.as_ref().map_or_else(
+                                                            || format!("/{}", command.name),
+                                                            |hint| {
+                                                                format!("/{} {hint}", command.name)
+                                                            },
+                                                        );
+                                                    if ui.selectable_label(false, label).clicked() {
+                                                        self.agent.prompt =
+                                                            format!("/{} ", command.name);
+                                                        self.agent_prompt_history_index = None;
+                                                        self.agent_prompt_history_draft.clear();
+                                                        ui.memory_mut(|memory| {
+                                                            memory.request_focus(Id::new(
+                                                                "agent_prompt",
+                                                            ));
+                                                        });
+                                                        selected = true;
+                                                    }
+                                                }
+                                                if matches == 0 {
                                                     ui.add_sized(
                                                         [
                                                             ui.available_width(),
-                                                            AGENT_SESSION_ROW_HEIGHT,
+                                                            AGENT_COMMAND_ROW_HEIGHT,
                                                         ],
                                                         Label::new(
-                                                            RichText::new("No previous sessions")
+                                                            RichText::new("No matching commands")
                                                                 .weak(),
                                                         ),
                                                     );
                                                 }
-                                                for session in sessions {
-                                                    let (open, remove) =
-                                                        agent_session_row(ui, session, false, false);
-                                                    if open {
-                                                        session_load = Some(session.id.clone());
+                                            }
+                                            AgentMenu::Permissions => {
+                                                for (enabled, label) in
+                                                    [(false, "Ask"), (true, "Allow all")]
+                                                {
+                                                    if agent_menu_option(
+                                                        ui,
+                                                        label,
+                                                        self.agent_run_everything.unwrap_or(false)
+                                                            == enabled,
+                                                        row_height,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        run_everything_change = Some(enabled);
                                                         selected = true;
                                                     }
-                                                    if remove {
-                                                        session_remove = Some(session.id.clone());
-                                                    }
                                                 }
                                             }
-                                        }
-                                        AgentMenu::Commands(query) => {
-                                            let mut matches = 0;
-                                            for command in &self.agent.commands {
-                                                if !command_matches(&command.name, query) {
-                                                    continue;
-                                                }
-                                                matches += 1;
-                                                let label =
-                                                    command.input_hint.as_ref().map_or_else(
-                                                        || format!("/{}", command.name),
-                                                        |hint| format!("/{} {hint}", command.name),
-                                                    );
-                                                if ui
-                                                    .selectable_label(false, label)
-                                                    .on_hover_text(&command.description)
-                                                    .clicked()
-                                                {
-                                                    self.agent.prompt =
-                                                        format!("/{} ", command.name);
-                                                    self.agent_prompt_history_index = None;
-                                                    self.agent_prompt_history_draft.clear();
-                                                    ui.memory_mut(|memory| {
-                                                        memory
-                                                            .request_focus(Id::new("agent_prompt"));
-                                                    });
-                                                    selected = true;
-                                                }
-                                            }
-                                            if matches == 0 {
-                                                ui.add_sized(
-                                                    [
-                                                        ui.available_width(),
-                                                        AGENT_COMMAND_ROW_HEIGHT,
-                                                    ],
-                                                    Label::new(
-                                                        RichText::new("No matching commands")
-                                                            .weak(),
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                        AgentMenu::Permissions => {
-                                            for (enabled, label, description) in [
-                                                (
-                                                    false,
-                                                    "Ask",
-                                                    "Ask before tools that are not already allowed",
-                                                ),
-                                                (
-                                                    true,
-                                                    "Allow all",
-                                                    "Approve every supported provider tool unless explicitly denied",
-                                            ),
-                                        ] {
-                                            if agent_menu_option(
-                                                ui,
-                                                label,
-                                                self.agent_run_everything.unwrap_or(false)
-                                                    == enabled,
-                                                row_height,
-                                            )
-                                                .on_hover_text(description)
-                                                .clicked()
-                                                {
-                                                    run_everything_change = Some(enabled);
-                                                    selected = true;
-                                                }
-                                            }
-                                        }
-                                        AgentMenu::Mode => {
-                                            let current = self
-                                                .agent
-                                                .current_mode
-                                                .as_deref()
-                                                .unwrap_or_default();
-                                            for mode in &self.agent.modes {
-                                                let response = agent_menu_option(
-                                                    ui,
-                                                    &mode.name,
-                                                    current == mode.id,
-                                                    row_height,
-                                                );
-                                                let response = if let Some(description) = mode
-                                                    .description
+                                            AgentMenu::Mode => {
+                                                let current = self
+                                                    .agent
+                                                    .current_mode
                                                     .as_deref()
-                                                    .filter(|description| !description.is_empty())
-                                                {
-                                                    response.on_hover_text(description)
-                                                } else {
-                                                    response
-                                                };
-                                                if response.clicked() {
-                                                    mode_change = Some(mode.id.clone());
-                                                    selected = true;
-                                                }
-                                            }
-                                        }
-                                        AgentMenu::Config(id) => {
-                                            if let Some(option) = self
-                                                .agent
-                                                .config_options
-                                                .iter()
-                                                .find(|option| option.id == *id)
-                                                && let ConfigValue::Select(current) = &option.value
-                                            {
-                                                for value in &option.options {
-                                                    let label = if is_model_config(
-                                                        &option.id,
-                                                        &option.name,
-                                                    ) {
-                                                        model_display_name(&value.id, &value.name)
-                                                    } else {
-                                                        Cow::Borrowed(value.name.as_str())
-                                                    };
+                                                    .unwrap_or_default();
+                                                for mode in &self.agent.modes {
                                                     let response = agent_menu_option(
                                                         ui,
-                                                        &label,
-                                                        value.id == *current,
+                                                        &mode.name,
+                                                        current == mode.id,
                                                         row_height,
                                                     );
-                                                    let response = if let Some(description) =
-                                                        value.description.as_deref().filter(
-                                                            |description| !description.is_empty(),
-                                                        ) {
-                                                        response.on_hover_text(description)
-                                                    } else {
-                                                        response
-                                                    };
                                                     if response.clicked() {
-                                                        config_changes.push((
-                                                            option.id.clone(),
-                                                            ConfigValue::Select(value.id.clone()),
-                                                        ));
+                                                        mode_change = Some(mode.id.clone());
                                                         selected = true;
                                                     }
                                                 }
                                             }
+                                            AgentMenu::Config(id) => {
+                                                if let Some(option) = self
+                                                    .agent
+                                                    .config_options
+                                                    .iter()
+                                                    .find(|option| option.id == *id)
+                                                    && let ConfigValue::Select(current) =
+                                                        &option.value
+                                                {
+                                                    for value in &option.options {
+                                                        let label = if is_model_config(
+                                                            &option.id,
+                                                            &option.name,
+                                                        ) {
+                                                            model_display_name(
+                                                                &value.id,
+                                                                &value.name,
+                                                            )
+                                                        } else {
+                                                            Cow::Borrowed(value.name.as_str())
+                                                        };
+                                                        let response = agent_menu_option(
+                                                            ui,
+                                                            &label,
+                                                            value.id == *current,
+                                                            row_height,
+                                                        );
+                                                        if response.clicked() {
+                                                            config_changes.push((
+                                                                option.id.clone(),
+                                                                ConfigValue::Select(
+                                                                    value.id.clone(),
+                                                                ),
+                                                            ));
+                                                            selected = true;
+                                                        }
+                                                    }
+                                                    if is_thinking_config(&option.id, &option.name)
+                                                        && let Some((fast, enabled)) =
+                                                            fast_mode_config(
+                                                                &self.agent.config_options,
+                                                            )
+                                                        && agent_toggle_row(
+                                                            ui, &fast.name, enabled, row_height,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        config_changes.push((
+                                                            fast.id.clone(),
+                                                            ConfigValue::Boolean(!enabled),
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                         }
-                                    }
                                     });
                                 scroll_y = output.state.offset.y;
                             },
@@ -5524,7 +5774,7 @@ impl EditorApp {
 
         for (request_id, option_id) in permission_decisions {
             if self.agent.decide_permission(request_id, &option_id)
-                && let Some(controller) = &self.agent_controller
+                && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
             {
                 let _ = controller.send(AgentCommand::DecidePermission {
                     request_id,
@@ -5534,7 +5784,7 @@ impl EditorApp {
         }
         for (request_id, response) in interaction_responses {
             if self.agent.answer_interaction(request_id)
-                && let Some(controller) = &self.agent_controller
+                && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
             {
                 let _ = controller.send(AgentCommand::RespondInteraction {
                     request_id,
@@ -5543,7 +5793,7 @@ impl EditorApp {
             }
         }
         if let Some(enabled) = run_everything_change
-            && let Some(controller) = &self.agent_controller
+            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
             match controller.send(AgentCommand::SetRunEverything(enabled)) {
                 Ok(()) => {
@@ -5555,7 +5805,7 @@ impl EditorApp {
         if let Some(provider) = provider_change {
             self.request_provider_switch(provider, ui.ctx());
         }
-        if let Some(controller) = &self.agent_controller {
+        if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
             if let Some(session_id) = session_remove {
                 let _ = controller.send(AgentCommand::RemoveSession(session_id));
             }
@@ -5575,11 +5825,12 @@ impl EditorApp {
         if send || submit_shortcut {
             self.queue_agent_prompt();
         }
-        if new_session && let Some(controller) = &self.agent_controller {
+        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+        {
             let _ = controller.send(AgentCommand::NewSession);
         }
         if let Some(method) = authenticate
-            && let Some(controller) = &self.agent_controller
+            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
             let _ = controller.send(AgentCommand::Authenticate(method));
         }
@@ -5610,12 +5861,11 @@ impl EditorApp {
             format!("{} / {}", self.find_selected + 1, self.find_matches.len())
         };
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(26, 26, 28));
+        ui.painter().rect_filled(rect, 0.0, SURFACE);
         ui.painter().hline(
             rect.x_range(),
             rect.top(),
-            egui::Stroke::new(1.0, Color32::from_rgb(53, 53, 59)),
+            egui::Stroke::new(1.0, BORDER_STRONG),
         );
         ui.scope_builder(
             UiBuilder::new()
@@ -5625,7 +5875,7 @@ impl EditorApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let input_width = (ui.available_width() - 142.0).max(40.0);
                 let response = egui::Frame::new()
-                    .fill(Color32::from_rgb(31, 31, 34))
+                    .fill(SURFACE_INPUT)
                     .inner_margin(egui::Margin::symmetric(6, 3))
                     .corner_radius(4)
                     .show(ui, |ui| {
@@ -5717,7 +5967,7 @@ impl EditorApp {
             palette_size,
         );
         let palette_frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
-            .fill(Color32::from_rgb(24, 24, 26))
+            .fill(SURFACE)
             .stroke(egui::Stroke::new(
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 22),
@@ -5754,10 +6004,6 @@ impl EditorApp {
                 .max_rect(palette_rect.shrink(15.0))
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
-                ui.visuals_mut().selection.bg_fill = Color32::from_rgb(30, 83, 94);
-                ui.visuals_mut().selection.stroke.color = Color32::from_rgb(126, 228, 239);
-                ui.visuals_mut().widgets.hovered.weak_bg_fill = Color32::from_rgb(35, 35, 39);
-                ui.visuals_mut().widgets.hovered.bg_fill = Color32::from_rgb(35, 35, 39);
                 ui.spacing_mut().item_spacing.y = 4.0;
 
                 ui.horizontal(|ui| {
@@ -5772,7 +6018,7 @@ impl EditorApp {
                 });
                 ui.add_space(8.0);
                 let response = egui::Frame::new()
-                    .fill(Color32::from_rgb(33, 33, 37))
+                    .fill(SURFACE_INPUT)
                     .inner_margin(egui::Margin::symmetric(10, 7))
                     .corner_radius(7)
                     .show(ui, |ui| {
@@ -5819,12 +6065,7 @@ impl EditorApp {
                         }
 
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("FILES")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(145, 153, 169)),
-                            );
+                            ui.label(RichText::new("FILES").size(11.0).strong().color(TEXT_MUTED));
                             ui.label(
                                 RichText::new(results.files.len().to_string())
                                     .small()
@@ -5840,7 +6081,7 @@ impl EditorApp {
                                 0.0,
                                 TextFormat {
                                     font_id: FontId::monospace(13.5),
-                                    color: Color32::from_rgb(205, 210, 220),
+                                    color: TEXT_SECONDARY,
                                     ..TextFormat::default()
                                 },
                             );
@@ -5860,7 +6101,7 @@ impl EditorApp {
                                 RichText::new("FILE CONTENT")
                                     .size(11.0)
                                     .strong()
-                                    .color(Color32::from_rgb(145, 153, 169)),
+                                    .color(TEXT_MUTED),
                             );
                             ui.label(
                                 RichText::new(results.contents.len().to_string())
@@ -6166,17 +6407,7 @@ impl EditorApp {
         let mut refresh = false;
         let remaining = MAX_PROMPT_ATTACHMENTS
             .saturating_sub(attached_count.saturating_add(picker.selected.len()));
-        let frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
-            .fill(Color32::from_rgb(24, 25, 29))
-            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(24)))
-            .inner_margin(0)
-            .corner_radius(12)
-            .shadow(egui::Shadow {
-                offset: [0, 10],
-                blur: 32,
-                spread: 2,
-                color: Color32::from_black_alpha(170),
-            });
+        let frame = dialog_frame(ctx).inner_margin(0);
         egui::Window::new("Add context")
             .id(Id::new("agent_file_picker"))
             .fixed_pos(position)
@@ -6202,10 +6433,8 @@ impl EditorApp {
                 let content = egui::Rect::from_min_max(rail.right_top(), body.right_bottom());
                 let divider = egui::Stroke::new(1.0, Color32::from_white_alpha(18));
 
-                ui.painter()
-                    .rect_filled(rail, 0.0, Color32::from_rgb(21, 22, 25));
-                ui.painter()
-                    .rect_filled(footer, 0.0, Color32::from_rgb(22, 23, 27));
+                ui.painter().rect_filled(rail, 0.0, CANVAS);
+                ui.painter().rect_filled(footer, 0.0, CANVAS);
                 ui.painter()
                     .hline(header.x_range(), header.bottom(), divider);
                 ui.painter().vline(rail.right(), rail.y_range(), divider);
@@ -6220,12 +6449,14 @@ impl EditorApp {
                             RichText::new("Add context")
                                 .size(15.5)
                                 .strong()
-                                .color(Color32::from_rgb(231, 234, 240)),
+                                .color(TEXT_PRIMARY),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            close |= agent_file_picker_icon_button(
+                            close |= icon_button(
                                 ui,
                                 "Close (Esc)",
+                                egui::vec2(40.0, 40.0),
+                                TEXT_MUTED,
                                 |painter, rect, color| {
                                     let stroke = egui::Stroke::new(1.4, color);
                                     painter.line_segment(
@@ -6258,7 +6489,7 @@ impl EditorApp {
                             RichText::new("LOCATIONS")
                                 .size(9.5)
                                 .strong()
-                                .color(Color32::from_rgb(102, 111, 126)),
+                                .color(TEXT_DISABLED),
                         );
                         ui.add_space(8.0);
                         if agent_file_picker_location_row(
@@ -6294,8 +6525,7 @@ impl EditorApp {
                     egui::Rect::from_min_max(columns.left_bottom(), content.right_bottom());
                 ui.painter()
                     .hline(toolbar.x_range(), toolbar.bottom(), divider);
-                ui.painter()
-                    .rect_filled(columns, 0.0, Color32::from_rgb(22, 23, 27));
+                ui.painter().rect_filled(columns, 0.0, CANVAS);
                 ui.painter()
                     .hline(columns.x_range(), columns.bottom(), divider);
 
@@ -6309,9 +6539,11 @@ impl EditorApp {
                         .layout(Layout::left_to_right(Align::Center)),
                     |ui| {
                         ui.add_enabled_ui(picker.directory.parent().is_some(), |ui| {
-                            if agent_file_picker_icon_button(
+                            if icon_button(
                                 ui,
                                 "Parent folder",
+                                egui::vec2(40.0, 40.0),
+                                TEXT_MUTED,
                                 |painter, rect, color| {
                                     let center = rect.center();
                                     let stroke = egui::Stroke::new(1.4, color);
@@ -6353,9 +6585,11 @@ impl EditorApp {
                         .max_rect(refresh_rect)
                         .layout(Layout::left_to_right(Align::Center)),
                     |ui| {
-                        refresh |= agent_file_picker_icon_button(
+                        refresh |= icon_button(
                             ui,
                             "Refresh folder",
+                            egui::vec2(40.0, 40.0),
+                            TEXT_MUTED,
                             |painter, rect, color| {
                                 let center = rect.center();
                                 let stroke = egui::Stroke::new(1.3, color);
@@ -6388,8 +6622,7 @@ impl EditorApp {
                     ),
                     egui::pos2(refresh_rect.left() - 6.0, toolbar.bottom() - 10.0),
                 );
-                ui.painter()
-                    .rect_filled(search_rect, 5.0, Color32::from_rgb(19, 20, 23));
+                ui.painter().rect_filled(search_rect, 5.0, CANVAS);
                 let search_response = ui
                     .scope_builder(
                         UiBuilder::new()
@@ -6413,7 +6646,7 @@ impl EditorApp {
                     egui::Stroke::new(
                         1.0,
                         if search_response.has_focus() {
-                            Color32::from_rgb(83, 164, 178)
+                            ACCENT
                         } else {
                             Color32::from_white_alpha(18)
                         },
@@ -6439,7 +6672,7 @@ impl EditorApp {
                     Align2::LEFT_CENTER,
                     folder_name,
                     FontId::proportional(12.5),
-                    Color32::from_rgb(201, 207, 218),
+                    TEXT_SECONDARY,
                 );
 
                 ui.painter().text(
@@ -6447,14 +6680,14 @@ impl EditorApp {
                     Align2::LEFT_CENTER,
                     "NAME",
                     FontId::proportional(9.5),
-                    Color32::from_rgb(102, 111, 126),
+                    TEXT_DISABLED,
                 );
                 ui.painter().text(
                     egui::pos2(columns.right() - 14.0, columns.center().y),
                     Align2::RIGHT_CENTER,
                     "TYPE",
                     FontId::proportional(9.5),
-                    Color32::from_rgb(102, 111, 126),
+                    TEXT_DISABLED,
                 );
 
                 ui.scope_builder(
@@ -6478,7 +6711,7 @@ impl EditorApp {
                                                 "No matching files"
                                             })
                                             .size(12.0)
-                                            .color(Color32::from_rgb(117, 126, 141)),
+                                            .color(TEXT_DISABLED),
                                         );
                                     });
                                 }
@@ -6517,7 +6750,7 @@ impl EditorApp {
                     if picker.error.is_some() {
                         Color32::from_rgb(244, 139, 145)
                     } else {
-                        Color32::from_rgb(125, 134, 149)
+                        TEXT_MUTED
                     },
                 );
                 ui.scope_builder(
@@ -6532,15 +6765,11 @@ impl EditorApp {
                         attach |= ui
                             .add_enabled(
                                 !picker.selected.is_empty(),
-                                egui::Button::new(
-                                    RichText::new(label)
-                                        .strong()
-                                        .color(Color32::from_rgb(9, 28, 32)),
-                                )
-                                .fill(Color32::from_rgb(94, 210, 224))
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(6)
-                                .min_size(egui::vec2(104.0, 40.0)),
+                                egui::Button::new(RichText::new(label).strong().color(ACCENT_INK))
+                                    .fill(ACCENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(6)
+                                    .min_size(egui::vec2(104.0, 40.0)),
                             )
                             .clicked();
                         close |= ui
@@ -6577,115 +6806,20 @@ impl EditorApp {
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
         self.draw_agent_file_picker(ctx);
-        if let Some(target) = self.pending_provider_confirmation {
-            let current = provider_descriptor(self.selected_provider).display_name;
-            let next = provider_descriptor(target).display_name;
-            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
-            let mut proceed = false;
-            let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
-            egui::Window::new("Switch ACP provider")
-                .id(Id::new("provider_switch_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.add(
-                        Label::new(format!(
-                            "Switching from {current} to {next} will end the current provider session and clear its transcript. Your composer draft will be preserved."
-                        ))
-                        .wrap(),
-                    );
-                    if !switchable {
-                        ui.label(
-                            RichText::new(
-                                "Stop or answer the current request before switching providers.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        proceed = ui
-                            .add_enabled(switchable, egui::Button::new(format!("Switch to {next}")))
-                            .clicked();
-                        cancel |= ui.button("Cancel").clicked();
-                    });
-                });
-            if proceed {
-                self.pending_provider_confirmation = None;
-                self.request_provider_terms_or_transition(target, ctx);
-            } else if cancel {
-                self.pending_provider_confirmation = None;
-            }
-        }
-        if let Some(target) = self.pending_provider_terms {
-            let provider = provider_descriptor(target);
-            let switchable = self.agent.can_switch_provider() && self.provider_transition.is_none();
-            let mut accept = false;
-            let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
-            egui::Window::new(format!("Use {} Agent", provider.display_name))
-                .id(Id::new("provider_terms_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.add(
-                        Label::new(format!(
-                            "Editur will download and run a pinned {} package in Editur's private application-data directory.",
-                            provider.display_name
-                        ))
-                        .wrap(),
-                    );
-                    ui.hyperlink_to("Provider license", provider.license_url);
-                    ui.hyperlink_to("Provider terms", provider.terms_url);
-                    if !switchable {
-                        ui.label(
-                            RichText::new(
-                                "Stop or answer the current request before switching providers.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        accept = ui
-                            .add_enabled(switchable, egui::Button::new("Accept and Continue"))
-                            .clicked();
-                        cancel |= ui.button("Cancel").clicked();
-                    });
-                });
-            if accept {
-                match data_dir()
-                    .and_then(|directory| crate::agent::provider::accept_terms(&directory, target))
-                {
-                    Ok(()) => {
-                        self.pending_provider_terms = None;
-                        self.begin_provider_transition(target, ctx);
-                    }
-                    Err(error) => self.show_error(error),
-                }
-            } else if cancel {
-                self.pending_provider_terms = None;
-            }
-        }
         if self.pending_agent_prompt {
             let mut save_and_run = false;
             let mut cancel = false;
-            egui::Window::new("Save before running Agent")
-                .id(Id::new("agent_save_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "{} Agent reads files from disk. Save the current buffer first?",
-                        provider_descriptor(self.selected_provider).display_name
-                    ));
-                    ui.horizontal(|ui| {
-                        save_and_run = ui.button("Save and Run").clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
+            dialog_window(ctx, "Save before running Agent", "agent_save_dialog").show(ctx, |ui| {
+                begin_dialog(ui, "Save before running Agent");
+                ui.label(format!(
+                    "{} Agent reads files from disk. Save the current buffer first?",
+                    provider_descriptor(self.selected_provider).display_name
+                ));
+                dialog_actions(ui, |ui| {
+                    save_and_run = ui.add(dialog_button("Save and Run", true)).clicked();
+                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
                 });
+            });
             if save_and_run && self.save(None) {
                 self.pending_agent_prompt = false;
                 self.send_agent_prompt();
@@ -6694,138 +6828,84 @@ impl EditorApp {
             }
         }
         if self.pending.is_some() && !self.conflict && self.save_as.is_none() {
-            let dialog_frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
-                .fill(Color32::from_rgb(28, 28, 31))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-                ))
-                .inner_margin(18)
-                .corner_radius(12)
-                .shadow(egui::Shadow {
-                    offset: [0, 8],
-                    blur: 28,
-                    spread: 2,
-                    color: Color32::from_black_alpha(150),
+            dialog_window(ctx, "Unsaved changes", "unsaved_dialog").show(ctx, |ui| {
+                begin_dialog(ui, "Unsaved changes");
+                ui.label(RichText::new("Save your changes before continuing?").color(TEXT_MUTED));
+                ui.add_space(18.0);
+                dialog_actions(ui, |ui| {
+                    if ui.add(dialog_button("Save", true)).clicked() && self.save(None) {
+                        self.finish_pending();
+                    }
+                    let discard = egui::Button::new(
+                        RichText::new("Discard").color(Color32::from_rgb(224, 156, 160)),
+                    )
+                    .fill(Color32::from_rgb(40, 34, 37))
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(78.0, 40.0));
+                    if ui.add(discard).clicked() {
+                        self.discard_pending();
+                    }
+                    if ui.add(dialog_button("Cancel", false)).clicked() {
+                        self.pending = None;
+                        self.tree
+                            .select(self.buffer().map(|buffer| buffer.path.clone()));
+                    }
                 });
-            egui::Window::new("Unsaved changes")
-                .id(Id::new("unsaved_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .title_bar(false)
-                .fade_in(false)
-                .fixed_size(egui::vec2(360.0, 134.0))
-                .collapsible(false)
-                .resizable(false)
-                .frame(dialog_frame)
-                .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new("Unsaved changes")
-                            .size(16.0)
-                            .strong()
-                            .color(Color32::from_rgb(226, 230, 238)),
-                    );
-                    ui.add_space(5.0);
-                    ui.label(
-                        RichText::new("Save your changes before continuing?")
-                            .color(Color32::from_rgb(145, 151, 164)),
-                    );
-                    ui.add_space(18.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let save = egui::Button::new(
-                            RichText::new("Save")
-                                .strong()
-                                .color(Color32::from_rgb(9, 28, 32)),
-                        )
-                        .fill(Color32::from_rgb(94, 210, 224))
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(6)
-                        .min_size(egui::vec2(72.0, 32.0));
-                        if ui.add(save).clicked() && self.save(None) {
-                            self.finish_pending();
-                        }
-                        let discard = egui::Button::new(
-                            RichText::new("Discard").color(Color32::from_rgb(224, 156, 160)),
-                        )
-                        .fill(Color32::from_rgb(40, 34, 37))
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(6)
-                        .min_size(egui::vec2(78.0, 32.0));
-                        if ui.add(discard).clicked() {
-                            self.discard_pending();
-                        }
-                        let cancel = egui::Button::new("Cancel")
-                            .fill(Color32::from_rgb(39, 39, 43))
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(6)
-                            .min_size(egui::vec2(72.0, 32.0));
-                        if ui.add(cancel).clicked() {
-                            self.pending = None;
-                            self.tree
-                                .select(self.buffer().map(|buffer| buffer.path.clone()));
-                        }
-                    });
-                });
+            });
         }
         if self.conflict {
-            egui::Window::new("File changed on disk")
-                .id(Id::new("conflict_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("The file changed outside Editur. It was not overwritten.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Reload").clicked()
-                            && let Some(index) = self.active_tab
-                        {
-                            let path = self.tabs[index].buffer.path.clone();
-                            match load_buffer(&path) {
-                                Ok(buffer) => {
-                                    self.tabs[index] = FileTab::new(buffer);
-                                    self.conflict = false;
-                                    if self.pending.is_some() {
-                                        self.finish_pending();
-                                    }
+            dialog_window(ctx, "File changed on disk", "conflict_dialog").show(ctx, |ui| {
+                begin_dialog(ui, "File changed on disk");
+                ui.label("The file changed outside Editur. It was not overwritten.");
+                dialog_actions(ui, |ui| {
+                    if ui.add(dialog_button("Reload", true)).clicked()
+                        && let Some(index) = self.active_tab
+                    {
+                        let path = self.tabs[index].buffer.path.clone();
+                        match load_buffer(&path) {
+                            Ok(buffer) => {
+                                self.tabs[index] = FileTab::new(buffer);
+                                self.conflict = false;
+                                if self.pending.is_some() {
+                                    self.finish_pending();
                                 }
-                                Err(error) => self.show_error(error),
                             }
+                            Err(error) => self.show_error(error),
                         }
-                        if ui.button("Save As…").clicked() {
-                            let suggestion = self.buffer().map_or_else(String::new, |buffer| {
-                                format!("{}.editur-copy", buffer.path.display())
-                            });
-                            self.save_as = Some(suggestion);
-                            self.conflict = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.conflict = false;
-                            self.pending = None;
-                        }
-                    });
+                    }
+                    if ui.add(dialog_button("Save As…", false)).clicked() {
+                        let suggestion = self.buffer().map_or_else(String::new, |buffer| {
+                            format!("{}.editur-copy", buffer.path.display())
+                        });
+                        self.save_as = Some(suggestion);
+                        self.conflict = false;
+                    }
+                    if ui.add(dialog_button("Cancel", false)).clicked() {
+                        self.conflict = false;
+                        self.pending = None;
+                    }
                 });
+            });
         }
         if self.save_as.is_some() {
             let mut save_clicked = false;
             let mut cancel_clicked = false;
-            egui::Window::new("Save As")
-                .id(Id::new("save_as_dialog"))
-                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label("Destination path");
-                    if let Some(path) = self.save_as.as_mut() {
-                        ui.text_edit_singleline(path);
+            dialog_window(ctx, "Save As", "save_as_dialog").show(ctx, |ui| {
+                begin_dialog(ui, "Save As");
+                ui.label("Destination path");
+                if let Some(path) = self.save_as.as_mut() {
+                    ui.text_edit_singleline(path);
+                }
+                dialog_actions(ui, |ui| {
+                    if ui.add(dialog_button("Save", true)).clicked() {
+                        save_clicked = true;
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            save_clicked = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel_clicked = true;
-                        }
-                    });
+                    if ui.add(dialog_button("Cancel", false)).clicked() {
+                        cancel_clicked = true;
+                    }
                 });
+            });
             if save_clicked {
                 if let Some(path) = self.save_as.clone()
                     && self.save(Some(PathBuf::from(path)))
@@ -7211,11 +7291,13 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             eprintln!("editur: renderer initialized in {renderer_time:.2?}");
         }
         let context = egui::Context::default();
+        theme::apply(&context);
         disable_transient_egui_debug_overlays(&context);
         let event_proxy = self.event_proxy.clone();
         install_repaint_wake(&context, move || {
             let _ = event_proxy.send_event(InstanceEvent::Wake);
         });
+        self.editor.warm_providers(&context);
         let state = egui_winit::State::new(
             context,
             ViewportId::ROOT,
@@ -7504,24 +7586,9 @@ fn search_result_row(
     job: LayoutJob,
     min_height: f32,
 ) -> egui::Response {
-    let mut row = egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(9, 6))
-        .corner_radius(6)
-        .begin(ui);
-    row.content_ui
-        .set_min_width(row.content_ui.available_width());
-    row.content_ui.set_min_height(min_height);
-    row.content_ui.add(Label::new(job).wrap());
-    let response = row.allocate_space(ui).interact(Sense::click());
-    row.frame.fill = if selected {
-        Color32::from_rgb(30, 74, 84)
-    } else if response.hovered() {
-        Color32::from_rgb(35, 35, 39)
-    } else {
-        Color32::TRANSPARENT
-    };
-    row.paint(ui);
-    response
+    selectable_content_row(ui, selected, min_height, |ui| {
+        ui.add(Label::new(job).wrap());
+    })
 }
 
 fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
@@ -7533,7 +7600,7 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
 }
 
 fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
-    let idle_color = Color32::from_rgb(166, 175, 190);
+    let idle_color = TEXT_SECONDARY;
     let idle_galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), idle_color);
@@ -7543,7 +7610,7 @@ fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui:
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let text_color = if response.hovered() {
-        Color32::from_rgb(218, 224, 235)
+        TEXT_PRIMARY
     } else {
         idle_color
     };
@@ -7553,16 +7620,17 @@ fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui:
     } else {
         idle_galley
     };
+    let content_center_y = rect.center().y + 2.0;
     ui.painter().galley(
-        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        egui::pos2(rect.left(), content_center_y - galley.size().y * 0.5),
         galley,
         text_color,
     );
-    let tip = egui::pos2(rect.right() - 5.5, rect.center().y + 2.0);
+    let tip = egui::pos2(rect.right() - 5.5, content_center_y + 2.0);
     let arrow_color = if response.hovered() {
-        Color32::from_rgb(230, 235, 243)
+        TEXT_PRIMARY
     } else {
-        Color32::from_rgb(190, 199, 214)
+        TEXT_SECONDARY
     };
     let stroke = egui::Stroke::new(1.4, arrow_color);
     ui.painter()
@@ -7574,20 +7642,34 @@ fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui:
 
 fn agent_send_button_colors(ready: bool) -> (Color32, Color32) {
     if ready {
-        (
-            Color32::from_rgb(94, 210, 224),
-            Color32::from_rgb(9, 28, 32),
-        )
+        (ACCENT, ACCENT_INK)
     } else {
-        (
-            Color32::from_rgb(35, 43, 47),
-            Color32::from_rgb(92, 140, 149),
-        )
+        (SURFACE_SELECTED, TEXT_DISABLED)
     }
 }
 
 fn is_model_config(id: &str, name: &str) -> bool {
     id.eq_ignore_ascii_case("model") || name.eq_ignore_ascii_case("model")
+}
+
+fn is_thinking_config(id: &str, name: &str) -> bool {
+    id.eq_ignore_ascii_case("reasoning_effort")
+        || id.eq_ignore_ascii_case("effort")
+        || name.eq_ignore_ascii_case("reasoning effort")
+        || name.eq_ignore_ascii_case("thinking level")
+}
+
+fn fast_mode_config(options: &[ConfigChoice]) -> Option<(&ConfigChoice, bool)> {
+    options.iter().find_map(|option| match &option.value {
+        ConfigValue::Boolean(enabled)
+            if option.id.eq_ignore_ascii_case("fast-mode")
+                || option.id.eq_ignore_ascii_case("fast")
+                || option.name.eq_ignore_ascii_case("fast mode") =>
+        {
+            Some((option, *enabled))
+        }
+        _ => None,
+    })
 }
 
 fn model_display_name<'a>(id: &str, name: &'a str) -> Cow<'a, str> {
@@ -7631,14 +7713,7 @@ fn provider_menu_option(
     let unavailable = provider
         .unavailable_reason
         .or_else(|| (!packaged).then_some("Unavailable in this build"));
-    let status = unavailable.or_else(|| {
-        (provider.install_policy == InstallPolicy::Lazy).then_some("Installs on first use")
-    });
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), AGENT_PROVIDER_ROW_HEIGHT),
-        Sense::click(),
-    );
-    let accessibility = status.map_or_else(
+    let accessibility = unavailable.map_or_else(
         || format!("{}: {}", provider.display_name, provider.description),
         |status| {
             format!(
@@ -7647,86 +7722,22 @@ fn provider_menu_option(
             )
         },
     );
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            ui.is_enabled(),
-            selected,
-            accessibility.clone(),
-        )
-    });
-    let fill = if selected {
-        Color32::from_rgb(31, 42, 47)
-    } else if response.hovered() {
-        Color32::from_rgb(34, 35, 40)
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 5.0, fill);
-    }
-    let name_color = if !ui.is_enabled() {
-        Color32::from_rgb(132, 138, 149)
-    } else if selected || response.hovered() {
-        Color32::from_rgb(230, 233, 240)
-    } else {
-        Color32::from_rgb(198, 204, 215)
-    };
-    let detail_color = if ui.is_enabled() {
-        Color32::from_rgb(145, 153, 168)
-    } else {
-        Color32::from_rgb(103, 109, 120)
-    };
-    let icon_rect = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 9.0, rect.top() + 5.0),
-        egui::vec2(16.0, 16.0),
+    let row = selectable_row(ui, &accessibility, selected, AGENT_PROVIDER_ROW_HEIGHT);
+    let rect = row.rect;
+    let name_color = row.foreground;
+    let response = row.response;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 20.0, rect.center().y),
+        egui::vec2(18.0, 18.0),
     );
     paint_provider_icon(ui.painter(), icon_rect, provider.icon, name_color);
     ui.painter().text(
-        egui::pos2(rect.left() + 31.0, rect.top() + 13.0),
+        egui::pos2(rect.left() + 39.0, rect.center().y),
         Align2::LEFT_CENTER,
         provider.display_name,
-        FontId::proportional(12.5),
+        FontId::proportional(13.0),
         name_color,
     );
-    ui.painter().text(
-        egui::pos2(rect.left() + 31.0, rect.top() + 32.0),
-        Align2::LEFT_CENTER,
-        provider.description,
-        FontId::proportional(11.0),
-        detail_color,
-    );
-    if let Some(status) = status {
-        ui.painter().text(
-            egui::pos2(rect.left() + 31.0, rect.top() + 48.0),
-            Align2::LEFT_CENTER,
-            status,
-            FontId::proportional(10.5),
-            if unavailable.is_some() {
-                Color32::from_rgb(171, 112, 118)
-            } else {
-                Color32::from_rgb(109, 174, 186)
-            },
-        );
-    }
-    if selected {
-        let center = egui::pos2(rect.right() - 12.0, rect.top() + 13.0);
-        let stroke = egui::Stroke::new(1.4, Color32::from_rgb(105, 205, 220));
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-4.0, 0.0),
-                center + egui::vec2(-1.0, 3.0),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-1.0, 3.0),
-                center + egui::vec2(4.0, -3.0),
-            ],
-            stroke,
-        );
-    }
     response
 }
 
@@ -7736,113 +7747,61 @@ fn agent_menu_option(
     selected: bool,
     row_height: f32,
 ) -> egui::Response {
+    let row = selectable_row(ui, label, selected, row_height);
+    ui.painter().text(
+        egui::pos2(row.rect.left() + 9.0, row.rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.5),
+        row.foreground,
+    );
+    row.response
+}
+
+fn agent_toggle_row(ui: &mut egui::Ui, label: &str, enabled: bool, height: f32) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            ui.is_enabled(),
-            selected,
-            label,
-        )
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), enabled, label)
     });
-    let fill = if selected {
-        Color32::from_rgb(38, 55, 62)
-    } else if response.hovered() {
-        Color32::from_rgb(39, 40, 46)
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 5.0, fill);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 5.0, SURFACE_HOVER);
     }
-    let color = if selected {
-        Color32::from_rgb(213, 231, 235)
-    } else if response.hovered() {
-        Color32::from_rgb(230, 233, 240)
-    } else {
-        Color32::from_rgb(184, 191, 203)
-    };
     ui.painter().text(
         egui::pos2(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(12.5),
-        color,
+        if response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            TEXT_SECONDARY
+        },
     );
-    if selected {
-        let center = egui::pos2(rect.right() - 12.0, rect.center().y);
-        let stroke = egui::Stroke::new(1.4, Color32::from_rgb(105, 205, 220));
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-4.0, 0.0),
-                center + egui::vec2(-1.0, 3.0),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-1.0, 3.0),
-                center + egui::vec2(4.0, -3.0),
-            ],
-            stroke,
-        );
-    }
-    response
-}
-
-fn agentic_new_session_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "New session")
-    });
-    if response.hovered() || response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(
-            rect,
-            6.0,
-            if response.is_pointer_button_down_on() {
-                Color32::from_rgb(25, 48, 56)
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 19.0, rect.center().y),
+        egui::vec2(26.0, 14.0),
+    );
+    ui.painter()
+        .rect_filled(track, 7.0, if enabled { ACCENT } else { BORDER_STRONG });
+    ui.painter().circle_filled(
+        egui::pos2(
+            if enabled {
+                track.right() - 7.0
             } else {
-                Color32::from_rgb(30, 57, 66)
+                track.left() + 7.0
             },
-        );
-    }
-    let text_color = if ui.is_enabled() {
-        Color32::from_rgb(211, 216, 226)
-    } else {
-        Color32::from_rgb(103, 110, 123)
-    };
-    let icon_color = if ui.is_enabled() {
-        Color32::from_rgb(103, 196, 208)
-    } else {
-        Color32::from_rgb(103, 110, 123)
-    };
-    let icon_center = egui::pos2(rect.left() + 12.0, rect.center().y);
-    let stroke = egui::Stroke::new(1.4, icon_color);
-    ui.painter().hline(
-        (icon_center.x - 4.0)..=(icon_center.x + 4.0),
-        icon_center.y,
-        stroke,
-    );
-    ui.painter().vline(
-        icon_center.x,
-        (icon_center.y - 4.0)..=(icon_center.y + 4.0),
-        stroke,
-    );
-    ui.painter().text(
-        egui::pos2(rect.left() + 29.0, rect.center().y - 0.5),
-        Align2::LEFT_CENTER,
-        "New session",
-        FontId::proportional(13.0),
-        text_color,
+            track.center().y,
+        ),
+        5.0,
+        if enabled { ACCENT_INK } else { TEXT_SECONDARY },
     );
     response
 }
 
 fn draw_agentic_project_header(ui: &mut egui::Ui, name: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
-    let color = Color32::from_rgb(103, 196, 208);
+    let color = TEXT_SECONDARY;
     let folder = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 1.0, rect.center().y - 4.5),
         egui::vec2(14.0, 10.0),
@@ -7870,7 +7829,7 @@ fn draw_agentic_project_header(ui: &mut egui::Ui, name: &str) {
         Align2::LEFT_CENTER,
         name,
         FontId::proportional(12.5),
-        Color32::from_rgb(213, 218, 227),
+        TEXT_PRIMARY,
     );
 }
 
@@ -7926,29 +7885,18 @@ fn agent_session_row(
         )
     });
     if selected {
-        ui.painter()
-            .rect_filled(row, 6.0, Color32::from_rgb(30, 57, 66));
-        if compact {
-            ui.painter().vline(
-                row.left() + 1.0,
-                (row.top() + 6.0)..=(row.bottom() - 6.0),
-                egui::Stroke::new(2.0, Color32::from_rgb(86, 207, 225)),
-            );
-        }
+        ui.painter().rect_filled(row, 6.0, SURFACE_SELECTED);
     } else if open_response.hovered() {
-        ui.painter()
-            .rect_filled(row, 6.0, Color32::from_rgb(29, 29, 32));
+        ui.painter().rect_filled(row, 6.0, SURFACE_HOVER);
     }
     if remove_response.hovered() {
         ui.painter()
             .rect_filled(remove, 4.0, Color32::from_rgb(63, 37, 42));
     }
-    let color = if selected {
-        Color32::from_rgb(213, 231, 235)
-    } else if open_response.hovered() {
-        Color32::from_rgb(220, 224, 232)
+    let color = if selected || open_response.hovered() {
+        TEXT_PRIMARY
     } else {
-        Color32::from_rgb(174, 181, 194)
+        TEXT_SECONDARY
     };
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -7973,60 +7921,11 @@ fn agent_session_row(
             if remove_response.hovered() {
                 Color32::from_rgb(236, 145, 150)
             } else {
-                Color32::from_rgb(137, 145, 159)
+                TEXT_MUTED
             },
         );
     }
     (open_response.clicked(), remove_response.clicked())
-}
-
-fn chevron_icon_button(ui: &mut egui::Ui, upward: bool, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_white_alpha(14));
-    }
-    let center = rect.center();
-    let direction = if upward { -1.0 } else { 1.0 };
-    let tip = center + egui::vec2(0.0, 3.0 * direction);
-    let stroke = egui::Stroke::new(1.5, Color32::from_rgb(174, 181, 197));
-    ui.painter()
-        .line_segment([center + egui::vec2(-4.0, -2.0 * direction), tip], stroke);
-    ui.painter()
-        .line_segment([tip, center + egui::vec2(4.0, -2.0 * direction)], stroke);
-    response.on_hover_text(label)
-}
-
-fn close_icon_button(ui: &mut egui::Ui) -> egui::Response {
-    let label = "Close (Esc)";
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_white_alpha(14));
-    }
-    let center = rect.center();
-    let stroke = egui::Stroke::new(1.5, Color32::from_rgb(174, 181, 197));
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(-3.5, -3.5),
-            center + egui::vec2(3.5, 3.5),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(-3.5, 3.5),
-            center + egui::vec2(3.5, -3.5),
-        ],
-        stroke,
-    );
-    response.on_hover_text(label)
 }
 
 fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
@@ -8052,8 +7951,7 @@ fn draw_markdown_preview(
     cache: &mut Option<((u64, u32), Arc<egui::Galley>)>,
 ) {
     let rect = ui.available_rect_before_wrap();
-    ui.painter()
-        .rect_filled(rect, 0.0, Color32::from_rgb(24, 24, 26));
+    ui.painter().rect_filled(rect, 0.0, SURFACE);
     let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
     let side = ((rect.width() - content_width) * 0.5).max(0.0);
     let key = (revision, content_width.round().to_bits());
@@ -8206,19 +8104,19 @@ fn content_result_job(hit: &SearchHit, query: &str, wrap_width: f32) -> LayoutJo
         0.0,
         TextFormat {
             font_id: font_id.clone(),
-            color: Color32::from_rgb(163, 172, 190),
+            color: TEXT_SECONDARY,
             ..TextFormat::default()
         },
     );
     let normal = TextFormat {
         font_id: font_id.clone(),
-        color: Color32::from_rgb(205, 210, 220),
+        color: TEXT_SECONDARY,
         ..TextFormat::default()
     };
     let highlighted = TextFormat {
         font_id,
-        color: Color32::from_rgb(128, 232, 242),
-        background: Color32::from_rgb(30, 79, 89),
+        color: ACCENT,
+        background: SURFACE_SELECTED,
         ..TextFormat::default()
     };
     let mut cursor = 0;
@@ -8266,9 +8164,9 @@ fn find_highlighted_job(
             if start < end {
                 let mut format = section.format.clone();
                 format.background = if current_match == active {
-                    Color32::from_rgb(42, 117, 128)
+                    SURFACE_SELECTED
                 } else {
-                    Color32::from_rgb(30, 79, 89)
+                    SURFACE_HOVER
                 };
                 highlighted.append(&base.text[start..end], leading_space, format);
                 leading_space = 0.0;
@@ -8306,8 +8204,8 @@ fn bracket_highlighted_job(
             .iter()
             .any(|span| range.start < span.end && span.start < range.end)
         {
-            section.format.background = Color32::from_rgb(50, 57, 72);
-            section.format.underline = egui::Stroke::new(1.0, Color32::from_rgb(86, 207, 225));
+            section.format.background = SURFACE_SELECTED;
+            section.format.underline = egui::Stroke::new(1.0, ACCENT);
         }
     }
     highlighted
@@ -8347,26 +8245,30 @@ mod tests {
         TreeState, agent_collapsing_header, agent_composer_content, agent_composer_height,
         agent_diff_preview, agent_markdown_galley, agent_menu_rect, agent_near_bottom,
         agent_new_session_rect, agent_selector_button, agent_send_button_colors,
-        agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh,
-        agentic_new_session_button, build_agent_diff, cached_agent_diff, defer_resize,
-        disable_transient_egui_debug_overlays, draw_provider_selector_identity,
-        draw_sidebar_toggle_icon, find_highlighted_job, install_repaint_wake,
-        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
-        next_find_match, plain_text_job, presentation_job, provider_selector_visible,
-        repaint_deadline, repaint_delay_after_texture_update, run_everything_state,
-        search_needs_polling, search_selection_after_navigation, shutdown_agent_in_background,
+        agent_sessions_rect, agent_toggle_rect, agent_transcript_fade_mesh, build_agent_diff,
+        cached_agent_diff, defer_resize, disable_transient_egui_debug_overlays, draw_agent_diff,
+        draw_provider_selector_identity, draw_sidebar_toggle_icon, find_highlighted_job,
+        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
+        model_display_name, next_find_match, plain_text_job, presentation_job,
+        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
+        run_everything_state, search_needs_polling, search_selection_after_navigation,
         skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_workspace,
         split_editor_column, split_workspace,
     };
     use crate::{
         agent::controller::{
-            CommandChoice, ConfigChoice, ConfigValue, ConfigValueChoice, ConnectionState,
-            ModeChoice, PermissionChoice, SessionChoice, ToolActivity, ToolDetail,
+            AuthChoice, AuthKind, CommandChoice, ConfigChoice, ConfigValue, ConfigValueChoice,
+            ConnectionState, ModeChoice, PermissionChoice, SessionChoice, ToolActivity, ToolDetail,
         },
         agent::provider::ProviderId,
         agent::state::{PermissionCard, TranscriptItem},
         buffer::Buffer,
         file_io::OpenTarget,
+        syntax::{Highlighter, SyntaxManager},
+        theme::{
+            ACCENT, ACCENT_INK, CANVAS, SURFACE, SURFACE_INPUT, SURFACE_RAISED, SURFACE_SELECTED,
+            TEXT_PRIMARY, TEXT_SECONDARY,
+        },
     };
 
     #[test]
@@ -8389,23 +8291,58 @@ mod tests {
             Shape::Text(text) => text.galley.text() == "⌄",
             _ => false,
         });
+        let label = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == "Cursor" => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .expect("provider label");
         let strokes = output
             .shapes
             .iter()
-            .filter(|shape| match &shape.shape {
-                Shape::LineSegment { points, .. } => {
-                    points.iter().all(|point| selector.contains(*point))
+            .filter_map(|shape| match &shape.shape {
+                Shape::LineSegment { points, stroke }
+                    if points.iter().all(|point| selector.contains(*point)) =>
+                {
+                    Some((*points, stroke.width))
                 }
-                _ => false,
+                _ => None,
             })
-            .count();
+            .collect::<Vec<_>>();
+        let chevron_left = strokes
+            .iter()
+            .flat_map(|(points, _)| points)
+            .map(|point| point.x)
+            .min_by(f32::total_cmp)
+            .expect("chevron left");
+        let chevron_right = strokes
+            .iter()
+            .flat_map(|(points, _)| points)
+            .map(|point| point.x)
+            .max_by(f32::total_cmp)
+            .expect("chevron right");
 
         assert!(!glyph);
-        assert_eq!(strokes, 2);
+        assert_eq!(strokes.len(), 2);
+        assert!(chevron_left - label.right() >= 10.0);
+        assert!(chevron_right - chevron_left >= 8.0);
+        assert!(strokes.iter().all(|(_, width)| *width >= 1.5));
     }
 
     #[test]
     fn provider_selector_stays_open_in_ide_and_agentic_layouts() {
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
         for agentic_mode in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let mut app = EditorApp::new(OpenTarget {
@@ -8416,26 +8353,27 @@ mod tests {
             .unwrap();
             app.agentic_mode = agentic_mode;
             app.agent_sidebar = !agentic_mode;
-            app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+            app.available_providers =
+                vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
             app.agent.connection = ConnectionState::Ready;
             app.agent.session_ready = true;
             let context = egui::Context::default();
             let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
             let draw = |app: &mut EditorApp, events| {
-                let _ = context.run_ui(
+                context.run_ui(
                     RawInput {
                         screen_rect: Some(screen),
                         events,
                         ..RawInput::default()
                     },
                     |root| app.ui(root),
-                );
+                )
             };
 
-            draw(&mut app, Vec::new());
+            let _ = draw(&mut app, Vec::new());
             let anchor = app.provider_menu_anchor.expect("provider selector");
             let selector = anchor.center();
-            draw(
+            let _ = draw(
                 &mut app,
                 vec![
                     Event::PointerMoved(selector),
@@ -8447,7 +8385,7 @@ mod tests {
                     },
                 ],
             );
-            draw(
+            let _ = draw(
                 &mut app,
                 vec![Event::PointerButton {
                     pos: selector,
@@ -8456,7 +8394,7 @@ mod tests {
                     modifiers: Modifiers::NONE,
                 }],
             );
-            draw(&mut app, Vec::new());
+            let output = draw(&mut app, Vec::new());
 
             assert_eq!(
                 app.agent_menu,
@@ -8466,6 +8404,13 @@ mod tests {
             let popup = app.agent_menu_popup.expect("provider menu");
             assert_eq!(popup.left(), anchor.left());
             assert_eq!(popup.top(), anchor.bottom() + 6.0);
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| has_text(&shape.shape, "Claude")),
+                "Claude missing in agentic_mode={agentic_mode}"
+            );
         }
     }
 
@@ -8479,7 +8424,7 @@ mod tests {
         })
         .unwrap();
         assert!(app.available_providers.is_empty());
-        assert!(app.agent_controller.is_none());
+        assert!(app.agent_controllers.is_empty());
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
@@ -8501,7 +8446,7 @@ mod tests {
         draw(&mut app);
         assert!(app.provider_menu_anchor.is_none());
 
-        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
         draw(&mut app);
         assert!(app.provider_menu_anchor.is_some());
 
@@ -8522,33 +8467,27 @@ mod tests {
         });
         let text = text_shapes.collect::<Vec<_>>();
         assert!(text.contains(&"Cursor"));
-        assert!(text.contains(&"Cursor's ACP coding agent"));
-        assert!(text.contains(&"◎"));
         assert!(text.contains(&"Codex"));
-        assert!(text.contains(&"OpenAI Codex through the canonical ACP adapter"));
-        assert!(text.contains(&"Installs on first use"));
-        assert!(text.contains(&"✦"));
         assert!(text.contains(&"Claude"));
-        assert!(text.contains(&"Anthropic Claude through the canonical ACP adapter"));
-        assert!(text.iter().any(|text| text.starts_with("Unavailable:")));
-        let popup = app.agent_menu_popup.unwrap();
-        assert!(popup.top() >= app.provider_menu_anchor.unwrap().bottom());
-        for expected in [
+        for removed in [
+            "Cursor's ACP coding agent",
             "OpenAI Codex through the canonical ACP adapter",
             "Anthropic Claude through the canonical ACP adapter",
-            "Unavailable: distribution and licensing review incomplete",
+            "Installs on first use",
+            "◎",
+            "✦",
         ] {
-            let shape = output
-                .shapes
-                .iter()
-                .find_map(|shape| match &shape.shape {
-                    Shape::Text(text) if text.galley.text() == expected => Some(text),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(shape.pos.x >= popup.left());
-            assert!(shape.pos.x + shape.galley.size().x <= popup.right());
+            assert!(
+                !text.contains(&removed),
+                "provider menu still paints {removed}"
+            );
         }
+        let popup = app.agent_menu_popup.unwrap();
+        assert!(popup.top() >= app.provider_menu_anchor.unwrap().bottom());
+        assert!(
+            popup.height() <= 150.0,
+            "provider menu is not compact: {popup:?}"
+        );
 
         app.agent_menu = Some(super::AgentMenu::Permissions);
         draw(&mut app);
@@ -8561,29 +8500,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_provider_drives_agent_identity_and_copy() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut app = EditorApp::new(OpenTarget {
-            root: temp.path().canonicalize().unwrap(),
-            file: None,
-            create: false,
-        })
-        .unwrap();
-        app.agent_sidebar = true;
-        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
-        app.selected_provider = ProviderId::Codex;
-        app.agent.connection = ConnectionState::Ready;
-        app.agent.session_ready = true;
-        let output = egui::Context::default().run_ui(
-            RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    pos2(0.0, 0.0),
-                    Vec2::new(1000.0, 700.0),
-                )),
-                ..RawInput::default()
-            },
-            |root| app.ui(root),
-        );
+    fn selected_provider_drives_agent_identity_and_failure_copy() {
         fn has_text(shape: &Shape, expected: &str) -> bool {
             match shape {
                 Shape::Text(text) => text.galley.text() == expected,
@@ -8592,21 +8509,122 @@ mod tests {
             }
         }
 
-        assert!(
-            output
-                .shapes
-                .iter()
-                .any(|shape| has_text(&shape.shape, "Codex"))
-        );
-        assert!(
-            !output
-                .shapes
-                .iter()
-                .any(|shape| has_text(&shape.shape, "Cursor"))
-        );
+        fn has_provider_logo(shape: &Shape) -> bool {
+            match shape {
+                Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+                Shape::Vec(shapes) => shapes.iter().any(has_provider_logo),
+                _ => false,
+            }
+        }
 
-        app.agent.connection = ConnectionState::Failed("adapter stopped".into());
-        app.agent.diagnostics = Some("Codex diagnostics were suppressed.".into());
+        for (provider, name) in [(ProviderId::Codex, "Codex"), (ProviderId::Claude, "Claude")] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agent_sidebar = true;
+            app.available_providers =
+                vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
+            app.selected_provider = provider;
+            app.agent.connection = ConnectionState::Ready;
+            app.agent.session_ready = true;
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant("Provider response".into()));
+            let context = egui::Context::default();
+            let input = || RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            };
+            let output = context.run_ui(input(), |root| app.ui(root));
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| has_text(&shape.shape, name))
+            );
+            assert!(!output.shapes.iter().any(|shape| {
+                has_text(
+                    &shape.shape,
+                    if provider == ProviderId::Claude {
+                        "Codex"
+                    } else {
+                        "Claude"
+                    },
+                )
+            }));
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| has_provider_logo(&shape.shape)),
+                "{name} response is missing its provider logo"
+            );
+
+            app.agent.connection = ConnectionState::Failed("adapter stopped".into());
+            app.agent.diagnostics = Some(format!("{name} diagnostics were suppressed."));
+            let output = context.run_ui(input(), |root| app.ui(root));
+            for expected in [
+                format!("{name} Agent unavailable"),
+                "adapter stopped".into(),
+                format!("{name} diagnostics were suppressed."),
+                "Retry".into(),
+            ] {
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| has_text(&shape.shape, &expected)),
+                    "missing failure-state text: {expected}"
+                );
+            }
+            assert!(app.provider_menu_anchor.is_some());
+            assert_eq!(app.selected_provider, provider);
+        }
+    }
+
+    #[test]
+    fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() {
+        fn collect_text(shape: &Shape, text: &mut Vec<String>) {
+            match shape {
+                Shape::Text(value) => text.push(value.galley.text().to_owned()),
+                Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
+        app.selected_provider = ProviderId::Claude;
+        app.agent.connection = ConnectionState::AuthenticationRequired(vec![AuthChoice {
+            id: "anthropic-environment".into(),
+            name: "Anthropic API or commercial cloud credentials".into(),
+            description: Some(
+                "Configure credentials outside Editur, then retry the Claude provider.".into(),
+            ),
+            kind: AuthKind::Environment,
+            setup: Some(
+                "variables: ANTHROPIC_API_KEY or supported commercial cloud credentials".into(),
+            ),
+            can_authenticate: false,
+        }]);
         let output = egui::Context::default().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -8617,25 +8635,75 @@ mod tests {
             },
             |root| app.ui(root),
         );
+        let mut text = Vec::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut text);
+        }
+        let joined = text.join("\n");
+
         for expected in [
-            "Codex Agent unavailable",
-            "adapter stopped",
-            "Codex diagnostics were suppressed.",
+            "Connect Claude",
+            "Configure API or supported commercial cloud credentials outside Editur, then retry this provider.",
+            "Anthropic API or commercial cloud credentials",
+            "variables: ANTHROPIC_API_KEY or supported commercial cloud credentials",
             "Retry",
         ] {
             assert!(
-                output
-                    .shapes
-                    .iter()
-                    .any(|shape| has_text(&shape.shape, expected)),
-                "missing failure-state text: {expected}"
+                text.iter().any(|text| text == expected),
+                "missing {expected}"
             );
         }
-        assert_eq!(app.selected_provider, ProviderId::Codex);
+        assert!(!joined.contains("subscription"));
+        assert!(!joined.contains("secret"));
+        assert!(!joined.contains("Authenticate"));
     }
 
     #[test]
-    fn provider_switch_requires_confirmation_and_is_blocked_during_a_turn() {
+    fn provider_switch_preserves_each_providers_session_and_the_composer_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.selected_provider = ProviderId::Cursor;
+        app.agent.prompt = "keep this draft".into();
+        app.agent.session_id = Some("cursor-session".into());
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("cursor output".into()));
+
+        app.select_provider_state(ProviderId::Codex);
+        assert_eq!(app.selected_provider, ProviderId::Codex);
+        assert_eq!(app.agent.prompt, "keep this draft");
+        assert!(app.agent.session_id.is_none());
+        assert!(app.agent.transcript.is_empty());
+
+        app.agent.prompt = "new draft".into();
+        app.agent.session_id = Some("codex-session".into());
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("codex output".into()));
+        app.select_provider_state(ProviderId::Cursor);
+
+        assert_eq!(app.agent.prompt, "new draft");
+        assert_eq!(app.agent.session_id.as_deref(), Some("cursor-session"));
+        assert!(matches!(
+            app.agent.transcript.back(),
+            Some(TranscriptItem::Assistant(text)) if text == "cursor output"
+        ));
+
+        app.select_provider_state(ProviderId::Codex);
+        assert_eq!(app.agent.session_id.as_deref(), Some("codex-session"));
+        assert!(matches!(
+            app.agent.transcript.back(),
+            Some(TranscriptItem::Assistant(text)) if text == "codex output"
+        ));
+    }
+
+    #[test]
+    fn an_unbundled_provider_cannot_be_selected() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -8644,37 +8712,11 @@ mod tests {
         })
         .unwrap();
         app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
-        app.agent.prompt = "keep this draft".into();
-        app.agent
-            .transcript
-            .push_back(TranscriptItem::Assistant("provider-bound output".into()));
         let context = egui::Context::default();
 
-        app.agent.active = true;
-        app.request_provider_switch(ProviderId::Codex, &context);
-        assert!(app.pending_provider_confirmation.is_none());
+        app.request_provider_switch(ProviderId::Claude, &context);
 
-        app.agent.active = false;
-        app.request_provider_switch(ProviderId::Codex, &context);
         assert_eq!(app.selected_provider, ProviderId::Cursor);
-        assert_eq!(app.pending_provider_confirmation, Some(ProviderId::Codex));
-        assert_eq!(app.agent.prompt, "keep this draft");
-    }
-
-    #[test]
-    fn provider_shutdown_signal_is_sent_only_after_the_old_owner_drops() {
-        struct OldProvider(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for OldProvider {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let shutdown = shutdown_agent_in_background(OldProvider(dropped.clone()), || {}).unwrap();
-
-        shutdown.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
     }
     use egui::{
         Color32, CursorIcon, DroppedFile, Event, HoveredFile, Id, Key, Modifiers, MouseWheelUnit,
@@ -8736,10 +8778,7 @@ mod tests {
             active.map(|icon| icon.0 - button.center()),
             inactive.map(|icon| icon.0 - button.center())
         );
-        assert_eq!(
-            active.map(|icon| icon.1),
-            [Color32::from_rgb(218, 224, 235); 2]
-        );
+        assert_eq!(active.map(|icon| icon.1), [TEXT_PRIMARY; 2]);
     }
 
     #[test]
@@ -8828,7 +8867,56 @@ mod tests {
     }
 
     #[test]
-    fn agentic_toggle_text_keeps_sidebar_edge_padding() {
+    fn agentic_toggle_labels_share_sidebar_edge_padding() {
+        fn label_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| label_rect(shape, expected)),
+                _ => None,
+            }
+        }
+        let draw = |agentic_mode, expected| {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agentic_mode = agentic_mode;
+            let context = egui::Context::default();
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+            let button = context
+                .read_response(Id::new("agentic_mode_toggle"))
+                .expect("agentic mode toggle")
+                .rect;
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|shape| label_rect(&shape.shape, expected))
+                .expect("agentic mode toggle label");
+            button.right() - label.right()
+        };
+
+        let agent_padding = draw(false, "Agent");
+        let ide_padding = draw(true, "IDE");
+        assert!((agent_padding - ide_padding).abs() < 0.1);
+        assert!(agent_padding >= 12.0);
+    }
+
+    #[test]
+    fn agentic_toggle_hover_brightens_text_without_a_background() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -8837,7 +8925,104 @@ mod tests {
         })
         .unwrap();
         let context = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let button = context
+            .read_response(Id::new("agentic_mode_toggle"))
+            .expect("agentic mode toggle")
+            .rect;
         let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(button.center())],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn inspect(shape: &Shape, button: Rect, bright: &mut bool, background: &mut bool) {
+            match shape {
+                Shape::Text(text) if text.galley.text() == "Agent" => {
+                    *bright = text.galley.job.sections[0].format.color == TEXT_PRIMARY;
+                }
+                Shape::Rect(rect)
+                    if rect.fill == SURFACE_SELECTED
+                        && button.contains(rect.rect.left_top())
+                        && button.contains(rect.rect.right_bottom()) =>
+                {
+                    *background = true;
+                }
+                Shape::Vec(shapes) => shapes
+                    .iter()
+                    .for_each(|shape| inspect(shape, button, bright, background)),
+                _ => {}
+            }
+        }
+        let (mut bright, mut background) = (false, false);
+        output
+            .shapes
+            .iter()
+            .for_each(|shape| inspect(&shape.shape, button, &mut bright, &mut background));
+
+        assert!(bright);
+        assert!(!background);
+    }
+
+    #[test]
+    fn disabled_send_button_is_neutral_instead_of_blue_with_a_gray_arrow() {
+        let (ready_fill, ready_icon) = agent_send_button_colors(true);
+        let (disabled_fill, disabled_icon) = agent_send_button_colors(false);
+
+        assert_eq!(ready_fill, ACCENT);
+        assert_eq!(ready_icon, ACCENT_INK);
+        assert_eq!(disabled_fill, SURFACE_SELECTED);
+        assert_eq!(disabled_icon, Color32::from_rgb(126, 126, 130));
+    }
+
+    #[test]
+    fn agentic_transcript_uses_neutral_dark_surfaces() {
+        fn inspect(shape: &Shape) {
+            match shape {
+                Shape::Rect(rect) => {
+                    for (role, color) in [("fill", rect.fill), ("stroke", rect.stroke.color)] {
+                        let [red, green, blue, alpha] = color.to_array();
+                        if alpha > 0 && red.max(green).max(blue) <= 100 {
+                            let spread = red.max(green).max(blue) - red.min(green).min(blue);
+                            assert!(
+                                spread <= 4,
+                                "{role} is a tinted dark instead of neutral: {color:?}"
+                            );
+                        }
+                    }
+                }
+                Shape::Vec(shapes) => shapes.iter().for_each(inspect),
+                _ => {}
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.sidebar = false;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Use one neutral palette".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("Understood".into()));
+        let output = egui::Context::default().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -8847,38 +9032,8 @@ mod tests {
             },
             |root| app.ui(root),
         );
-        let button = context
-            .read_response(Id::new("agentic_mode_toggle"))
-            .expect("agentic mode toggle")
-            .rect;
-        fn label_rect(shape: &Shape) -> Option<Rect> {
-            match shape {
-                Shape::Text(text) if text.galley.text() == "Agent" => {
-                    Some(Rect::from_min_size(text.pos, text.galley.size()))
-                }
-                Shape::Vec(shapes) => shapes.iter().find_map(label_rect),
-                _ => None,
-            }
-        }
-        let label = output
-            .shapes
-            .iter()
-            .find_map(|shape| label_rect(&shape.shape))
-            .expect("Agent toggle label");
 
-        let right_padding = button.right() - label.right();
-        assert!(right_padding >= 12.0, "right padding was {right_padding}");
-    }
-
-    #[test]
-    fn disabled_send_button_is_neutral_instead_of_blue_with_a_gray_arrow() {
-        let (ready_fill, ready_icon) = agent_send_button_colors(true);
-        let (disabled_fill, disabled_icon) = agent_send_button_colors(false);
-
-        assert_eq!(ready_fill, Color32::from_rgb(94, 210, 224));
-        assert_eq!(ready_icon, Color32::from_rgb(9, 28, 32));
-        assert_eq!(disabled_fill, Color32::from_rgb(35, 43, 47));
-        assert_eq!(disabled_icon, Color32::from_rgb(92, 140, 149));
+        output.shapes.iter().for_each(|shape| inspect(&shape.shape));
     }
 
     #[test]
@@ -8926,9 +9081,12 @@ mod tests {
                 .unwrap()
         };
 
-        assert_eq!(text(&idle.0).0, Color32::from_rgb(166, 175, 190));
-        assert_eq!(text(&hovered.0).0, Color32::from_rgb(218, 224, 235));
-        assert_eq!(text(&idle.0).1 + text(&idle.0).2 * 0.5, idle.1.center().y);
+        assert_eq!(text(&idle.0).0, TEXT_SECONDARY);
+        assert_eq!(text(&hovered.0).0, TEXT_PRIMARY);
+        assert_eq!(
+            text(&idle.0).1 + text(&idle.0).2 * 0.5,
+            idle.1.center().y + 2.0
+        );
         assert!(
             !hovered
                 .0
@@ -8989,7 +9147,7 @@ mod tests {
         fn has_bright_icon(shape: &Shape, button: Rect) -> bool {
             match shape {
                 Shape::LineSegment { points, stroke } => {
-                    stroke.color == Color32::from_rgb(224, 228, 236)
+                    stroke.color == TEXT_PRIMARY
                         && points.iter().all(|point| button.contains(*point))
                 }
                 Shape::Vec(shapes) => shapes.iter().any(|shape| has_bright_icon(shape, button)),
@@ -9014,8 +9172,7 @@ mod tests {
             .iter()
             .find_map(|clipped| match &clipped.shape {
                 Shape::Circle(circle)
-                    if circle.radius == 6.0
-                        && circle.stroke.color == Color32::from_rgb(172, 180, 194) =>
+                    if circle.radius == 6.0 && circle.stroke.color == TEXT_SECONDARY =>
                 {
                     Some(circle.center)
                 }
@@ -9026,8 +9183,7 @@ mod tests {
             .iter()
             .find_map(|clipped| match &clipped.shape {
                 Shape::LineSegment { points, stroke }
-                    if stroke.color == Color32::from_rgb(224, 228, 236)
-                        && points[0].y == points[1].y =>
+                    if stroke.color == TEXT_PRIMARY && points[0].y == points[1].y =>
                 {
                     Some(Rect::from_points(points).center())
                 }
@@ -9038,7 +9194,7 @@ mod tests {
             .iter()
             .find_map(|clipped| match &clipped.shape {
                 Shape::Rect(rect)
-                    if rect.stroke.color == Color32::from_rgb(218, 224, 235)
+                    if rect.stroke.color == TEXT_PRIMARY
                         && rect.rect.size() == Vec2::new(16.0, 13.0) =>
                 {
                     Some(rect.rect.center())
@@ -9324,7 +9480,7 @@ mod tests {
     #[test]
     fn agent_transcript_fades_cover_both_scroll_edges() {
         let rect = Rect::from_min_size(pos2(10.0, 20.0), Vec2::new(300.0, 400.0));
-        let mesh = agent_transcript_fade_mesh(rect, Color32::from_rgb(20, 20, 22));
+        let mesh = agent_transcript_fade_mesh(rect, CANVAS);
 
         assert_eq!(mesh.vertices.len(), 8);
         assert_eq!(mesh.indices.len(), 12);
@@ -9389,7 +9545,25 @@ mod tests {
             },
             |root| app.ui(root),
         );
+        fn has_filled_disclosure_triangle(shape: &Shape) -> bool {
+            match shape {
+                Shape::Path(path) => {
+                    path.closed
+                        && path.points.len() == 3
+                        && path.visual_bounding_rect().width() < 20.0
+                        && path.visual_bounding_rect().height() < 20.0
+                }
+                Shape::Vec(shapes) => shapes.iter().any(has_filled_disclosure_triangle),
+                _ => false,
+            }
+        }
         assert!(!output.shapes.iter().any(|shape| has_id_clash(&shape.shape)));
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| has_filled_disclosure_triangle(&shape.shape))
+        );
     }
 
     #[test]
@@ -9433,11 +9607,19 @@ mod tests {
     #[test]
     fn unchanged_agent_markdown_and_diffs_reuse_their_frame_work() {
         let context = egui::Context::default();
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let highlighter = Highlighter::new().unwrap();
         let draw = |new_text: &str| {
             let mut cached = None;
             let _ = context.run_ui(RawInput::default(), |ui| {
-                let markdown =
-                    agent_markdown_galley(ui, Id::new("cached_markdown"), "**fast**", 320.0);
+                let markdown = agent_markdown_galley(
+                    ui,
+                    Id::new("cached_markdown"),
+                    "**fast**",
+                    320.0,
+                    &highlighter,
+                    &syntaxes,
+                );
                 let diff = cached_agent_diff(ui, Id::new("cached_diff"), Some("before"), new_text);
                 cached = Some((markdown, diff));
             });
@@ -9451,6 +9633,222 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&first.0, &unchanged.0));
         assert!(std::sync::Arc::ptr_eq(&first.1, &unchanged.1));
         assert!(!std::sync::Arc::ptr_eq(&unchanged.1, &changed.1));
+    }
+
+    #[test]
+    fn agent_markdown_syntax_highlights_fenced_code() {
+        let mut galley = None;
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let highlighter = Highlighter::new().unwrap();
+        let _ = egui::Context::default().run_ui(RawInput::default(), |ui| {
+            galley = Some(agent_markdown_galley(
+                ui,
+                Id::new("highlighted_markdown"),
+                "```rust\nfn main() { let value = \"ok\"; }\n```",
+                320.0,
+                &highlighter,
+                &syntaxes,
+            ));
+        });
+        let galley = galley.unwrap();
+        let color_at = |needle: &str| {
+            let offset = galley.text().find(needle).unwrap();
+            galley
+                .job
+                .sections
+                .iter()
+                .find(|section| section.byte_range.contains(&offset.into()))
+                .unwrap()
+                .format
+                .color
+        };
+
+        assert_ne!(color_at("fn"), color_at("main"));
+    }
+
+    #[test]
+    fn agent_tool_file_output_uses_detected_syntax() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "read-rust".into(),
+                title: Some("Read main.rs".into()),
+                status: Some("Completed".into()),
+                paths: vec!["main.rs".into()],
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![
+                        crate::agent::controller::ToolOutput::Text(
+                            "fn read_value() { let value = \"ok\"; }".into(),
+                        ),
+                        crate::agent::controller::ToolOutput::Diff {
+                            path: "main.rs".into(),
+                            old_text: Some("fn before() {}".into()),
+                            new_text: "fn after() {}".into(),
+                        },
+                    ],
+                    output: None,
+                }),
+            }));
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn code_colors(shape: &Shape) -> Option<(Color32, Color32)> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains("read_value") => {
+                    let color_at = |needle: &str| {
+                        let offset = text.galley.text().find(needle).unwrap();
+                        text.galley
+                            .job
+                            .sections
+                            .iter()
+                            .find(|section| section.byte_range.contains(&offset.into()))
+                            .unwrap()
+                            .format
+                            .color
+                    };
+                    Some((color_at("fn"), color_at("read_value")))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(code_colors),
+                _ => None,
+            }
+        }
+        let colors = output
+            .shapes
+            .iter()
+            .find_map(|shape| code_colors(&shape.shape))
+            .expect("rendered tool output");
+
+        assert_ne!(colors.0, colors.1);
+    }
+
+    #[test]
+    fn read_and_edit_tool_cards_do_not_repeat_their_paths_in_the_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        for (index, action) in ["Read", "Edit"].into_iter().enumerate() {
+            let path = format!("/workspace/src/file-{index}.rs");
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Tool(ToolActivity {
+                    id: format!("{action}-{index}"),
+                    title: Some(format!("{action} {path}")),
+                    status: Some("Completed".into()),
+                    paths: vec![path.into()],
+                    detail: Some(ToolDetail {
+                        input: None,
+                        content: vec![crate::agent::controller::ToolOutput::Diff {
+                            path: format!("changed-{index}.rs").into(),
+                            old_text: None,
+                            new_text: "fn changed() {}".into(),
+                        }],
+                        output: None,
+                    }),
+                }));
+        }
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn path_count(shape: &Shape) -> usize {
+            match shape {
+                Shape::Text(text) => {
+                    usize::from(text.galley.text().starts_with("/workspace/src/file-"))
+                }
+                Shape::Vec(shapes) => shapes.iter().map(path_count).sum(),
+                _ => 0,
+            }
+        }
+
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .map(|shape| path_count(&shape.shape))
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn agent_diff_uses_detected_syntax() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let highlighter = Highlighter::new().unwrap();
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 300.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                draw_agent_diff(
+                    ui,
+                    Id::new("highlighted_diff"),
+                    std::path::Path::new("main.rs"),
+                    Some("fn before() {}"),
+                    "fn after() {}",
+                    &highlighter,
+                    &syntaxes,
+                );
+            },
+        );
+        fn code_colors(shape: &Shape) -> Option<(Color32, Color32)> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains("before") => {
+                    let color_at = |needle: &str| {
+                        let offset = text.galley.text().find(needle).unwrap();
+                        text.galley
+                            .job
+                            .sections
+                            .iter()
+                            .find(|section| section.byte_range.contains(&offset.into()))
+                            .unwrap()
+                            .format
+                            .color
+                    };
+                    Some((color_at("fn"), color_at("before")))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(code_colors),
+                _ => None,
+            }
+        }
+        let colors = output
+            .shapes
+            .iter()
+            .find_map(|shape| code_colors(&shape.shape))
+            .expect("rendered removed diff line");
+
+        assert_ne!(colors.0, colors.1);
     }
 
     #[test]
@@ -9526,9 +9924,7 @@ mod tests {
         }
         fn diff_surface_right(shape: &Shape) -> Option<f32> {
             match shape {
-                Shape::Rect(rect) if rect.fill == Color32::from_rgb(24, 26, 30) => {
-                    Some(rect.rect.right())
-                }
+                Shape::Rect(rect) if rect.fill == SURFACE_INPUT => Some(rect.rect.right()),
                 Shape::Vec(shapes) => shapes
                     .iter()
                     .filter_map(diff_surface_right)
@@ -9624,7 +10020,7 @@ mod tests {
         }
         fn tool_card_rect(shape: &Shape) -> Option<Rect> {
             match shape {
-                Shape::Rect(rect) if rect.fill == Color32::from_rgb(25, 26, 29) => Some(rect.rect),
+                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
                 Shape::Vec(shapes) => shapes.iter().find_map(tool_card_rect),
                 _ => None,
             }
@@ -9680,19 +10076,40 @@ mod tests {
             },
         );
         let mut title_center = None;
-        let mut arrow_center = None;
+        let mut chevron_bounds = Rect::NOTHING;
+        let mut chevron_segments = 0;
+        let mut filled_triangle = false;
         let mut card_radius = None;
+        let mut done_text = false;
+        let mut completion_circle = false;
+        let mut completion_check_segments = 0;
+        let completion_color = Color32::from_rgb(105, 210, 157);
         for clipped in output.shapes {
             match clipped.shape {
                 Shape::Text(text) if text.galley.text() == "python3 -c" => {
                     title_center = Some(text.pos.y + text.galley.size().y * 0.5);
+                }
+                Shape::Text(text) if text.galley.text() == "Done" => done_text = true,
+                Shape::Circle(circle)
+                    if circle.fill == Color32::TRANSPARENT
+                        && circle.stroke.color == completion_color =>
+                {
+                    completion_circle = true;
+                }
+                Shape::LineSegment { stroke, .. } if stroke.color == completion_color => {
+                    completion_check_segments += 1;
+                }
+                Shape::LineSegment { points, .. } => {
+                    chevron_bounds.extend_with(points[0]);
+                    chevron_bounds.extend_with(points[1]);
+                    chevron_segments += 1;
                 }
                 Shape::Path(path)
                     if path.closed
                         && path.points.len() == 3
                         && path.visual_bounding_rect().width() < 20.0 =>
                 {
-                    arrow_center = Some(path.visual_bounding_rect().center().y);
+                    filled_triangle = true;
                 }
                 Shape::Rect(rect)
                     if rect.rect.width() > 300.0
@@ -9705,13 +10122,73 @@ mod tests {
             }
         }
 
-        let arrow_center = arrow_center.unwrap();
         let title_center = title_center.unwrap();
         assert!(
-            (arrow_center - title_center - 1.0).abs() < 0.1,
-            "arrow={arrow_center}, title={title_center}"
+            (chevron_bounds.center().y - title_center - 1.0).abs() < 0.1,
+            "chevron={chevron_bounds:?}, title={title_center}"
         );
+        assert_eq!(chevron_segments, 2);
+        assert!(!filled_triangle);
         assert!(card_radius.unwrap() <= 5);
+        assert!(!done_text);
+        assert!(completion_circle);
+        assert_eq!(completion_check_segments, 2);
+    }
+
+    #[test]
+    fn overflowing_tool_path_marquees_on_hover_without_moving_the_action() {
+        let context = egui::Context::default();
+        let path = "/Users/example/Documents/project/src/a-very-long-file-name.rs";
+        let draw = |time| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(300.0, 100.0))),
+                    events: vec![Event::PointerMoved(pos2(120.0, 20.0))],
+                    time: Some(time),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    agent_collapsing_header(
+                        ui,
+                        "marquee-tool",
+                        &format!("Edit {path}"),
+                        Some("Completed"),
+                        260.0,
+                        false,
+                        |_| {},
+                    );
+                },
+            )
+        };
+        fn positions(shape: &Shape, path: &str) -> (Option<f32>, Option<f32>) {
+            match shape {
+                Shape::Text(text) if text.galley.text().trim() == "Edit" => {
+                    (Some(text.pos.x), None)
+                }
+                Shape::Text(text) if text.galley.text() == path => (None, Some(text.pos.x)),
+                Shape::Vec(shapes) => shapes.iter().fold((None, None), |found, shape| {
+                    let next = positions(shape, path);
+                    (found.0.or(next.0), found.1.or(next.1))
+                }),
+                _ => (None, None),
+            }
+        }
+        let locate = |output: &egui::FullOutput| {
+            output.shapes.iter().fold((None, None), |found, shape| {
+                let next = positions(&shape.shape, path);
+                (found.0.or(next.0), found.1.or(next.1))
+            })
+        };
+        let _ = draw(0.0);
+        let before = locate(&draw(0.1));
+        let after = locate(&draw(2.1));
+        let (before_action, before_path) = (before.0.unwrap(), before.1.unwrap());
+        let (after_action, after_path) = (after.0.unwrap(), after.1.unwrap());
+
+        assert!(
+            (before_action - after_action).abs() < 0.1 && after_path < before_path - 5.0,
+            "action {before_action}->{after_action}, path {before_path}->{after_path}"
+        );
     }
 
     #[test]
@@ -9741,7 +10218,7 @@ mod tests {
             match shape {
                 Shape::Text(text)
                     if text.galley.text()
-                        == "Result\n\n• Done\n• Run cargo-test-with-an-unbroken-argument-that-is-much-wider-than-the-agent-sidebar.\n" =>
+                        == "Result\n\n• Done\n• Run cargo-test-with-an-unbroken-argument-that-is-much-wider-than-the-agent-sidebar." =>
                 {
                     Some((
                         Rect::from_min_size(text.pos, text.galley.size()),
@@ -9785,7 +10262,7 @@ mod tests {
             .filter_map(|clipped| match &clipped.shape {
                 Shape::Path(path)
                     if path.closed
-                        && path.fill == Color32::from_rgb(238, 240, 246)
+                        && path.fill == TEXT_PRIMARY
                         && (3..=4).contains(&path.points.len()) =>
                 {
                     Some(path.visual_bounding_rect())
@@ -9797,11 +10274,11 @@ mod tests {
                 (count + 1, bounds.union(path))
             });
         let (cursor_text, cursor_size, cursor_color) = cursor_metrics.expect("Cursor identity");
-        assert_eq!(cursor_color, Color32::from_rgb(238, 240, 246));
+        assert_eq!(cursor_color, TEXT_PRIMARY);
         assert!(cursor_size >= 13.0);
         assert_eq!(cursor_facets, 3);
-        assert!(cursor_mark.height() >= 14.0);
-        assert!(rect.top() - cursor_text.union(cursor_mark).bottom() >= 2.0);
+        assert!(cursor_mark.height() >= 15.5);
+        assert!(rect.top() - cursor_text.union(cursor_mark).bottom() >= 5.0);
     }
 
     #[test]
@@ -10639,6 +11116,7 @@ mod tests {
             create: false,
         })
         .unwrap();
+        app.agentic_mode = true;
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
@@ -10649,17 +11127,37 @@ mod tests {
             name: "Agent".into(),
             description: None,
         }];
-        app.agent.config_options = vec![ConfigChoice {
-            id: "model-id".into(),
-            name: "Model".into(),
-            description: None,
-            value: ConfigValue::Select("auto".into()),
-            options: vec![ConfigValueChoice {
-                id: "auto".into(),
-                name: "Auto".into(),
+        app.agent.config_options = vec![
+            ConfigChoice {
+                id: "model-id".into(),
+                name: "Model".into(),
                 description: None,
-            }],
-        }];
+                value: ConfigValue::Select("auto".into()),
+                options: vec![ConfigValueChoice {
+                    id: "auto".into(),
+                    name: "Auto".into(),
+                    description: None,
+                }],
+            },
+            ConfigChoice {
+                id: "reasoning_effort".into(),
+                name: "Reasoning effort".into(),
+                description: None,
+                value: ConfigValue::Select("xhigh".into()),
+                options: vec![ConfigValueChoice {
+                    id: "xhigh".into(),
+                    name: "Xhigh".into(),
+                    description: None,
+                }],
+            },
+            ConfigChoice {
+                id: "fast-mode".into(),
+                name: "Fast mode".into(),
+                description: None,
+                value: ConfigValue::Boolean(true),
+                options: Vec::new(),
+            },
+        ];
         let context = egui::Context::default();
         let draw = |app: &mut EditorApp| {
             context.run_ui(
@@ -10684,7 +11182,7 @@ mod tests {
         }
 
         let output = draw(&mut app);
-        for label in ["Ask", "Agent", "Auto"] {
+        for label in ["Ask", "Agent", "Auto", "Xhigh · Fast"] {
             assert!(
                 output
                     .shapes
@@ -10702,8 +11200,42 @@ mod tests {
         };
         let attach = find("+");
         let permissions = find("Ask");
-        assert_eq!(attach.center().y, permissions.center().y);
-        assert!(permissions.left() - attach.right() <= 16.0);
+        let mode = find("Agent");
+        let model = find("Auto");
+        for selector in [permissions, mode, model] {
+            assert!((selector.center().y - attach.center().y - 2.0).abs() < 0.1);
+        }
+        fn composer_surface(shape: &Shape) -> Option<(Rect, u8)> {
+            match shape {
+                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => {
+                    Some((rect.rect, rect.corner_radius.nw))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(composer_surface),
+                _ => None,
+            }
+        }
+        let (composer, composer_radius) = output
+            .shapes
+            .iter()
+            .find_map(|shape| composer_surface(&shape.shape))
+            .expect("agentic composer panel");
+        assert_eq!(composer_radius, 10);
+        let left_gap = attach.left() - composer.left();
+        let bottom_gap = composer.bottom() - attach.bottom();
+        assert!(
+            (left_gap - bottom_gap).abs() <= 2.0,
+            "attachment inset is uneven: left={left_gap}, bottom={bottom_gap}"
+        );
+        assert!(
+            mode.left() - permissions.right() >= 29.5 && model.left() - mode.right() >= 29.5,
+            "selectors are cramped: permissions={permissions:?}, mode={mode:?}, model={model:?}"
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .all(|shape| text_rect(&shape.shape, "Fast mode").is_none())
+        );
 
         app.agent_menu = Some(super::AgentMenu::Permissions);
         assert!(
@@ -10711,6 +11243,86 @@ mod tests {
                 .shapes
                 .iter()
                 .any(|shape| text_rect(&shape.shape, "Allow all").is_some())
+        );
+
+        app.agent_menu = Some(super::AgentMenu::Config("reasoning_effort".into()));
+        let output = draw(&mut app);
+        let popup = app.agent_menu_popup.expect("thinking menu");
+        let fast_mode = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, "Fast mode"))
+            .expect("Fast mode toggle label");
+        assert!(popup.contains(fast_mode.center()));
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Circle(circle) => popup.contains(circle.center),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn config_menu_hover_does_not_paint_a_transient_tooltip() {
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.config_options = vec![ConfigChoice {
+            id: "effort".into(),
+            name: "Thinking level".into(),
+            description: None,
+            value: ConfigValue::Select("high".into()),
+            options: vec![ConfigValueChoice {
+                id: "high".into(),
+                name: "High".into(),
+                description: Some("Transient tooltip text".into()),
+            }],
+        }];
+        app.agent_menu = Some(super::AgentMenu::Config("effort".into()));
+        let context = egui::Context::default();
+        context.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let draw = |app: &mut EditorApp, events, time| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(&mut app, Vec::new(), 0.0);
+        let popup = app.agent_menu_popup.expect("config menu");
+        let hovered = draw(&mut app, vec![Event::PointerMoved(popup.center())], 1.0);
+        let hovered_again = draw(&mut app, Vec::new(), 2.0);
+
+        assert!(
+            [&hovered, &hovered_again].iter().all(|output| output
+                .shapes
+                .iter()
+                .all(|shape| !has_text(&shape.shape, "Transient tooltip text"))),
+            "popup option descriptions must not flash as floating tooltips"
         );
     }
 
@@ -10877,9 +11489,7 @@ mod tests {
         fn popup_rect(output: &egui::FullOutput) -> Option<Rect> {
             fn find(shape: &Shape) -> Option<Rect> {
                 match shape {
-                    Shape::Rect(rect) if rect.fill == Color32::from_rgb(26, 27, 31) => {
-                        Some(rect.rect)
-                    }
+                    Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
                     Shape::Vec(shapes) => shapes.iter().find_map(find),
                     _ => None,
                 }
@@ -10984,9 +11594,7 @@ mod tests {
         fn popup_rect(output: &egui::FullOutput) -> Option<Rect> {
             fn find(shape: &Shape) -> Option<Rect> {
                 match shape {
-                    Shape::Rect(rect) if rect.fill == Color32::from_rgb(26, 27, 31) => {
-                        Some(rect.rect)
-                    }
+                    Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
                     Shape::Vec(shapes) => shapes.iter().find_map(find),
                     _ => None,
                 }
@@ -11014,7 +11622,7 @@ mod tests {
         }
         fn has_selected_surface(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == Color32::from_rgb(38, 55, 62),
+                Shape::Rect(rect) => rect.fill == SURFACE_SELECTED,
                 Shape::Vec(shapes) => shapes.iter().any(has_selected_surface),
                 _ => false,
             }
@@ -11210,7 +11818,7 @@ mod tests {
                 Shape::Rect(rect) => {
                     rect.rect.width() > 650.0
                         && height.contains(&rect.rect.height())
-                        && rect.fill == Color32::from_rgb(24, 24, 26)
+                        && rect.fill == SURFACE
                 }
                 Shape::Vec(shapes) => shapes
                     .iter()
@@ -11312,11 +11920,7 @@ mod tests {
         );
         fn active_divider_width(shape: &Shape) -> Option<f32> {
             match shape {
-                Shape::LineSegment { stroke, .. }
-                    if stroke.color == Color32::from_rgb(86, 207, 225) =>
-                {
-                    Some(stroke.width)
-                }
+                Shape::LineSegment { stroke, .. } if stroke.color == ACCENT => Some(stroke.width),
                 Shape::Vec(shapes) => shapes.iter().find_map(active_divider_width),
                 _ => None,
             }
@@ -11324,7 +11928,7 @@ mod tests {
         fn contains_editor_header(shape: &Shape) -> bool {
             match shape {
                 Shape::Rect(rect) => {
-                    rect.fill == Color32::from_rgb(24, 24, 26)
+                    rect.fill == SURFACE
                         && rect.rect.contains(pos2(500.0, 20.0))
                         && rect.rect.height() == TITLEBAR_HEIGHT
                 }
@@ -11891,17 +12495,7 @@ mod tests {
     }
 
     #[test]
-    fn agentic_new_session_matches_the_compact_session_height() {
-        let mut button = Rect::NOTHING;
-        let _ = egui::Context::default().run_ui(RawInput::default(), |ui| {
-            button = agentic_new_session_button(ui).rect;
-        });
-
-        assert_eq!(button.height(), 32.0);
-    }
-
-    #[test]
-    fn agentic_new_session_uses_a_drawn_icon_instead_of_a_missing_glyph() {
+    fn agentic_session_rail_omits_new_session_and_keeps_project_near_provider() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -11910,8 +12504,16 @@ mod tests {
         })
         .unwrap();
         app.agentic_mode = true;
+        app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
+        let project = app
+            .tree
+            .root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let output = egui::Context::default().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -11922,32 +12524,27 @@ mod tests {
             },
             |root| app.ui(root),
         );
-        fn has_text(shape: &Shape, expected: &str) -> bool {
+        fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
             match shape {
-                Shape::Text(text) => text.galley.text() == expected,
-                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
-                _ => false,
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+                _ => None,
             }
         }
 
-        assert!(
+        let find = |expected| {
             output
                 .shapes
                 .iter()
-                .any(|shape| has_text(&shape.shape, "New session"))
-        );
-        assert!(
-            output
-                .shapes
-                .iter()
-                .any(|shape| has_text(&shape.shape, "Cursor"))
-        );
-        assert!(
-            !output
-                .shapes
-                .iter()
-                .any(|shape| has_text(&shape.shape, "Cursor Agent"))
-        );
+                .find_map(|shape| text_rect(&shape.shape, expected))
+        };
+        let provider = find("Cursor").expect("provider");
+        let project = find(&project).expect("project");
+
+        assert!(find("New session").is_none());
+        assert!(project.top() - provider.bottom() <= 24.0);
     }
 
     #[test]
@@ -12063,7 +12660,7 @@ mod tests {
         );
         fn has_selected_fill(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == Color32::from_rgb(30, 57, 66),
+                Shape::Rect(rect) => rect.fill == SURFACE_SELECTED,
                 Shape::Vec(shapes) => shapes.iter().any(has_selected_fill),
                 _ => false,
             }
@@ -12099,7 +12696,7 @@ mod tests {
         );
         fn composer_rect(shape: &Shape) -> Option<Rect> {
             match shape {
-                Shape::Rect(rect) if rect.fill == Color32::from_rgb(27, 31, 35) => Some(rect.rect),
+                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
                 Shape::Vec(shapes) => shapes.iter().find_map(composer_rect),
                 _ => None,
             }
@@ -12186,7 +12783,7 @@ mod tests {
         fn cyan_underline(shape: &Shape) -> Option<[egui::Pos2; 2]> {
             match shape {
                 Shape::LineSegment { points, stroke }
-                    if stroke.width == 2.0 && stroke.color == Color32::from_rgb(86, 207, 225) =>
+                    if stroke.width == 2.0 && stroke.color == ACCENT =>
                 {
                     Some(*points)
                 }

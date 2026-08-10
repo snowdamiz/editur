@@ -85,6 +85,7 @@ pub fn join_windows_job(name: &str) -> Result<(), String> {
 pub fn run_managed_process(
     provider: provider::ProviderId,
     project_root: &std::path::Path,
+    extra_args: Vec<std::ffi::OsString>,
 ) -> Result<(), String> {
     let project_root = std::fs::canonicalize(project_root).map_err(|error| {
         format!(
@@ -110,6 +111,7 @@ pub fn run_managed_process(
     let mut process = std::process::Command::new(&prepared.command);
     process
         .args(&prepared.args)
+        .args(extra_args)
         .current_dir(&project_root)
         .envs(prepared.env.iter().map(|(name, value)| (name, value)));
     for name in prepared.remove_env {
