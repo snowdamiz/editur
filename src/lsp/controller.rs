@@ -432,14 +432,16 @@ fn run(
                         active.latest_hover.remove(&path);
                         active.latest_definition.remove(&path);
                     }
-                    if documents.is_empty() && process.is_some() {
-                        stop_process(
-                            process.take().unwrap(),
-                            &project_root,
-                            &input,
-                            &mut queued_commands,
-                            &events,
-                        );
+                    if documents.is_empty() {
+                        if let Some(active) = process.take() {
+                            stop_process(
+                                active,
+                                &project_root,
+                                &input,
+                                &mut queued_commands,
+                                &events,
+                            );
+                        }
                         events.send(Event::StateChanged(ServerStatus::Stopped));
                     }
                 }

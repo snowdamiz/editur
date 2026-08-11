@@ -43,12 +43,20 @@ use crate::{
         dialog_frame, dialog_window, icon_button, selectable_content_row, selectable_row,
     },
     data_dir,
-    editor_surface::{DocumentMetrics, EDITOR_BACKGROUND, EditorShowOptions, EditorSurface},
+    editor_surface::{
+        DocumentMetrics, EDITOR_BACKGROUND, EditorShowOptions, EditorSurface, TextInputMode,
+    },
     file_io::{
         OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, resolve_target,
         safe_save,
     },
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
+    keybindings::{
+        BUILTIN_VIM, BUILTIN_VSCODE, Behavior as KeybindingBehavior, BindingRule, BindingSource,
+        CATALOG as KEYBINDING_CATALOG, Command as KeybindingCommand, InputStroke,
+        Platform as KeybindingPlatform, Resolver, Scope, Stroke as BindingStroke,
+        rules_have_sequence_conflict,
+    },
     lsp::{
         Command as LspCommand, CompletionItem, Controller as LspController, DefinitionLocation,
         HoverContent, PresetId, RequestTag, ServerCapabilities, ServerLaunch, ServerStatus,
@@ -67,6 +75,10 @@ use crate::{
     },
     tree::{TreeEntry, read_directory},
     tree_surface::{TreeRow, TreeSurface},
+    vim::{
+        ExCommand, SearchDirection as VimSearchDirection, VimMode, VimRequest, VimSession,
+        VimState, parse_ex,
+    },
 };
 
 #[derive(Clone)]
@@ -88,6 +100,139 @@ enum WindowAction {
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const TAB_WIDTH: f32 = 176.0;
 const FIND_BAR_HEIGHT: f32 = 38.0;
+
+fn key_character(key: Key, modifiers: egui::Modifiers) -> Option<char> {
+    if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
+        return None;
+    }
+    let letter = match key {
+        Key::A => 'a',
+        Key::B => 'b',
+        Key::C => 'c',
+        Key::D => 'd',
+        Key::E => 'e',
+        Key::F => 'f',
+        Key::G => 'g',
+        Key::H => 'h',
+        Key::I => 'i',
+        Key::J => 'j',
+        Key::K => 'k',
+        Key::L => 'l',
+        Key::M => 'm',
+        Key::N => 'n',
+        Key::O => 'o',
+        Key::P => 'p',
+        Key::Q => 'q',
+        Key::R => 'r',
+        Key::S => 's',
+        Key::T => 't',
+        Key::U => 'u',
+        Key::V => 'v',
+        Key::W => 'w',
+        Key::X => 'x',
+        Key::Y => 'y',
+        Key::Z => 'z',
+        _ => '\0',
+    };
+    if letter != '\0' {
+        return Some(if modifiers.shift {
+            letter.to_ascii_uppercase()
+        } else {
+            letter
+        });
+    }
+    Some(match (key, modifiers.shift) {
+        (Key::Space, _) => ' ',
+        (Key::Quote, false) => '\'',
+        (Key::Quote, true) => '"',
+        (Key::Comma, false) => ',',
+        (Key::Comma, true) => '<',
+        (Key::Period, false) => '.',
+        (Key::Period, true) => '>',
+        (Key::Slash, false) => '/',
+        (Key::Slash, true) => '?',
+        (Key::OpenBracket, false) => '[',
+        (Key::OpenBracket, true) => '{',
+        (Key::CloseBracket, false) => ']',
+        (Key::CloseBracket, true) => '}',
+        (Key::Minus, false) => '-',
+        (Key::Minus, true) => '_',
+        (Key::Equals, false) => '=',
+        (Key::Equals, true) => '+',
+        (Key::Semicolon, false) => ';',
+        (Key::Semicolon, true) => ':',
+        (Key::Backslash, false) => '\\',
+        (Key::Backslash, true) => '|',
+        (Key::Backtick, false) => '`',
+        (Key::Backtick, true) => '~',
+        (Key::Num0, false) => '0',
+        (Key::Num1, false) => '1',
+        (Key::Num2, false) => '2',
+        (Key::Num3, false) => '3',
+        (Key::Num4, false) => '4',
+        (Key::Num5, false) => '5',
+        (Key::Num6, false) => '6',
+        (Key::Num7, false) => '7',
+        (Key::Num8, false) => '8',
+        (Key::Num9, false) => '9',
+        (Key::Num1, true) => '!',
+        (Key::Num3, true) => '#',
+        (Key::Num4, true) => '$',
+        (Key::Num5, true) => '%',
+        (Key::Num6, true) => '^',
+        (Key::Num7, true) => '&',
+        (Key::Num8, true) => '*',
+        (Key::Num9, true) => '(',
+        (Key::Num0, true) => ')',
+        (Key::Colon, _) => ':',
+        (Key::Questionmark, _) => '?',
+        (Key::OpenCurlyBracket, _) => '{',
+        (Key::CloseCurlyBracket, _) => '}',
+        (Key::Plus, _) => '+',
+        (Key::Pipe, _) => '|',
+        (Key::Exclamationmark, _) => '!',
+        _ => return None,
+    })
+}
+
+fn text_scope_owns_printable(scopes: &[Scope], behavior: KeybindingBehavior) -> bool {
+    if scopes.iter().any(|scope| {
+        matches!(
+            scope,
+            Scope::VimNormal | Scope::VimVisual | Scope::VimOperator
+        )
+    }) {
+        return false;
+    }
+    scopes.iter().any(|scope| {
+        matches!(
+            scope,
+            Scope::VimInsert
+                | Scope::VimReplace
+                | Scope::Find
+                | Scope::ProjectSearch
+                | Scope::Agent
+                | Scope::Terminal
+                | Scope::Settings
+        ) || (*scope == Scope::DocumentEditor && behavior == KeybindingBehavior::Standard)
+    })
+}
+
+fn primary_modifiers() -> egui::Modifiers {
+    if KeybindingPlatform::current() == KeybindingPlatform::Macos {
+        egui::Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        }
+    } else {
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        }
+    }
+}
 const PANE_FOCUS_BORDER: Color32 = Color32::from_rgb(75, 101, 128);
 const WINDOW_CORNER_RADIUS: u8 = 10;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
@@ -1453,6 +1598,16 @@ impl PaneLayout {
         rects
     }
 
+    fn panes(&self) -> Vec<PaneId> {
+        self.rects(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::splat(1.0),
+        ))
+        .into_iter()
+        .map(|(pane, _)| pane)
+        .collect()
+    }
+
     pub(crate) fn split_handles(&self, available: egui::Rect) -> Vec<PaneSplitHandle> {
         let mut handles = Vec::new();
         self.root.append_split_handles(available, &mut handles);
@@ -2281,6 +2436,7 @@ struct FileTab {
     pane: PaneId,
     markdown_preview: bool,
     markdown_layout: Option<((u64, u32), Arc<egui::Galley>)>,
+    vim: VimState,
 }
 
 struct PaneFind {
@@ -2321,6 +2477,69 @@ enum SettingsAction {
     Apply(PresetId, String, String),
     Reset(PresetId),
     Rescan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsSection {
+    Keybindings,
+    LanguageServers,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeybindingFilter {
+    All,
+    Bound,
+    Unbound,
+    Modified,
+}
+
+struct ShortcutRecorder {
+    command: KeybindingCommand,
+    strokes: Vec<BindingStroke>,
+    logical_keys: Vec<String>,
+    physical_keys: Vec<Option<String>>,
+    scope: Scope,
+    platform: Option<KeybindingPlatform>,
+    replace_index: Option<usize>,
+    disable_id: Option<String>,
+    error: Option<String>,
+    can_replace: bool,
+}
+
+struct NewProfileDraft {
+    name: String,
+    base: Option<String>,
+    behavior: KeybindingBehavior,
+}
+
+enum KeybindingUiAction {
+    Activate(String),
+    Customize,
+    Duplicate,
+    ResetAll,
+    DeleteToVsCode,
+    Rename(String),
+    Disable(String),
+    Remove(usize),
+    ResetCommand(KeybindingCommand),
+}
+
+enum VimOverlayKind {
+    Search(VimSearchDirection),
+    Ex,
+}
+
+struct VimOverlay {
+    kind: VimOverlayKind,
+    input: String,
+    error: Option<String>,
+    focus: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ClipboardRequest {
+    EditorPaste,
+    VimPaste { before: bool },
 }
 
 struct LspDiagnosticsState {
@@ -2715,6 +2934,7 @@ impl FileTab {
             pane,
             markdown_preview: false,
             markdown_layout: None,
+            vim: VimState::default(),
         }
     }
 }
@@ -2778,10 +2998,22 @@ pub struct EditorApp {
     should_close: bool,
     window_action: Option<WindowAction>,
     settings_open: bool,
+    settings_section: SettingsSection,
     settings_search: String,
     settings: Settings,
     settings_error: Option<String>,
     settings_drafts: HashMap<PresetId, (String, String)>,
+    keybinding_resolver: Resolver,
+    keybinding_filter: KeybindingFilter,
+    keybinding_category: Option<String>,
+    keybinding_vim_scope: Option<Scope>,
+    confirm_profile_reset: bool,
+    shortcut_recorder: Option<ShortcutRecorder>,
+    new_profile: Option<NewProfileDraft>,
+    rename_profile: Option<String>,
+    vim_session: VimSession,
+    vim_overlay: Option<VimOverlay>,
+    clipboard_request: Option<ClipboardRequest>,
     lsp_controllers: HashMap<PresetId, LspController>,
     lsp_pending_controls: HashMap<PresetId, LspCommand>,
     lsp_status: HashMap<PresetId, ServerStatus>,
@@ -2834,25 +3066,32 @@ fn settings_quiet_button(
     response
 }
 
-fn settings_navigation_row(ui: &mut egui::Ui, id: impl egui::AsId, label: &str) -> egui::Response {
+fn settings_navigation_row(
+    ui: &mut egui::Ui,
+    id: impl egui::AsId,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
             ui.is_enabled(),
-            true,
+            selected,
             label,
         )
     });
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 1.0, rect.center().y),
-            egui::vec2(2.0, 18.0),
-        ),
-        1.0,
-        ACCENT,
-    );
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 1.0, rect.center().y),
+                egui::vec2(2.0, 18.0),
+            ),
+            1.0,
+            ACCENT,
+        );
+    }
     ui.painter().text(
         egui::pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -3040,6 +3279,10 @@ impl EditorApp {
                 },
                 Err(error) => (Settings::default(), Some(error)),
             };
+        let keybinding_resolver = Resolver::new(
+            settings.keybindings.effective_bindings()?,
+            KeybindingPlatform::current(),
+        )?;
         Ok(Self {
             tabs,
             active_tab,
@@ -3099,10 +3342,22 @@ impl EditorApp {
             should_close: false,
             window_action: None,
             settings_open: false,
+            settings_section: SettingsSection::LanguageServers,
             settings_search: String::new(),
             settings,
             settings_error,
             settings_drafts: HashMap::new(),
+            keybinding_resolver,
+            keybinding_filter: KeybindingFilter::All,
+            keybinding_category: None,
+            keybinding_vim_scope: None,
+            confirm_profile_reset: false,
+            shortcut_recorder: None,
+            new_profile: None,
+            rename_profile: None,
+            vim_session: VimSession::default(),
+            vim_overlay: None,
+            clipboard_request: None,
             lsp_controllers: HashMap::new(),
             lsp_pending_controls: HashMap::new(),
             lsp_status: HashMap::new(),
@@ -3752,6 +4007,7 @@ impl EditorApp {
         }
         self.draw_lsp_popups(root);
         self.draw_search(root);
+        self.draw_vim_overlay(&ctx);
         self.draw_dialogs(&ctx);
         self.draw_error(&ctx);
     }
@@ -3945,17 +4201,17 @@ impl EditorApp {
             }
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
-            self.sidebar = !self.sidebar;
+            self.execute_keybinding(KeybindingCommand::ViewToggleSidebar, None, ui.ctx());
             self.sidebar_dragging = false;
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
-            self.toggle_terminal(ui.ctx());
+            self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
         }
         if self.draw_settings_toggle(ui, settings_button) {
-            self.open_settings();
+            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
-            self.set_agentic_mode(false, ui.ctx());
+            self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
         }
 
         #[cfg(target_os = "macos")]
@@ -3984,6 +4240,35 @@ impl EditorApp {
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
+        let vim_status = (pane == self.active_pane
+            && self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim)
+            .then(|| active.map(|index| self.tabs[index].vim.status()))
+            .flatten();
+        let vim_rect = vim_status.as_ref().map(|_| {
+            egui::Rect::from_min_max(
+                egui::pos2((controls_right - 78.0).max(tabs_left), rect.top() + 5.0),
+                egui::pos2(controls_right - 6.0, rect.bottom() - 5.0),
+            )
+        });
+        if let (Some(status), Some(pill)) = (&vim_status, vim_rect) {
+            let response = ui.interact(pill, Id::new(("vim_mode", pane.0)), Sense::hover());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    true,
+                    format!("Vim mode: {status}"),
+                )
+            });
+            ui.painter().rect_filled(pill, 4.0, SURFACE_SELECTED);
+            ui.painter().text(
+                pill.center(),
+                Align2::CENTER_CENTER,
+                status,
+                FontId::monospace(10.5),
+                ACCENT,
+            );
+        }
+        let controls_right = vim_rect.map_or(controls_right, |pill| pill.left() - 4.0);
         let diagnostic_counts = active
             .and_then(|index| self.lsp_diagnostics.get(&self.tabs[index].buffer.path))
             .map(|state| {
@@ -4065,7 +4350,11 @@ impl EditorApp {
                 && let Some(index) = active
             {
                 self.activate_tab(index);
-                self.tabs[index].markdown_preview = !preview;
+                self.execute_keybinding(
+                    KeybindingCommand::ViewToggleMarkdownPreview,
+                    None,
+                    ui.ctx(),
+                );
                 self.focus_editor = preview;
                 ui.ctx().request_repaint();
             }
@@ -4230,24 +4519,22 @@ impl EditorApp {
         }
 
         if agent_button.is_some_and(|button| self.draw_agent_toggle(ui, button)) {
-            self.agent_sidebar = true;
-            self.agent_sidebar_dragging = false;
-            self.open_agent(ui.ctx());
+            self.execute_keybinding(KeybindingCommand::AppToggleAgentSidebar, None, ui.ctx());
             ui.ctx().request_repaint();
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
-            self.sidebar = !self.sidebar;
+            self.execute_keybinding(KeybindingCommand::ViewToggleSidebar, None, ui.ctx());
             self.sidebar_dragging = false;
             ui.ctx().request_repaint();
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
-            self.toggle_terminal(ui.ctx());
+            self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
         }
         if self.draw_settings_toggle(ui, settings_button) {
-            self.open_settings();
+            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
-            self.set_agentic_mode(true, ui.ctx());
+            self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
         }
 
         #[cfg(target_os = "macos")]
@@ -4947,7 +5234,28 @@ impl EditorApp {
                         .color(TEXT_MUTED),
                 );
                 ui.add_space(8.0);
-                settings_navigation_row(ui, "settings_language_servers", "Language Servers");
+                if settings_navigation_row(
+                    ui,
+                    "settings_keybindings",
+                    "Keybindings",
+                    self.settings_section == SettingsSection::Keybindings,
+                )
+                .clicked()
+                {
+                    self.settings_section = SettingsSection::Keybindings;
+                    self.settings_search.clear();
+                }
+                if settings_navigation_row(
+                    ui,
+                    "settings_language_servers",
+                    "Language Servers",
+                    self.settings_section == SettingsSection::LanguageServers,
+                )
+                .clicked()
+                {
+                    self.settings_section = SettingsSection::LanguageServers;
+                    self.settings_search.clear();
+                }
             },
         );
         root.scope_builder(
@@ -4965,6 +5273,11 @@ impl EditorApp {
                             ui.vertical(|ui| {
                                 ui.set_width(width.min(ui.available_width()));
                                 ui.add_space(40.0);
+                                if self.settings_section == SettingsSection::Keybindings {
+                                    self.draw_keybinding_settings(ui);
+                                    ui.add_space(34.0);
+                                    return;
+                                }
                                 ui.label(
                                     RichText::new("Language Servers")
                                         .size(20.0)
@@ -5062,8 +5375,875 @@ impl EditorApp {
         for action in actions {
             self.apply_settings_action(action, root.ctx());
         }
+        self.draw_keybinding_dialogs(root.ctx());
         if self.lsp_sync_needed {
             root.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn draw_keybinding_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Keybindings")
+                .size(20.0)
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.add_space(8.0);
+        let active = self.settings.keybindings.active_profile.clone();
+        let behavior = self.settings.keybindings.active_behavior();
+        let active_label = self.keybinding_profile_label(&active);
+        let mut action = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Profile").color(TEXT_SECONDARY));
+            egui::ComboBox::from_id_salt("keybinding_profile")
+                .selected_text(format!("{active_label} · {}", behavior.label()))
+                .show_ui(ui, |ui| {
+                    for (id, label, behavior) in self.keybinding_profile_choices() {
+                        if ui
+                            .selectable_label(
+                                id == active,
+                                format!("{label} · {}", behavior.label()),
+                            )
+                            .clicked()
+                        {
+                            action = Some(KeybindingUiAction::Activate(id));
+                        }
+                    }
+                });
+            if !self.settings.keybindings.profiles.contains_key(&active)
+                && ui.button("Customize").clicked()
+            {
+                action = Some(KeybindingUiAction::Customize);
+            }
+            if ui.button("New profile").clicked() {
+                self.new_profile = Some(NewProfileDraft {
+                    name: String::new(),
+                    base: Some(BUILTIN_VSCODE.to_owned()),
+                    behavior: KeybindingBehavior::Standard,
+                });
+            }
+            if ui.button("Duplicate").clicked() {
+                action = Some(KeybindingUiAction::Duplicate);
+            }
+        });
+        if let Some(profile) = self.settings.keybindings.profiles.get(&active) {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let rename = self
+                    .rename_profile
+                    .get_or_insert_with(|| profile.name.clone());
+                ui.add(
+                    TextEdit::singleline(rename)
+                        .hint_text("Profile name")
+                        .desired_width(190.0),
+                );
+                if ui.button("Rename").clicked() {
+                    action = Some(KeybindingUiAction::Rename(rename.clone()));
+                }
+                if self.confirm_profile_reset {
+                    if ui.button("Confirm reset all").clicked() {
+                        self.confirm_profile_reset = false;
+                        action = Some(KeybindingUiAction::ResetAll);
+                    }
+                    if ui.button("Cancel reset").clicked() {
+                        self.confirm_profile_reset = false;
+                    }
+                } else if ui.button("Reset all deviations").clicked() {
+                    self.confirm_profile_reset = true;
+                }
+                if ui.button("Delete → VS Code").clicked() {
+                    action = Some(KeybindingUiAction::DeleteToVsCode);
+                }
+            });
+        } else {
+            self.rename_profile = None;
+        }
+        ui.add_space(16.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.settings_search)
+                    .hint_text("Search commands or keys…")
+                    .desired_width(280.0),
+            );
+            for (filter, label) in [
+                (KeybindingFilter::All, "All"),
+                (KeybindingFilter::Bound, "Bound"),
+                (KeybindingFilter::Unbound, "Unbound"),
+                (KeybindingFilter::Modified, "Modified"),
+            ] {
+                if ui
+                    .selectable_label(self.keybinding_filter == filter, label)
+                    .clicked()
+                {
+                    self.keybinding_filter = filter;
+                }
+            }
+            egui::ComboBox::from_id_salt("keybinding_category")
+                .selected_text(
+                    self.keybinding_category
+                        .as_deref()
+                        .unwrap_or("All categories"),
+                )
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.keybinding_category.is_none(), "All categories")
+                        .clicked()
+                    {
+                        self.keybinding_category = None;
+                    }
+                    let mut categories = KEYBINDING_CATALOG
+                        .iter()
+                        .map(|info| info.category)
+                        .collect::<Vec<_>>();
+                    categories.sort_unstable();
+                    categories.dedup();
+                    for category in categories {
+                        if ui
+                            .selectable_label(
+                                self.keybinding_category.as_deref() == Some(category),
+                                category,
+                            )
+                            .clicked()
+                        {
+                            self.keybinding_category = Some(category.to_owned());
+                        }
+                    }
+                });
+            if behavior == KeybindingBehavior::Vim {
+                egui::ComboBox::from_id_salt("keybinding_vim_scope")
+                    .selected_text(
+                        self.keybinding_vim_scope
+                            .map_or("All Vim modes", Scope::label),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.keybinding_vim_scope, None, "All Vim modes");
+                        for scope in [
+                            Scope::VimNormal,
+                            Scope::VimInsert,
+                            Scope::VimReplace,
+                            Scope::VimVisual,
+                            Scope::VimOperator,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.keybinding_vim_scope,
+                                Some(scope),
+                                scope.label(),
+                            );
+                        }
+                    });
+            } else {
+                self.keybinding_vim_scope = None;
+            }
+        });
+        ui.add_space(12.0);
+        let effective = self
+            .settings
+            .keybindings
+            .effective_bindings()
+            .unwrap_or_default();
+        let query = self.settings_search.trim().to_lowercase();
+        let removed = self
+            .settings
+            .keybindings
+            .profiles
+            .get(&active)
+            .map_or(&[][..], |profile| profile.removed.as_slice());
+        let base_bindings = self
+            .settings
+            .keybindings
+            .profiles
+            .get(&active)
+            .and_then(|profile| profile.base.as_deref())
+            .and_then(crate::keybindings::builtin_bindings)
+            .unwrap_or_default();
+        let mut shown = 0;
+        for info in KEYBINDING_CATALOG {
+            if behavior == KeybindingBehavior::Standard && info.category == "Vim" {
+                continue;
+            }
+            if self
+                .keybinding_category
+                .as_deref()
+                .is_some_and(|category| category != info.category)
+            {
+                continue;
+            }
+            if self
+                .keybinding_vim_scope
+                .is_some_and(|scope| !info.scopes.contains(&scope))
+            {
+                continue;
+            }
+            let bindings = effective
+                .iter()
+                .filter(|binding| {
+                    binding.rule.command == info.id
+                        && self
+                            .keybinding_vim_scope
+                            .is_none_or(|scope| binding.rule.scope == scope)
+                })
+                .collect::<Vec<_>>();
+            let removed_for_command = base_bindings
+                .iter()
+                .any(|binding| binding.rule.command == info.id && removed.contains(&binding.id));
+            let modified = removed_for_command
+                || bindings
+                    .iter()
+                    .any(|binding| binding.source == BindingSource::Custom);
+            if matches!(
+                (self.keybinding_filter, bindings.is_empty(), modified),
+                (KeybindingFilter::Bound, true, _)
+                    | (KeybindingFilter::Unbound, false, _)
+                    | (KeybindingFilter::Modified, _, false)
+            ) {
+                continue;
+            }
+            let rendered = bindings
+                .iter()
+                .map(|binding| {
+                    binding.rule.label(
+                        binding
+                            .rule
+                            .platform
+                            .unwrap_or_else(KeybindingPlatform::current),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !query.is_empty()
+                && ![
+                    info.label.to_lowercase(),
+                    info.id.to_lowercase(),
+                    info.category.to_lowercase(),
+                    rendered.to_lowercase(),
+                ]
+                .iter()
+                .any(|value| value.contains(&query))
+                && !bindings
+                    .iter()
+                    .any(|binding| binding.rule.scope.label().to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            shown += 1;
+            egui::Frame::new()
+                .fill(SURFACE_RAISED)
+                .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(220.0);
+                            ui.label(RichText::new(info.label).strong().color(TEXT_PRIMARY));
+                            ui.label(
+                                RichText::new(info.id)
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Add binding").clicked() {
+                                self.shortcut_recorder = Some(ShortcutRecorder {
+                                    command: info.command,
+                                    strokes: Vec::new(),
+                                    logical_keys: Vec::new(),
+                                    physical_keys: Vec::new(),
+                                    scope: info.scopes[0],
+                                    platform: None,
+                                    replace_index: None,
+                                    disable_id: None,
+                                    error: None,
+                                    can_replace: false,
+                                });
+                            }
+                            if modified && ui.button("Reset command").clicked() {
+                                action = Some(KeybindingUiAction::ResetCommand(info.command));
+                            }
+                        });
+                    });
+                    if bindings.is_empty() {
+                        ui.label(RichText::new("Unbound").color(TEXT_MUTED));
+                    }
+                    for binding in &bindings {
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(
+                                    binding.rule.label(
+                                        binding
+                                            .rule
+                                            .platform
+                                            .unwrap_or_else(KeybindingPlatform::current),
+                                    ),
+                                )
+                                .monospace()
+                                .color(TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new(binding.rule.platform.map_or_else(
+                                    || "All platforms".to_owned(),
+                                    |platform| platform.to_string(),
+                                ))
+                                .size(11.0)
+                                .color(TEXT_MUTED),
+                            );
+                            ui.label(
+                                RichText::new(binding.rule.scope.label())
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.label(
+                                RichText::new(match binding.source {
+                                    BindingSource::BuiltIn => "Built-in",
+                                    BindingSource::Custom => "Custom",
+                                })
+                                .size(11.0)
+                                .color(TEXT_MUTED),
+                            );
+                            if ui.small_button("Change").clicked() {
+                                self.shortcut_recorder = Some(ShortcutRecorder {
+                                    command: info.command,
+                                    strokes: binding.rule.sequence.clone(),
+                                    logical_keys: binding
+                                        .rule
+                                        .sequence
+                                        .iter()
+                                        .map(|stroke| stroke.key.clone())
+                                        .collect(),
+                                    physical_keys: vec![None; binding.rule.sequence.len()],
+                                    scope: binding.rule.scope,
+                                    platform: binding.rule.platform,
+                                    replace_index: binding
+                                        .id
+                                        .strip_prefix("custom-")
+                                        .and_then(|index| index.parse().ok()),
+                                    disable_id: (binding.source == BindingSource::BuiltIn)
+                                        .then(|| binding.id.clone()),
+                                    error: None,
+                                    can_replace: false,
+                                });
+                            }
+                            if binding.source == BindingSource::Custom {
+                                if ui.small_button("Remove").clicked()
+                                    && let Some(index) = binding
+                                        .id
+                                        .strip_prefix("custom-")
+                                        .and_then(|index| index.parse().ok())
+                                {
+                                    action = Some(KeybindingUiAction::Remove(index));
+                                }
+                            } else if self.settings.keybindings.profiles.contains_key(&active)
+                                && ui.small_button("Disable").clicked()
+                            {
+                                action = Some(KeybindingUiAction::Disable(binding.id.clone()));
+                            }
+                        });
+                    }
+                });
+            ui.add_space(6.0);
+        }
+        if shown == 0 {
+            ui.label(RichText::new("No matching commands").color(TEXT_MUTED));
+        }
+        if let Some(error) = &self.settings_error {
+            ui.add_space(12.0);
+            ui.colored_label(
+                Color32::from_rgb(255, 125, 125),
+                format!("Settings were not changed: {error}"),
+            );
+        }
+        if let Some(action) = action {
+            self.apply_keybinding_ui_action(action, ui.ctx());
+        }
+    }
+
+    fn keybinding_profile_choices(&self) -> Vec<(String, String, KeybindingBehavior)> {
+        let mut profiles = vec![
+            (
+                BUILTIN_VSCODE.to_owned(),
+                "VS Code (Built-in)".to_owned(),
+                KeybindingBehavior::Standard,
+            ),
+            (
+                BUILTIN_VIM.to_owned(),
+                "Vim (Built-in)".to_owned(),
+                KeybindingBehavior::Vim,
+            ),
+        ];
+        let mut custom = self
+            .settings
+            .keybindings
+            .profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.name.clone(), profile.behavior))
+            .collect::<Vec<_>>();
+        custom.sort_by_key(|profile| profile.1.to_lowercase());
+        profiles.extend(custom);
+        profiles
+    }
+
+    fn keybinding_profile_label(&self, id: &str) -> String {
+        match id {
+            BUILTIN_VSCODE => "VS Code (Built-in)".into(),
+            BUILTIN_VIM => "Vim (Built-in)".into(),
+            _ => self
+                .settings
+                .keybindings
+                .profiles
+                .get(id)
+                .map_or_else(|| id.to_owned(), |profile| profile.name.clone()),
+        }
+    }
+
+    fn apply_keybinding_ui_action(&mut self, action: KeybindingUiAction, ctx: &egui::Context) {
+        let old = self.settings.clone();
+        let active = self.settings.keybindings.active_profile.clone();
+        let result = match action {
+            KeybindingUiAction::Activate(id) => self.settings.keybindings.set_active(&id),
+            KeybindingUiAction::Customize => self
+                .settings
+                .keybindings
+                .derive_profile(&active)
+                .map(|_| ()),
+            KeybindingUiAction::Duplicate => self
+                .settings
+                .keybindings
+                .duplicate_profile(&active)
+                .map(|_| ()),
+            KeybindingUiAction::ResetAll => self.settings.keybindings.reset_all(&active),
+            KeybindingUiAction::DeleteToVsCode => self
+                .settings
+                .keybindings
+                .delete_profile(&active, BUILTIN_VSCODE),
+            KeybindingUiAction::Rename(name) => {
+                self.settings.keybindings.rename_profile(&active, &name)
+            }
+            KeybindingUiAction::Disable(id) => {
+                self.settings.keybindings.disable_binding(&active, &id)
+            }
+            KeybindingUiAction::Remove(index) => {
+                self.settings.keybindings.remove_binding(&active, index)
+            }
+            KeybindingUiAction::ResetCommand(command) => {
+                self.settings.keybindings.reset_command(&active, command)
+            }
+        };
+        if let Err(error) = result {
+            self.settings = old;
+            self.settings_error = Some(error);
+            return;
+        }
+        self.commit_keybinding_settings(old, ctx);
+    }
+
+    fn commit_keybinding_settings(&mut self, old: Settings, ctx: &egui::Context) -> bool {
+        let profile_changed =
+            old.keybindings.active_profile != self.settings.keybindings.active_profile;
+        if !self.persist_settings() {
+            self.settings = old;
+            return false;
+        }
+        if let Err(error) = self.rebuild_keybinding_resolver() {
+            self.settings = old;
+            self.settings_error = Some(error);
+            return false;
+        }
+        if profile_changed {
+            self.confirm_profile_reset = false;
+            self.keybinding_vim_scope = None;
+            let behavior = self.settings.keybindings.active_behavior();
+            for tab in &mut self.tabs {
+                if behavior == KeybindingBehavior::Vim {
+                    tab.vim = VimState::default();
+                    let cursor = tab.editor_surface.cursor();
+                    tab.editor_surface.set_selection(cursor, cursor);
+                } else {
+                    tab.vim.execute(
+                        KeybindingCommand::VimNormal,
+                        &mut tab.editor_surface,
+                        &mut tab.buffer.text,
+                        &mut self.vim_session,
+                    );
+                    tab.vim = VimState::default();
+                }
+            }
+            self.vim_overlay = None;
+            self.focus_editor = self.active_tab.is_some();
+            ctx.request_repaint();
+        }
+        true
+    }
+
+    fn draw_keybinding_dialogs(&mut self, ctx: &egui::Context) {
+        self.draw_new_profile_dialog(ctx);
+        self.draw_shortcut_recorder(ctx);
+    }
+
+    fn draw_new_profile_dialog(&mut self, ctx: &egui::Context) {
+        let Some(draft) = &mut self.new_profile else {
+            return;
+        };
+        let mut create = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
+        dialog_window(ctx, "New keybinding profile", "new_keybinding_profile").show(ctx, |ui| {
+            begin_dialog(ui, "New keybinding profile");
+            ui.label("Name");
+            ui.add(TextEdit::singleline(&mut draft.name).desired_width(320.0));
+            ui.label("Start from");
+            egui::ComboBox::from_id_salt("new_profile_base")
+                .selected_text(match draft.base.as_deref() {
+                    Some(BUILTIN_VSCODE) => "VS Code",
+                    Some(BUILTIN_VIM) => "Vim",
+                    _ => "Empty",
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(draft.base.as_deref() == Some(BUILTIN_VSCODE), "VS Code")
+                        .clicked()
+                    {
+                        draft.base = Some(BUILTIN_VSCODE.to_owned());
+                        draft.behavior = KeybindingBehavior::Standard;
+                    }
+                    if ui
+                        .selectable_label(draft.base.as_deref() == Some(BUILTIN_VIM), "Vim")
+                        .clicked()
+                    {
+                        draft.base = Some(BUILTIN_VIM.to_owned());
+                        draft.behavior = KeybindingBehavior::Vim;
+                    }
+                    if ui.selectable_label(draft.base.is_none(), "Empty").clicked() {
+                        draft.base = None;
+                    }
+                });
+            if draft.base.is_none() {
+                ui.horizontal(|ui| {
+                    ui.label("Editing behavior");
+                    ui.selectable_value(
+                        &mut draft.behavior,
+                        KeybindingBehavior::Standard,
+                        "Standard",
+                    );
+                    ui.selectable_value(&mut draft.behavior, KeybindingBehavior::Vim, "Vim modal");
+                });
+            }
+            dialog_actions(ui, |ui| {
+                cancel = ui.add(dialog_button("Cancel", false)).clicked();
+                create = ui.add(dialog_button("Create", true)).clicked();
+            });
+        });
+        if cancel {
+            self.new_profile = None;
+        } else if create {
+            let draft = self.new_profile.take().expect("draft exists");
+            let old = self.settings.clone();
+            match self.settings.keybindings.create_profile(
+                &draft.name,
+                draft.base.as_deref(),
+                draft.behavior,
+            ) {
+                Ok(id) => {
+                    self.settings.keybindings.active_profile = id;
+                    self.commit_keybinding_settings(old, ctx);
+                }
+                Err(error) => {
+                    self.settings = old;
+                    self.settings_error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn draw_shortcut_recorder(&mut self, ctx: &egui::Context) {
+        let Some(recorder) = &mut self.shortcut_recorder else {
+            return;
+        };
+        let events = ctx.input(|input| input.events.clone());
+        let mut captured = HashSet::new();
+        for (index, event) in events.iter().enumerate() {
+            let (key, physical_key, modifiers) = match event {
+                egui::Event::Copy => (Key::C, Some(Key::C), primary_modifiers()),
+                egui::Event::Cut => (Key::X, Some(Key::X), primary_modifiers()),
+                egui::Event::Paste(_) => (Key::V, Some(Key::V), primary_modifiers()),
+                egui::Event::Key {
+                    key: Key::Escape,
+                    pressed: true,
+                    ..
+                } => {
+                    self.shortcut_recorder = None;
+                    return;
+                }
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => (*key, *physical_key, *modifiers),
+                _ => continue,
+            };
+            if recorder.strokes.len() == 4 {
+                break;
+            }
+            let platform = KeybindingPlatform::current();
+            let primary = modifiers.command;
+            recorder.strokes.push(BindingStroke {
+                key: key.name().to_owned(),
+                primary,
+                ctrl: modifiers.ctrl && !(primary && platform != KeybindingPlatform::Macos),
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                super_key: modifiers.mac_cmd && !(primary && platform == KeybindingPlatform::Macos),
+                physical: false,
+            });
+            recorder.logical_keys.push(key.name().to_owned());
+            recorder
+                .physical_keys
+                .push(physical_key.map(|key| key.name().to_owned()));
+            recorder.error = None;
+            recorder.can_replace = false;
+            captured.insert(index);
+        }
+        if !captured.is_empty() {
+            ctx.input_mut(|input| {
+                input.events = input
+                    .events
+                    .drain(..)
+                    .enumerate()
+                    .filter_map(|(index, event)| (!captured.contains(&index)).then_some(event))
+                    .collect();
+            });
+        }
+        let mut done = false;
+        let mut replace = false;
+        let mut clear = false;
+        let mut cancel = false;
+        dialog_window(ctx, "Record shortcut", "shortcut_recorder").show(ctx, |ui| {
+            begin_dialog(ui, "Record shortcut");
+            ui.label(
+                RichText::new(recorder.command.info().label)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if recorder.strokes.is_empty() {
+                    ui.label(RichText::new("Press up to four keys").color(TEXT_MUTED));
+                }
+                for stroke in &recorder.strokes {
+                    ui.label(
+                        RichText::new(stroke.label(KeybindingPlatform::current()))
+                            .monospace()
+                            .background_color(SURFACE_SELECTED),
+                    );
+                }
+            });
+            if let Some(last) = recorder.strokes.last_mut() {
+                let response = ui.checkbox(
+                    &mut last.physical,
+                    "Use physical key position for last stroke",
+                );
+                if response.changed() {
+                    if last.physical {
+                        if let Some(physical) =
+                            recorder.physical_keys.last().and_then(Option::as_ref)
+                        {
+                            last.key.clone_from(physical);
+                        } else {
+                            last.physical = false;
+                            recorder.error =
+                                Some("This input did not report a physical key".into());
+                            recorder.can_replace = false;
+                        }
+                    } else {
+                        if let Some(logical) = recorder.logical_keys.last() {
+                            last.key.clone_from(logical);
+                        }
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Scope");
+                egui::ComboBox::from_id_salt("recorder_scope")
+                    .selected_text(recorder.scope.label())
+                    .show_ui(ui, |ui| {
+                        for scope in recorder.command.info().scopes {
+                            ui.selectable_value(&mut recorder.scope, *scope, scope.label());
+                        }
+                    });
+                ui.label("Platform");
+                egui::ComboBox::from_id_salt("recorder_platform")
+                    .selected_text(
+                        recorder
+                            .platform
+                            .map_or_else(|| "All".to_owned(), |platform| platform.to_string()),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut recorder.platform, None, "All");
+                        ui.selectable_value(
+                            &mut recorder.platform,
+                            Some(KeybindingPlatform::Macos),
+                            "macOS",
+                        );
+                        ui.selectable_value(
+                            &mut recorder.platform,
+                            Some(KeybindingPlatform::Windows),
+                            "Windows",
+                        );
+                        ui.selectable_value(
+                            &mut recorder.platform,
+                            Some(KeybindingPlatform::Linux),
+                            "Linux",
+                        );
+                    });
+            });
+            if recorder.scope == Scope::Global
+                && recorder.strokes.iter().any(|stroke| {
+                    (stroke.ctrl
+                        && matches!(
+                            stroke.parsed_key(),
+                            Some(Key::C | Key::D | Key::Q | Key::S | Key::W)
+                        ))
+                        || (stroke.ctrl
+                            && stroke.alt
+                            && stroke.parsed_key().is_some_and(|key| {
+                                key_character(key, egui::Modifiers::NONE).is_some()
+                            }))
+                })
+            {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    "This global binding may capture terminal or AltGr input.",
+                );
+            }
+            if let Some(error) = &recorder.error {
+                ui.colored_label(Color32::from_rgb(255, 125, 125), error);
+                if recorder.can_replace {
+                    replace = ui.button("Replace existing").clicked();
+                }
+            }
+            dialog_actions(ui, |ui| {
+                cancel = ui.add(dialog_button("Cancel", false)).clicked();
+                clear = ui.add(dialog_button("Clear", false)).clicked();
+                done = ui
+                    .add_enabled(!recorder.strokes.is_empty(), dialog_button("Done", true))
+                    .clicked();
+            });
+        });
+        if cancel {
+            self.shortcut_recorder = None;
+        } else if clear {
+            if let Some(recorder) = &mut self.shortcut_recorder {
+                recorder.strokes.clear();
+                recorder.logical_keys.clear();
+                recorder.physical_keys.clear();
+                recorder.error = None;
+                recorder.can_replace = false;
+            }
+        } else if done || replace {
+            self.finish_shortcut_recording(replace, ctx);
+        }
+    }
+
+    fn finish_shortcut_recording(&mut self, replace_conflict: bool, ctx: &egui::Context) {
+        let Some(mut recorder) = self.shortcut_recorder.take() else {
+            return;
+        };
+        let rule = BindingRule {
+            sequence: recorder.strokes.clone(),
+            command: recorder.command.id().to_owned(),
+            scope: recorder.scope,
+            platform: recorder.platform,
+        };
+        if let Err(error) = crate::keybindings::validate_rule(&rule) {
+            recorder.error = Some(error);
+            recorder.can_replace = false;
+            self.shortcut_recorder = Some(recorder);
+            return;
+        }
+        let old = self.settings.clone();
+        let active = self.settings.keybindings.active_profile.clone();
+        if !self.settings.keybindings.profiles.contains_key(&active) {
+            match self.settings.keybindings.derive_profile(&active) {
+                Ok(_) => {}
+                Err(error) => {
+                    recorder.error = Some(error);
+                    self.settings = old;
+                    self.shortcut_recorder = Some(recorder);
+                    return;
+                }
+            }
+        }
+        let active = self.settings.keybindings.active_profile.clone();
+        let conflict = self
+            .settings
+            .keybindings
+            .effective_bindings()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|binding| {
+                rules_have_sequence_conflict(&binding.rule, &rule)
+                    && recorder
+                        .replace_index
+                        .is_none_or(|index| binding.id != format!("custom-{index}"))
+                    && recorder.disable_id.as_deref() != Some(binding.id.as_str())
+            });
+        if let Some(conflict) = &conflict
+            && !replace_conflict
+        {
+            self.settings = old;
+            recorder.error = Some(format!(
+                "{} already uses this shortcut in {}",
+                KeybindingCommand::from_id(&conflict.rule.command)
+                    .map_or(conflict.rule.command.as_str(), |command| command
+                        .info()
+                        .label),
+                conflict.rule.scope.label(),
+            ));
+            recorder.can_replace = true;
+            self.shortcut_recorder = Some(recorder);
+            return;
+        }
+        let result = (|| {
+            let mut remove = recorder.replace_index.into_iter().collect::<Vec<_>>();
+            let mut disable = recorder
+                .disable_id
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if replace_conflict && let Some(conflict) = &conflict {
+                if conflict.source == BindingSource::BuiltIn {
+                    disable.push(&conflict.id);
+                } else if let Some(index) = conflict
+                    .id
+                    .strip_prefix("custom-")
+                    .and_then(|index| index.parse().ok())
+                {
+                    remove.push(index);
+                }
+            }
+            remove.sort_unstable();
+            remove.dedup();
+            for index in remove.into_iter().rev() {
+                self.settings.keybindings.remove_binding(&active, index)?;
+            }
+            disable.sort_unstable();
+            disable.dedup();
+            for id in disable {
+                self.settings.keybindings.disable_binding(&active, id)?;
+            }
+            self.settings.keybindings.add_binding(&active, rule, true)
+        })();
+        match result {
+            Ok(()) => {
+                self.commit_keybinding_settings(old, ctx);
+            }
+            Err(error) => {
+                self.settings = old;
+                recorder.error = Some(error);
+                recorder.can_replace = false;
+                self.shortcut_recorder = Some(recorder);
+            }
         }
     }
 
@@ -5325,13 +6505,13 @@ impl EditorApp {
     }
 
     fn persist_settings(&mut self) -> bool {
-        if self.settings_error.is_some() {
-            return false;
-        }
         let result = data_dir()
             .and_then(|directory| settings::save(&directory.join("settings.json"), &self.settings));
         match result {
-            Ok(()) => true,
+            Ok(()) => {
+                self.settings_error = None;
+                true
+            }
             Err(error) => {
                 self.settings_error = Some(error);
                 false
@@ -5655,9 +6835,9 @@ impl EditorApp {
             for event in events {
                 match event {
                     crate::lsp::Event::StateChanged(status) => {
+                        self.lsp_detail.remove(&preset);
                         if matches!(status, ServerStatus::Ready(_)) {
                             self.lsp_sync_needed = true;
-                            self.lsp_detail.remove(&preset);
                         }
                         if self.lsp_pending_completion.is_some()
                             || self.lsp_pending_hover.is_some()
@@ -6011,120 +7191,716 @@ impl EditorApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let toggle_settings =
-            ctx.input(|input| input.modifiers.command && input.key_pressed(Key::Comma));
-        if self.settings_open {
-            if toggle_settings || ctx.input(|input| input.key_pressed(Key::Escape)) {
-                self.settings_open = false;
-            }
+        if self.shortcut_recorder.is_some()
+            || self.new_profile.is_some()
+            || self.vim_overlay.is_some()
+        {
             return;
         }
-        if toggle_settings {
-            self.open_settings();
-            self.focus_editor = false;
-            self.tree_focused = false;
-            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+        if self.settings_open && ctx.input(|input| input.key_pressed(Key::Escape)) {
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape));
+            self.settings_open = false;
+            return;
+        }
+        if self.pending.is_some()
+            || self.conflict
+            || self.save_as.is_some()
+            || self.error.is_some()
+            || self.agent_file_picker.is_some()
+        {
             return;
         }
         if self.handle_lsp_popup_keys(ctx) {
             return;
         }
-        let completion =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, Key::Space));
-        if completion && let Some(tag) = self.active_request_tag() {
-            self.lsp_completion = None;
-            self.lsp_hover = None;
-            self.lsp_pending_completion = Some((tag, None));
-            self.lsp_sync_needed = true;
-        }
-        let definition = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::F12));
-        if definition && let Some(tag) = self.active_request_tag() {
-            self.lsp_pending_definition = Some(tag);
-            self.lsp_definitions = None;
-            self.lsp_sync_needed = true;
-        }
-        if ctx.input(|input| input.key_pressed(Key::F8)) {
-            let forward = !ctx.input(|input| input.modifiers.shift);
-            self.navigate_diagnostic(forward);
-        }
-        let (save, save_quit, project_search, find, sidebar, tree, editor, close) =
-            ctx.input(|input| {
-                let command = input.modifiers.command;
-                (
-                    command && input.key_pressed(Key::S),
-                    command
-                        && ((input.key_pressed(Key::Q) && input.key_down(Key::S))
-                            || (input.key_pressed(Key::S) && input.key_down(Key::Q))),
-                    command && input.modifiers.shift && input.key_pressed(Key::F),
-                    command && !input.modifiers.shift && input.key_pressed(Key::F),
-                    command && input.key_pressed(Key::B),
-                    command && input.key_pressed(Key::Num1),
-                    command && input.key_pressed(Key::Num2),
-                    command && input.key_pressed(Key::W),
-                )
-            });
-        if save_quit {
-            if self.save(None) {
-                self.request_close();
-            }
-        } else if save {
-            self.save(None);
-        }
-        if project_search {
-            self.lsp_completion = None;
-            self.lsp_hover = None;
-            self.lsp_definitions = None;
-            self.search_open = true;
-            if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
-                find.open = false;
-            }
-            self.focus_search = true;
-            self.focus_editor = false;
-            self.tree_focused = false;
-            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
-        }
-        if find {
-            self.lsp_completion = None;
-            self.lsp_hover = None;
-            if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
-                tab.markdown_preview = false;
-            }
-            self.search_open = false;
-            let find = self.pane_find.entry(self.active_pane).or_default();
-            find.open = true;
-            find.focus = true;
-            find.scroll_to_match = !find.matches.is_empty();
-            self.focus_editor = false;
-            self.tree_focused = false;
-            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
-        }
-        if sidebar {
-            self.sidebar = !self.sidebar;
-        }
-        if tree {
-            self.sidebar = true;
-            self.focus_editor = false;
-            self.tree_focused = true;
-            ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
-        }
-        if editor {
-            if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
-                tab.markdown_preview = false;
-            }
-            self.focus_editor = true;
-            self.tree_focused = false;
-        }
-        if close {
-            if self.terminal.focused(ctx) {
-                self.terminal.close_active();
-                if self.terminal.is_empty() {
-                    self.terminal_open = false;
+        let events = ctx.input(|input| input.events.clone());
+        let special_copy = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Copy));
+        let special_cut = events.iter().any(|event| matches!(event, egui::Event::Cut));
+        let special_paste = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Paste(_)));
+        let now = ctx.input(|input| Duration::from_secs_f64(input.time.max(0.0)));
+        let mut consumed = HashSet::new();
+        let mut duplicate_events = Vec::new();
+        let mut special_handled = [false; 3];
+        for (index, event) in events.iter().enumerate() {
+            let scopes = self.active_keybinding_scopes(ctx);
+            let (stroke, repeated, paste) = match event {
+                egui::Event::Copy => (
+                    InputStroke::new(Key::C, Some(Key::C), primary_modifiers()),
+                    false,
+                    None,
+                ),
+                egui::Event::Cut => (
+                    InputStroke::new(Key::X, Some(Key::X), primary_modifiers()),
+                    false,
+                    None,
+                ),
+                egui::Event::Paste(value) => (
+                    InputStroke::new(Key::V, Some(Key::V), primary_modifiers()),
+                    false,
+                    Some(value.clone()),
+                ),
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                } => {
+                    if (special_copy && *key == Key::C && modifiers.command)
+                        || (special_cut && *key == Key::X && modifiers.command)
+                        || (special_paste && *key == Key::V && modifiers.command)
+                    {
+                        let kind = if *key == Key::C {
+                            0
+                        } else if *key == Key::X {
+                            1
+                        } else {
+                            2
+                        };
+                        duplicate_events.push((index, kind));
+                        continue;
+                    }
+                    if !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && !modifiers.mac_cmd
+                        && key_character(*key, *modifiers).is_some()
+                        && text_scope_owns_printable(
+                            &scopes,
+                            self.settings.keybindings.active_behavior(),
+                        )
+                    {
+                        continue;
+                    }
+                    if self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim
+                        && scopes.iter().any(|scope| scope.is_vim())
+                        && self
+                            .active_tab
+                            .and_then(|tab| self.tabs.get(tab))
+                            .is_some_and(|tab| tab.vim.awaits_character())
+                        && let Some(character) = key_character(*key, *modifiers)
+                    {
+                        consumed.insert(index);
+                        self.execute_vim_character(character, ctx);
+                        continue;
+                    }
+                    (
+                        InputStroke::new(*key, *physical_key, *modifiers),
+                        *repeat,
+                        None,
+                    )
                 }
-            } else if let Some(index) = self.active_tab {
-                self.request(PendingAction::CloseTab(index));
-            } else {
-                self.request_close();
+                _ => continue,
+            };
+            let result = self
+                .keybinding_resolver
+                .resolve(stroke, &scopes, repeated, now);
+            if matches!(
+                event,
+                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+            ) {
+                consumed.insert(index);
             }
+            if result.consumed {
+                match event {
+                    egui::Event::Copy => special_handled[0] = true,
+                    egui::Event::Cut => special_handled[1] = true,
+                    egui::Event::Paste(_) => special_handled[2] = true,
+                    _ => {}
+                }
+                consumed.insert(index);
+                if result.command.is_none() {
+                    ctx.request_repaint_after(Duration::from_secs(1));
+                }
+            }
+            if result.consumed
+                && result.command.is_none()
+                && stroke.key == Key::Escape
+                && self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim
+                && scopes.iter().any(|scope| scope.is_vim())
+            {
+                self.execute_keybinding(KeybindingCommand::VimNormal, None, ctx);
+            }
+            if let Some(command) = result.command {
+                self.execute_keybinding(command, paste.as_deref(), ctx);
+            }
+        }
+        consumed.extend(
+            duplicate_events
+                .into_iter()
+                .filter_map(|(index, kind)| special_handled[kind].then_some(index)),
+        );
+        if !consumed.is_empty() {
+            let consumed_events = consumed
+                .iter()
+                .filter_map(|index| events.get(*index))
+                .collect::<Vec<_>>();
+            ctx.input_mut(|input| {
+                input
+                    .events
+                    .retain(|event| !consumed_events.contains(&event));
+            });
+        }
+    }
+
+    fn active_keybinding_scopes(&self, ctx: &egui::Context) -> Vec<Scope> {
+        if self.settings_open {
+            return vec![Scope::Settings];
+        }
+        if self.terminal.focused(ctx) {
+            return vec![Scope::Terminal];
+        }
+        if ctx.memory(|memory| memory.has_focus(Id::new("agent_prompt"))) {
+            return vec![Scope::Agent];
+        }
+        if self.search_open {
+            return vec![Scope::ProjectSearch];
+        }
+        if self
+            .pane_find
+            .get(&self.active_pane)
+            .is_some_and(|find| find.open)
+            && ctx.memory(|memory| {
+                memory.has_focus(Id::new(("file_search_query", self.active_pane.0)))
+            })
+        {
+            return vec![Scope::Find];
+        }
+        if self.tree_focused {
+            return vec![Scope::FilesTree];
+        }
+        if self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim
+            && let Some(tab) = self.active_tab.and_then(|index| self.tabs.get(index))
+        {
+            return vec![tab.vim.scope(), Scope::DocumentEditor];
+        }
+        vec![Scope::DocumentEditor]
+    }
+
+    fn execute_keybinding(
+        &mut self,
+        command: KeybindingCommand,
+        paste: Option<&str>,
+        ctx: &egui::Context,
+    ) {
+        match command {
+            KeybindingCommand::AppOpenSettings => {
+                if self.settings_open {
+                    self.settings_open = false;
+                } else {
+                    self.open_settings();
+                }
+            }
+            KeybindingCommand::AppOpenKeybindings => {
+                self.settings_section = SettingsSection::Keybindings;
+                self.open_settings();
+            }
+            KeybindingCommand::AppCloseWindow => self.request_close(),
+            KeybindingCommand::AppToggleAgentSidebar => {
+                self.agent_sidebar = !self.agent_sidebar;
+                self.agent_sidebar_dragging = false;
+                if self.agent_sidebar {
+                    self.open_agent(ctx);
+                }
+            }
+            KeybindingCommand::AppToggleAgenticView => {
+                self.set_agentic_mode(!self.agentic_mode, ctx)
+            }
+            KeybindingCommand::FileSave => {
+                self.save(None);
+            }
+            KeybindingCommand::FileSaveAndClose => {
+                if self.save(None)
+                    && let Some(index) = self.active_tab
+                {
+                    self.request(PendingAction::CloseTab(index));
+                }
+            }
+            KeybindingCommand::FileCloseActive => {
+                if self.terminal.focused(ctx) {
+                    self.terminal.close_active();
+                    if self.terminal.is_empty() {
+                        self.terminal_open = false;
+                    }
+                } else if let Some(index) = self.active_tab {
+                    self.request(PendingAction::CloseTab(index));
+                } else {
+                    self.request_close();
+                }
+            }
+            KeybindingCommand::FileFocusPane1
+            | KeybindingCommand::FileFocusPane2
+            | KeybindingCommand::FileFocusPane3
+            | KeybindingCommand::FileFocusPane4
+            | KeybindingCommand::FileFocusPane5
+            | KeybindingCommand::FileFocusPane6
+            | KeybindingCommand::FileFocusPane7
+            | KeybindingCommand::FileFocusPane8
+            | KeybindingCommand::FileFocusPane9 => {
+                let index = match command {
+                    KeybindingCommand::FileFocusPane1 => 0,
+                    KeybindingCommand::FileFocusPane2 => 1,
+                    KeybindingCommand::FileFocusPane3 => 2,
+                    KeybindingCommand::FileFocusPane4 => 3,
+                    KeybindingCommand::FileFocusPane5 => 4,
+                    KeybindingCommand::FileFocusPane6 => 5,
+                    KeybindingCommand::FileFocusPane7 => 6,
+                    KeybindingCommand::FileFocusPane8 => 7,
+                    _ => 8,
+                };
+                self.focus_pane(index);
+            }
+            KeybindingCommand::FileSplitEditor => {
+                self.pane_layout.split(self.active_pane, DropZone::Right);
+            }
+            KeybindingCommand::FileFocusNextPane | KeybindingCommand::FileFocusRightPane => {
+                self.focus_relative_pane(1);
+            }
+            KeybindingCommand::FileFocusPreviousPane | KeybindingCommand::FileFocusLeftPane => {
+                self.focus_relative_pane(-1);
+            }
+            KeybindingCommand::ViewToggleSidebar => self.sidebar = !self.sidebar,
+            KeybindingCommand::ViewFocusExplorer => {
+                self.sidebar = true;
+                self.focus_editor = false;
+                self.tree_focused = true;
+                ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+            }
+            KeybindingCommand::ViewToggleTerminal => self.toggle_terminal(ctx),
+            KeybindingCommand::ViewToggleMarkdownPreview => {
+                if let Some(index) = self.active_tab {
+                    self.tabs[index].markdown_preview = !self.tabs[index].markdown_preview;
+                }
+            }
+            KeybindingCommand::SearchFind => self.open_find(ctx),
+            KeybindingCommand::SearchNext => self.step_find(false),
+            KeybindingCommand::SearchPrevious => self.step_find(true),
+            KeybindingCommand::SearchProject => self.open_project_search(ctx),
+            KeybindingCommand::SearchClose => {
+                self.search_open = false;
+                if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                    find.open = false;
+                }
+                self.focus_editor = self.active_tab.is_some();
+            }
+            KeybindingCommand::TreeMoveUp
+            | KeybindingCommand::TreeMoveDown
+            | KeybindingCommand::TreeExpand
+            | KeybindingCommand::TreeCollapse
+            | KeybindingCommand::TreeOpen => self.execute_tree_command(command),
+            KeybindingCommand::EditorTriggerSuggest => {
+                if let Some(tag) = self.active_request_tag() {
+                    self.lsp_completion = None;
+                    self.lsp_hover = None;
+                    self.lsp_pending_completion = Some((tag, None));
+                    self.lsp_sync_needed = true;
+                }
+            }
+            KeybindingCommand::EditorGoToDefinition => {
+                if let Some(tag) = self.active_request_tag() {
+                    self.lsp_pending_definition = Some(tag);
+                    self.lsp_definitions = None;
+                    self.lsp_sync_needed = true;
+                }
+            }
+            KeybindingCommand::EditorNextDiagnostic => self.navigate_diagnostic(true),
+            KeybindingCommand::EditorPreviousDiagnostic => self.navigate_diagnostic(false),
+            command if command.id().starts_with("editor.") => {
+                if command == KeybindingCommand::EditorPaste && paste.is_none() {
+                    self.clipboard_request = Some(ClipboardRequest::EditorPaste);
+                    return;
+                }
+                let Some(index) = self.active_tab else {
+                    return;
+                };
+                let changed = {
+                    let tab = &mut self.tabs[index];
+                    tab.editor_surface
+                        .execute_command(ctx, &mut tab.buffer.text, command, paste)
+                };
+                if changed {
+                    self.mark_tab_changed(index);
+                }
+            }
+            command if command.id().starts_with("vim.") => self.execute_vim_command(command, ctx),
+            _ => {}
+        }
+    }
+
+    fn rebuild_keybinding_resolver(&mut self) -> Result<(), String> {
+        self.keybinding_resolver = Resolver::new(
+            self.settings.keybindings.effective_bindings()?,
+            KeybindingPlatform::current(),
+        )?;
+        Ok(())
+    }
+
+    fn mark_tab_changed(&mut self, index: usize) {
+        self.tabs[index].buffer.mark_changed();
+        self.tabs[index].highlight_cache.valid = false;
+        self.lsp_sync_needed = true;
+        self.lsp_completion = None;
+        self.lsp_hover = None;
+        self.lsp_hover_probe = None;
+        self.lsp_pending_hover = None;
+        self.cursor = self.tabs[index]
+            .buffer
+            .line_column(self.tabs[index].editor_surface.cursor());
+    }
+
+    fn focus_pane(&mut self, pane_index: usize) {
+        let Some(pane) = self.pane_layout.panes().get(pane_index).copied() else {
+            return;
+        };
+        if let Some(index) = self
+            .pane_active_tabs
+            .get(&pane)
+            .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
+        {
+            self.activate_tab(index);
+        } else {
+            self.active_pane = pane;
+        }
+    }
+
+    fn focus_relative_pane(&mut self, direction: isize) {
+        let panes = self.pane_layout.panes();
+        let Some(current) = panes.iter().position(|pane| *pane == self.active_pane) else {
+            return;
+        };
+        let next = (current as isize + direction).rem_euclid(panes.len() as isize) as usize;
+        self.focus_pane(next);
+    }
+
+    fn open_find(&mut self, ctx: &egui::Context) {
+        self.lsp_completion = None;
+        self.lsp_hover = None;
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            tab.markdown_preview = false;
+        }
+        self.search_open = false;
+        let find = self.pane_find.entry(self.active_pane).or_default();
+        find.open = true;
+        find.focus = true;
+        find.scroll_to_match = !find.matches.is_empty();
+        self.focus_editor = false;
+        self.tree_focused = false;
+        ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+    }
+
+    fn open_project_search(&mut self, ctx: &egui::Context) {
+        self.lsp_completion = None;
+        self.lsp_hover = None;
+        self.lsp_definitions = None;
+        self.search_open = true;
+        if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+            find.open = false;
+        }
+        self.focus_search = true;
+        self.focus_editor = false;
+        self.tree_focused = false;
+        ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+    }
+
+    fn step_find(&mut self, previous: bool) {
+        self.refresh_find_matches(self.active_pane);
+        let Some(find) = self.pane_find.get_mut(&self.active_pane) else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        find.selected = next_find_match(find.selected, find.matches.len(), previous);
+        find.scroll_to_match = true;
+    }
+
+    fn execute_tree_command(&mut self, command: KeybindingCommand) {
+        let count = self.tree.visible.len();
+        if count == 0 {
+            return;
+        }
+        let current = self.tree.selected_index.unwrap_or(0).min(count - 1);
+        if matches!(
+            command,
+            KeybindingCommand::TreeMoveUp | KeybindingCommand::TreeMoveDown
+        ) {
+            let next = if command == KeybindingCommand::TreeMoveDown {
+                (current + 1).min(count - 1)
+            } else {
+                current.saturating_sub(1)
+            };
+            self.tree
+                .select(Some(self.tree.visible[next].entry.path.clone()));
+            return;
+        }
+        let entry = self.tree.visible[current].entry.clone();
+        match command {
+            KeybindingCommand::TreeExpand if entry.is_dir => {
+                if !self.tree.expanded.contains(&entry.path)
+                    && let Err(error) = self.tree.toggle(&entry.path)
+                {
+                    self.show_error(error);
+                }
+            }
+            KeybindingCommand::TreeCollapse if entry.is_dir => self.tree.collapse(&entry.path),
+            KeybindingCommand::TreeOpen if entry.is_dir => {
+                if let Err(error) = self.tree.toggle(&entry.path) {
+                    self.show_error(error);
+                }
+            }
+            KeybindingCommand::TreeOpen => self.request(PendingAction::Open(entry.path)),
+            _ => {}
+        }
+    }
+
+    fn execute_vim_command(&mut self, command: KeybindingCommand, ctx: &egui::Context) {
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let outcome = {
+            let tab = &mut self.tabs[index];
+            tab.vim.execute(
+                command,
+                &mut tab.editor_surface,
+                &mut tab.buffer.text,
+                &mut self.vim_session,
+            )
+        };
+        self.apply_vim_outcome(index, outcome, ctx);
+    }
+
+    fn execute_vim_character(&mut self, character: char, ctx: &egui::Context) {
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let outcome = {
+            let tab = &mut self.tabs[index];
+            tab.vim.provide_character(
+                character,
+                &mut tab.editor_surface,
+                &mut tab.buffer.text,
+                &mut self.vim_session,
+            )
+        };
+        self.apply_vim_outcome(index, outcome, ctx);
+    }
+
+    fn apply_vim_outcome(
+        &mut self,
+        index: usize,
+        outcome: crate::vim::VimOutcome,
+        ctx: &egui::Context,
+    ) {
+        if outcome.changed {
+            self.mark_tab_changed(index);
+        }
+        if let Some(text) = outcome.copy_to_system {
+            ctx.output_mut(|output| {
+                output.commands.push(egui::OutputCommand::CopyText(text));
+            });
+        }
+        match outcome.request {
+            Some(VimRequest::Search {
+                direction,
+                seed: Some(seed),
+            }) if !seed.is_empty() => {
+                self.apply_vim_search(direction, seed);
+            }
+            Some(VimRequest::Search { direction, seed }) => {
+                self.vim_overlay = Some(VimOverlay {
+                    kind: VimOverlayKind::Search(direction),
+                    input: seed.unwrap_or_default(),
+                    error: None,
+                    focus: true,
+                });
+            }
+            Some(VimRequest::Ex) => {
+                self.vim_overlay = Some(VimOverlay {
+                    kind: VimOverlayKind::Ex,
+                    input: String::new(),
+                    error: None,
+                    focus: true,
+                });
+            }
+            Some(VimRequest::SystemPaste { before }) => {
+                self.clipboard_request = Some(ClipboardRequest::VimPaste { before });
+            }
+            None => {}
+        }
+    }
+
+    fn apply_vim_search(&mut self, direction: VimSearchDirection, query: String) {
+        if query.is_empty() {
+            return;
+        }
+        self.vim_session.last_search.clone_from(&query);
+        self.vim_session.search_direction = direction;
+        let find = self.pane_find.entry(self.active_pane).or_default();
+        find.open = true;
+        find.query = query;
+        find.focus = false;
+        find.match_revision = u64::MAX;
+        self.refresh_find_matches(self.active_pane);
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let cursor = self.tabs[index]
+            .buffer
+            .byte_index(self.tabs[index].editor_surface.cursor());
+        let Some(find) = self.pane_find.get_mut(&self.active_pane) else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        find.selected = match direction {
+            VimSearchDirection::Forward => find
+                .matches
+                .iter()
+                .position(|range| range.start > cursor)
+                .unwrap_or(0),
+            VimSearchDirection::Backward => find
+                .matches
+                .iter()
+                .rposition(|range| range.start < cursor)
+                .unwrap_or(find.matches.len() - 1),
+        };
+        find.scroll_to_match = true;
+        let byte = find.matches[find.selected].start;
+        let character = self.tabs[index].buffer.text[..byte].chars().count();
+        self.tabs[index]
+            .editor_surface
+            .set_selection(character, character);
+        self.cursor = self.tabs[index].buffer.line_column(character);
+    }
+
+    fn execute_ex(&mut self, command: ExCommand) -> Result<(), String> {
+        match command {
+            ExCommand::Write => {
+                if self.save(None) {
+                    Ok(())
+                } else {
+                    Err("write failed".into())
+                }
+            }
+            ExCommand::Quit { force } => {
+                let index = self
+                    .active_tab
+                    .ok_or_else(|| "no active editor".to_owned())?;
+                if force {
+                    self.close_tab(index);
+                    Ok(())
+                } else if self.tabs[index].buffer.dirty {
+                    Err("changes are unsaved; use :q! to discard them".into())
+                } else {
+                    self.close_tab(index);
+                    Ok(())
+                }
+            }
+            ExCommand::WriteQuit => {
+                if self.save(None) {
+                    if let Some(index) = self.active_tab {
+                        self.close_tab(index);
+                    }
+                    Ok(())
+                } else {
+                    Err("write failed".into())
+                }
+            }
+            ExCommand::Exit => {
+                let dirty = self
+                    .active_tab
+                    .is_some_and(|index| self.tabs[index].buffer.dirty);
+                if !dirty || self.save(None) {
+                    if let Some(index) = self.active_tab {
+                        self.close_tab(index);
+                    }
+                    Ok(())
+                } else {
+                    Err("write failed".into())
+                }
+            }
+            ExCommand::Edit(path) => {
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.tree.root.join(path)
+                };
+                self.request(PendingAction::Open(path));
+                Ok(())
+            }
+            ExCommand::NoHighlight => {
+                if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                    find.open = false;
+                }
+                Ok(())
+            }
+            ExCommand::Line(line) => {
+                let index = self
+                    .active_tab
+                    .ok_or_else(|| "no active editor".to_owned())?;
+                let text = &self.tabs[index].buffer.text;
+                let mut current_line = 1;
+                let mut target = 0;
+                for (character, value) in text.chars().enumerate() {
+                    if current_line == line {
+                        break;
+                    }
+                    if value == '\n' {
+                        current_line += 1;
+                        target = character + 1;
+                    }
+                }
+                self.tabs[index]
+                    .editor_surface
+                    .set_selection(target, target);
+                self.cursor = self.tabs[index].buffer.line_column(target);
+                Ok(())
+            }
+        }
+    }
+
+    fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        self.clipboard_request.take()
+    }
+
+    fn receive_clipboard(&mut self, request: ClipboardRequest, text: &str, ctx: &egui::Context) {
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let changed = match request {
+            ClipboardRequest::EditorPaste => {
+                let tab = &mut self.tabs[index];
+                let changed = tab.editor_surface.execute_command(
+                    ctx,
+                    &mut tab.buffer.text,
+                    KeybindingCommand::EditorPaste,
+                    Some(text),
+                );
+                if changed && self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim
+                {
+                    tab.vim.record_insert_text(text);
+                }
+                changed
+            }
+            ClipboardRequest::VimPaste { before } => {
+                let tab = &mut self.tabs[index];
+                tab.vim.paste_system_text(
+                    before,
+                    text,
+                    &mut tab.editor_surface,
+                    &mut tab.buffer.text,
+                    &mut self.vim_session,
+                )
+            }
+        };
+        if changed {
+            self.mark_tab_changed(index);
         }
     }
 
@@ -8999,6 +10775,80 @@ impl EditorApp {
         }
     }
 
+    fn draw_vim_overlay(&mut self, ctx: &egui::Context) {
+        let Some(overlay) = &mut self.vim_overlay else {
+            return;
+        };
+        let escape = ctx.input(|input| input.key_pressed(Key::Escape));
+        let enter = ctx.input(|input| input.key_pressed(Key::Enter));
+        let screen = ctx.content_rect();
+        let width = screen.width().min(640.0);
+        egui::Area::new(Id::new("vim_command_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(
+                screen.center().x - width * 0.5,
+                screen.bottom() - 48.0,
+            ))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 20.0);
+                        ui.horizontal(|ui| {
+                            let prefix = match overlay.kind {
+                                VimOverlayKind::Search(VimSearchDirection::Forward) => "/",
+                                VimOverlayKind::Search(VimSearchDirection::Backward) => "?",
+                                VimOverlayKind::Ex => ":",
+                            };
+                            ui.label(RichText::new(prefix).monospace().color(ACCENT));
+                            let response = ui.add_sized(
+                                egui::vec2(ui.available_width(), 24.0),
+                                TextEdit::singleline(&mut overlay.input)
+                                    .id(Id::new("vim_command_input"))
+                                    .hint_text(match overlay.kind {
+                                        VimOverlayKind::Ex => "Vim Ex command",
+                                        VimOverlayKind::Search(_) => "Vim search",
+                                    })
+                                    .frame(egui::Frame::NONE),
+                            );
+                            if overlay.focus {
+                                response.request_focus();
+                                overlay.focus = false;
+                            }
+                        });
+                        if let Some(error) = &overlay.error {
+                            ui.colored_label(Color32::from_rgb(255, 125, 125), error);
+                        }
+                    });
+            });
+        if escape {
+            self.vim_overlay = None;
+        } else if enter {
+            let overlay = self.vim_overlay.take().expect("overlay exists");
+            match overlay.kind {
+                VimOverlayKind::Search(direction) => {
+                    self.apply_vim_search(direction, overlay.input);
+                }
+                VimOverlayKind::Ex => {
+                    match parse_ex(&overlay.input).and_then(|command| self.execute_ex(command)) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            self.vim_overlay = Some(VimOverlay {
+                                kind: VimOverlayKind::Ex,
+                                input: overlay.input,
+                                error: Some(error),
+                                focus: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn draw_search(&mut self, root: &mut egui::Ui) {
         if !self.search_open {
             return;
@@ -9401,8 +11251,21 @@ impl EditorApp {
             buffer,
             editor_surface,
             highlight_cache: cache,
+            vim,
             ..
         } = &mut self.tabs[index];
+        let vim_enabled = self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim;
+        let text_input = if vim_enabled {
+            match vim.mode() {
+                VimMode::Insert => TextInputMode::Insert,
+                VimMode::Replace => TextInputMode::Replace,
+                VimMode::Normal | VimMode::VisualCharacter | VimMode::VisualLine => {
+                    TextInputMode::Disabled
+                }
+            }
+        } else {
+            TextInputMode::Standard
+        };
         if buffer.large_file_warning {
             ui.colored_label(
                 Color32::YELLOW,
@@ -9506,8 +11369,17 @@ impl EditorApp {
                 scroll_to_character: scroll_character,
                 id: editor_id,
                 line_markers: &line_markers,
+                text_input,
+                native_keybindings: false,
+                block_caret: vim_enabled && !vim.text_input_enabled(),
             },
         );
+        if vim_enabled && (output.response.clicked() || output.response.dragged()) {
+            vim.clear_preferred_column();
+        }
+        if vim_enabled && !output.inserted_text.is_empty() {
+            vim.record_insert_text(&output.inserted_text);
+        }
         let mut diagnostic_at_pointer = false;
         if let Some(character) = output.hovered_character
             && let Some(state) = diagnostics
@@ -11223,6 +13095,19 @@ impl Shell {
         let input = state.take_egui_input(window);
         let context = state.egui_ctx().clone();
         let output = context.run_ui(input, |root| self.editor.ui(root));
+        if let Some(request) = self.editor.take_clipboard_request() {
+            match system_clipboard(&mut self.clipboard)
+                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
+            {
+                Ok(text) => {
+                    self.editor.receive_clipboard(request, &text, &context);
+                    window.request_redraw();
+                }
+                Err(error) => self
+                    .editor
+                    .show_error(format!("cannot paste from system clipboard: {error}")),
+            }
+        }
         let mut maximize_requested = false;
         if let Some(action) = self.editor.take_window_action() {
             match action {
@@ -17531,7 +19416,16 @@ mod tests {
                 Default::default(),
                 Vec2::new(1000.0, 700.0),
             )),
-            events: vec![Event::Text("needle".into())],
+            events: vec![
+                Event::Key {
+                    key: Key::F,
+                    physical_key: Some(Key::F),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: command,
+                },
+                Event::Text("needle".into()),
+            ],
             ..RawInput::default()
         };
         let _ = context.run_ui(input, |root| app.ui(root));
@@ -17710,6 +19604,23 @@ mod tests {
         };
 
         let _ = draw(&mut app);
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                events: vec![Event::Key {
+                    key: Key::F,
+                    physical_key: Some(Key::F),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
         app.activate_tab(0);
         let output = draw(&mut app);
         fn find_hints(shape: &Shape) -> usize {
@@ -18803,5 +20714,121 @@ mod tests {
 
         assert!(app.should_close);
         assert_eq!(fs::read_to_string(file).unwrap(), "after\n");
+    }
+
+    #[test]
+    fn normalized_paste_runs_once_and_an_empty_profile_can_disable_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.rs");
+        fs::write(&file, "base").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file),
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        let command = Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        };
+        let paste = || RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            events: vec![
+                Event::Paste("X".into()),
+                Event::Key {
+                    key: Key::V,
+                    physical_key: Some(Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                },
+            ],
+            ..RawInput::default()
+        };
+
+        let _ = context.run_ui(paste(), |root| app.ui(root));
+        assert_eq!(app.tabs[0].buffer.text, "Xbase");
+
+        let empty = app
+            .settings
+            .keybindings
+            .create_profile("Empty", None, crate::keybindings::Behavior::Standard)
+            .unwrap();
+        app.settings.keybindings.set_active(&empty).unwrap();
+        app.rebuild_keybinding_resolver().unwrap();
+        let _ = context.run_ui(paste(), |root| app.ui(root));
+
+        assert_eq!(app.tabs[0].buffer.text, "Xbase");
+    }
+
+    #[test]
+    fn vim_operator_scope_updates_between_events_in_one_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("current.rs");
+        fs::write(&file, "one two").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file),
+            create: false,
+        })
+        .unwrap();
+        app.settings
+            .keybindings
+            .set_active(crate::keybindings::BUILTIN_VIM)
+            .unwrap();
+        app.rebuild_keybinding_resolver().unwrap();
+        let context = egui::Context::default();
+        let screen = Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 700.0),
+        ));
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events: [Key::C, Key::I, Key::W]
+                    .into_iter()
+                    .map(|key| Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    })
+                    .collect(),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        assert_eq!(app.tabs[0].vim.mode(), crate::vim::VimMode::Insert);
+
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events: vec![Event::Text("X".into())],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events: vec![Event::Key {
+                    key: Key::Escape,
+                    physical_key: Some(Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert_eq!(app.tabs[0].buffer.text, "X two");
+        assert_eq!(app.tabs[0].vim.mode(), crate::vim::VimMode::Normal);
     }
 }

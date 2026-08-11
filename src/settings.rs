@@ -6,6 +6,8 @@ use std::{
     path::Path,
 };
 
+use crate::keybindings::{self, KeybindingSettings};
+
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
@@ -16,6 +18,8 @@ const MAX_COMMAND_BYTES: usize = 32 * 1024;
 pub struct Settings {
     #[serde(skip_serializing_if = "LanguageServerSettings::is_default")]
     pub language_servers: LanguageServerSettings,
+    #[serde(skip_serializing_if = "KeybindingSettings::is_default")]
+    pub keybindings: KeybindingSettings,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -92,6 +96,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
 }
 
 fn validate(settings: &Settings) -> Result<(), String> {
+    keybindings::validate_settings(&settings.keybindings)?;
     for (preset, override_) in &settings.language_servers.servers {
         if override_.args.len() > MAX_ARGUMENTS {
             return Err(format!("{preset} has more than 64 arguments"));
@@ -215,6 +220,7 @@ mod tests {
                 )]
                 .into(),
             },
+            keybindings: KeybindingSettings::default(),
         };
 
         save(&path, &settings).unwrap();
@@ -288,6 +294,7 @@ mod tests {
                 )]
                 .into(),
             },
+            keybindings: KeybindingSettings::default(),
         };
 
         assert!(save(&path, &settings).is_err());
@@ -326,12 +333,76 @@ mod tests {
                 ]
                 .into(),
             },
+            keybindings: KeybindingSettings::default(),
         };
         save(&path, &settings).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "{\n  \"languageServers\": {\n    \"servers\": {\n      \"pyright\": {\n        \"mode\": \"off\"\n      }\n    }\n  }\n}"
         );
+    }
+
+    #[test]
+    fn keybinding_profiles_round_trip_without_writing_the_default_section() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings
+            .keybindings
+            .set_active(crate::keybindings::BUILTIN_VIM)
+            .unwrap();
+
+        save(&path, &settings).unwrap();
+
+        assert_eq!(load(&path).unwrap().keybindings.active_profile, "vim");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "{\n  \"keybindings\": {\n    \"activeProfile\": \"vim\"\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn invalid_keybinding_ids_keys_scopes_profiles_and_conflicts_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let rule = |command: &str, key: &str, scope: &str| {
+            serde_json::json!({
+                "sequence": [{"key": key, "primary": true}],
+                "command": command,
+                "scope": scope
+            })
+        };
+        let profile = |bindings: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "activeProfile": "profile-1",
+                "profiles": {
+                    "profile-1": {
+                        "name": "Mine",
+                        "behavior": "standard",
+                        "bindings": bindings
+                    }
+                }
+            })
+        };
+        let invalid = [
+            serde_json::json!({"activeProfile": "missing"}),
+            profile(vec![rule("unknown.command", "S", "global")]),
+            profile(vec![rule("file.save", "NotAKey", "global")]),
+            profile(vec![rule("file.save", "S", "documentEditor")]),
+            profile(vec![
+                rule("file.save", "S", "global"),
+                rule("search.findInFile", "S", "global"),
+            ]),
+        ];
+
+        for keybindings in invalid {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({"keybindings": keybindings})).unwrap(),
+            )
+            .unwrap();
+            assert!(load(&path).is_err(), "accepted {keybindings}");
+        }
     }
 
     #[cfg(unix)]

@@ -7,6 +7,7 @@ use egui::{
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use crate::{
+    keybindings::Command,
     renderer::mark_retained,
     theme::{ACCENT, BORDER_STRONG, SURFACE, TEXT_DISABLED},
 };
@@ -42,8 +43,9 @@ pub struct EditorSurface {
     h_pos: Option<f32>,
     scroll_y: f32,
     scrollbar: crate::scrollbar::State,
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
+    undo: Vec<Vec<Edit>>,
+    redo: Vec<Vec<Edit>>,
+    transaction: Option<Vec<Edit>>,
     lines: Vec<RetainedLine>,
     line_numbers: Vec<Option<Arc<Galley>>>,
     offsets: Vec<f32>,
@@ -60,6 +62,7 @@ pub struct EditorOutput {
     pub caret_rect: Option<Rect>,
     pub hovered_character: Option<usize>,
     pub last_inserted: Option<char>,
+    pub inserted_text: String,
     pub scrolled: bool,
 }
 
@@ -68,6 +71,17 @@ pub(crate) struct EditorShowOptions<'a> {
     pub scroll_to_character: Option<usize>,
     pub id: Id,
     pub line_markers: &'a [(usize, Color32)],
+    pub text_input: TextInputMode,
+    pub native_keybindings: bool,
+    pub block_caret: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TextInputMode {
+    Standard,
+    Disabled,
+    Insert,
+    Replace,
 }
 
 #[derive(Clone, Copy)]
@@ -104,37 +118,194 @@ impl EditorSurface {
         let cursor = range.start + replacement.chars().count();
         self.anchor = cursor;
         self.cursor = cursor;
-        self.undo.push(Edit {
+        self.record_edit(Edit {
             start: range.start,
             deleted,
             inserted: replacement.to_owned(),
             before,
             after: (cursor, cursor),
         });
-        self.redo.clear();
         true
     }
 
+    fn record_edit(&mut self, edit: Edit) {
+        if let Some(transaction) = &mut self.transaction {
+            transaction.push(edit);
+        } else {
+            self.undo.push(vec![edit]);
+            self.redo.clear();
+        }
+    }
+
+    pub fn begin_transaction(&mut self) {
+        if self.transaction.is_none() {
+            self.transaction = Some(Vec::new());
+        }
+    }
+
+    pub fn end_transaction(&mut self) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        if !transaction.is_empty() {
+            self.undo.push(transaction);
+            self.redo.clear();
+        }
+    }
+
     pub fn undo(&mut self, text: &mut String) -> bool {
-        let Some(edit) = self.undo.pop() else {
+        self.end_transaction();
+        let Some(edits) = self.undo.pop() else {
             return false;
         };
-        let end = edit.start + edit.inserted.chars().count();
-        replace_chars(text, edit.start..end, &edit.deleted);
-        (self.anchor, self.cursor) = edit.before;
-        self.redo.push(edit);
+        for edit in edits.iter().rev() {
+            let end = edit.start + edit.inserted.chars().count();
+            replace_chars(text, edit.start..end, &edit.deleted);
+        }
+        (self.anchor, self.cursor) = edits
+            .first()
+            .map_or((self.anchor, self.cursor), |edit| edit.before);
+        self.redo.push(edits);
         true
     }
 
     pub fn redo(&mut self, text: &mut String) -> bool {
-        let Some(edit) = self.redo.pop() else {
+        self.end_transaction();
+        let Some(edits) = self.redo.pop() else {
             return false;
         };
-        let end = edit.start + edit.deleted.chars().count();
-        replace_chars(text, edit.start..end, &edit.inserted);
-        (self.anchor, self.cursor) = edit.after;
-        self.undo.push(edit);
+        for edit in &edits {
+            let end = edit.start + edit.deleted.chars().count();
+            replace_chars(text, edit.start..end, &edit.inserted);
+        }
+        (self.anchor, self.cursor) = edits
+            .last()
+            .map_or((self.anchor, self.cursor), |edit| edit.after);
+        self.undo.push(edits);
         true
+    }
+
+    pub fn execute_command(
+        &mut self,
+        ctx: &egui::Context,
+        text: &mut String,
+        command: Command,
+        paste: Option<&str>,
+    ) -> bool {
+        let movement = |command| {
+            matches!(
+                command,
+                Command::EditorSelectLeft
+                    | Command::EditorSelectRight
+                    | Command::EditorSelectUp
+                    | Command::EditorSelectDown
+                    | Command::EditorSelectWordLeft
+                    | Command::EditorSelectWordRight
+                    | Command::EditorSelectLineStart
+                    | Command::EditorSelectLineEnd
+                    | Command::EditorSelectPageUp
+                    | Command::EditorSelectPageDown
+                    | Command::EditorSelectDocumentStart
+                    | Command::EditorSelectDocumentEnd
+            )
+        };
+        match command {
+            Command::EditorCopy => {
+                self.copy(ctx, text);
+                false
+            }
+            Command::EditorCut => {
+                self.copy(ctx, text);
+                self.replace_selection(text, "")
+            }
+            Command::EditorPaste => paste.is_some_and(|value| self.replace_selection(text, value)),
+            Command::EditorUndo => self.undo(text),
+            Command::EditorRedo => self.redo(text),
+            Command::EditorSelectAll => {
+                self.anchor = 0;
+                self.cursor = text.chars().count();
+                false
+            }
+            Command::EditorDeleteLeft => {
+                if self.selection().is_empty() && self.cursor > 0 {
+                    self.anchor = self.cursor - 1;
+                }
+                self.replace_selection(text, "")
+            }
+            Command::EditorDeleteRight => {
+                if self.selection().is_empty() && self.cursor < text.chars().count() {
+                    self.cursor += 1;
+                }
+                self.replace_selection(text, "")
+            }
+            Command::EditorInsertLineBreak => self.replace_selection(text, "\n"),
+            Command::EditorIndent => self.replace_selection(text, "    "),
+            Command::EditorOutdent => self.decrease_indent(text),
+            Command::EditorCursorLeft | Command::EditorSelectLeft => {
+                self.move_cursor(self.cursor.saturating_sub(1), movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorRight | Command::EditorSelectRight => {
+                self.move_cursor(
+                    (self.cursor + 1).min(text.chars().count()),
+                    movement(command),
+                );
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorWordLeft | Command::EditorSelectWordLeft => {
+                self.move_cursor(previous_word(text, self.cursor), movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorWordRight | Command::EditorSelectWordRight => {
+                self.move_cursor(next_word(text, self.cursor), movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorUp | Command::EditorSelectUp => {
+                self.move_vertical(-1, movement(command));
+                false
+            }
+            Command::EditorCursorDown | Command::EditorSelectDown => {
+                self.move_vertical(1, movement(command));
+                false
+            }
+            Command::EditorCursorLineStart | Command::EditorSelectLineStart => {
+                self.move_cursor(text_line_start(text, self.cursor), movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorLineEnd | Command::EditorSelectLineEnd => {
+                self.move_cursor(text_line_end(text, self.cursor), movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorPageUp | Command::EditorSelectPageUp => {
+                for _ in 0..20 {
+                    self.move_vertical(-1, movement(command));
+                }
+                false
+            }
+            Command::EditorCursorPageDown | Command::EditorSelectPageDown => {
+                for _ in 0..20 {
+                    self.move_vertical(1, movement(command));
+                }
+                false
+            }
+            Command::EditorCursorDocumentStart | Command::EditorSelectDocumentStart => {
+                self.move_cursor(0, movement(command));
+                self.h_pos = None;
+                false
+            }
+            Command::EditorCursorDocumentEnd | Command::EditorSelectDocumentEnd => {
+                self.move_cursor(text.chars().count(), movement(command));
+                self.h_pos = None;
+                false
+            }
+            _ => false,
+        }
     }
 
     pub fn show(
@@ -180,6 +351,9 @@ impl EditorSurface {
                 scroll_to_character,
                 id: Id::new("editor"),
                 line_markers: &[],
+                text_input: TextInputMode::Standard,
+                native_keybindings: true,
+                block_caret: false,
             },
         )
     }
@@ -197,6 +371,9 @@ impl EditorSurface {
             scroll_to_character,
             id: editor_id,
             line_markers,
+            text_input,
+            native_keybindings,
+            block_caret,
         } = options;
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
@@ -272,6 +449,7 @@ impl EditorSurface {
 
         let mut changed = false;
         let mut last_inserted = None;
+        let mut inserted_text = String::new();
         let cursor_before_events = self.cursor;
         if response.has_focus() {
             ui.memory_mut(|memory| {
@@ -285,7 +463,8 @@ impl EditorSurface {
                     },
                 );
             });
-            (changed, last_inserted) = self.handle_events(ui, text, editor_id);
+            (changed, last_inserted, inserted_text) =
+                self.handle_events(ui, text, editor_id, text_input, native_keybindings);
             if changed {
                 response.mark_changed();
                 ui.ctx().request_repaint();
@@ -309,16 +488,13 @@ impl EditorSurface {
             self.caret_blink_started = time;
         }
         self.caret_was_focused = focused;
-        let caret_visible = focused
-            && (((time - self.caret_blink_started).max(0.0) / CARET_BLINK_INTERVAL) as u64)
-                .is_multiple_of(2);
         if focused {
             let elapsed = (time - self.caret_blink_started).max(0.0);
             let until_next = CARET_BLINK_INTERVAL - elapsed.rem_euclid(CARET_BLINK_INTERVAL);
             ui.ctx()
                 .request_repaint_after(Duration::from_secs_f64(until_next));
         }
-        self.paint(ui, rect, content, focused, caret_visible, line_markers);
+        self.paint(ui, rect, content, focused, block_caret, line_markers);
         if focused {
             self.update_ime(ui, rect, content);
         }
@@ -345,6 +521,7 @@ impl EditorSurface {
                 .filter(|pointer| editor_rect.contains(*pointer))
                 .map(|pointer| self.character_at(pointer, content)),
             last_inserted,
+            inserted_text,
             scrolled: scrolling,
         }
     }
@@ -481,7 +658,7 @@ impl EditorSurface {
         rect: Rect,
         content: Rect,
         focused: bool,
-        caret_visible: bool,
+        block_caret: bool,
         line_markers: &[(usize, Color32)],
     ) {
         let painter = ui.painter_at(rect);
@@ -570,6 +747,10 @@ impl EditorSurface {
                 Color32::LIGHT_GRAY,
             );
         }
+        let caret_visible = focused
+            && (((ui.input(|input| input.time) - self.caret_blink_started).max(0.0)
+                / CARET_BLINK_INTERVAL) as u64)
+                .is_multiple_of(2);
         if caret_visible {
             mark_retained(
                 &painter,
@@ -578,43 +759,77 @@ impl EditorSurface {
                 self.cursor as u64 ^ u64::from(self.scroll_y.to_bits()) ^ horizontal_geometry,
             );
             if let Some(caret) = self.cursor_rect(content) {
-                painter.line_segment(
-                    [caret.left_top(), caret.left_bottom()],
-                    Stroke::new(1.5, ACCENT),
-                );
+                if block_caret {
+                    painter.rect_filled(
+                        Rect::from_min_size(caret.left_top(), egui::vec2(8.0, caret.height())),
+                        0.0,
+                        ACCENT.gamma_multiply(0.65),
+                    );
+                } else {
+                    painter.line_segment(
+                        [caret.left_top(), caret.left_bottom()],
+                        Stroke::new(1.5, ACCENT),
+                    );
+                }
             }
         }
     }
 
-    fn handle_events(&mut self, ui: &Ui, text: &mut String, editor_id: Id) -> (bool, Option<char>) {
+    fn handle_events(
+        &mut self,
+        ui: &Ui,
+        text: &mut String,
+        editor_id: Id,
+        text_input: TextInputMode,
+        native_keybindings: bool,
+    ) -> (bool, Option<char>, String) {
         let events = ui.input(|input| input.events.clone());
         let mut changed = false;
         let mut last_inserted = None;
+        let mut inserted_text = String::new();
         for event in events {
             match event {
-                Event::Copy => self.copy(ui, text),
-                Event::Cut => {
-                    self.copy(ui, text);
+                Event::Copy if text_input != TextInputMode::Disabled => self.copy(ui.ctx(), text),
+                Event::Cut if text_input != TextInputMode::Disabled => {
+                    self.copy(ui.ctx(), text);
                     changed |= self.replace_selection(text, "");
                 }
-                Event::Paste(value) | Event::Text(value) if !value.is_empty() => {
+                Event::Paste(value) | Event::Text(value)
+                    if text_input != TextInputMode::Disabled && !value.is_empty() =>
+                {
+                    if text_input == TextInputMode::Replace {
+                        let end = (self.cursor + value.chars().count())
+                            .min(text_line_end(text, self.cursor));
+                        self.set_selection(self.cursor, end);
+                    }
                     changed |= self.replace_selection(text, &value);
                     last_inserted = value.chars().last();
+                    inserted_text.push_str(&value);
                 }
                 Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } => changed |= self.handle_key(ui, text, key, modifiers, editor_id),
-                Event::Ime(egui::ImeEvent::Commit(value)) if !value.is_empty() => {
+                } if native_keybindings => {
+                    changed |= self.handle_key(ui, text, key, modifiers, editor_id);
+                }
+                Event::Ime(egui::ImeEvent::Commit(value))
+                    if text_input != TextInputMode::Disabled && !value.is_empty() =>
+                {
+                    if text_input == TextInputMode::Replace {
+                        let end = (self.cursor + value.chars().count())
+                            .min(text_line_end(text, self.cursor));
+                        self.set_selection(self.cursor, end);
+                    }
                     changed |= self.replace_selection(text, &value);
                     last_inserted = value.chars().last();
+                    inserted_text.push_str(&value);
                 }
                 _ => {}
             }
         }
-        (changed, last_inserted)
+        (changed, last_inserted, inserted_text)
     }
 
     fn handle_key(
@@ -625,78 +840,44 @@ impl EditorSurface {
         modifiers: Modifiers,
         editor_id: Id,
     ) -> bool {
-        if modifiers.command {
-            match key {
-                Key::A => {
-                    self.anchor = 0;
-                    self.cursor = text.chars().count();
-                    return false;
-                }
-                Key::Z if modifiers.shift => return self.redo(text),
-                Key::Z => return self.undo(text),
-                Key::Y => return self.redo(text),
-                _ => {}
+        let command = if modifiers.command {
+            match (key, modifiers.shift) {
+                (Key::A, _) => Some(Command::EditorSelectAll),
+                (Key::Z, true) => Some(Command::EditorRedo),
+                (Key::Z, false) => Some(Command::EditorUndo),
+                (Key::Y, _) => Some(Command::EditorRedo),
+                _ => None,
             }
+        } else {
+            match (key, modifiers.alt, modifiers.shift) {
+                (Key::Backspace, _, _) => Some(Command::EditorDeleteLeft),
+                (Key::Delete, _, _) => Some(Command::EditorDeleteRight),
+                (Key::Enter, _, _) => Some(Command::EditorInsertLineBreak),
+                (Key::Tab, _, true) => Some(Command::EditorOutdent),
+                (Key::Tab, _, false) => Some(Command::EditorIndent),
+                (Key::ArrowLeft, true, true) => Some(Command::EditorSelectWordLeft),
+                (Key::ArrowLeft, true, false) => Some(Command::EditorCursorWordLeft),
+                (Key::ArrowRight, true, true) => Some(Command::EditorSelectWordRight),
+                (Key::ArrowRight, true, false) => Some(Command::EditorCursorWordRight),
+                (Key::ArrowLeft, false, true) => Some(Command::EditorSelectLeft),
+                (Key::ArrowLeft, false, false) => Some(Command::EditorCursorLeft),
+                (Key::ArrowRight, false, true) => Some(Command::EditorSelectRight),
+                (Key::ArrowRight, false, false) => Some(Command::EditorCursorRight),
+                (Key::ArrowUp, _, true) => Some(Command::EditorSelectUp),
+                (Key::ArrowUp, _, false) => Some(Command::EditorCursorUp),
+                (Key::ArrowDown, _, true) => Some(Command::EditorSelectDown),
+                (Key::ArrowDown, _, false) => Some(Command::EditorCursorDown),
+                (Key::Home, _, true) => Some(Command::EditorSelectLineStart),
+                (Key::Home, _, false) => Some(Command::EditorCursorLineStart),
+                (Key::End, _, true) => Some(Command::EditorSelectLineEnd),
+                (Key::End, _, false) => Some(Command::EditorCursorLineEnd),
+                _ => None,
+            }
+        };
+        if let Some(command) = command {
+            return self.execute_command(ui.ctx(), text, command, None);
         }
         match key {
-            Key::Backspace => {
-                if self.selection().is_empty() && self.cursor > 0 {
-                    self.anchor = self.cursor - 1;
-                }
-                self.replace_selection(text, "")
-            }
-            Key::Delete => {
-                if self.selection().is_empty() && self.cursor < text.chars().count() {
-                    self.cursor += 1;
-                }
-                self.replace_selection(text, "")
-            }
-            Key::Enter => self.replace_selection(text, "\n"),
-            Key::Tab if modifiers.shift => self.decrease_indent(text),
-            Key::Tab => self.replace_selection(text, "    "),
-            Key::ArrowLeft => {
-                let next = if modifiers.alt {
-                    previous_word(text, self.cursor)
-                } else {
-                    self.cursor.saturating_sub(1)
-                };
-                self.move_cursor(next, modifiers.shift);
-                self.h_pos = None;
-                false
-            }
-            Key::ArrowRight => {
-                let next = if modifiers.alt {
-                    next_word(text, self.cursor)
-                } else {
-                    (self.cursor + 1).min(text.chars().count())
-                };
-                self.move_cursor(next, modifiers.shift);
-                self.h_pos = None;
-                false
-            }
-            Key::ArrowUp => {
-                self.move_vertical(-1, modifiers.shift);
-                false
-            }
-            Key::ArrowDown => {
-                self.move_vertical(1, modifiers.shift);
-                false
-            }
-            Key::Home => {
-                let line = self.line_for_character(self.cursor);
-                let start = self.lines.get(line).map_or(0, |line| line.char_start);
-                self.move_cursor(start, modifiers.shift);
-                false
-            }
-            Key::End => {
-                let line = self.line_for_character(self.cursor);
-                let end = self.lines.get(line).map_or_else(
-                    || text.chars().count(),
-                    |line| line.char_start + line.character_len,
-                );
-                self.move_cursor(end, modifiers.shift);
-                false
-            }
             Key::Escape => {
                 ui.memory_mut(|memory| memory.surrender_focus(editor_id));
                 false
@@ -721,10 +902,10 @@ impl EditorSurface {
         self.replace_selection(text, "")
     }
 
-    fn copy(&self, ui: &Ui, text: &str) {
+    fn copy(&self, ctx: &egui::Context, text: &str) {
         let selection = self.selection();
         if !selection.is_empty() {
-            ui.output_mut(|output| {
+            ctx.output_mut(|output| {
                 output.commands.push(OutputCommand::CopyText(
                     char_slice(text, selection).to_owned(),
                 ));
@@ -949,6 +1130,25 @@ fn line_count(text: &str) -> usize {
 fn gutter_width(lines: usize) -> f32 {
     let digits = lines.max(1).ilog10() + 1;
     (digits as f32 * 7.0 + 11.0).max(22.0)
+}
+
+fn text_line_start(text: &str, cursor: usize) -> usize {
+    text.chars()
+        .take(cursor)
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1)
+}
+
+fn text_line_end(text: &str, cursor: usize) -> usize {
+    let characters = text.chars().collect::<Vec<_>>();
+    characters[cursor.min(characters.len())..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(characters.len(), |offset| {
+            cursor.min(characters.len()) + offset
+        })
 }
 
 fn previous_word(text: &str, cursor: usize) -> usize {
@@ -1271,6 +1471,19 @@ mod tests {
             visible_again.shapes,
             visible_again.pixels_per_point,
         )));
+    }
+
+    #[test]
+    fn transaction_undoes_a_complete_insert_session_at_once() {
+        let mut editor = EditorSurface::default();
+        let mut text = String::new();
+        editor.begin_transaction();
+        assert!(editor.replace_selection(&mut text, "a"));
+        assert!(editor.replace_selection(&mut text, "b"));
+        editor.end_transaction();
+
+        assert!(editor.undo(&mut text));
+        assert_eq!(text, "");
     }
 
     #[test]

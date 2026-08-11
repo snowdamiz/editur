@@ -725,6 +725,35 @@ fn missing_sync_and_malformed_output_fail_only_the_controller() {
 }
 
 #[test]
+fn closing_the_last_document_clears_a_failed_server_status() {
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().join("main.rs");
+    std::fs::write(&path, "fn main() {}").unwrap();
+    let controller = Controller::start_process(
+        project.path().to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_editur-fake-lsp")),
+        vec!["--malformed".into()],
+        Arc::new(|| {}),
+    );
+    controller
+        .send(Command::Open(DocumentSnapshot {
+            path: path.clone(),
+            language_id: "rust".into(),
+            text: "fn main() {}".into(),
+            revision: 0,
+        }))
+        .unwrap();
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::ProcessExited { .. })
+    });
+
+    controller.send(Command::Close(path)).unwrap();
+    receive_until(&controller, Duration::from_secs(1), |event| {
+        matches!(event, Event::StateChanged(ServerStatus::Stopped))
+    });
+}
+
+#[test]
 fn old_versioned_diagnostics_are_dropped_but_new_versionless_results_are_current() {
     for (argument, expect_diagnostic) in [
         ("--stale-diagnostics", false),

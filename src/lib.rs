@@ -6,6 +6,7 @@ mod components;
 pub mod editor_surface;
 pub mod file_io;
 mod instance;
+pub mod keybindings;
 pub mod lsp;
 mod markdown;
 mod network;
@@ -19,6 +20,7 @@ mod theme;
 pub mod tree;
 pub mod tree_surface;
 pub mod update;
+pub mod vim;
 
 pub fn data_dir() -> Result<std::path::PathBuf, String> {
     directories::ProjectDirs::from("io", "editur", "Editur")

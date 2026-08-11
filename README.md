@@ -64,7 +64,168 @@ editur update
 
 The editor wraps long lines and scrolls vertically without a horizontal scrollbar. It preserves LF/CRLF line endings and file permissions. If the file changes externally, saving stops and offers Reload, Save As, or Cancel. Invalid UTF-8 and binary input are rejected.
 
-Core shortcuts follow platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle sidebar (`Cmd/Ctrl+B`), focus tree/editor (`Cmd/Ctrl+1/2`), and close (`Cmd/Ctrl+W`). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches; recursive indexing does not start until the first non-empty project query.
+Core shortcuts follow VS Code platform conventions: search the current file (`Cmd/Ctrl+F`), search project files and contents (`Cmd/Ctrl+Shift+F`), save (`Cmd/Ctrl+S`), toggle the sidebar (`Cmd/Ctrl+B`), focus editor panes (`Cmd/Ctrl+1` through `9`), and close the active editor (`Cmd+W` on macOS, `Ctrl+F4` on Windows, or `Ctrl+W` on Linux). In-file matches highlight live with Enter/Shift+Enter navigation. Project results are grouped into filename and content matches; recursive indexing does not start until the first non-empty project query.
+
+## Keyboard profiles
+
+Open Settings with the titlebar gear or `Cmd/Ctrl+,`; use `Cmd/Ctrl+K Cmd/Ctrl+S` to open Keybindings directly. The immutable VS Code and Vim profiles are always available. **Customize** derives an editable profile without copying the preset, while **New profile** can start from VS Code, Vim, or an empty Standard/Vim behavior. The command list searches labels, IDs, keys, and scopes and can add, change, remove, disable, replace conflicts, or reset bindings. The recorder accepts one-to-four-stroke logical chords and can opt a stroke into physical-key-position matching. Profile changes are saved atomically and do not change buffers or undo history.
+
+The VS Code profile includes only actions Editur implements; command palettes, multi-cursor editing, folding, refactoring, editor history, extension commands, and arbitrary `when` expressions are intentionally absent. Built-in terminal control keys fall through to the PTY; an explicit custom terminal/global rule can override one. Standard text fields retain printable and IME input, and `Ctrl+Alt` printable bindings require an explicit physical key so AltGr remains usable.
+
+The Vim profile is practical modal editing, not a Vim runtime. It supports Normal, Insert, Replace, Visual character/line, and Operator-pending modes; counts; basic, word, paragraph, file, and character-find motions; `d/c/y/>/<`; common text objects; `x/X/D/C/r/J/~/p/P`; grouped undo/redo and `.`, unnamed and `"+` registers, find reuse, `Ctrl+W` pane commands, and the safe Ex subset `:w`, `:q`, `:q!`, `:wq`, `:x`, `:e {path}`, `:noh`, and `:{line}`. Visual block, named registers, marks, macros, substitutions, shell commands, `.vimrc`, plugins, and recursive mappings are not supported.
+
+<details>
+<summary>Stable command IDs</summary>
+
+These IDs are persisted and are also searchable in Settings:
+
+```text
+Application
+application.closeWindow
+application.openKeyboardShortcuts
+application.openSettings
+application.toggleAgentSidebar
+application.toggleAgenticView
+
+Files and workbench
+file.closeActiveEditor
+file.focusLeftPane
+file.focusNextPane
+file.focusPane1 … file.focusPane9
+file.focusPreviousPane
+file.focusRightPane
+file.save
+file.saveAndClose
+file.splitEditor
+workbench.focusExplorer
+workbench.toggleMarkdownPreview
+workbench.toggleSidebar
+workbench.toggleTerminal
+
+Search and tree
+search.close
+search.findInFile
+search.findNext
+search.findPrevious
+search.searchProject
+tree.collapse
+tree.expand
+tree.moveDown
+tree.moveUp
+tree.open
+
+Editor
+editor.copy
+editor.cut
+editor.paste
+editor.undo
+editor.redo
+editor.selectAll
+editor.deleteLeft
+editor.deleteRight
+editor.insertLineBreak
+editor.indent
+editor.outdent
+editor.cursorLeft
+editor.cursorRight
+editor.cursorUp
+editor.cursorDown
+editor.cursorWordLeft
+editor.cursorWordRight
+editor.cursorLineStart
+editor.cursorLineEnd
+editor.cursorPageUp
+editor.cursorPageDown
+editor.cursorDocumentStart
+editor.cursorDocumentEnd
+editor.selectLeft
+editor.selectRight
+editor.selectUp
+editor.selectDown
+editor.selectWordLeft
+editor.selectWordRight
+editor.selectLineStart
+editor.selectLineEnd
+editor.selectPageUp
+editor.selectPageDown
+editor.selectDocumentStart
+editor.selectDocumentEnd
+editor.triggerSuggest
+editor.goToDefinition
+editor.nextDiagnostic
+editor.previousDiagnostic
+
+Vim modes and changes
+vim.mode.normal
+vim.mode.insert
+vim.mode.insertLineStart
+vim.mode.append
+vim.mode.appendLineEnd
+vim.mode.openAbove
+vim.mode.openBelow
+vim.mode.replace
+vim.mode.visualCharacter
+vim.mode.visualLine
+vim.change.deleteCharacter
+vim.change.deleteCharacterLeft
+vim.change.deleteToLineEnd
+vim.change.joinLines
+vim.change.putAfter
+vim.change.putBefore
+vim.change.replaceCharacter
+vim.change.substituteCharacter
+vim.change.substituteLine
+vim.change.toLineEnd
+vim.change.toggleCase
+
+Vim motions, operators, and text objects
+vim.motion.left
+vim.motion.right
+vim.motion.up
+vim.motion.down
+vim.motion.lineStart
+vim.motion.firstNonBlank
+vim.motion.lineEnd
+vim.motion.fileStart
+vim.motion.fileEnd
+vim.motion.wordForward
+vim.motion.bigWordForward
+vim.motion.wordEnd
+vim.motion.bigWordEnd
+vim.motion.wordBack
+vim.motion.bigWordBack
+vim.motion.paragraphBack
+vim.motion.paragraphForward
+vim.motion.findForward
+vim.motion.findBackward
+vim.motion.tillForward
+vim.motion.tillBackward
+vim.motion.repeatFind
+vim.motion.reverseFind
+vim.operator.delete
+vim.operator.change
+vim.operator.yank
+vim.operator.indent
+vim.operator.outdent
+vim.textObject.inner
+vim.textObject.around
+
+Vim history, search, register, Ex, and counts
+vim.history.undo
+vim.history.redo
+vim.history.repeat
+vim.search.forward
+vim.search.backward
+vim.search.next
+vim.search.previous
+vim.search.wordForward
+vim.search.wordBackward
+vim.register.system
+vim.ex.open
+vim.count.0 … vim.count.9
+```
+
+</details>
 
 `editur update` is intentionally terminal-only. It downloads the matching build from the continuous `release`, verifies its SHA-256 checksum, asks a clean resident editor to exit, and replaces the installation after verification. An update refuses to discard unsaved work. The install directory must be writable. CI release builds embed the update URL; local source builds can opt in by setting `EDITUR_UPDATE_BASE` to an HTTPS release directory at compile time or when running the command.
 
