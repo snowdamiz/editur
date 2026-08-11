@@ -604,30 +604,30 @@ fn managed_provider_namespaces_cannot_collide() {
 
 #[test]
 fn installed_package_becomes_an_exact_provider_owned_launch() {
-    let data = std::path::Path::new("/application-data");
+    let data = tempfile::tempdir().unwrap();
+    let root = provider_root(data.path(), ProviderId::Codex);
+    let command = root.join("versions/1.1.14/runtime/bin/node");
+    let entrypoint = root
+        .join("versions/1.1.14/package/dist/index.js")
+        .to_string_lossy()
+        .into_owned();
     let installed = InstalledSidecar {
-        command: "/application-data/agents/codex/versions/1.1.14/runtime/bin/node".into(),
-        args: vec!["/application-data/agents/codex/versions/1.1.14/package/dist/index.js".into()],
+        command: command.clone(),
+        args: vec![entrypoint.clone()],
         version: "1.1.14".into(),
     };
 
-    let prepared = prepare_installed(ProviderId::Codex, installed, data);
+    let prepared = prepare_installed(ProviderId::Codex, installed, data.path());
 
     assert_eq!(prepared.provider, ProviderId::Codex);
     assert_eq!(prepared.display_name, "Codex");
-    assert_eq!(
-        prepared.command,
-        std::path::Path::new("/application-data/agents/codex/versions/1.1.14/runtime/bin/node")
-    );
-    assert_eq!(
-        prepared.args,
-        ["/application-data/agents/codex/versions/1.1.14/package/dist/index.js"]
-    );
+    assert_eq!(prepared.command, command);
+    assert_eq!(prepared.args, [entrypoint]);
     assert_eq!(
         prepared.env,
         [(
             "NODE_COMPILE_CACHE".into(),
-            data.join("agents/codex/cache").into_os_string()
+            root.join("cache").into_os_string()
         )]
     );
     assert_eq!(
@@ -662,26 +662,29 @@ fn cursor_launch_keeps_its_existing_identity_and_auto_update_arguments() {
 
 #[test]
 fn claude_launch_uses_provider_owned_auth_and_strips_runtime_overrides() {
-    let data = std::path::Path::new("/application-data");
+    let data = tempfile::tempdir().unwrap();
+    let root = provider_root(data.path(), ProviderId::Claude);
+    let command = root.join("versions/0.66.0/runtime/bin/node");
+    let entrypoint = root
+        .join("versions/0.66.0/package/dist/index.js")
+        .to_string_lossy()
+        .into_owned();
     let installed = InstalledSidecar {
-        command: "/application-data/agents/claude/versions/0.66.0/runtime/bin/node".into(),
-        args: vec!["/application-data/agents/claude/versions/0.66.0/package/dist/index.js".into()],
+        command: command.clone(),
+        args: vec![entrypoint.clone()],
         version: "0.66.0".into(),
     };
 
-    let prepared = prepare_installed(ProviderId::Claude, installed, data);
+    let prepared = prepare_installed(ProviderId::Claude, installed, data.path());
 
     assert_eq!(prepared.display_name, "Claude");
-    assert_eq!(
-        prepared.args,
-        ["/application-data/agents/claude/versions/0.66.0/package/dist/index.js"]
-    );
+    assert_eq!(prepared.args, [entrypoint]);
     assert!(!prepared.remove_env.contains(&"ANTHROPIC_API_KEY"));
     assert_eq!(
         prepared.env,
         [(
             "NODE_COMPILE_CACHE".into(),
-            data.join("agents/claude/cache").into_os_string()
+            root.join("cache").into_os_string()
         )]
     );
     assert_eq!(
