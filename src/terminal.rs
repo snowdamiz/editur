@@ -12,13 +12,10 @@ use egui::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::app::{
-    DropZone, PANE_FOCUS_BORDER, PaneId, PaneLayout, SplitAxis, TabDrop, resize_divider_stroke,
-    stable_tab_drop_zone, tab_drop_preview,
+    DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, resize_divider_stroke, stable_tab_drop_zone,
+    tab_drop_preview,
 };
-use crate::theme::{
-    ACCENT, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT,
-    SURFACE_SELECTED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-};
+use crate::theme;
 
 const HEADER_HEIGHT: f32 = 30.0;
 const TAB_WIDTH: f32 = 154.0;
@@ -118,7 +115,7 @@ impl TerminalPanel {
         rect: egui::Rect,
         root: &Path,
     ) -> TerminalOutput {
-        ui.painter().rect_filled(rect, 0.0, CANVAS);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         let mut error = None;
         let mut panes = self.pane_layout.rects(rect);
         if self.update_tab_drag(ui.ctx(), rect, &panes) {
@@ -159,12 +156,12 @@ impl TerminalPanel {
             ui.painter().vline(
                 pane_rect.right() - 0.5,
                 pane_rect.y_range(),
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
             ui.painter().hline(
                 pane_rect.x_range(),
                 pane_rect.bottom() - 0.5,
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
         }
         if let Some(index) = clicked {
@@ -176,22 +173,19 @@ impl TerminalPanel {
             ui.painter().rect_stroke(
                 *pane,
                 0.0,
-                egui::Stroke::new(1.0, PANE_FOCUS_BORDER),
+                egui::Stroke::new(1.0, theme::border::focus_color()),
                 egui::StrokeKind::Inside,
             );
         }
         self.draw_split_handles(ui, rect);
         if let Some(drop) = self.tab_drop {
             let preview = drop.preview.shrink(4.0);
-            ui.painter().rect_filled(
-                preview,
-                5.0,
-                Color32::from_rgba_unmultiplied(74, 197, 225, 42),
-            );
+            ui.painter()
+                .rect_filled(preview, 5.0, theme::subtle(theme::accent()));
             ui.painter().rect_stroke(
                 preview,
                 5.0,
-                egui::Stroke::new(1.5, ACCENT),
+                egui::Stroke::new(1.5, theme::accent()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -217,11 +211,11 @@ impl TerminalPanel {
         root: &Path,
         error: &mut Option<String>,
     ) {
-        ui.painter().rect_filled(rect, 0.0, SURFACE);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         ui.painter().hline(
             rect.x_range(),
             rect.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         let active = self.pane_active_tabs.get(&pane).copied();
         let tabs = self
@@ -263,11 +257,11 @@ impl TerminalPanel {
                             tab,
                             0.0,
                             if dragging {
-                                SURFACE_SELECTED
+                                theme::state::selected()
                             } else if selected {
-                                SURFACE_INPUT
+                                theme::surface().input
                             } else {
-                                SURFACE_HOVER
+                                theme::state::hover()
                             },
                         );
                     }
@@ -275,7 +269,7 @@ impl TerminalPanel {
                         ui.painter().hline(
                             tab.x_range(),
                             tab.bottom() - 1.0,
-                            egui::Stroke::new(2.0, ACCENT),
+                            egui::Stroke::new(2.0, theme::accent()),
                         );
                     }
                     let close_rect = egui::Rect::from_center_size(
@@ -286,8 +280,12 @@ impl TerminalPanel {
                         egui::pos2(tab.left() + 12.0, tab.center().y),
                         Align2::LEFT_CENTER,
                         title,
-                        FontId::proportional(12.0),
-                        if selected { TEXT_PRIMARY } else { TEXT_MUTED },
+                        theme::typography::small(),
+                        if selected {
+                            theme::text().primary
+                        } else {
+                            theme::text().muted
+                        },
                     );
                     let close_response = ui
                         .interact(
@@ -301,11 +299,11 @@ impl TerminalPanel {
                             close_rect.center(),
                             Align2::CENTER_CENTER,
                             "×",
-                            FontId::proportional(14.0),
+                            theme::typography::body(),
                             if close_response.hovered() {
-                                TEXT_PRIMARY
+                                theme::text().primary
                             } else {
-                                TEXT_SECONDARY
+                                theme::text().secondary
                             },
                         );
                     }
@@ -338,8 +336,12 @@ impl TerminalPanel {
                 if ui
                     .add_sized(
                         egui::vec2(32.0, rect.height()),
-                        egui::Button::new(RichText::new("+").size(16.0).color(TEXT_SECONDARY))
-                            .frame(false),
+                        egui::Button::new(
+                            RichText::new("+")
+                                .size(theme::typography::TITLE_SIZE)
+                                .color(theme::text().secondary),
+                        )
+                        .frame(false),
                     )
                     .on_hover_text("New Terminal")
                     .clicked()
@@ -724,7 +726,7 @@ impl TerminalSession {
         let font = FontId::monospace(FONT_SIZE);
         let cell_width = ui.fonts_mut(|fonts| {
             fonts
-                .layout_no_wrap("M".into(), font.clone(), TEXT_PRIMARY)
+                .layout_no_wrap("M".into(), font.clone(), theme::text().primary)
                 .size()
                 .x
         });
@@ -786,26 +788,27 @@ impl TerminalSession {
         let cursor =
             (screen.scrollback() == 0 && !screen.hide_cursor()).then(|| screen.cursor_position());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, CANVAS);
+        painter.rect_filled(rect, 0.0, theme::surface().editor);
         for row in 0..rows {
             let mut job = LayoutJob::default();
             job.wrap.max_width = f32::INFINITY;
             for col in 0..cols {
                 let cell = screen.cell(row, col);
-                let mut foreground =
-                    cell.map_or(TEXT_PRIMARY, |cell| terminal_color(cell.fgcolor(), true));
+                let mut foreground = cell.map_or(theme::text().primary, |cell| {
+                    terminal_color(cell.fgcolor(), true)
+                });
                 let mut background = cell.map_or(Color32::TRANSPARENT, |cell| {
                     terminal_color(cell.bgcolor(), false)
                 });
                 if cell.is_some_and(vt100::Cell::inverse) {
                     std::mem::swap(&mut foreground, &mut background);
                     if foreground == Color32::TRANSPARENT {
-                        foreground = CANVAS;
+                        foreground = theme::surface().editor;
                     }
                 }
                 if cursor == Some((row, col)) {
-                    foreground = CANVAS;
-                    background = ACCENT;
+                    foreground = theme::surface().editor;
+                    background = theme::accent();
                 }
                 let mut format = TextFormat {
                     font_id: font.clone(),
@@ -833,7 +836,7 @@ impl TerminalSession {
                     rect.top() + CONTENT_PADDING + row as f32 * LINE_HEIGHT,
                 ),
                 galley,
-                TEXT_PRIMARY,
+                theme::text().primary,
             );
         }
         Ok(response.clicked())
@@ -980,47 +983,25 @@ fn terminal_color(color: vt100::Color, foreground: bool) -> Color32 {
     match color {
         vt100::Color::Default => {
             if foreground {
-                TEXT_PRIMARY
+                theme::text().primary
             } else {
                 Color32::TRANSPARENT
             }
         }
-        vt100::Color::Rgb(red, green, blue) => Color32::from_rgb(red, green, blue),
-        vt100::Color::Idx(index @ 0..=15) => ANSI_COLORS[index as usize],
+        vt100::Color::Rgb(red, green, blue) => theme::color::literal(red, green, blue),
+        vt100::Color::Idx(index @ 0..=15) => theme::color::ansi()[index as usize],
         vt100::Color::Idx(index @ 16..=231) => {
             let index = index - 16;
             let component = |value| if value == 0 { 0 } else { value * 40 + 55 };
-            Color32::from_rgb(
+            theme::color::literal(
                 component(index / 36),
                 component((index / 6) % 6),
                 component(index % 6),
             )
         }
-        vt100::Color::Idx(index) => {
-            let gray = 8 + (index - 232) * 10;
-            Color32::from_gray(gray)
-        }
+        vt100::Color::Idx(index) => theme::color::literal_gray(8 + (index - 232) * 10),
     }
 }
-
-const ANSI_COLORS: [Color32; 16] = [
-    Color32::from_rgb(30, 32, 36),
-    Color32::from_rgb(224, 82, 82),
-    Color32::from_rgb(105, 190, 112),
-    Color32::from_rgb(224, 188, 87),
-    Color32::from_rgb(91, 155, 213),
-    Color32::from_rgb(190, 112, 198),
-    Color32::from_rgb(86, 190, 190),
-    Color32::from_rgb(205, 208, 214),
-    Color32::from_rgb(103, 110, 122),
-    Color32::from_rgb(240, 112, 112),
-    Color32::from_rgb(135, 214, 141),
-    Color32::from_rgb(241, 211, 119),
-    Color32::from_rgb(119, 177, 231),
-    Color32::from_rgb(211, 143, 218),
-    Color32::from_rgb(113, 211, 211),
-    Color32::from_rgb(245, 246, 248),
-];
 
 #[cfg(test)]
 mod tests {
@@ -1033,14 +1014,15 @@ mod tests {
     use egui::{Key, Modifiers};
     use portable_pty::CommandBuilder;
 
-    use crate::app::{DropZone, PANE_FOCUS_BORDER, PaneId};
+    use crate::app::{DropZone, PaneId};
+    use crate::theme;
 
     use super::{TerminalPanel, TerminalSession, key_sequence};
 
     #[cfg(unix)]
     #[test]
     fn terminal_tabs_can_be_reordered() {
-        let ctx = egui::Context::default();
+        let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
         panel.add(Path::new("."), &ctx).unwrap();
         panel.add(Path::new("."), &ctx).unwrap();
@@ -1061,7 +1043,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_tabs_can_split_into_panes() {
-        let ctx = egui::Context::default();
+        let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
         panel.add(Path::new("."), &ctx).unwrap();
         panel.add(Path::new("."), &ctx).unwrap();
@@ -1084,7 +1066,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_tab_can_be_inserted_between_two_existing_panes() {
-        let ctx = egui::Context::default();
+        let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
         panel.add(Path::new("."), &ctx).unwrap();
         panel.add(Path::new("."), &ctx).unwrap();
@@ -1114,7 +1096,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn selected_terminal_pane_draws_the_editor_focus_outline() {
-        let ctx = egui::Context::default();
+        let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
         panel.add(Path::new("."), &ctx).unwrap();
         panel.add(Path::new("."), &ctx).unwrap();
@@ -1136,7 +1118,7 @@ mod tests {
         assert!(output.shapes.iter().any(|shape| {
             matches!(
                 &shape.shape,
-                egui::Shape::Rect(rect) if rect.stroke.color == PANE_FOCUS_BORDER
+                egui::Shape::Rect(rect) if rect.stroke.color == theme::border::focus_color()
             )
         }));
     }
@@ -1144,7 +1126,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn closing_a_panes_last_terminal_collapses_the_pane() {
-        let ctx = egui::Context::default();
+        let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
         panel.add(Path::new("."), &ctx).unwrap();
         panel.add(Path::new("."), &ctx).unwrap();
@@ -1221,7 +1203,7 @@ mod tests {
             "Terminal 1".into(),
             PaneId(0),
             CommandBuilder::new("/bin/sh"),
-            &egui::Context::default(),
+            &theme::test_context(),
         )
         .unwrap();
         session

@@ -100,7 +100,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
-    window::{Icon, Window, WindowId},
+    window::{Icon as WindowIcon, Window, WindowId},
 };
 
 use crate::{
@@ -119,17 +119,19 @@ use crate::{
     },
     buffer::{Buffer, LARGE_FILE_BYTES},
     components::{
-        begin_dialog, chevron_icon_button, close_icon_button, dialog_actions, dialog_button,
-        dialog_frame, dialog_window, icon_button, selectable_content_row, selectable_row,
+        chevron_icon_button, chip, close_icon_button, icon_button, popover_frame, segment,
+        selectable_content_row, selectable_row,
     },
     data_dir,
+    dialog::{Dialog, Outcome, Severity},
     editor_surface::{
-        DocumentMetrics, EDITOR_BACKGROUND, EditorShowOptions, EditorSurface, TextInputMode,
+        DocumentMetrics, EditorShowOptions, EditorSurface, TextInputMode, editor_background,
     },
     file_io::{
         OpenTarget, ReconcileOutcome, SaveError, load_buffer, reconcile_buffer, resolve_target,
         safe_save,
     },
+    icons::{self, Icon},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
     keybindings::{
         BUILTIN_VIM, BUILTIN_VSCODE, Behavior as KeybindingBehavior, BindingRule, BindingSource,
@@ -145,14 +147,13 @@ use crate::{
     markdown,
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
-    settings::{self, ServerMode, ServerOverride, Settings},
+    settings::{
+        self, DensityPreference, LineHeightPreference, ServerMode, ServerOverride, Settings,
+        ThemePreference,
+    },
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
     terminal::TerminalPanel,
-    theme::{
-        self, ACCENT, ACCENT_INK, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER,
-        SURFACE_INPUT, SURFACE_RAISED, SURFACE_SELECTED, TEXT_DISABLED, TEXT_MUTED, TEXT_PRIMARY,
-        TEXT_SECONDARY,
-    },
+    theme,
     tree::{TreeEntry, read_directory},
     tree_surface::{TreeRow, TreeSurface},
     vim::{
@@ -177,9 +178,17 @@ enum WindowAction {
     Drag,
 }
 
-const TITLEBAR_HEIGHT: f32 = 34.0;
-const TAB_WIDTH: f32 = 176.0;
-const FIND_BAR_HEIGHT: f32 = 38.0;
+const TITLEBAR_HEIGHT: f32 = theme::chrome::TITLEBAR;
+/// A tab is as wide as its own label needs, inside a range that keeps a strip
+/// of them scannable: never so narrow that the close control crowds the name,
+/// never so wide that one long filename pushes its neighbours off screen.
+const TAB_MIN_WIDTH: f32 = 120.0;
+const TAB_MAX_WIDTH: f32 = 240.0;
+const TAB_CLOSE: f32 = 20.0;
+/// The leading slot the unsaved dot occupies, so the label sits in the same
+/// place whether the buffer is dirty or clean.
+const TAB_DOT: f32 = 12.0;
+const FIND_BAR_HEIGHT: f32 = theme::chrome::FIND;
 
 fn key_character(key: Key, modifiers: egui::Modifiers) -> Option<char> {
     if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
@@ -313,16 +322,18 @@ fn primary_modifiers() -> egui::Modifiers {
         }
     }
 }
-pub(crate) const PANE_FOCUS_BORDER: Color32 = Color32::from_rgb(75, 101, 128);
-
 pub(crate) fn resize_divider_stroke(ctx: &egui::Context, active: bool) -> egui::Stroke {
     egui::Stroke::new(
         ctx.input(|input| input.physical_pixel_size()),
-        if active { ACCENT } else { BORDER_STRONG },
+        if active {
+            theme::accent()
+        } else {
+            theme::border::strong_color()
+        },
     )
 }
 
-const WINDOW_CORNER_RADIUS: u8 = 10;
+const WINDOW_CORNER_RADIUS: u8 = theme::radius::WINDOW;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
@@ -347,7 +358,7 @@ const SIDEBAR_MIN_WIDTH: f32 = if cfg!(target_os = "macos") {
 } else {
     120.0
 };
-const PANE_TAB_HEIGHT: f32 = 30.0;
+const PANE_TAB_HEIGHT: f32 = theme::chrome::HEADER;
 const PANE_DIVIDER_HIT_WIDTH: f32 = 8.0;
 const MIN_EDITOR_PANE_WIDTH: f32 = 200.0;
 const MIN_EDITOR_PANE_HEIGHT: f32 = 200.0;
@@ -737,21 +748,28 @@ fn tool_contains_diff(tool: &crate::agent::controller::ToolActivity) -> bool {
 
 fn agent_tool_status(status: Option<&str>) -> (&'static str, Color32) {
     match status.unwrap_or_default() {
-        "Completed" => ("Completed", Color32::from_rgb(105, 210, 157)),
-        "InProgress" | "Pending" => ("Running", ACCENT),
-        "Failed" => ("Failed", Color32::from_rgb(238, 132, 139)),
-        _ => ("", TEXT_MUTED),
+        "Completed" => ("Completed", theme::ink(theme::semantic().success)),
+        "InProgress" | "Pending" => ("Running", theme::accent()),
+        "Failed" => ("Failed", theme::ink(theme::semantic().danger)),
+        _ => ("", theme::text().muted),
     }
 }
 
 fn paint_agent_disclosure(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
     let center = response.rect.center() + egui::vec2(0.0, 1.0);
-    let rotation = egui::emath::Rot2::from_angle(openness * std::f32::consts::FRAC_PI_2);
-    let tip = center + rotation * egui::vec2(2.0, 0.0);
-    let stroke = egui::Stroke::new(1.5, ui.style().interact(response).fg_stroke.color);
-    for point in [egui::vec2(-2.0, -3.5), egui::vec2(-2.0, 3.5)] {
-        ui.painter()
-            .line_segment([center + rotation * point, tip], stroke);
+    let box_rect = egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID * 0.75));
+    let color = ui.style().interact(response).fg_stroke.color;
+    let shapes = icons::shapes(
+        if openness > 0.5 {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        },
+        box_rect,
+        color,
+    );
+    for shape in shapes {
+        ui.painter().add(shape);
     }
 }
 
@@ -832,12 +850,12 @@ fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(17.0, 20.0), Sense::hover());
-        paint_provider_icon(ui.painter(), rect, provider.icon, TEXT_PRIMARY);
+        paint_provider_icon(ui.painter(), rect, provider.icon, theme::text().primary);
         ui.label(
             RichText::new(provider.display_name)
-                .size(13.0)
+                .size(theme::typography::BODY_SIZE)
                 .strong()
-                .color(TEXT_PRIMARY),
+                .color(theme::text().primary),
         );
     });
     ui.add_space(5.0);
@@ -852,13 +870,13 @@ fn draw_provider_selector_identity(
     let response = ui
         .add_enabled_ui(enabled, |ui| {
             let text_color = if ui.is_enabled() {
-                TEXT_PRIMARY
+                theme::text().primary
             } else {
-                TEXT_DISABLED
+                theme::text_disabled()
             };
             let galley = ui.painter().layout_no_wrap(
                 provider.display_name.to_owned(),
-                FontId::proportional(13.0),
+                theme::typography::body(),
                 text_color,
             );
             let (rect, response) =
@@ -868,9 +886,9 @@ fn draw_provider_selector_identity(
                     rect.expand2(egui::vec2(4.0, 2.0)),
                     5.0,
                     if response.is_pointer_button_down_on() {
-                        SURFACE_SELECTED
+                        theme::state::selected()
                     } else {
-                        SURFACE_HOVER
+                        theme::state::hover()
                     },
                 );
             }
@@ -882,12 +900,15 @@ fn draw_provider_selector_identity(
             let text_pos = egui::pos2(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5);
             let text_right = text_pos.x + galley.size().x;
             ui.painter().galley(text_pos, galley, text_color);
-            let tip = egui::pos2(text_right + 14.0, rect.center().y + 1.5);
-            let stroke = egui::Stroke::new(1.5, text_color);
-            ui.painter()
-                .line_segment([tip + egui::vec2(-4.0, -3.5), tip], stroke);
-            ui.painter()
-                .line_segment([tip, tip + egui::vec2(4.0, -3.5)], stroke);
+            icons::paint(
+                ui.painter(),
+                Icon::ChevronDown,
+                egui::Rect::from_center_size(
+                    egui::pos2(text_right + 14.0, rect.center().y),
+                    egui::Vec2::splat(icons::GRID),
+                ),
+                text_color,
+            );
             response
         })
         .inner;
@@ -985,8 +1006,8 @@ fn append_agent_syntax_line(
             fallback,
             0.0,
             TextFormat {
-                font_id: FontId::monospace(12.0),
-                color: TEXT_SECONDARY,
+                font_id: theme::typography::code_small(),
+                color: theme::text().secondary,
                 ..TextFormat::default()
             },
         );
@@ -1102,9 +1123,13 @@ fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui:
                 |ui| {
                     ui.set_width(width);
                     ui.add(
-                        Label::new(RichText::new(title).size(13.5).color(TEXT_PRIMARY))
-                            .truncate()
-                            .sense(Sense::click()),
+                        Label::new(
+                            RichText::new(title)
+                                .size(theme::typography::BODY_SIZE)
+                                .color(theme::text().primary),
+                        )
+                        .truncate()
+                        .sense(Sense::click()),
                     )
                 },
             )
@@ -1115,18 +1140,18 @@ fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui:
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), title)
     });
-    let font = FontId::proportional(13.5);
-    let action = ui
-        .painter()
-        .layout_no_wrap(format!("{action} "), font.clone(), TEXT_PRIMARY);
+    let font = theme::typography::body();
+    let action =
+        ui.painter()
+            .layout_no_wrap(format!("{action} "), font.clone(), theme::text().primary);
     let path = ui
         .painter()
-        .layout_no_wrap(path.to_owned(), font, TEXT_PRIMARY);
+        .layout_no_wrap(path.to_owned(), font, theme::text().primary);
     let y = rect.center().y - action.size().y * 0.5;
     ui.painter().with_clip_rect(rect).galley(
         egui::pos2(rect.left(), y),
         action.clone(),
-        TEXT_PRIMARY,
+        theme::text().primary,
     );
     let path_left = (rect.left() + action.size().x).min(rect.right());
     let path_rect =
@@ -1154,15 +1179,15 @@ fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui:
         ui.painter().with_clip_rect(path_rect).galley(
             egui::pos2(path_rect.left() - offset, y),
             path,
-            TEXT_PRIMARY,
+            theme::text().primary,
         );
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     } else {
         ui.data_mut(|data| data.remove::<f64>(animation_id));
         let path = egui::WidgetText::from(
             RichText::new(path.text())
-                .font(FontId::proportional(13.5))
-                .color(TEXT_PRIMARY),
+                .font(theme::typography::body())
+                .color(theme::text().primary),
         )
         .into_galley(
             ui,
@@ -1173,7 +1198,7 @@ fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui:
         ui.painter().with_clip_rect(path_rect).galley(
             egui::pos2(path_rect.left(), y),
             path,
-            TEXT_PRIMARY,
+            theme::text().primary,
         );
     }
     response
@@ -1201,8 +1226,8 @@ fn agent_collapsing_header(
         .filter(|title| !title.is_empty())
         .unwrap_or("Tool activity");
     let frame = egui::Frame::new()
-        .fill(SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+        .fill(theme::surface().raised)
+        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
         .corner_radius(5);
     let content_width = (width - frame.total_margin().sum().x).max(0.0);
     frame.show(ui, |ui| {
@@ -1251,27 +1276,23 @@ fn agent_collapsing_header(
                                 label,
                             )
                         });
-                        let center = rect.center();
-                        let stroke = egui::Stroke::new(1.3, color);
-                        ui.painter().circle_stroke(center, 7.0, stroke);
-                        ui.painter().line_segment(
-                            [
-                                center + egui::vec2(-3.0, 0.0),
-                                center + egui::vec2(-1.0, 2.0),
-                            ],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [
-                                center + egui::vec2(-1.0, 2.0),
-                                center + egui::vec2(3.5, -2.5),
-                            ],
-                            stroke,
+                        icons::paint(
+                            ui.painter(),
+                            Icon::CheckCircle,
+                            egui::Rect::from_center_size(
+                                rect.center(),
+                                egui::Vec2::splat(icons::GRID),
+                            ),
+                            color,
                         );
                     } else if !label.is_empty() {
                         ui.add_sized(
                             egui::vec2(status_width, 24.0),
-                            Label::new(RichText::new(label).size(11.5).color(color)),
+                            Label::new(
+                                RichText::new(label)
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(color),
+                            ),
                         );
                     }
                 });
@@ -1281,7 +1302,7 @@ fn agent_collapsing_header(
             ui.painter().hline(
                 ui.available_rect_before_wrap().x_range(),
                 ui.cursor().top(),
-                egui::Stroke::new(1.0, BORDER_SUBTLE),
+                egui::Stroke::new(1.0, theme::border::hairline_color()),
             );
             if default_open {
                 add_body(ui);
@@ -1332,159 +1353,170 @@ fn draw_agent_diff(
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
     ui.set_width(ui.available_width());
-    egui::Frame::new().fill(SURFACE_INPUT).show(ui, |ui| {
-        egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(file_name.as_ref())
-                            .size(13.5)
-                            .strong()
-                            .color(TEXT_PRIMARY),
-                    )
-                    .on_hover_text(path.display().to_string());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    egui::Frame::new()
+        .fill(theme::surface().input)
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("+{}  −{}", diff.added, diff.removed))
-                                .monospace()
-                                .size(11.5)
-                                .color(TEXT_MUTED),
-                        );
-                        ui.label(
-                            RichText::new(if old_text.is_some() {
-                                "MODIFIED"
-                            } else {
-                                "NEW FILE"
-                            })
-                            .size(10.5)
-                            .strong()
-                            .color(ACCENT),
-                        );
-                    });
-                });
-            });
-        ui.painter().hline(
-            ui.available_rect_before_wrap().x_range(),
-            ui.cursor().top(),
-            egui::Stroke::new(1.0, BORDER_STRONG),
-        );
-        let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
-        let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
-        let longest = lines
-            .iter()
-            .map(|line| line.text.chars().count())
-            .max()
-            .unwrap_or(0);
-        let content_width = ui.available_width();
-        let desired_width =
-            content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
-        ScrollArea::horizontal()
-            .id_salt(id)
-            .max_width(content_width)
-            .auto_shrink([false, true])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| {
-                ui.set_width(desired_width);
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for line in lines {
-                    let fill = match line.kind {
-                        AgentDiffKind::Added => Color32::from_rgb(24, 48, 38),
-                        AgentDiffKind::Removed => Color32::from_rgb(55, 31, 37),
-                        AgentDiffKind::Omitted => SURFACE_RAISED,
-                        AgentDiffKind::Context => Color32::TRANSPARENT,
-                    };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(9, 3))
-                        .show(ui, |ui| {
-                            ui.set_min_width(desired_width - 18.0);
-                            if line.kind == AgentDiffKind::Omitted {
-                                ui.label(
-                                    RichText::new(format!("⋯  {} lines hidden", line.omitted))
-                                        .monospace()
-                                        .size(11.5)
-                                        .color(TEXT_MUTED),
-                                );
-                                return;
-                            }
-                            let old_number = line.old_number.map_or_else(
-                                || " ".repeat(old_digits),
-                                |number| format!("{number:>old_digits$}"),
+                            RichText::new(file_name.as_ref())
+                                .size(theme::typography::BODY_SIZE)
+                                .strong()
+                                .color(theme::text().primary),
+                        )
+                        .on_hover_text(path.display().to_string());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("+{}  −{}", diff.added, diff.removed))
+                                    .monospace()
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(theme::text().muted),
                             );
-                            let new_number = line.new_number.map_or_else(
-                                || " ".repeat(new_digits),
-                                |number| format!("{number:>new_digits$}"),
-                            );
-                            let (sign, color) = match line.kind {
-                                AgentDiffKind::Added => ("+", Color32::from_rgb(143, 224, 177)),
-                                AgentDiffKind::Removed => ("−", Color32::from_rgb(239, 157, 164)),
-                                AgentDiffKind::Context => (" ", TEXT_SECONDARY),
-                                AgentDiffKind::Omitted => unreachable!(),
-                            };
-                            let mut job = LayoutJob::default();
-                            job.append(
-                                &format!("{old_number} {new_number}  "),
-                                0.0,
-                                TextFormat {
-                                    font_id: FontId::monospace(12.0),
-                                    color: TEXT_DISABLED,
-                                    ..TextFormat::default()
-                                },
-                            );
-                            job.append(
-                                &format!("{sign} "),
-                                0.0,
-                                TextFormat {
-                                    font_id: FontId::monospace(12.0),
-                                    color,
-                                    ..TextFormat::default()
-                                },
-                            );
-                            let highlighted = match line.kind {
-                                AgentDiffKind::Removed => old_syntax.as_deref(),
-                                AgentDiffKind::Added | AgentDiffKind::Context => Some(&*new_syntax),
-                                AgentDiffKind::Omitted => unreachable!(),
-                            };
-                            let line_number = match line.kind {
-                                AgentDiffKind::Removed => line.old_number,
-                                AgentDiffKind::Added | AgentDiffKind::Context => line.new_number,
-                                AgentDiffKind::Omitted => None,
-                            };
-                            if let (Some(highlighted), Some(line_number)) =
-                                (highlighted, line_number)
-                            {
-                                append_agent_syntax_line(
-                                    &mut job,
-                                    highlighted,
-                                    line_number,
-                                    &line.text,
-                                );
-                            }
-                            ui.add(
-                                Label::new(job)
-                                    .wrap_mode(egui::TextWrapMode::Extend)
-                                    .selectable(true),
+                            ui.label(
+                                RichText::new(if old_text.is_some() {
+                                    "MODIFIED"
+                                } else {
+                                    "NEW FILE"
+                                })
+                                .size(theme::typography::MICRO_SIZE)
+                                .strong()
+                                .color(theme::accent()),
                             );
                         });
-                }
-            });
-        if can_toggle {
-            let label = if expanded {
-                "Collapse diff".to_owned()
-            } else {
-                format!("Show all {} lines", diff.lines.len())
-            };
-            let toggle = ui.add_sized(
-                egui::vec2(ui.available_width(), 40.0),
-                egui::Button::new(RichText::new(label).size(11.5).color(ACCENT)).frame(false),
+                    });
+                });
+            ui.painter().hline(
+                ui.available_rect_before_wrap().x_range(),
+                ui.cursor().top(),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
-            if toggle.clicked() {
-                ui.data_mut(|data| data.insert_temp(expanded_id, !expanded));
-                ui.ctx().request_repaint();
+            let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
+            let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
+            let longest = lines
+                .iter()
+                .map(|line| line.text.chars().count())
+                .max()
+                .unwrap_or(0);
+            let content_width = ui.available_width();
+            let desired_width =
+                content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
+            ScrollArea::horizontal()
+                .id_salt(id)
+                .max_width(content_width)
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    ui.set_width(desired_width);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for line in lines {
+                        let fill = match line.kind {
+                            AgentDiffKind::Added => theme::diff::added(),
+                            AgentDiffKind::Removed => theme::diff::removed(),
+                            AgentDiffKind::Omitted => theme::surface().raised,
+                            AgentDiffKind::Context => Color32::TRANSPARENT,
+                        };
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                ui.set_min_width(desired_width - 18.0);
+                                if line.kind == AgentDiffKind::Omitted {
+                                    ui.label(
+                                        RichText::new(format!("⋯  {} lines hidden", line.omitted))
+                                            .monospace()
+                                            .size(theme::typography::MICRO_SIZE)
+                                            .color(theme::text().muted),
+                                    );
+                                    return;
+                                }
+                                let old_number = line.old_number.map_or_else(
+                                    || " ".repeat(old_digits),
+                                    |number| format!("{number:>old_digits$}"),
+                                );
+                                let new_number = line.new_number.map_or_else(
+                                    || " ".repeat(new_digits),
+                                    |number| format!("{number:>new_digits$}"),
+                                );
+                                let (sign, color) = match line.kind {
+                                    AgentDiffKind::Added => ("+", theme::diff::added_ink()),
+                                    AgentDiffKind::Removed => ("−", theme::diff::removed_ink()),
+                                    AgentDiffKind::Context => (" ", theme::text().secondary),
+                                    AgentDiffKind::Omitted => unreachable!(),
+                                };
+                                let mut job = LayoutJob::default();
+                                job.append(
+                                    &format!("{old_number} {new_number}  "),
+                                    0.0,
+                                    TextFormat {
+                                        font_id: theme::typography::code_small(),
+                                        color: theme::text_disabled(),
+                                        ..TextFormat::default()
+                                    },
+                                );
+                                job.append(
+                                    &format!("{sign} "),
+                                    0.0,
+                                    TextFormat {
+                                        font_id: theme::typography::code_small(),
+                                        color,
+                                        ..TextFormat::default()
+                                    },
+                                );
+                                let highlighted = match line.kind {
+                                    AgentDiffKind::Removed => old_syntax.as_deref(),
+                                    AgentDiffKind::Added | AgentDiffKind::Context => {
+                                        Some(&*new_syntax)
+                                    }
+                                    AgentDiffKind::Omitted => unreachable!(),
+                                };
+                                let line_number = match line.kind {
+                                    AgentDiffKind::Removed => line.old_number,
+                                    AgentDiffKind::Added | AgentDiffKind::Context => {
+                                        line.new_number
+                                    }
+                                    AgentDiffKind::Omitted => None,
+                                };
+                                if let (Some(highlighted), Some(line_number)) =
+                                    (highlighted, line_number)
+                                {
+                                    append_agent_syntax_line(
+                                        &mut job,
+                                        highlighted,
+                                        line_number,
+                                        &line.text,
+                                    );
+                                }
+                                ui.add(
+                                    Label::new(job)
+                                        .wrap_mode(egui::TextWrapMode::Extend)
+                                        .selectable(true),
+                                );
+                            });
+                    }
+                });
+            if can_toggle {
+                let label = if expanded {
+                    "Collapse diff".to_owned()
+                } else {
+                    format!("Show all {} lines", diff.lines.len())
+                };
+                let toggle = ui.add_sized(
+                    egui::vec2(ui.available_width(), 40.0),
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(theme::typography::MICRO_SIZE)
+                            .color(theme::accent()),
+                    )
+                    .frame(false),
+                );
+                if toggle.clicked() {
+                    ui.data_mut(|data| data.insert_temp(expanded_id, !expanded));
+                    ui.ctx().request_repaint();
+                }
             }
-        }
-    });
+        });
 }
 
 fn split_workspace(
@@ -2063,6 +2095,22 @@ pub(crate) fn tab_drop_preview(rect: egui::Rect, zone: DropZone) -> egui::Rect {
     }
 }
 
+/// Measured with the active tab's face so a tab does not resize when it is
+/// selected, which would shift every label to its right.
+fn tab_width(ui: &egui::Ui, label: &str) -> f32 {
+    let text = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            theme::typography::strong(),
+            theme::text().primary,
+        )
+        .size()
+        .x;
+    (theme::space::MEDIUM + TAB_DOT + text + theme::space::SMALL + TAB_CLOSE + theme::space::SMALL)
+        .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
 fn drag_label(path: &Path) -> Cow<'_, str> {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -2076,37 +2124,27 @@ fn draw_dragged_pane_preview(painter: &egui::Painter, rect: egui::Rect, path: Op
     let header = rect.with_max_y((rect.top() + PANE_TAB_HEIGHT).min(rect.bottom()));
     painter.rect_filled(
         rect,
-        4.0,
-        Color32::from_rgba_unmultiplied(
-            EDITOR_BACKGROUND.r(),
-            EDITOR_BACKGROUND.g(),
-            EDITOR_BACKGROUND.b(),
-            178,
-        ),
+        theme::corner(theme::radius::ROW),
+        editor_background().gamma_multiply(0.70),
     );
     painter.rect_filled(
         header,
-        4.0,
-        Color32::from_rgba_unmultiplied(SURFACE.r(), SURFACE.g(), SURFACE.b(), 196),
+        theme::corner(theme::radius::ROW),
+        theme::surface().chrome.gamma_multiply(0.77),
     );
     painter.rect_stroke(
         rect,
-        4.0,
-        egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(74, 197, 225, 190)),
+        theme::corner(theme::radius::ROW),
+        egui::Stroke::new(theme::stroke::FOCUS, theme::accent().gamma_multiply(0.75)),
         egui::StrokeKind::Inside,
     );
     if let Some(path) = path {
         painter.text(
-            egui::pos2(header.left() + 12.0, header.center().y),
+            egui::pos2(header.left() + theme::space::MEDIUM, header.center().y),
             Align2::LEFT_CENTER,
             drag_label(path),
-            FontId::proportional(12.0),
-            Color32::from_rgba_unmultiplied(
-                TEXT_PRIMARY.r(),
-                TEXT_PRIMARY.g(),
-                TEXT_PRIMARY.b(),
-                190,
-            ),
+            theme::typography::small(),
+            theme::text().primary.gamma_multiply(0.75),
         );
     }
 }
@@ -2120,7 +2158,11 @@ pub(crate) fn draw_tab_drag_ghost(ctx: &egui::Context, label: &str) {
         egui::Order::Tooltip,
         Id::new("tab_drag_ghost"),
     ));
-    let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(12.0), TEXT_PRIMARY);
+    let galley = painter.layout_no_wrap(
+        label.to_owned(),
+        theme::typography::small(),
+        theme::text().primary,
+    );
     let size = egui::vec2(
         (galley.size().x + 28.0)
             .clamp(100.0, 220.0)
@@ -2142,44 +2184,31 @@ pub(crate) fn draw_tab_drag_ghost(ctx: &egui::Context, label: &str) {
             ^ u64::from(rect.width().to_bits()).rotate_left(32)
             ^ u64::from(rect.height().to_bits()).rotate_left(48),
     );
-    painter.add(
-        egui::Shadow {
-            offset: [0, 4],
-            blur: 12,
-            spread: 0,
-            color: Color32::from_black_alpha(100),
-        }
-        .as_shape(rect, 6.0),
-    );
+    painter.add(theme::shadow::popover().as_shape(rect, theme::corner(theme::radius::CONTROL)));
     painter.rect_filled(
         rect,
-        6.0,
-        Color32::from_rgba_unmultiplied(
-            SURFACE_RAISED.r(),
-            SURFACE_RAISED.g(),
-            SURFACE_RAISED.b(),
-            224,
-        ),
+        theme::corner(theme::radius::CONTROL),
+        theme::surface().raised.gamma_multiply(0.88),
     );
     painter.rect_stroke(
         rect,
-        6.0,
-        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+        theme::corner(theme::radius::CONTROL),
+        theme::border::strong(),
         egui::StrokeKind::Inside,
     );
     painter.rect_filled(
         egui::Rect::from_min_max(
             rect.left_top(),
-            egui::pos2(rect.left() + 3.0, rect.bottom()),
+            egui::pos2(rect.left() + theme::space::HAIR + 1.0, rect.bottom()),
         ),
-        6.0,
-        ACCENT,
+        theme::corner(theme::radius::CONTROL),
+        theme::accent(),
     );
     let clip_inset = 6.0_f32.min(rect.width().min(rect.height()).max(0.0) * 0.5);
     painter.with_clip_rect(rect.shrink(clip_inset)).galley(
         egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y * 0.5),
         galley,
-        TEXT_PRIMARY,
+        theme::text().primary,
     );
 }
 
@@ -2216,17 +2245,22 @@ fn macos_titlebar_controls(
     let hovered = button_centers
         .iter()
         .position(|center| pointer.is_some_and(|pointer| pointer.distance(*center) <= 10.0));
+    let focused = ui.input(|input| input.focused);
     let actions = [
-        (WindowAction::Close, Color32::from_rgb(255, 95, 87), "×"),
-        (WindowAction::Minimize, Color32::from_rgb(254, 188, 46), "−"),
+        (WindowAction::Close, theme::traffic::CLOSE, Icon::Close),
+        (
+            WindowAction::Minimize,
+            theme::traffic::MINIMIZE,
+            Icon::Minus,
+        ),
         (
             WindowAction::ToggleMaximize,
-            Color32::from_rgb(40, 200, 64),
-            "+",
+            theme::traffic::ZOOM,
+            Icon::Plus,
         ),
     ];
     let mut selected = None;
-    for (index, ((action, color, symbol), center)) in
+    for (index, ((action, color, glyph), center)) in
         actions.into_iter().zip(button_centers).enumerate()
     {
         let button = egui::Rect::from_center_size(center, egui::vec2(18.0, 24.0));
@@ -2240,14 +2274,18 @@ fn macos_titlebar_controls(
         {
             selected = Some(action);
         }
-        ui.painter().circle_filled(center, 6.0, color);
+        let fill = if focused {
+            color
+        } else {
+            theme::traffic::unfocused()
+        };
+        ui.painter().circle_filled(center, 6.0, fill);
         if hovered == Some(index) {
-            ui.painter().text(
-                center,
-                Align2::CENTER_CENTER,
-                symbol,
-                FontId::proportional(10.0),
-                Color32::from_black_alpha(150),
+            icons::paint(
+                ui.painter(),
+                glyph,
+                egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID * 0.5)),
+                theme::traffic::glyph(),
             );
         }
     }
@@ -2333,9 +2371,9 @@ fn draw_sidebar_toggle_icon(
     let icon_center = button.center();
     let icon = egui::Rect::from_center_size(icon_center, egui::vec2(16.0, 13.0));
     let icon_color = if response.hovered() || open {
-        TEXT_PRIMARY
+        theme::text().primary
     } else {
-        TEXT_MUTED
+        theme::text().muted
     };
     ui.painter().rect_stroke(
         icon,
@@ -2360,7 +2398,7 @@ fn draw_sidebar_toggle_icon(
             egui::Rect::from_min_max(icon.left_top(), egui::pos2(divider_x, icon.bottom()))
         };
         ui.painter()
-            .rect_filled(selected, 1.0, Color32::from_white_alpha(28));
+            .rect_filled(selected, 1.0, theme::state::selected());
     }
     icon_center
 }
@@ -2381,8 +2419,10 @@ fn agent_sessions_rect(header: egui::Rect) -> egui::Rect {
     )
 }
 
+/// One inset on every side, so the composer's controls sit the same distance
+/// from its edge horizontally as they do vertically.
 fn agent_composer_content(composer: egui::Rect) -> egui::Rect {
-    composer.shrink2(egui::vec2(14.0, 10.0))
+    composer.shrink(theme::space::MEDIUM)
 }
 
 fn agent_menu_rect(
@@ -2699,6 +2739,7 @@ enum SettingsAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsSection {
+    Appearance,
     Keybindings,
     LanguageServers,
 }
@@ -2911,7 +2952,8 @@ fn agent_attachment_tile(
         )
     } else {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        ui.painter().rect_filled(rect, 7.0, SURFACE_SELECTED);
+        ui.painter()
+            .rect_filled(rect, 7.0, theme::state::selected());
         let extension = attachment
             .file
             .path()
@@ -2923,28 +2965,25 @@ fn agent_attachment_tile(
             rect.center() + egui::vec2(0.0, 1.0),
             Align2::CENTER_CENTER,
             extension.chars().take(5).collect::<String>(),
-            FontId::proportional(9.5),
-            TEXT_SECONDARY,
+            theme::typography::micro(),
+            theme::text().secondary,
         );
         response
     };
     ui.painter().rect_stroke(
         response.rect,
         7.0,
-        egui::Stroke::new(1.0, Color32::from_white_alpha(28)),
+        egui::Stroke::new(1.0, theme::state::selected()),
         egui::StrokeKind::Inside,
     );
     let close = response.rect.right_top() + egui::vec2(-8.0, 8.0);
     ui.painter()
-        .circle_filled(close, 6.5, Color32::from_black_alpha(185));
-    let stroke = egui::Stroke::new(1.2, TEXT_PRIMARY);
-    ui.painter().line_segment(
-        [close + egui::vec2(-2.0, -2.0), close + egui::vec2(2.0, 2.0)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [close + egui::vec2(-2.0, 2.0), close + egui::vec2(2.0, -2.0)],
-        stroke,
+        .circle_filled(close, 6.5, theme::surface().sunken.gamma_multiply(0.72));
+    icons::paint(
+        ui.painter(),
+        Icon::Close,
+        egui::Rect::from_center_size(close, egui::Vec2::splat(icons::GRID * 0.55)),
+        theme::text().primary,
     );
     response.on_hover_text(format!("Remove {}", attachment.file.path().display()))
 }
@@ -2953,9 +2992,9 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
     let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 36.0));
     let response = ui.interact(rect, id.with(&entry.path), Sense::click());
     let fill = if selected {
-        SURFACE_SELECTED
+        theme::state::selected()
     } else if response.hovered() {
-        SURFACE_INPUT
+        theme::surface().input
     } else {
         Color32::TRANSPARENT
     };
@@ -2967,14 +3006,14 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
                 egui::vec2(2.0, rect.height() - 10.0),
             ),
             1.0,
-            ACCENT,
+            theme::accent(),
         );
     }
     let icon_left = rect.left() + 12.0;
     let icon_color = if entry.is_dir {
-        TEXT_SECONDARY
+        theme::text().secondary
     } else {
-        TEXT_DISABLED
+        theme::text_disabled()
     };
     if entry.is_dir {
         ui.painter().rect_filled(
@@ -3025,51 +3064,35 @@ fn agent_file_picker_row(ui: &mut egui::Ui, entry: &TreeEntry, selected: bool) -
             egui::pos2(icon_left + 20.0, rect.center().y),
             Align2::LEFT_CENTER,
             entry.name.to_string_lossy(),
-            FontId::proportional(13.0),
-            TEXT_PRIMARY,
+            theme::typography::body(),
+            theme::text().primary,
         );
     let metadata_right = rect.right() - if entry.is_dir || selected { 36.0 } else { 12.0 };
     ui.painter().text(
         egui::pos2(metadata_right, rect.center().y),
         Align2::RIGHT_CENTER,
         metadata,
-        FontId::proportional(10.5),
-        TEXT_DISABLED,
+        theme::typography::micro(),
+        theme::text_disabled(),
     );
     if entry.is_dir {
-        let center = egui::pos2(rect.right() - 14.0, rect.center().y);
-        let stroke = egui::Stroke::new(1.1, TEXT_MUTED);
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-2.0, -3.5),
-                center + egui::vec2(1.5, 0.0),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(1.5, 0.0),
-                center + egui::vec2(-2.0, 3.5),
-            ],
-            stroke,
+        icons::paint(
+            ui.painter(),
+            Icon::ChevronRight,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 14.0, rect.center().y),
+                egui::Vec2::splat(icons::GRID * 0.75),
+            ),
+            theme::text().muted,
         );
     } else if selected {
         let center = egui::pos2(rect.right() - 16.0, rect.center().y);
-        ui.painter().circle_filled(center, 8.0, ACCENT);
-        let stroke = egui::Stroke::new(1.4, ACCENT_INK);
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-3.5, 0.0),
-                center + egui::vec2(-1.0, 2.5),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-1.0, 2.5),
-                center + egui::vec2(4.0, -3.0),
-            ],
-            stroke,
+        ui.painter().circle_filled(center, 8.0, theme::accent());
+        icons::paint(
+            ui.painter(),
+            Icon::Check,
+            egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID * 0.62)),
+            theme::text().on_accent,
         );
     }
     response.on_hover_text(entry.path.display().to_string())
@@ -3095,9 +3118,9 @@ fn agent_file_picker_location_row(
             rect,
             5.0,
             if selected {
-                SURFACE_SELECTED
+                theme::state::selected()
             } else {
-                SURFACE_HOVER
+                theme::state::hover()
             },
         );
     }
@@ -3108,36 +3131,32 @@ fn agent_file_picker_location_row(
                 egui::vec2(2.0, rect.height() - 16.0),
             ),
             1.0,
-            ACCENT,
+            theme::accent(),
         );
     }
-    let folder = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 12.0, rect.center().y - 4.0),
-        egui::vec2(13.0, 9.0),
-    );
-    let icon_color = if selected { ACCENT } else { TEXT_MUTED };
-    ui.painter().rect_stroke(
-        folder,
-        1.5,
-        egui::Stroke::new(1.2, icon_color),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(folder.left() + 1.5, folder.top()),
-            egui::pos2(folder.left() + 4.5, folder.top() - 2.5),
-        ],
-        egui::Stroke::new(1.2, icon_color),
+    let icon_color = if selected {
+        theme::accent()
+    } else {
+        theme::text().muted
+    };
+    icons::paint(
+        ui.painter(),
+        Icon::Folder,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 18.0, rect.center().y),
+            egui::Vec2::splat(icons::GRID),
+        ),
+        icon_color,
     );
     ui.painter().text(
         egui::pos2(rect.left() + 34.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.5),
+        theme::typography::small(),
         if selected {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_SECONDARY
+            theme::text().secondary
         },
     );
     response
@@ -3216,6 +3235,7 @@ pub struct EditorApp {
     conflict: bool,
     save_as: Option<String>,
     error: Option<String>,
+    toasts: crate::toast::Toasts,
     should_close: bool,
     window_action: Option<WindowAction>,
     settings_open: bool,
@@ -3261,9 +3281,11 @@ fn settings_quiet_button(
     label: &str,
     icon_space: f32,
 ) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), TEXT_SECONDARY);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        theme::typography::body(),
+        theme::text().secondary,
+    );
     let (_, rect) = ui.allocate_space(egui::vec2(
         (galley.size().x + icon_space + 20.0).max(40.0),
         40.0,
@@ -3273,15 +3295,15 @@ fn settings_quiet_button(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let color = if response.hovered() {
-        TEXT_PRIMARY
+        theme::text().primary
     } else {
-        TEXT_SECONDARY
+        theme::text().secondary
     };
     ui.painter().text(
         egui::pos2(rect.left() + 10.0 + icon_space, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
+        theme::typography::body(),
         color,
     );
     response
@@ -3310,15 +3332,109 @@ fn settings_navigation_row(
                 egui::vec2(2.0, 18.0),
             ),
             1.0,
-            ACCENT,
+            theme::accent(),
         );
     }
     ui.painter().text(
         egui::pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
-        TEXT_PRIMARY,
+        theme::typography::body(),
+        theme::text().primary,
+    );
+    response
+}
+
+fn appearance_choice_row<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    value: &mut T,
+    choices: impl IntoIterator<Item = (T, &'static str)>,
+) -> bool {
+    ui.label(
+        RichText::new(title)
+            .font(theme::typography::body())
+            .color(theme::text().secondary),
+    );
+    ui.label(
+        RichText::new(detail)
+            .font(theme::typography::micro())
+            .color(theme::text().muted),
+    );
+    ui.add_space(theme::space::TIGHT);
+    let mut dirty = false;
+    ui.horizontal(|ui| {
+        for (candidate, label) in choices {
+            let selected = *value == candidate;
+            let response = segment(ui, label, selected, None);
+            if response.clicked() && !selected {
+                *value = candidate;
+                dirty = true;
+            }
+        }
+    });
+    ui.add_space(theme::space::LARGE);
+    dirty
+}
+
+fn appearance_toggle_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), enabled, title)
+    });
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        title,
+        theme::typography::body(),
+        if response.hovered() {
+            theme::text().primary
+        } else {
+            theme::text().secondary
+        },
+    );
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y + 11.0),
+        Align2::LEFT_CENTER,
+        detail,
+        theme::typography::micro(),
+        theme::text().muted,
+    );
+    let track = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 18.0, rect.center().y),
+        egui::vec2(36.0, 20.0),
+    );
+    ui.painter().rect_filled(
+        track,
+        10.0,
+        if enabled {
+            theme::accent()
+        } else {
+            theme::border::strong_color()
+        },
+    );
+    ui.painter().circle_filled(
+        egui::pos2(
+            if enabled {
+                track.right() - 9.0
+            } else {
+                track.left() + 9.0
+            },
+            track.center().y,
+        ),
+        7.0,
+        if enabled {
+            theme::text().on_accent
+        } else {
+            theme::text().secondary
+        },
     );
     response
 }
@@ -3338,26 +3454,33 @@ fn settings_toggle_row(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
         egui::pos2(rect.left(), rect.center().y - 9.0),
         Align2::LEFT_CENTER,
         "Enable language servers",
-        FontId::proportional(13.0),
+        theme::typography::body(),
         if response.hovered() {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_SECONDARY
+            theme::text().secondary
         },
     );
     ui.painter().text(
         egui::pos2(rect.left(), rect.center().y + 11.0),
         Align2::LEFT_CENTER,
         "Servers start only for supported open files.",
-        FontId::proportional(11.0),
-        TEXT_MUTED,
+        theme::typography::micro(),
+        theme::text().muted,
     );
     let track = egui::Rect::from_center_size(
         egui::pos2(rect.right() - 18.0, rect.center().y),
         egui::vec2(36.0, 20.0),
     );
-    ui.painter()
-        .rect_filled(track, 10.0, if enabled { ACCENT } else { BORDER_STRONG });
+    ui.painter().rect_filled(
+        track,
+        10.0,
+        if enabled {
+            theme::accent()
+        } else {
+            theme::border::strong_color()
+        },
+    );
     ui.painter().circle_filled(
         egui::pos2(
             if enabled {
@@ -3368,35 +3491,33 @@ fn settings_toggle_row(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
             track.center().y,
         ),
         7.0,
-        if enabled { ACCENT_INK } else { TEXT_SECONDARY },
+        if enabled {
+            theme::text().on_accent
+        } else {
+            theme::text().secondary
+        },
     );
     response
 }
 
 fn settings_primary_button(ui: &mut egui::Ui, id: impl egui::AsId, label: &str) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), ACCENT_INK);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        theme::typography::small(),
+        theme::text().on_accent,
+    );
     let (_, rect) = ui.allocate_space(egui::vec2((galley.size().x + 24.0).max(88.0), 40.0));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    ui.painter().rect_filled(
-        rect,
-        6.0,
-        if response.hovered() {
-            Color32::from_rgb(112, 222, 234)
-        } else {
-            ACCENT
-        },
-    );
+    ui.painter().rect_filled(rect, 6.0, theme::accent());
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(12.5),
-        ACCENT_INK,
+        theme::typography::small(),
+        theme::text().on_accent,
     );
     response
 }
@@ -3415,36 +3536,45 @@ fn settings_mode_combo(
         ui.spacing_mut().button_padding = egui::vec2(11.0, 7.0);
         ui.spacing_mut().interact_size.y = 34.0;
         let visuals = &mut ui.style_mut().visuals.widgets;
-        visuals.inactive.weak_bg_fill = SURFACE_INPUT;
-        visuals.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER_SUBTLE);
-        visuals.hovered.weak_bg_fill = SURFACE_HOVER;
-        visuals.hovered.bg_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
-        visuals.active.weak_bg_fill = SURFACE_SELECTED;
-        visuals.active.bg_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
-        visuals.open.weak_bg_fill = SURFACE_SELECTED;
-        visuals.open.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        visuals.inactive.weak_bg_fill = theme::surface().input;
+        visuals.inactive.bg_stroke = egui::Stroke::new(1.0, theme::border::hairline_color());
+        visuals.hovered.weak_bg_fill = theme::state::hover();
+        visuals.hovered.bg_stroke = egui::Stroke::new(1.0, theme::border::strong_color());
+        visuals.active.weak_bg_fill = theme::state::selected();
+        visuals.active.bg_stroke = egui::Stroke::new(1.0, theme::border::strong_color());
+        visuals.open.weak_bg_fill = theme::state::selected();
+        visuals.open.bg_stroke = egui::Stroke::new(1.0, theme::accent());
         visuals.inactive.corner_radius = 6.into();
         visuals.hovered.corner_radius = 6.into();
         visuals.active.corner_radius = 6.into();
         visuals.open.corner_radius = 6.into();
         egui::ComboBox::from_id_salt(("server_mode", preset.as_str()))
             .width(120.0)
-            .selected_text(RichText::new(label).color(TEXT_PRIMARY).size(12.5))
+            .selected_text(
+                RichText::new(label)
+                    .color(theme::text().primary)
+                    .size(theme::typography::SMALL_SIZE),
+            )
             .icon(|ui, rect, visuals, open| {
-                let center = rect.center();
-                let direction = if open { -1.0 } else { 1.0 };
-                let tip = center + egui::vec2(0.0, 2.5 * direction);
-                let stroke = egui::Stroke::new(1.4, visuals.fg_stroke.color);
-                ui.painter()
-                    .line_segment([center + egui::vec2(-3.5, -2.0 * direction), tip], stroke);
-                ui.painter()
-                    .line_segment([tip, center + egui::vec2(3.5, -2.0 * direction)], stroke);
+                icons::paint(
+                    ui.painter(),
+                    if open {
+                        Icon::ChevronUp
+                    } else {
+                        Icon::ChevronDown
+                    },
+                    egui::Rect::from_center_size(
+                        rect.center(),
+                        egui::Vec2::splat(icons::GRID * 0.75),
+                    ),
+                    visuals.fg_stroke.color,
+                );
             })
             .popup_style(egui::style::StyleModifier::new(|style| {
                 style.spacing.item_spacing.y = 2.0;
-                style.visuals.window_fill = SURFACE_RAISED;
-                style.visuals.window_stroke = egui::Stroke::new(1.0, BORDER_STRONG);
-                style.visuals.menu_corner_radius = 8.into();
+                style.visuals.window_fill = theme::surface().raised;
+                style.visuals.window_stroke = egui::Stroke::new(1.0, theme::border::strong_color());
+                style.visuals.menu_corner_radius = theme::corner(theme::radius::CARD);
             }))
             .show_ui(ui, |ui| {
                 for (candidate, label) in [
@@ -3457,7 +3587,7 @@ fn settings_mode_combo(
                         egui::pos2(row.rect.left() + 9.0, row.rect.center().y),
                         Align2::LEFT_CENTER,
                         label,
-                        FontId::proportional(12.5),
+                        theme::typography::small(),
                         row.foreground,
                     );
                     if row.response.clicked() {
@@ -3563,6 +3693,7 @@ impl EditorApp {
             conflict: false,
             save_as: None,
             error: None,
+            toasts: crate::toast::Toasts::default(),
             should_close: false,
             window_action: None,
             settings_open: false,
@@ -3865,7 +3996,7 @@ impl EditorApp {
 
     fn show_error(&mut self, error: String) {
         eprintln!("editur: {error}");
-        self.error = Some(error);
+        self.toasts.push(Severity::Danger, error);
     }
 
     pub fn ui(&mut self, root: &mut egui::Ui) {
@@ -3874,6 +4005,7 @@ impl EditorApp {
     }
 
     fn draw_ui(&mut self, root: &mut egui::Ui) {
+        self.apply_appearance(root.ctx());
         theme::apply_to(root.style_mut());
         self.scrollbar_activity.style_egui(root);
         let ctx = root.ctx().clone();
@@ -4091,7 +4223,7 @@ impl EditorApp {
             root.painter().rect_stroke(
                 focus_rect,
                 pane_focus_corner_radius(focus_rect, window),
-                egui::Stroke::new(1.0, PANE_FOCUS_BORDER),
+                egui::Stroke::new(1.0, theme::border::focus_color()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4206,12 +4338,12 @@ impl EditorApp {
             root.painter().rect_filled(
                 drop.preview.shrink(4.0),
                 5.0,
-                Color32::from_rgba_unmultiplied(74, 197, 225, 42),
+                theme::subtle(theme::accent()),
             );
             root.painter().rect_stroke(
                 drop.preview.shrink(4.0),
                 5.0,
-                egui::Stroke::new(1.5, ACCENT),
+                egui::Stroke::new(1.5, theme::accent()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4243,14 +4375,14 @@ impl EditorApp {
             root.painter().vline(
                 sessions.right(),
                 sessions.y_range(),
-                egui::Stroke::new(1.0, BORDER_SUBTLE),
+                egui::Stroke::new(1.0, theme::border::hairline_color()),
             );
         }
         root.scope_builder(
             UiBuilder::new().id_salt("agentic_canvas").max_rect(agent),
             |ui| {
                 ui.painter()
-                    .rect_filled(ui.max_rect(), 0.0, EDITOR_BACKGROUND);
+                    .rect_filled(ui.max_rect(), 0.0, editor_background());
                 self.draw_agent(ui, ui.max_rect());
             },
         );
@@ -4274,7 +4406,7 @@ impl EditorApp {
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, CANVAS);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
             egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
@@ -4306,7 +4438,7 @@ impl EditorApp {
                     draw_provider_identity(ui, self.selected_provider);
                     self.provider_menu_anchor = None;
                 }
-                ui.add_space(10.0);
+                ui.add_space(theme::space::SMALL);
                 ScrollArea::vertical()
                     .id_salt("agentic_session_list")
                     .auto_shrink([false, false])
@@ -4446,11 +4578,11 @@ impl EditorApp {
         controls_right: f32,
         preview_path: Option<&Path>,
     ) -> (f32, f32) {
-        ui.painter().rect_filled(rect, 0.0, SURFACE);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         ui.painter().hline(
             rect.x_range(),
             rect.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         let active = self
             .pane_active_tabs
@@ -4476,13 +4608,14 @@ impl EditorApp {
                     format!("Vim mode: {status}"),
                 )
             });
-            ui.painter().rect_filled(pill, 4.0, SURFACE_SELECTED);
+            ui.painter()
+                .rect_filled(pill, 4.0, theme::state::selected());
             ui.painter().text(
                 pill.center(),
                 Align2::CENTER_CENTER,
                 status,
-                FontId::monospace(10.5),
-                ACCENT,
+                theme::typography::code_small(),
+                theme::accent(),
             );
         }
         let controls_right = vim_rect.map_or(controls_right, |pill| pill.left() - 4.0);
@@ -4501,22 +4634,86 @@ impl EditorApp {
                     })
             })
             .filter(|counts| *counts != (0, 0));
-        let diagnostic_rect = diagnostic_counts.map(|_| {
-            egui::Rect::from_min_max(
-                egui::pos2((controls_right - 86.0).max(tabs_left), rect.top()),
-                egui::pos2(controls_right, rect.bottom()),
-            )
-        });
-        if let (Some((errors, warnings)), Some(button)) = (diagnostic_counts, diagnostic_rect) {
+        // The pane header is the product's status surface, so a count reads as
+        // what it costs: errors in danger, warnings in warning, never as gray text.
+        let mut status_left = controls_right;
+        let mut pill = |ui: &mut egui::Ui, text: String, color: Color32, hint: String, id: Id| {
+            let width = ui
+                .painter()
+                .layout_no_wrap(text.clone(), theme::typography::micro(), color)
+                .size()
+                .x
+                + theme::space::MEDIUM;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    (status_left - width).max(tabs_left),
+                    rect.top() + theme::space::TIGHT,
+                ),
+                egui::pos2(status_left, rect.bottom() - theme::space::TIGHT),
+            );
+            if rect.width() < width {
+                return;
+            }
+            let tint = theme::callout(color);
+            ui.painter()
+                .rect_filled(rect, theme::corner(theme::radius::ROW), tint.fill);
             ui.painter().text(
-                button.center(),
+                rect.center(),
                 Align2::CENTER_CENTER,
-                format!("E {errors}   W {warnings}"),
-                FontId::proportional(11.0),
-                TEXT_SECONDARY,
+                text,
+                theme::typography::micro(),
+                tint.text,
+            );
+            let response = ui.interact(rect, id, Sense::hover());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, true, hint.clone())
+            });
+            response.on_hover_text(hint);
+            status_left = rect.left() - theme::space::TIGHT;
+        };
+        if let Some((errors, warnings)) = diagnostic_counts {
+            if warnings > 0 {
+                pill(
+                    ui,
+                    format!("{warnings}"),
+                    theme::semantic().warning,
+                    format!("{warnings} warnings"),
+                    Id::new(("pane_warnings", pane.0)),
+                );
+            }
+            if errors > 0 {
+                pill(
+                    ui,
+                    format!("{errors}"),
+                    theme::semantic().danger,
+                    format!("{errors} errors"),
+                    Id::new(("pane_errors", pane.0)),
+                );
+            }
+        }
+        if let Some(language) = active
+            .and_then(|index| preset_for_path(&self.tabs[index].buffer.path))
+            .and_then(|(preset, _)| {
+                let status = self.lsp_status.get(&preset.id)?;
+                let color = match status {
+                    ServerStatus::Ready(_) => theme::semantic().success,
+                    ServerStatus::Starting => theme::semantic().info,
+                    ServerStatus::NotStarted | ServerStatus::Stopped => return None,
+                    ServerStatus::NotFound | ServerStatus::Failed(_) => theme::semantic().danger,
+                };
+                Some((preset.language, color, self.server_status_label(preset.id)))
+            })
+        {
+            let (name, color, state) = language;
+            pill(
+                ui,
+                name.to_owned(),
+                color,
+                format!("{name} language server: {state}"),
+                Id::new(("pane_language_server", pane.0)),
             );
         }
-        let controls_right = diagnostic_rect.map_or(controls_right, |button| button.left());
+        let controls_right = status_left;
         let markdown =
             active.is_some_and(|index| markdown::is_markdown(&self.tabs[index].buffer.path));
         let preview = active.is_some_and(|index| self.tabs[index].markdown_preview);
@@ -4553,15 +4750,15 @@ impl EditorApp {
                 ui.painter().rect_filled(
                     button.shrink2(egui::vec2(3.0, 3.0)),
                     4.0,
-                    SURFACE_SELECTED,
+                    theme::state::selected(),
                 );
             }
             ui.painter().text(
                 button.center(),
                 Align2::CENTER_CENTER,
                 if preview { "Edit" } else { "Preview" },
-                FontId::proportional(12.0),
-                TEXT_SECONDARY,
+                theme::typography::small(),
+                theme::text().secondary,
             );
             if response.clicked()
                 && let Some(index) = active
@@ -4588,33 +4785,34 @@ impl EditorApp {
                     .iter()
                     .any(|tab| tab.pane == pane && tab.buffer.path == **path)
             });
-        let tab_count = if preview_path.is_some() {
-            1
-        } else {
-            self.tabs
+        let strip_width = match preview_path {
+            Some(path) => tab_width(ui, &drag_label(path)),
+            None => self
+                .tabs
                 .iter()
                 .filter(|tab| tab.pane == pane && hidden_path != Some(tab.buffer.path.as_path()))
-                .count()
+                .map(|tab| tab_width(ui, &drag_label(&tab.buffer.path)))
+                .sum(),
         };
-        let tabs_used_right = (tabs_left + tab_count as f32 * TAB_WIDTH).min(tabs_right);
+        let tabs_used_right = (tabs_left + strip_width).min(tabs_right);
         if let Some(path) = preview_path {
             let tab = egui::Rect::from_min_max(
                 egui::pos2(tabs_left, rect.top()),
                 egui::pos2(tabs_used_right, rect.bottom()),
             );
             ui.painter()
-                .rect_filled(tab, 0.0, SURFACE_INPUT.gamma_multiply(0.62));
+                .rect_filled(tab, 0.0, theme::surface().input.gamma_multiply(0.62));
             ui.painter().hline(
                 tab.x_range(),
                 tab.bottom() - 1.0,
-                egui::Stroke::new(2.0, ACCENT.gamma_multiply(0.62)),
+                egui::Stroke::new(2.0, theme::accent().gamma_multiply(0.62)),
             );
             ui.painter().text(
                 egui::pos2(tab.left() + 12.0, tab.center().y),
                 Align2::LEFT_CENTER,
                 drag_label(path),
-                FontId::proportional(12.0),
-                TEXT_PRIMARY.gamma_multiply(0.62),
+                theme::typography::small(),
+                theme::text().primary.gamma_multiply(0.62),
             );
         } else if tabs_used_right > tabs_left {
             self.draw_file_tabs(
@@ -4880,14 +5078,14 @@ impl EditorApp {
             ui.painter().vline(
                 rect.right() - 0.5,
                 rect.y_range(),
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
         }
         if rect.bottom() + 0.5 < editor.bottom() {
             ui.painter().hline(
                 rect.x_range(),
                 rect.bottom() - 0.5,
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
         }
     }
@@ -4952,10 +5150,15 @@ impl EditorApp {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                        let widths = tabs
+                            .iter()
+                            .map(|(_, label, ..)| tab_width(ui, label))
+                            .collect::<Vec<_>>();
                         for (position, (index, label, path, path_display, dirty)) in
                             tabs.iter().enumerate()
                         {
-                            let (_, tab) = ui.allocate_space(egui::vec2(TAB_WIDTH, rect.height()));
+                            let (_, tab) =
+                                ui.allocate_space(egui::vec2(widths[position], rect.height()));
                             let selected = active == Some(*index);
                             let response = ui
                                 .interact(
@@ -4984,38 +5187,54 @@ impl EditorApp {
                                     tab,
                                     0.0,
                                     if dragging {
-                                        SURFACE_SELECTED
+                                        theme::state::selected()
                                     } else if selected {
-                                        SURFACE_INPUT
+                                        // The active tab is the top edge of the
+                                        // document, so it wears the document's fill.
+                                        theme::surface().editor
                                     } else {
-                                        SURFACE
+                                        theme::state::hover()
                                     },
                                 );
                             }
-                            ui.painter().vline(
-                                tab.right() - 0.5,
-                                tab.y_range().shrink(5.0),
-                                egui::Stroke::new(1.0, BORDER_SUBTLE),
-                            );
+                            // A divider only earns its place between two inactive
+                            // tabs; beside the active one it competes with the bar.
+                            let touches_active = selected
+                                || active == Some(tabs[(position + 1).min(tabs.len() - 1)].0);
+                            if !touches_active && position + 1 < tabs.len() {
+                                ui.painter().vline(
+                                    tab.right() - 0.5,
+                                    tab.y_range().shrink(theme::space::SNUG),
+                                    theme::border::hairline(),
+                                );
+                            }
                             if selected {
                                 ui.painter().hline(
                                     tab.x_range(),
-                                    tab.bottom() - 1.0,
-                                    egui::Stroke::new(2.0, ACCENT),
+                                    tab.top() + 1.0,
+                                    egui::Stroke::new(2.0, theme::accent()),
                                 );
                             }
                             let close_rect = egui::Rect::from_center_size(
-                                egui::pos2(tab.right() - 14.0, tab.center().y),
-                                egui::vec2(20.0, 20.0),
+                                egui::pos2(tab.right() - theme::space::LARGE, tab.center().y),
+                                egui::Vec2::splat(TAB_CLOSE),
                             );
                             let text_rect = egui::Rect::from_min_max(
-                                egui::pos2(tab.left() + 12.0, tab.top()),
-                                egui::pos2(close_rect.left() - 8.0, tab.bottom()),
+                                egui::pos2(tab.left() + theme::space::MEDIUM + TAB_DOT, tab.top()),
+                                egui::pos2(close_rect.left() - theme::space::SMALL, tab.bottom()),
                             );
-                            let text_color = if selected { TEXT_PRIMARY } else { TEXT_MUTED };
+                            let text_color = if selected {
+                                theme::text().primary
+                            } else {
+                                theme::text().muted
+                            };
                             let galley = egui::WidgetText::from(
                                 RichText::new(label)
-                                    .font(FontId::proportional(12.0))
+                                    .font(if selected {
+                                        theme::typography::strong()
+                                    } else {
+                                        theme::typography::small()
+                                    })
                                     .color(text_color),
                             )
                             .into_galley(
@@ -5025,18 +5244,21 @@ impl EditorApp {
                                 egui::FontSelection::Default,
                             );
                             let text_position = egui::pos2(
-                                text_rect.center().x - galley.size().x * 0.5,
+                                text_rect.left(),
                                 text_rect.center().y - galley.size().y * 0.5,
                             );
                             ui.painter().galley(text_position, galley, text_color);
-                            let show_close = hovered || (selected && !dirty);
-                            if *dirty && !show_close {
+                            if *dirty {
                                 ui.painter().circle_filled(
-                                    close_rect.center(),
+                                    egui::pos2(
+                                        tab.left() + theme::space::MEDIUM + TAB_DOT * 0.5,
+                                        tab.center().y,
+                                    ),
                                     3.0,
-                                    Color32::from_rgb(245, 184, 77),
+                                    theme::ink(theme::semantic().warning),
                                 );
                             }
+                            let show_close = hovered || selected;
                             let close_response = ui
                                 .interact(
                                     close_rect,
@@ -5052,16 +5274,13 @@ impl EditorApp {
                                 )
                             });
                             if show_close {
-                                ui.painter().text(
-                                    close_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "×",
-                                    FontId::proportional(14.0),
-                                    if close_response.hovered() {
-                                        TEXT_PRIMARY
-                                    } else {
-                                        TEXT_SECONDARY
-                                    },
+                                icons::paint_button(
+                                    ui.painter(),
+                                    Icon::Close,
+                                    close_rect,
+                                    &close_response,
+                                    ui.is_enabled(),
+                                    theme::text().secondary,
                                 );
                             }
                             if close_response.clicked() {
@@ -5080,11 +5299,17 @@ impl EditorApp {
                                     ui.input(|input| input.pointer.interact_pos())
                                     && rect.contains(pointer)
                                 {
-                                    let first_left = tab.left() - position as f32 * TAB_WIDTH;
-                                    let target_position = ((pointer.x - first_left) / TAB_WIDTH)
-                                        .floor()
-                                        .clamp(0.0, (tabs.len() - 1) as f32)
-                                        as usize;
+                                    let first_left =
+                                        tab.left() - widths[..position].iter().sum::<f32>();
+                                    let mut edge = first_left;
+                                    let mut target_position = tabs.len() - 1;
+                                    for (candidate, width) in widths.iter().enumerate() {
+                                        edge += width;
+                                        if pointer.x < edge {
+                                            target_position = candidate;
+                                            break;
+                                        }
+                                    }
                                     let target = tabs[target_position].0;
                                     if target != *index {
                                         reorder = Some((*index, target));
@@ -5126,7 +5351,7 @@ impl EditorApp {
             ui.painter().circle_filled(
                 icon_center + egui::vec2(8.0, -7.0),
                 3.0,
-                Color32::from_rgb(245, 184, 77),
+                theme::ink(theme::semantic().warning),
             );
         }
         response.clicked()
@@ -5161,35 +5386,15 @@ impl EditorApp {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
         let color = if response.hovered() || self.terminal_open {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_MUTED
+            theme::text().muted
         };
-        let icon = egui::Rect::from_center_size(button.center(), egui::vec2(16.0, 13.0));
-        ui.painter().rect_stroke(
-            icon,
-            2.0,
-            egui::Stroke::new(1.2, color),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().line_segment(
-            [
-                egui::pos2(icon.left() + 3.0, icon.top() + 3.0),
-                egui::pos2(icon.left() + 6.0, icon.center().y),
-            ],
-            egui::Stroke::new(1.2, color),
-        );
-        ui.painter().line_segment(
-            [
-                egui::pos2(icon.left() + 6.0, icon.center().y),
-                egui::pos2(icon.left() + 3.0, icon.bottom() - 3.0),
-            ],
-            egui::Stroke::new(1.2, color),
-        );
-        ui.painter().hline(
-            (icon.left() + 8.0)..=(icon.right() - 2.5),
-            icon.bottom() - 3.0,
-            egui::Stroke::new(1.2, color),
+        icons::paint(
+            ui.painter(),
+            Icon::Terminal,
+            egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
+            color,
         );
         response.clicked()
     }
@@ -5255,15 +5460,15 @@ impl EditorApp {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
         });
         let color = if response.hovered() {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_SECONDARY
+            theme::text().secondary
         };
         ui.painter().text(
             egui::pos2(button.right() - 12.0, button.center().y),
             Align2::RIGHT_CENTER,
             label,
-            FontId::proportional(12.0),
+            theme::typography::small(),
             color,
         );
         response.clicked()
@@ -5309,47 +5514,24 @@ impl EditorApp {
                     button,
                     0.0,
                     if index == 2 {
-                        Color32::from_rgb(196, 43, 28)
+                        theme::semantic().danger
                     } else {
-                        BORDER_SUBTLE
+                        theme::border::hairline_color()
                     },
                 );
             }
             let center = button.center();
-            let color = TEXT_SECONDARY;
-            match index {
-                0 => {
-                    ui.painter().hline(
-                        (center.x - 5.0)..=(center.x + 5.0),
-                        center.y + 3.0,
-                        egui::Stroke::new(1.0, color),
-                    );
-                }
-                1 => {
-                    ui.painter().rect_stroke(
-                        egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
-                        0.0,
-                        egui::Stroke::new(1.0, color),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                _ => {
-                    ui.painter().line_segment(
-                        [
-                            center + egui::vec2(-4.0, -4.0),
-                            center + egui::vec2(4.0, 4.0),
-                        ],
-                        egui::Stroke::new(1.0, color),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            center + egui::vec2(4.0, -4.0),
-                            center + egui::vec2(-4.0, 4.0),
-                        ],
-                        egui::Stroke::new(1.0, color),
-                    );
-                }
-            }
+            let color = theme::text().secondary;
+            icons::paint(
+                ui.painter(),
+                match index {
+                    0 => Icon::Minus,
+                    1 => Icon::Square,
+                    _ => Icon::Close,
+                },
+                egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID * 0.75)),
+                color,
+            );
             if response.clicked() {
                 self.window_action = Some(action);
             }
@@ -5363,27 +5545,22 @@ impl EditorApp {
         });
         let center = rect.center();
         let color = if response.hovered() {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_SECONDARY
+            theme::text().secondary
         };
-        ui.painter()
-            .circle_stroke(center, 5.5, egui::Stroke::new(1.5, color));
-        ui.painter()
-            .circle_stroke(center, 1.8, egui::Stroke::new(1.4, color));
-        for index in 0..8 {
-            let angle = index as f32 * std::f32::consts::FRAC_PI_4;
-            let direction = egui::vec2(angle.cos(), angle.sin());
-            ui.painter().line_segment(
-                [center + direction * 5.5, center + direction * 8.0],
-                egui::Stroke::new(1.8, color),
-            );
-        }
+        icons::paint(
+            ui.painter(),
+            Icon::Gear,
+            egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID)),
+            color,
+        );
         response.clicked()
     }
 
     fn draw_settings(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        root.painter().rect_filled(window, 0.0, CANVAS);
+        root.painter()
+            .rect_filled(window, 0.0, theme::surface().chrome);
         let rail_width = 270.0_f32.min((window.width() * 0.38).max(210.0));
         let rail = egui::Rect::from_min_max(
             window.left_top(),
@@ -5393,11 +5570,12 @@ impl EditorApp {
             egui::pos2(rail.right(), window.top()),
             window.right_bottom(),
         );
-        root.painter().rect_filled(rail, 0.0, SURFACE);
+        root.painter()
+            .rect_filled(rail, 0.0, theme::surface().chrome);
         root.painter().vline(
             rail.right(),
             rail.y_range(),
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         let mut actions = Vec::new();
         root.scope_builder(
@@ -5407,28 +5585,18 @@ impl EditorApp {
             |ui| {
                 ui.set_width(ui.available_width());
                 let back = settings_quiet_button(ui, "settings_back", "Back to app", 16.0);
-                let arrow_center = egui::pos2(back.rect.left() + 11.0, back.rect.center().y);
-                let arrow_stroke = egui::Stroke::new(
-                    1.4,
+                icons::paint(
+                    ui.painter(),
+                    Icon::ChevronLeft,
+                    egui::Rect::from_center_size(
+                        egui::pos2(back.rect.left() + 11.0, back.rect.center().y),
+                        egui::Vec2::splat(icons::GRID * 0.75),
+                    ),
                     if back.hovered() {
-                        TEXT_PRIMARY
+                        theme::text().primary
                     } else {
-                        TEXT_SECONDARY
+                        theme::text().secondary
                     },
-                );
-                ui.painter().line_segment(
-                    [
-                        arrow_center + egui::vec2(3.0, -4.0),
-                        arrow_center + egui::vec2(-1.0, 0.0),
-                    ],
-                    arrow_stroke,
-                );
-                ui.painter().line_segment(
-                    [
-                        arrow_center + egui::vec2(-1.0, 0.0),
-                        arrow_center + egui::vec2(3.0, 4.0),
-                    ],
-                    arrow_stroke,
                 );
                 if back.clicked() {
                     actions.push(SettingsAction::Back);
@@ -5443,11 +5611,22 @@ impl EditorApp {
                 ui.add_space(24.0);
                 ui.label(
                     RichText::new("EDITOR")
-                        .size(10.0)
+                        .size(theme::typography::MICRO_SIZE)
                         .strong()
-                        .color(TEXT_MUTED),
+                        .color(theme::text().muted),
                 );
                 ui.add_space(8.0);
+                if settings_navigation_row(
+                    ui,
+                    "settings_appearance",
+                    "Appearance",
+                    self.settings_section == SettingsSection::Appearance,
+                )
+                .clicked()
+                {
+                    self.settings_section = SettingsSection::Appearance;
+                    self.settings_search.clear();
+                }
                 if settings_navigation_row(
                     ui,
                     "settings_keybindings",
@@ -5492,11 +5671,16 @@ impl EditorApp {
                                     ui.add_space(34.0);
                                     return;
                                 }
+                                if self.settings_section == SettingsSection::Appearance {
+                                    self.draw_appearance_settings(ui);
+                                    ui.add_space(34.0);
+                                    return;
+                                }
                                 ui.label(
                                     RichText::new("Language Servers")
-                                        .size(20.0)
+                                        .size(theme::typography::DISPLAY_SIZE)
                                         .strong()
-                                        .color(TEXT_PRIMARY),
+                                        .color(theme::text().primary),
                                 );
                                 ui.add_space(8.0);
                                 let query = self.settings_search.trim().to_ascii_lowercase();
@@ -5514,14 +5698,17 @@ impl EditorApp {
                                 if show_general {
                                     ui.label(
                                         RichText::new("General")
-                                            .size(13.0)
+                                            .size(theme::typography::BODY_SIZE)
                                             .strong()
-                                            .color(TEXT_PRIMARY),
+                                            .color(theme::text().primary),
                                     );
                                     ui.add_space(10.0);
                                     egui::Frame::new()
-                                        .fill(SURFACE_RAISED)
-                                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                                        .fill(theme::surface().raised)
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            theme::border::hairline_color(),
+                                        ))
                                         .corner_radius(10)
                                         .inner_margin(egui::Margin::symmetric(18, 10))
                                         .show(ui, |ui| {
@@ -5540,9 +5727,9 @@ impl EditorApp {
                                         ui.set_min_height(40.0);
                                         ui.label(
                                             RichText::new("Servers")
-                                                .size(13.0)
+                                                .size(theme::typography::BODY_SIZE)
                                                 .strong()
-                                                .color(TEXT_PRIMARY),
+                                                .color(theme::text().primary),
                                         );
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
@@ -5562,21 +5749,25 @@ impl EditorApp {
                                     });
                                     ui.add_space(2.0);
                                     egui::Frame::new()
-                                        .fill(SURFACE_RAISED)
-                                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                                        .fill(theme::surface().raised)
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            theme::border::hairline_color(),
+                                        ))
                                         .corner_radius(10)
                                         .inner_margin(egui::Margin::symmetric(18, 0))
                                         .show(ui, |ui| self.draw_server_settings(ui, &mut actions));
                                 }
                                 if !show_general && !show_servers {
                                     ui.label(
-                                        RichText::new("No matching settings").color(TEXT_MUTED),
+                                        RichText::new("No matching settings")
+                                            .color(theme::text().muted),
                                     );
                                 }
                                 if let Some(error) = &self.settings_error {
                                     ui.add_space(12.0);
                                     ui.colored_label(
-                                        Color32::from_rgb(255, 125, 125),
+                                        theme::ink(theme::semantic().danger),
                                         format!("Settings were not changed: {error}"),
                                     );
                                 }
@@ -5595,12 +5786,117 @@ impl EditorApp {
         }
     }
 
+    fn draw_appearance_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Appearance")
+                .size(theme::typography::DISPLAY_SIZE)
+                .strong()
+                .color(theme::text().primary),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Theme, density, and the editor face. Changes apply immediately.")
+                .font(theme::typography::small())
+                .color(theme::text().muted),
+        );
+        ui.add_space(theme::space::XWIDE);
+        let mut dirty = false;
+        let appearance = &mut self.settings.appearance;
+
+        dirty |= appearance_choice_row(
+            ui,
+            "Theme",
+            "Dark, light, or follow the system.",
+            &mut appearance.theme,
+            [
+                (ThemePreference::Dark, "Dark"),
+                (ThemePreference::Light, "Light"),
+                (ThemePreference::System, "System"),
+            ],
+        );
+        dirty |= appearance_choice_row(
+            ui,
+            "Density",
+            "Comfortable is the default rhythm; Compact tightens every list.",
+            &mut appearance.density,
+            [
+                (DensityPreference::Comfortable, "Comfortable"),
+                (DensityPreference::Compact, "Compact"),
+            ],
+        );
+        dirty |= appearance_choice_row(
+            ui,
+            "Line height",
+            "The editor's line box as a ratio of its font size.",
+            &mut appearance.line_height,
+            [
+                (LineHeightPreference::Compact, "Compact"),
+                (LineHeightPreference::Default, "Default"),
+                (LineHeightPreference::Comfortable, "Comfortable"),
+            ],
+        );
+
+        ui.add_space(theme::space::LARGE);
+        ui.label(
+            RichText::new("Editor font size")
+                .font(theme::typography::body())
+                .color(theme::text().secondary),
+        );
+        ui.add_space(theme::space::TIGHT);
+        let before = appearance.editor_font_size;
+        ui.add(
+            egui::Slider::new(&mut appearance.editor_font_size, 10.0..=24.0)
+                .step_by(1.0)
+                .suffix(" px"),
+        );
+        dirty |= (appearance.editor_font_size - before).abs() > f32::EPSILON;
+
+        ui.add_space(theme::space::LARGE);
+        ui.label(
+            RichText::new("Editor font family")
+                .font(theme::typography::body())
+                .color(theme::text().secondary),
+        );
+        ui.add_space(theme::space::TIGHT);
+        let mut family = appearance.editor_font_family.clone().unwrap_or_default();
+        let response = ui.add(
+            TextEdit::singleline(&mut family)
+                .hint_text("JetBrains Mono (bundled)")
+                .desired_width(f32::INFINITY),
+        );
+        if response.changed() {
+            appearance.editor_font_family = (!family.trim().is_empty()).then_some(family);
+            dirty = true;
+        }
+
+        ui.add_space(theme::space::LARGE);
+        let reduced = appearance_toggle_row(
+            ui,
+            "Reduce motion",
+            "Skip animated transitions. Every change still lands.",
+            appearance.reduced_motion,
+        );
+        if reduced.clicked() {
+            appearance.reduced_motion = !appearance.reduced_motion;
+            dirty = true;
+        }
+
+        if dirty {
+            let ctx = ui.ctx().clone();
+            if !self.persist_settings() {
+                return;
+            }
+            self.apply_appearance(&ctx);
+            ctx.request_repaint();
+        }
+    }
+
     fn draw_keybinding_settings(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new("Keybindings")
-                .size(20.0)
+                .size(theme::typography::DISPLAY_SIZE)
                 .strong()
-                .color(TEXT_PRIMARY),
+                .color(theme::text().primary),
         );
         ui.add_space(8.0);
         let active = self.settings.keybindings.active_profile.clone();
@@ -5608,7 +5904,7 @@ impl EditorApp {
         let active_label = self.keybinding_profile_label(&active);
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Profile").color(TEXT_SECONDARY));
+            ui.label(RichText::new("Profile").color(theme::text().secondary));
             egui::ComboBox::from_id_salt("keybinding_profile")
                 .selected_text(format!("{active_label} · {}", behavior.label()))
                 .show_ui(ui, |ui| {
@@ -5841,20 +6137,24 @@ impl EditorApp {
             }
             shown += 1;
             egui::Frame::new()
-                .fill(SURFACE_RAISED)
-                .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                .fill(theme::surface().raised)
+                .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
                 .corner_radius(8)
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.set_min_width(220.0);
-                            ui.label(RichText::new(info.label).strong().color(TEXT_PRIMARY));
+                            ui.label(
+                                RichText::new(info.label)
+                                    .strong()
+                                    .color(theme::text().primary),
+                            );
                             ui.label(
                                 RichText::new(info.id)
                                     .monospace()
-                                    .size(10.0)
-                                    .color(TEXT_MUTED),
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(theme::text().muted),
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5878,7 +6178,7 @@ impl EditorApp {
                         });
                     });
                     if bindings.is_empty() {
-                        ui.label(RichText::new("Unbound").color(TEXT_MUTED));
+                        ui.label(RichText::new("Unbound").color(theme::text().muted));
                     }
                     for binding in &bindings {
                         ui.separator();
@@ -5893,28 +6193,28 @@ impl EditorApp {
                                     ),
                                 )
                                 .monospace()
-                                .color(TEXT_PRIMARY),
+                                .color(theme::text().primary),
                             );
                             ui.label(
                                 RichText::new(binding.rule.platform.map_or_else(
                                     || "All platforms".to_owned(),
                                     |platform| platform.to_string(),
                                 ))
-                                .size(11.0)
-                                .color(TEXT_MUTED),
+                                .size(theme::typography::MICRO_SIZE)
+                                .color(theme::text().muted),
                             );
                             ui.label(
                                 RichText::new(binding.rule.scope.label())
-                                    .size(11.0)
-                                    .color(TEXT_SECONDARY),
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(theme::text().secondary),
                             );
                             ui.label(
                                 RichText::new(match binding.source {
                                     BindingSource::BuiltIn => "Built-in",
                                     BindingSource::Custom => "Custom",
                                 })
-                                .size(11.0)
-                                .color(TEXT_MUTED),
+                                .size(theme::typography::MICRO_SIZE)
+                                .color(theme::text().muted),
                             );
                             if ui.small_button("Change").clicked() {
                                 self.shortcut_recorder = Some(ShortcutRecorder {
@@ -5959,12 +6259,12 @@ impl EditorApp {
             ui.add_space(6.0);
         }
         if shown == 0 {
-            ui.label(RichText::new("No matching commands").color(TEXT_MUTED));
+            ui.label(RichText::new("No matching commands").color(theme::text().muted));
         }
         if let Some(error) = &self.settings_error {
             ui.add_space(12.0);
             ui.colored_label(
-                Color32::from_rgb(255, 125, 125),
+                theme::ink(theme::semantic().danger),
                 format!("Settings were not changed: {error}"),
             );
         }
@@ -6099,57 +6399,70 @@ impl EditorApp {
         let Some(draft) = &mut self.new_profile else {
             return;
         };
-        let mut create = false;
-        let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
-        dialog_window(ctx, "New keybinding profile", "new_keybinding_profile").show(ctx, |ui| {
-            begin_dialog(ui, "New keybinding profile");
-            ui.label("Name");
-            ui.add(TextEdit::singleline(&mut draft.name).desired_width(320.0));
-            ui.label("Start from");
-            egui::ComboBox::from_id_salt("new_profile_base")
-                .selected_text(match draft.base.as_deref() {
-                    Some(BUILTIN_VSCODE) => "VS Code",
-                    Some(BUILTIN_VIM) => "Vim",
-                    _ => "Empty",
-                })
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(draft.base.as_deref() == Some(BUILTIN_VSCODE), "VS Code")
-                        .clicked()
-                    {
-                        draft.base = Some(BUILTIN_VSCODE.to_owned());
-                        draft.behavior = KeybindingBehavior::Standard;
-                    }
-                    if ui
-                        .selectable_label(draft.base.as_deref() == Some(BUILTIN_VIM), "Vim")
-                        .clicked()
-                    {
-                        draft.base = Some(BUILTIN_VIM.to_owned());
-                        draft.behavior = KeybindingBehavior::Vim;
-                    }
-                    if ui.selectable_label(draft.base.is_none(), "Empty").clicked() {
-                        draft.base = None;
-                    }
-                });
-            if draft.base.is_none() {
-                ui.horizontal(|ui| {
-                    ui.label("Editing behavior");
-                    ui.selectable_value(
-                        &mut draft.behavior,
-                        KeybindingBehavior::Standard,
-                        "Standard",
-                    );
-                    ui.selectable_value(&mut draft.behavior, KeybindingBehavior::Vim, "Vim modal");
-                });
-            }
-            dialog_actions(ui, |ui| {
-                cancel = ui.add(dialog_button("Cancel", false)).clicked();
-                create = ui.add(dialog_button("Create", true)).clicked();
+        let empty = draft.name.trim().is_empty();
+        let outcome = Dialog::new("new_keybinding_profile", "New keybinding profile")
+            .primary("Create")
+            .primary_enabled(!empty)
+            .show_with(ctx, |ui| {
+                ui.add_space(theme::space::TIGHT);
+                ui.label(
+                    RichText::new("Name")
+                        .font(theme::typography::small())
+                        .color(theme::text().muted),
+                );
+                ui.add(TextEdit::singleline(&mut draft.name).desired_width(320.0));
+                ui.label(
+                    RichText::new("Start from")
+                        .font(theme::typography::small())
+                        .color(theme::text().muted),
+                );
+                egui::ComboBox::from_id_salt("new_profile_base")
+                    .selected_text(match draft.base.as_deref() {
+                        Some(BUILTIN_VSCODE) => "VS Code",
+                        Some(BUILTIN_VIM) => "Vim",
+                        _ => "Empty",
+                    })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                draft.base.as_deref() == Some(BUILTIN_VSCODE),
+                                "VS Code",
+                            )
+                            .clicked()
+                        {
+                            draft.base = Some(BUILTIN_VSCODE.to_owned());
+                            draft.behavior = KeybindingBehavior::Standard;
+                        }
+                        if ui
+                            .selectable_label(draft.base.as_deref() == Some(BUILTIN_VIM), "Vim")
+                            .clicked()
+                        {
+                            draft.base = Some(BUILTIN_VIM.to_owned());
+                            draft.behavior = KeybindingBehavior::Vim;
+                        }
+                        if ui.selectable_label(draft.base.is_none(), "Empty").clicked() {
+                            draft.base = None;
+                        }
+                    });
+                if draft.base.is_none() {
+                    ui.horizontal(|ui| {
+                        ui.label("Editing behavior");
+                        ui.selectable_value(
+                            &mut draft.behavior,
+                            KeybindingBehavior::Standard,
+                            "Standard",
+                        );
+                        ui.selectable_value(
+                            &mut draft.behavior,
+                            KeybindingBehavior::Vim,
+                            "Vim modal",
+                        );
+                    });
+                }
             });
-        });
-        if cancel {
+        if matches!(outcome, Outcome::Cancel | Outcome::Dismissed) {
             self.new_profile = None;
-        } else if create {
+        } else if outcome == Outcome::Primary && !empty {
             let draft = self.new_profile.take().expect("draft exists");
             let old = self.settings.clone();
             match self.settings.keybindings.create_profile(
@@ -6229,124 +6542,118 @@ impl EditorApp {
                     .collect();
             });
         }
-        let mut done = false;
         let mut replace = false;
-        let mut clear = false;
-        let mut cancel = false;
-        dialog_window(ctx, "Record shortcut", "shortcut_recorder").show(ctx, |ui| {
-            begin_dialog(ui, "Record shortcut");
-            ui.label(
-                RichText::new(recorder.command.info().label)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
-            ui.horizontal_wrapped(|ui| {
-                if recorder.strokes.is_empty() {
-                    ui.label(RichText::new("Press up to four keys").color(TEXT_MUTED));
-                }
-                for stroke in &recorder.strokes {
-                    ui.label(
-                        RichText::new(stroke.label(KeybindingPlatform::current()))
-                            .monospace()
-                            .background_color(SURFACE_SELECTED),
-                    );
-                }
-            });
-            if let Some(last) = recorder.strokes.last_mut() {
-                let response = ui.checkbox(
-                    &mut last.physical,
-                    "Use physical key position for last stroke",
+        let recorded = !recorder.strokes.is_empty();
+        // The recorder is itself a key-capture field, so it cannot hand Enter
+        // and Esc to the buttons; it consumes Esc above.
+        let outcome = Dialog::new("shortcut_recorder", "Record shortcut")
+            .primary("Done")
+            .primary_enabled(recorded)
+            .neutral("Clear")
+            .without_keyboard()
+            .show_with(ctx, |ui| {
+                ui.add_space(theme::space::TIGHT);
+                ui.label(
+                    RichText::new(recorder.command.info().label)
+                        .font(theme::typography::strong())
+                        .color(theme::text().primary),
                 );
-                if response.changed() {
-                    if last.physical {
-                        if let Some(physical) =
-                            recorder.physical_keys.last().and_then(Option::as_ref)
-                        {
-                            last.key.clone_from(physical);
+                ui.horizontal_wrapped(|ui| {
+                    if recorder.strokes.is_empty() {
+                        ui.label(RichText::new("Press up to four keys").color(theme::text().muted));
+                    }
+                    for stroke in &recorder.strokes {
+                        chip(ui, &stroke.label(KeybindingPlatform::current()));
+                    }
+                });
+                if let Some(last) = recorder.strokes.last_mut() {
+                    let response = ui.checkbox(
+                        &mut last.physical,
+                        "Use physical key position for last stroke",
+                    );
+                    if response.changed() {
+                        if last.physical {
+                            if let Some(physical) =
+                                recorder.physical_keys.last().and_then(Option::as_ref)
+                            {
+                                last.key.clone_from(physical);
+                            } else {
+                                last.physical = false;
+                                recorder.error =
+                                    Some("This input did not report a physical key".into());
+                                recorder.can_replace = false;
+                            }
                         } else {
-                            last.physical = false;
-                            recorder.error =
-                                Some("This input did not report a physical key".into());
-                            recorder.can_replace = false;
-                        }
-                    } else {
-                        if let Some(logical) = recorder.logical_keys.last() {
-                            last.key.clone_from(logical);
+                            if let Some(logical) = recorder.logical_keys.last() {
+                                last.key.clone_from(logical);
+                            }
                         }
                     }
                 }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Scope");
-                egui::ComboBox::from_id_salt("recorder_scope")
-                    .selected_text(recorder.scope.label())
-                    .show_ui(ui, |ui| {
-                        for scope in recorder.command.info().scopes {
-                            ui.selectable_value(&mut recorder.scope, *scope, scope.label());
-                        }
-                    });
-                ui.label("Platform");
-                egui::ComboBox::from_id_salt("recorder_platform")
-                    .selected_text(
-                        recorder
-                            .platform
-                            .map_or_else(|| "All".to_owned(), |platform| platform.to_string()),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut recorder.platform, None, "All");
-                        ui.selectable_value(
-                            &mut recorder.platform,
-                            Some(KeybindingPlatform::Macos),
-                            "macOS",
-                        );
-                        ui.selectable_value(
-                            &mut recorder.platform,
-                            Some(KeybindingPlatform::Windows),
-                            "Windows",
-                        );
-                        ui.selectable_value(
-                            &mut recorder.platform,
-                            Some(KeybindingPlatform::Linux),
-                            "Linux",
-                        );
-                    });
-            });
-            if recorder.scope == Scope::Global
-                && recorder.strokes.iter().any(|stroke| {
-                    (stroke.ctrl
-                        && matches!(
-                            stroke.parsed_key(),
-                            Some(Key::C | Key::D | Key::Q | Key::S | Key::W)
-                        ))
-                        || (stroke.ctrl
-                            && stroke.alt
-                            && stroke.parsed_key().is_some_and(|key| {
-                                key_character(key, egui::Modifiers::NONE).is_some()
-                            }))
-                })
-            {
-                ui.colored_label(
-                    Color32::YELLOW,
-                    "This global binding may capture terminal or AltGr input.",
-                );
-            }
-            if let Some(error) = &recorder.error {
-                ui.colored_label(Color32::from_rgb(255, 125, 125), error);
-                if recorder.can_replace {
-                    replace = ui.button("Replace existing").clicked();
+                ui.horizontal(|ui| {
+                    ui.label("Scope");
+                    egui::ComboBox::from_id_salt("recorder_scope")
+                        .selected_text(recorder.scope.label())
+                        .show_ui(ui, |ui| {
+                            for scope in recorder.command.info().scopes {
+                                ui.selectable_value(&mut recorder.scope, *scope, scope.label());
+                            }
+                        });
+                    ui.label("Platform");
+                    egui::ComboBox::from_id_salt("recorder_platform")
+                        .selected_text(
+                            recorder
+                                .platform
+                                .map_or_else(|| "All".to_owned(), |platform| platform.to_string()),
+                        )
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut recorder.platform, None, "All");
+                            ui.selectable_value(
+                                &mut recorder.platform,
+                                Some(KeybindingPlatform::Macos),
+                                "macOS",
+                            );
+                            ui.selectable_value(
+                                &mut recorder.platform,
+                                Some(KeybindingPlatform::Windows),
+                                "Windows",
+                            );
+                            ui.selectable_value(
+                                &mut recorder.platform,
+                                Some(KeybindingPlatform::Linux),
+                                "Linux",
+                            );
+                        });
+                });
+                if recorder.scope == Scope::Global
+                    && recorder.strokes.iter().any(|stroke| {
+                        (stroke.ctrl
+                            && matches!(
+                                stroke.parsed_key(),
+                                Some(Key::C | Key::D | Key::Q | Key::S | Key::W)
+                            ))
+                            || (stroke.ctrl
+                                && stroke.alt
+                                && stroke.parsed_key().is_some_and(|key| {
+                                    key_character(key, egui::Modifiers::NONE).is_some()
+                                }))
+                    })
+                {
+                    ui.colored_label(
+                        theme::semantic().warning,
+                        "This global binding may capture terminal or AltGr input.",
+                    );
                 }
-            }
-            dialog_actions(ui, |ui| {
-                cancel = ui.add(dialog_button("Cancel", false)).clicked();
-                clear = ui.add(dialog_button("Clear", false)).clicked();
-                done = ui
-                    .add_enabled(!recorder.strokes.is_empty(), dialog_button("Done", true))
-                    .clicked();
+                if let Some(error) = &recorder.error {
+                    ui.colored_label(theme::ink(theme::semantic().danger), error);
+                    if recorder.can_replace {
+                        replace = ui.button("Replace existing").clicked();
+                    }
+                }
             });
-        });
-        if cancel {
+        if matches!(outcome, Outcome::Cancel | Outcome::Dismissed) {
             self.shortcut_recorder = None;
-        } else if clear {
+        } else if outcome == Outcome::Neutral {
             if let Some(recorder) = &mut self.shortcut_recorder {
                 recorder.strokes.clear();
                 recorder.logical_keys.clear();
@@ -6354,7 +6661,7 @@ impl EditorApp {
                 recorder.error = None;
                 recorder.can_replace = false;
             }
-        } else if done || replace {
+        } else if outcome == Outcome::Primary || replace {
             self.finish_shortcut_recording(replace, ctx);
         }
     }
@@ -6469,7 +6776,7 @@ impl EditorApp {
             .copied()
             .collect::<Vec<_>>();
         if presets.is_empty() {
-            ui.label(RichText::new("No matching language servers").color(TEXT_MUTED));
+            ui.label(RichText::new("No matching language servers").color(theme::text().muted));
             return;
         }
         for (row, preset) in presets.into_iter().enumerate() {
@@ -6482,15 +6789,15 @@ impl EditorApp {
                 egui::pos2(row_rect.left(), row_rect.center().y - 11.0),
                 Align2::LEFT_CENTER,
                 preset.language,
-                FontId::proportional(13.0),
-                TEXT_PRIMARY,
+                theme::typography::body(),
+                theme::text().primary,
             );
             ui.painter().text(
                 egui::pos2(row_rect.left(), row_rect.center().y + 8.0),
                 Align2::LEFT_CENTER,
                 preset.name,
-                FontId::proportional(10.5),
-                TEXT_MUTED,
+                theme::typography::micro(),
+                theme::text().muted,
             );
             let controls = egui::Rect::from_min_max(
                 egui::pos2(row_rect.center().x, row_rect.top()),
@@ -6503,8 +6810,8 @@ impl EditorApp {
                     ui.add_space(12.0);
                     ui.label(
                         RichText::new(self.server_status_label(preset.id))
-                            .size(10.5)
-                            .color(TEXT_SECONDARY),
+                            .size(theme::typography::MICRO_SIZE)
+                            .color(theme::text().secondary),
                     );
                 });
             });
@@ -6530,7 +6837,11 @@ impl EditorApp {
                     .entry(preset.id)
                     .or_insert_with(default);
                 ui.add_space(2.0);
-                ui.label(RichText::new("Executable").small().color(TEXT_SECONDARY));
+                ui.label(
+                    RichText::new("Executable")
+                        .small()
+                        .color(theme::text().secondary),
+                );
                 ui.add(
                     TextEdit::singleline(&mut draft.0)
                         .hint_text("Executable path or command")
@@ -6541,7 +6852,7 @@ impl EditorApp {
                 ui.label(
                     RichText::new("Arguments (one per line)")
                         .small()
-                        .color(TEXT_SECONDARY),
+                        .color(theme::text().secondary),
                 );
                 ui.add(
                     TextEdit::multiline(&mut draft.1)
@@ -6588,7 +6899,10 @@ impl EditorApp {
             };
             if let Some(detail) = detail {
                 ui.add_space(5.0);
-                ui.colored_label(Color32::from_rgb(255, 125, 125), truncate_lines(&detail, 3));
+                ui.colored_label(
+                    theme::ink(theme::semantic().danger),
+                    truncate_lines(&detail, 3),
+                );
             }
         }
     }
@@ -6719,6 +7033,7 @@ impl EditorApp {
     }
 
     fn persist_settings(&mut self) -> bool {
+        self.settings.appearance = self.settings.appearance.clone().normalized();
         let result = data_dir()
             .and_then(|directory| settings::save(&directory.join("settings.json"), &self.settings));
         match result {
@@ -6731,6 +7046,32 @@ impl EditorApp {
                 false
             }
         }
+    }
+
+    /// Pushes the Appearance settings into the live token layer so a change is
+    /// visible on the next frame without a restart.
+    fn apply_appearance(&self, ctx: &egui::Context) {
+        let appearance = &self.settings.appearance;
+        let light = match appearance.theme {
+            ThemePreference::Light => true,
+            ThemePreference::Dark => false,
+            ThemePreference::System => ctx
+                .system_theme()
+                .map(|theme| theme == egui::Theme::Light)
+                .unwrap_or(false),
+        };
+        theme::set_light(light);
+        theme::set_density(match appearance.density {
+            DensityPreference::Comfortable => theme::Density::Comfortable,
+            DensityPreference::Compact => theme::Density::Compact,
+        });
+        theme::typography::set_code_metrics(
+            appearance.editor_font_size,
+            appearance.line_height.ratio(),
+        );
+        theme::typography::set_code_family(appearance.editor_font_family.clone());
+        theme::motion::set_reduced(ctx, appearance.reduced_motion);
+        theme::apply(ctx);
     }
 
     fn server_launch(&self, preset: PresetId) -> ServerLaunch {
@@ -7240,8 +7581,8 @@ impl EditorApp {
             .fixed_pos(position)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(SURFACE_RAISED)
-                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .fill(theme::surface().raised)
+                    .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
                     .corner_radius(7)
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
@@ -7251,11 +7592,15 @@ impl EditorApp {
                                 selectable_content_row(ui, *index == selected, 22.0, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(label).monospace().color(TEXT_PRIMARY),
+                                            RichText::new(label)
+                                                .monospace()
+                                                .color(theme::text().primary),
                                         );
                                         if let Some(kind) = kind {
                                             ui.label(
-                                                RichText::new(*kind).small().color(TEXT_MUTED),
+                                                RichText::new(*kind)
+                                                    .small()
+                                                    .color(theme::text().muted),
                                             );
                                         }
                                         if let Some(detail) = detail {
@@ -7265,7 +7610,7 @@ impl EditorApp {
                                                     ui.label(
                                                         RichText::new(detail)
                                                             .small()
-                                                            .color(TEXT_SECONDARY),
+                                                            .color(theme::text().secondary),
                                                     );
                                                 },
                                             );
@@ -7304,8 +7649,8 @@ impl EditorApp {
             .fixed_pos(position)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(SURFACE_RAISED)
-                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .fill(theme::surface().raised)
+                    .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
                     .corner_radius(7)
                     .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
@@ -7339,17 +7684,21 @@ impl EditorApp {
             .fixed_pos(position)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(SURFACE_RAISED)
-                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .fill(theme::surface().raised)
+                    .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
                     .corner_radius(10)
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.set_width(size.x - 24.0);
-                        ui.label(RichText::new("Go to definition").size(15.0).strong());
+                        ui.label(
+                            RichText::new("Go to definition")
+                                .size(theme::typography::TITLE_SIZE)
+                                .strong(),
+                        );
                         ui.label(
                             RichText::new("Up/Down navigate   Enter open   Esc close")
                                 .small()
-                                .color(TEXT_MUTED),
+                                .color(theme::text().muted),
                         );
                         ui.add_space(8.0);
                         ScrollArea::vertical()
@@ -7367,7 +7716,7 @@ impl EditorApp {
                                             ui.label(
                                                 RichText::new(&label)
                                                     .monospace()
-                                                    .color(TEXT_PRIMARY),
+                                                    .color(theme::text().primary),
                                             );
                                         });
                                     if response.clicked() {
@@ -7383,21 +7732,12 @@ impl EditorApp {
         }
     }
 
+    /// Errors that need a decision are dialogs; these need only to be seen.
     fn draw_error(&mut self, ctx: &egui::Context) {
-        let Some(error) = self.error.clone() else {
-            return;
-        };
-        dialog_window(ctx, "Error", "error_banner")
-            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 42.0))
-            .show(ctx, |ui| {
-                begin_dialog(ui, "Error");
-                ui.colored_label(Color32::from_rgb(255, 125, 125), error);
-                dialog_actions(ui, |ui| {
-                    if ui.add(dialog_button("Dismiss", true)).clicked() {
-                        self.error = None;
-                    }
-                });
-            });
+        if let Some(error) = self.error.take() {
+            self.toasts.push(Severity::Danger, error);
+        }
+        self.toasts.show(ctx);
     }
 
     fn take_window_action(&mut self) -> Option<WindowAction> {
@@ -8350,7 +8690,8 @@ impl EditorApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.painter().rect_filled(ui.max_rect(), 0.0, CANVAS);
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, theme::surface().chrome);
         #[cfg(target_os = "macos")]
         ui.add_space(TITLEBAR_HEIGHT);
         self.draw_tree(ui);
@@ -8358,7 +8699,7 @@ impl EditorApp {
 
     fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, CANVAS);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         self.draw_agent(ui, rect);
     }
 
@@ -8777,13 +9118,13 @@ impl EditorApp {
     fn draw_agent(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         ui.style_mut()
             .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(15.0));
+            .insert(egui::TextStyle::Body, theme::typography::title());
         ui.style_mut()
             .text_styles
-            .insert(egui::TextStyle::Small, FontId::proportional(12.5));
+            .insert(egui::TextStyle::Small, theme::typography::small());
         ui.style_mut()
             .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(13.5));
+            .insert(egui::TextStyle::Button, theme::typography::body());
         let font_id = egui::TextStyle::Body.resolve(ui.style());
         let prompt_width = if self.agentic_mode {
             rect.width().min(AGENTIC_CONTENT_WIDTH) - 28.0
@@ -8832,11 +9173,11 @@ impl EditorApp {
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
-        painter.rect_filled(header, 0.0, SURFACE);
+        painter.rect_filled(header, 0.0, theme::surface().chrome);
         painter.hline(
             header.x_range(),
             header.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         let project_title = self
             .tree
@@ -8888,7 +9229,7 @@ impl EditorApp {
             painter.vline(
                 header.left() + 100.0,
                 (header.center().y - 7.0)..=(header.center().y + 7.0),
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
             );
             title_x = header.left() + 112.0;
         } else if !self.agentic_mode {
@@ -8898,8 +9239,8 @@ impl EditorApp {
             egui::pos2(title_x, header.center().y),
             Align2::LEFT_CENTER,
             title,
-            FontId::proportional(13.0),
-            TEXT_PRIMARY,
+            theme::typography::body(),
+            theme::text().primary,
         );
         let agent_button = agent_toggle_rect(header);
         if !self.agentic_mode && self.draw_agent_toggle(ui, agent_button) {
@@ -8922,9 +9263,9 @@ impl EditorApp {
                 )
             });
             let icon_color = if response.hovered() {
-                TEXT_PRIMARY
+                theme::text().primary
             } else {
-                TEXT_SECONDARY
+                theme::text().secondary
             };
             painter.hline(
                 (button.center().x - 5.0)..=(button.center().x + 5.0),
@@ -8951,19 +9292,16 @@ impl EditorApp {
                 )
             });
             let icon_color = if response.hovered() {
-                TEXT_PRIMARY
+                theme::text().primary
             } else {
-                TEXT_SECONDARY
+                theme::text().secondary
             };
             let icon_center = button.center() + egui::vec2(3.0, 0.0);
-            painter.circle_stroke(icon_center, 6.0, egui::Stroke::new(1.3, icon_color));
-            painter.line_segment(
-                [icon_center, icon_center + egui::vec2(0.0, -3.5)],
-                egui::Stroke::new(1.3, icon_color),
-            );
-            painter.line_segment(
-                [icon_center, icon_center + egui::vec2(3.0, 1.5)],
-                egui::Stroke::new(1.3, icon_color),
+            icons::paint(
+                &painter,
+                Icon::History,
+                egui::Rect::from_center_size(icon_center, egui::Vec2::splat(icons::GRID)),
+                icon_color,
             );
             if response.clicked() {
                 let menu = AgentMenu::Sessions;
@@ -9009,9 +9347,9 @@ impl EditorApp {
                             "Installing {} Agent",
                             provider_descriptor(self.selected_provider).display_name
                         ))
-                            .size(15.0)
+                            .size(theme::typography::TITLE_SIZE)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(theme::text().primary),
                     );
                     let total = total
                         .map_or_else(|| "?".into(), |value| (value / 1_048_576).to_string());
@@ -9020,7 +9358,7 @@ impl EditorApp {
                             "Downloading {} / {total} MiB…",
                             downloaded / 1_048_576
                         ))
-                        .color(TEXT_MUTED),
+                        .color(theme::text().muted),
                     );
                 }
                 ConnectionState::Starting => {
@@ -9029,8 +9367,8 @@ impl EditorApp {
                             "Connecting to {}…",
                             provider_descriptor(self.selected_provider).display_name
                         ))
-                            .size(14.0)
-                            .color(TEXT_SECONDARY),
+                            .size(theme::typography::BODY_SIZE)
+                            .color(theme::text().secondary),
                     );
                 }
                 ConnectionState::AuthenticationRequired(methods) => {
@@ -9039,8 +9377,8 @@ impl EditorApp {
                             method.kind == AuthKind::Environment && !method.can_authenticate
                         });
                     egui::Frame::new()
-                        .fill(SURFACE_RAISED)
-                        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+                        .fill(theme::surface().raised)
+                        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
                         .inner_margin(egui::Margin::same(14))
                         .corner_radius(7)
                         .show(ui, |ui| {
@@ -9050,9 +9388,9 @@ impl EditorApp {
                                     "Connect {}",
                                     provider_descriptor(self.selected_provider).display_name
                                 ))
-                                    .size(15.0)
+                                    .size(theme::typography::TITLE_SIZE)
                                     .strong()
-                                    .color(TEXT_PRIMARY),
+                                    .color(theme::text().primary),
                             );
                             ui.add_space(3.0);
                             ui.add(
@@ -9066,7 +9404,7 @@ impl EditorApp {
                                             provider_descriptor(self.selected_provider).display_name
                                         )
                                     })
-                                    .color(TEXT_MUTED),
+                                    .color(theme::text().muted),
                                 )
                                 .wrap(),
                             );
@@ -9080,9 +9418,9 @@ impl EditorApp {
                                             &method.name
                                         })
                                             .strong()
-                                            .color(ACCENT_INK),
+                                            .color(theme::text().on_accent),
                                     )
-                                    .fill(ACCENT)
+                                    .fill(theme::accent())
                                     .stroke(egui::Stroke::NONE)
                                     .corner_radius(5)
                                     .min_size(egui::vec2(ui.available_width(), 30.0));
@@ -9127,8 +9465,8 @@ impl EditorApp {
                 }
                 ConnectionState::Failed(error) => {
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(34, 27, 31))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(78, 45, 51)))
+                        .fill(theme::callout(theme::semantic().danger).fill)
+                        .stroke(egui::Stroke::new(1.0, theme::callout(theme::semantic().danger).border))
                         .inner_margin(egui::Margin::same(14))
                         .corner_radius(7)
                         .show(ui, |ui| {
@@ -9139,7 +9477,7 @@ impl EditorApp {
                                     provider_descriptor(self.selected_provider).display_name
                                 ))
                                     .strong()
-                                    .color(Color32::from_rgb(237, 191, 194)),
+                                    .color(theme::ink(theme::semantic().danger)),
                             );
                             ui.add(Label::new(RichText::new(error).weak()).wrap());
                             if let Some(diagnostics) = &self.agent.diagnostics {
@@ -9178,41 +9516,28 @@ impl EditorApp {
                             .unwrap_or(self.tree.root.as_os_str())
                             .to_string_lossy();
                         if self.agentic_mode {
-                            let (_, mark) = ui.allocate_space(egui::vec2(48.0, 48.0));
+                            let (_, mark) = ui.allocate_space(egui::Vec2::splat(48.0));
                             ui.painter().rect_filled(
                                 mark,
-                                14.0,
-                                SURFACE_SELECTED,
+                                theme::corner(theme::radius::DIALOG),
+                                theme::state::selected(),
                             );
                             ui.painter().rect_stroke(
                                 mark,
-                                14.0,
-                                egui::Stroke::new(1.0, BORDER_STRONG),
+                                theme::corner(theme::radius::DIALOG),
+                                theme::border::hairline(),
                                 egui::StrokeKind::Inside,
                             );
-                            let center = mark.center();
-                            let stroke =
-                                egui::Stroke::new(1.8, ACCENT);
-                            ui.painter().line_segment(
-                                [
-                                    center + egui::vec2(-8.0, -5.0),
-                                    center + egui::vec2(-3.0, 0.0),
-                                ],
-                                stroke,
+                            icons::paint(
+                                ui.painter(),
+                                Icon::Sparkle,
+                                egui::Rect::from_center_size(
+                                    mark.center(),
+                                    egui::Vec2::splat(icons::GRID * 1.5),
+                                ),
+                                theme::accent(),
                             );
-                            ui.painter().line_segment(
-                                [
-                                    center + egui::vec2(-3.0, 0.0),
-                                    center + egui::vec2(-8.0, 5.0),
-                                ],
-                                stroke,
-                            );
-                            ui.painter().hline(
-                                (center.x + 1.0)..=(center.x + 9.0),
-                                center.y + 5.0,
-                                stroke,
-                            );
-                            ui.add_space(16.0);
+                            ui.add_space(theme::space::LARGE);
                         }
                         let heading = RichText::new(if self.agentic_mode {
                                 format!("What should we work on in {project}?")
@@ -9220,7 +9545,7 @@ impl EditorApp {
                                 "Start a task".to_owned()
                             })
                             .size(if self.agentic_mode { 24.0 } else { 18.0 })
-                            .color(TEXT_SECONDARY);
+                            .color(theme::text().secondary);
                         ui.label(if self.agentic_mode {
                             heading
                         } else {
@@ -9232,8 +9557,8 @@ impl EditorApp {
                                 RichText::new(
                                     "Describe a task, ask a question, or review changes.",
                                 )
-                                .size(13.0)
-                                .color(TEXT_DISABLED),
+                                .size(theme::typography::BODY_SIZE)
+                                .color(theme::text_disabled()),
                             );
                         } else {
                             ui.add_space(3.0);
@@ -9245,8 +9570,8 @@ impl EditorApp {
                                             provider_descriptor(self.selected_provider).display_name
                                         ),
                                     )
-                                    .size(13.5)
-                                    .color(TEXT_DISABLED),
+                                    .size(theme::typography::BODY_SIZE)
+                                    .color(theme::text_disabled()),
                                 )
                                 .wrap(),
                             );
@@ -9289,15 +9614,15 @@ impl EditorApp {
                                     TranscriptItem::User(text) => {
                                         ui.label(
                                             RichText::new("YOU")
-                                                .size(11.5)
+                                                .size(theme::typography::MICRO_SIZE)
                                                 .strong()
-                                                .color(TEXT_MUTED),
+                                                .color(theme::text().muted),
                                         );
                                         egui::Frame::new()
-                                            .fill(SURFACE_INPUT)
+                                            .fill(theme::surface().input)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                BORDER_STRONG,
+                                                theme::border::strong_color(),
                                             ))
                                             .inner_margin(egui::Margin::same(12))
                                             .corner_radius(8)
@@ -9390,7 +9715,7 @@ impl EditorApp {
                                                                     path.display().to_string(),
                                                                 )
                                                                 .monospace()
-                                                                .size(12.5),
+                                                                .size(theme::typography::SMALL_SIZE),
                                                             )
                                                             .truncate(),
                                                         );
@@ -9543,10 +9868,8 @@ impl EditorApp {
                                                             Label::new(
                                                                 RichText::new(text)
                                                                     .monospace()
-                                                                    .size(12.5)
-                                                                    .color(Color32::from_rgb(
-                                                                        174, 181, 194,
-                                                                    )),
+                                                                    .size(theme::typography::SMALL_SIZE)
+                                                                    .color(theme::text().secondary),
                                                             )
                                                             .wrap()
                                                             .selectable(true),
@@ -9567,27 +9890,27 @@ impl EditorApp {
                                             let (status, color) = match selected.kind.as_str() {
                                                 "AllowAlways" => (
                                                     "Allowed globally",
-                                                    Color32::from_rgb(123, 205, 158),
+                                                    theme::diff::added_ink(),
                                                 ),
                                                 "AllowOnce" => (
                                                     "Allowed once",
-                                                    Color32::from_rgb(123, 205, 158),
+                                                    theme::diff::added_ink(),
                                                 ),
                                                 "RejectAlways" => (
                                                     "Rejected globally",
-                                                    Color32::from_rgb(224, 137, 145),
+                                                    theme::diff::removed_ink(),
                                                 ),
                                                 "RejectOnce" => (
                                                     "Rejected",
-                                                    Color32::from_rgb(224, 137, 145),
+                                                    theme::diff::removed_ink(),
                                                 ),
                                                 _ => (selected.name.as_str(), Color32::GRAY),
                                             };
                                             egui::Frame::new()
-                                            .fill(SURFACE_RAISED)
+                                            .fill(theme::surface().raised)
                                                 .stroke(egui::Stroke::new(
                                                     1.0,
-                                                    BORDER_SUBTLE,
+                                                    theme::border::hairline_color(),
                                                 ))
                                                 .inner_margin(egui::Margin::same(8))
                                                 .corner_radius(7)
@@ -9604,10 +9927,10 @@ impl EditorApp {
                                             continue;
                                         }
                                         egui::Frame::new()
-                                            .fill(Color32::from_rgb(31, 30, 27))
+                                            .fill(theme::callout(theme::semantic().warning).fill)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                Color32::from_rgb(73, 62, 42),
+                                                theme::callout(theme::semantic().warning).border,
                                             ))
                                             .inner_margin(egui::Margin::same(10))
                                             .corner_radius(8)
@@ -9616,7 +9939,7 @@ impl EditorApp {
                                                 ui.label(
                                                     RichText::new("Permission required")
                                                         .strong()
-                                                        .color(Color32::from_rgb(235, 204, 137)),
+                                                        .color(theme::ink(theme::semantic().warning)),
                                                 );
                                                 ui.add_space(3.0);
                                                 ui.add(Label::new(&card.action).wrap());
@@ -9634,19 +9957,19 @@ impl EditorApp {
                                                         let (fill, stroke, text_color) =
                                                             match option.kind.as_str() {
                                                                 "AllowAlways" => (
-                                                                    Color32::from_rgb(37, 55, 57),
-                                                                    Color32::from_rgb(62, 120, 126),
-                                                                    Color32::from_rgb(210, 237, 240),
+                                                                    theme::callout(theme::semantic().info).fill,
+                                                                    theme::callout(theme::semantic().info).border,
+                                                                    theme::ink(theme::semantic().info),
                                                                 ),
                                                                 "RejectOnce" | "RejectAlways" => (
-                                                                    Color32::from_rgb(42, 32, 35),
-                                                                    Color32::from_rgb(84, 53, 60),
-                                                                    Color32::from_rgb(225, 190, 195),
+                                                                    theme::callout(theme::semantic().danger).fill,
+                                                                    theme::callout(theme::semantic().danger).border,
+                                                                    theme::ink(theme::semantic().danger),
                                                                 ),
                                                                 _ => (
-                                                                    SURFACE_SELECTED,
-                                                                    BORDER_STRONG,
-                                                                    TEXT_PRIMARY,
+                                                                    theme::state::selected(),
+                                                                    theme::border::strong_color(),
+                                                                    theme::text().primary,
                                                                 ),
                                                             };
                                                         let response = ui
@@ -9682,10 +10005,10 @@ impl EditorApp {
                                     }
                                     TranscriptItem::Interaction(card) => {
                                         egui::Frame::new()
-                                            .fill(SURFACE_INPUT)
+                                            .fill(theme::surface().input)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                BORDER_STRONG,
+                                                theme::border::strong_color(),
                                             ))
                                             .inner_margin(egui::Margin::same(10))
                                             .corner_radius(7)
@@ -9698,7 +10021,7 @@ impl EditorApp {
                                                     } => {
                                                         ui.label(
                                                             RichText::new(title).strong().color(
-                                                                TEXT_PRIMARY,
+                                                                theme::text().primary,
                                                             ),
                                                         );
                                                         for question in questions {
@@ -9799,7 +10122,7 @@ impl EditorApp {
                                                                     .unwrap_or("Proposed plan"),
                                                             )
                                                             .strong()
-                                                            .color(TEXT_PRIMARY),
+                                                            .color(theme::text().primary),
                                                         );
                                                         if let Some(overview) = &plan.overview {
                                                             ui.add(
@@ -9867,7 +10190,7 @@ impl EditorApp {
                                     }
                                     TranscriptItem::Error(error) => {
                                         egui::Frame::new()
-                                            .fill(Color32::from_rgb(38, 28, 32))
+                                            .fill(theme::callout(theme::semantic().danger).fill)
                                             .inner_margin(egui::Margin::same(10))
                                             .corner_radius(6)
                                             .show(ui, |ui| {
@@ -9875,7 +10198,7 @@ impl EditorApp {
                                                 ui.add(
                                                     Label::new(
                                                         RichText::new(error.as_str()).color(
-                                                            Color32::from_rgb(235, 145, 150),
+                                                            theme::ink(theme::semantic().danger),
                                                         ),
                                                     )
                                                     .wrap(),
@@ -9914,9 +10237,9 @@ impl EditorApp {
                     ui.painter().add(egui::Shape::mesh(agent_transcript_fade_mesh(
                         output.inner_rect,
                         if self.agentic_mode {
-                            EDITOR_BACKGROUND
+                            editor_background()
                         } else {
-                            CANVAS
+                            theme::surface().chrome
                         },
                     )));
                     if !self.agent_follow_transcript {
@@ -9931,29 +10254,22 @@ impl EditorApp {
                             .put(
                                 button,
                                 egui::Button::new("")
-                                .fill(SURFACE_SELECTED)
+                                .fill(theme::state::selected())
                                 .stroke(egui::Stroke::new(
                                     1.0,
-                                    BORDER_STRONG,
+                                    theme::border::strong_color(),
                                 ))
                                 .corner_radius(6),
                             )
                             .on_hover_text("Jump to latest");
-                        let center = jump.rect.center();
-                        let stroke = egui::Stroke::new(1.5, TEXT_SECONDARY);
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(center.x - 4.0, center.y - 2.0),
-                                egui::pos2(center.x, center.y + 2.0),
-                            ],
-                            stroke,
-                        );
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(center.x, center.y + 2.0),
-                                egui::pos2(center.x + 4.0, center.y - 2.0),
-                            ],
-                            stroke,
+                        icons::paint(
+                            ui.painter(),
+                            Icon::ChevronDown,
+                            egui::Rect::from_center_size(
+                                jump.rect.center(),
+                                egui::Vec2::splat(icons::GRID * 0.75),
+                            ),
+                            theme::text().secondary,
                         );
                         if jump.clicked() {
                             let mut state = output.state;
@@ -10013,31 +10329,25 @@ impl EditorApp {
                 egui::pos2(composer.left() + padding, composer.top() + 10.0),
                 egui::pos2(composer.right() - padding, composer.bottom() - 18.0),
             );
-            ui.painter().rect_filled(composer, 0.0, EDITOR_BACKGROUND);
-            ui.painter().add(
-                egui::Shadow {
-                    offset: [0, 5],
-                    blur: 18,
-                    spread: 0,
-                    color: Color32::from_black_alpha(80),
-                }
-                .as_shape(panel, AGENTIC_COMPOSER_RADIUS),
-            );
+            ui.painter().rect_filled(composer, 0.0, editor_background());
             ui.painter()
-                .rect_filled(panel, AGENTIC_COMPOSER_RADIUS, SURFACE_RAISED);
+                .add(theme::shadow::popover().as_shape(panel, AGENTIC_COMPOSER_RADIUS));
+            ui.painter()
+                .rect_filled(panel, AGENTIC_COMPOSER_RADIUS, theme::surface().raised);
             ui.painter().rect_stroke(
                 panel,
                 AGENTIC_COMPOSER_RADIUS,
-                egui::Stroke::new(1.0, BORDER_STRONG),
+                egui::Stroke::new(1.0, theme::border::strong_color()),
                 egui::StrokeKind::Inside,
             );
             panel
         } else {
-            ui.painter().rect_filled(composer, 0.0, SURFACE);
+            ui.painter()
+                .rect_filled(composer, 0.0, theme::surface().chrome);
             ui.painter().hline(
                 composer.x_range(),
                 composer.top() + 0.5,
-                egui::Stroke::new(1.0, BORDER_SUBTLE),
+                egui::Stroke::new(1.0, theme::border::hairline_color()),
             );
             composer
         };
@@ -10079,8 +10389,16 @@ impl EditorApp {
                     .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add(egui::Spinner::new().size(12.0).color(ACCENT));
-                    ui.label(RichText::new("Working").size(11.5).color(TEXT_MUTED));
+                    ui.add(
+                        egui::Spinner::new()
+                            .size(theme::typography::SMALL_SIZE)
+                            .color(theme::accent()),
+                    );
+                    ui.label(
+                        RichText::new("Working")
+                            .size(theme::typography::MICRO_SIZE)
+                            .color(theme::text().muted),
+                    );
                 },
             );
         }
@@ -10130,8 +10448,8 @@ impl EditorApp {
         }
         let footer = egui::Rect::from_min_max(
             egui::pos2(
-                composer_panel.left() + 3.0,
-                composer_content.bottom() - 30.0,
+                composer_content.left(),
+                composer_content.bottom() - theme::control::STANDARD,
             ),
             composer_content.right_bottom(),
         );
@@ -10252,15 +10570,17 @@ impl EditorApp {
             |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let attach = ui
-                    .add_enabled(
-                        composer_enabled,
-                        egui::Button::new(RichText::new("+").size(20.0).color(TEXT_SECONDARY))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(6)
-                            .min_size(egui::vec2(32.0, 30.0)),
-                    )
-                    .on_hover_text("Attach files");
+                    .add_enabled_ui(composer_enabled, |ui| {
+                        icons::button_with_id(
+                            ui,
+                            Some(Id::new("agent_attach")),
+                            Icon::Plus,
+                            "Attach files",
+                            theme::text().secondary,
+                            egui::Vec2::splat(theme::control::STANDARD),
+                        )
+                    })
+                    .inner;
                 open_file_picker = attach.clicked();
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     if self.agent.allow_run_everything {
@@ -10375,7 +10695,7 @@ impl EditorApp {
                             .map_or(String::new(), |cost| format!(" · {cost}"));
                         ui.label(
                             RichText::new(format!("{} / {}{cost}", usage.used, usage.size))
-                                .size(10.0)
+                                .size(theme::typography::MICRO_SIZE)
                                 .weak(),
                         )
                         .on_hover_text("Context usage");
@@ -10383,61 +10703,29 @@ impl EditorApp {
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if self.agent.active {
-                        let response = ui
-                            .add(
-                                egui::Button::new("")
-                                    .fill(BORDER_STRONG)
-                                    .corner_radius(6)
-                                    .min_size(egui::vec2(32.0, 30.0)),
-                            )
-                            .on_hover_text("Stop");
-                        ui.painter().rect_filled(
-                            egui::Rect::from_center_size(
-                                response.rect.center(),
-                                egui::vec2(8.0, 8.0),
-                            ),
-                            1.5,
-                            TEXT_PRIMARY,
-                        );
-                        cancel = response.clicked();
+                        cancel = agent_composer_action(
+                            ui,
+                            Icon::Stop,
+                            "Stop",
+                            theme::state::selected(),
+                            theme::text().primary,
+                            true,
+                        )
+                        .clicked();
                     } else {
                         let ready = self.agent.session_ready
                             && (!self.agent.prompt.trim().is_empty()
                                 || !self.agent_attachments.is_empty());
                         let (fill, color) = agent_send_button_colors(ready);
-                        let response = ui
-                            .add_enabled(
-                                ready,
-                                egui::Button::new("")
-                                    .fill(fill)
-                                    .stroke(egui::Stroke::NONE)
-                                    .corner_radius(6)
-                                    .min_size(egui::vec2(32.0, 30.0)),
-                            )
-                            .on_hover_text("Send (Enter)");
-                        let center = response.rect.center();
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(center.x, center.y + 5.0),
-                                egui::pos2(center.x, center.y - 5.0),
-                            ],
-                            egui::Stroke::new(1.5, color),
-                        );
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(center.x - 4.0, center.y - 1.0),
-                                egui::pos2(center.x, center.y - 5.0),
-                            ],
-                            egui::Stroke::new(1.5, color),
-                        );
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(center.x, center.y - 5.0),
-                                egui::pos2(center.x + 4.0, center.y - 1.0),
-                            ],
-                            egui::Stroke::new(1.5, color),
-                        );
-                        send = response.clicked();
+                        send = agent_composer_action(
+                            ui,
+                            Icon::ArrowUp,
+                            "Send (Enter)",
+                            fill,
+                            color,
+                            ready,
+                        )
+                        .clicked();
                     }
                 });
             },
@@ -10451,20 +10739,20 @@ impl EditorApp {
             ui.painter().rect_filled(
                 composer_panel,
                 radius,
-                Color32::from_rgba_unmultiplied(39, 39, 43, 236),
+                theme::surface().raised.gamma_multiply(0.93),
             );
             ui.painter().rect_stroke(
                 composer_panel.shrink(1.0),
                 radius,
-                egui::Stroke::new(1.5, ACCENT),
+                egui::Stroke::new(1.5, theme::accent()),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
                 composer_panel.center(),
                 Align2::CENTER_CENTER,
                 "Drop files to attach",
-                FontId::proportional(14.0),
-                TEXT_PRIMARY,
+                theme::typography::body(),
+                theme::text().primary,
             );
         }
 
@@ -10553,19 +10841,18 @@ impl EditorApp {
                     |ui| {
                         ui.set_clip_rect(ui.ctx().content_rect());
                         ui.painter().add(
-                            egui::Shadow {
-                                offset: [0, 6],
-                                blur: 18,
-                                spread: 0,
-                                color: Color32::from_black_alpha(110),
-                            }
-                            .as_shape(popup, 11),
+                            theme::shadow::popover()
+                                .as_shape(popup, theme::corner(theme::radius::CARD)),
                         );
-                        ui.painter().rect_filled(popup, 11.0, SURFACE_RAISED);
+                        ui.painter().rect_filled(
+                            popup,
+                            theme::corner(theme::radius::CARD),
+                            theme::surface().raised,
+                        );
                         ui.painter().rect_stroke(
                             popup,
                             11.0,
-                            egui::Stroke::new(1.0, BORDER_STRONG),
+                            egui::Stroke::new(1.0, theme::border::strong_color()),
                             egui::StrokeKind::Inside,
                         );
                         ui.scope_builder(
@@ -10909,11 +11196,11 @@ impl EditorApp {
             _ => "0 / 0".to_owned(),
         };
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, SURFACE);
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         ui.painter().hline(
             rect.x_range(),
             rect.top(),
-            egui::Stroke::new(1.0, BORDER_STRONG),
+            egui::Stroke::new(1.0, theme::border::strong_color()),
         );
         ui.scope_builder(
             UiBuilder::new()
@@ -10923,7 +11210,7 @@ impl EditorApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let input_width = (ui.available_width() - 142.0).max(40.0);
                 let response = egui::Frame::new()
-                    .fill(SURFACE_INPUT)
+                    .fill(theme::surface().input)
                     .inner_margin(egui::Margin::symmetric(6, 3))
                     .corner_radius(4)
                     .show(ui, |ui| {
@@ -10933,14 +11220,17 @@ impl EditorApp {
                             egui::vec2(ui.available_width(), 20.0),
                             TextEdit::singleline(&mut find.query)
                                 .id(query_id)
-                                .font(FontId::proportional(13.0))
+                                .font(theme::typography::body())
                                 .hint_text("Find in current file…")
                                 .frame(egui::Frame::NONE),
                         )
                     })
                     .inner;
                 ui.add(Label::new(
-                    RichText::new(&count).monospace().size(11.0).weak(),
+                    RichText::new(&count)
+                        .monospace()
+                        .size(theme::typography::MICRO_SIZE)
+                        .weak(),
                 ));
                 previous = chevron_icon_button(ui, true, "Previous match (Shift+Enter)").clicked();
                 next = chevron_icon_button(ui, false, "Next match (Enter)").clicked();
@@ -11007,8 +11297,8 @@ impl EditorApp {
             ))
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(SURFACE_RAISED)
-                    .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                    .fill(theme::surface().raised)
+                    .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
                     .corner_radius(6)
                     .inner_margin(egui::Margin::symmetric(10, 7))
                     .show(ui, |ui| {
@@ -11019,7 +11309,7 @@ impl EditorApp {
                                 VimOverlayKind::Search(VimSearchDirection::Backward) => "?",
                                 VimOverlayKind::Ex => ":",
                             };
-                            ui.label(RichText::new(prefix).monospace().color(ACCENT));
+                            ui.label(RichText::new(prefix).monospace().color(theme::accent()));
                             let response = ui.add_sized(
                                 egui::vec2(ui.available_width(), 24.0),
                                 TextEdit::singleline(&mut overlay.input)
@@ -11036,7 +11326,7 @@ impl EditorApp {
                             }
                         });
                         if let Some(error) = &overlay.error {
-                            ui.colored_label(Color32::from_rgb(255, 125, 125), error);
+                            ui.colored_label(theme::ink(theme::semantic().danger), error);
                         }
                     });
             });
@@ -11105,19 +11395,11 @@ impl EditorApp {
             palette_size,
         );
         let palette_frame = egui::Frame::window(&ctx.style_of(ctx.theme()))
-            .fill(SURFACE)
-            .stroke(egui::Stroke::new(
-                1.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-            ))
-            .inner_margin(14)
-            .corner_radius(12)
-            .shadow(egui::Shadow {
-                offset: [0, 8],
-                blur: 28,
-                spread: 2,
-                color: Color32::from_black_alpha(150),
-            });
+            .fill(theme::surface().raised)
+            .stroke(theme::border::strong())
+            .inner_margin(theme::space::WIDE as i8)
+            .corner_radius(theme::corner(theme::radius::DIALOG))
+            .shadow(theme::shadow::dialog());
         let mut palette = root.new_child(
             UiBuilder::new()
                 .id_salt("project_search")
@@ -11145,7 +11427,11 @@ impl EditorApp {
                 ui.spacing_mut().item_spacing.y = 4.0;
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Search project").size(15.0).strong());
+                    ui.label(
+                        RichText::new("Search project")
+                            .size(theme::typography::TITLE_SIZE)
+                            .strong(),
+                    );
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("Up/Down navigate   Enter open   Esc close")
@@ -11156,7 +11442,7 @@ impl EditorApp {
                 });
                 ui.add_space(8.0);
                 let response = egui::Frame::new()
-                    .fill(SURFACE_INPUT)
+                    .fill(theme::surface().input)
                     .inner_margin(egui::Margin::symmetric(10, 7))
                     .corner_radius(7)
                     .show(ui, |ui| {
@@ -11202,29 +11488,20 @@ impl EditorApp {
                             return;
                         }
 
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("FILES").size(11.0).strong().color(TEXT_MUTED));
-                            ui.label(
-                                RichText::new(results.files.len().to_string())
-                                    .small()
-                                    .weak(),
-                            );
-                        });
+                        if !results.files.is_empty() {
+                            search_group_header(ui, "FILES", results.files.len());
+                        }
                         for (index, hit) in results.files.iter().enumerate() {
-                            let mut job = LayoutJob::default();
-                            job.wrap.max_width = ui.available_width() - 18.0;
-                            job.wrap.break_anywhere = true;
-                            job.append(
-                                &format!("  {}", hit.relative),
-                                0.0,
-                                TextFormat {
-                                    font_id: FontId::monospace(13.5),
-                                    color: TEXT_SECONDARY,
-                                    ..TextFormat::default()
-                                },
+                            let response = search_result_row(
+                                ui,
+                                self.search_selected == index,
+                                file_result_job(
+                                    &hit.relative,
+                                    self.search_query.trim(),
+                                    ui.available_width() - 18.0,
+                                ),
+                                30.0,
                             );
-                            let response =
-                                search_result_row(ui, self.search_selected == index, job, 30.0);
                             if scroll_to_selection && self.search_selected == index {
                                 response.scroll_to_me(None);
                             }
@@ -11233,20 +11510,10 @@ impl EditorApp {
                             }
                         }
 
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("FILE CONTENT")
-                                    .size(11.0)
-                                    .strong()
-                                    .color(TEXT_MUTED),
-                            );
-                            ui.label(
-                                RichText::new(results.contents.len().to_string())
-                                    .small()
-                                    .weak(),
-                            );
-                        });
+                        if !results.contents.is_empty() {
+                            ui.add_space(theme::space::SMALL);
+                            search_group_header(ui, "FILE CONTENT", results.contents.len());
+                        }
                         for (offset, hit) in results.contents.iter().enumerate() {
                             let index = results.files.len() + offset;
                             let response = search_result_row(
@@ -11295,6 +11562,33 @@ impl EditorApp {
         }
     }
 
+    /// The five things a new window can do, labelled with the chords that are
+    /// actually bound right now, so a rebind changes the hint with it.
+    fn keybinding_hints(&self) -> Vec<(&'static str, String)> {
+        let platform = KeybindingPlatform::current();
+        let bindings = self
+            .settings
+            .keybindings
+            .effective_bindings()
+            .unwrap_or_default();
+        let chord = |command: KeybindingCommand| {
+            bindings
+                .iter()
+                .find(|binding| binding.rule.command == command.id())
+                .map(|binding| binding.rule.label(platform))
+        };
+        [
+            ("Search project", KeybindingCommand::SearchProject),
+            ("Toggle file tree", KeybindingCommand::ViewToggleSidebar),
+            ("Open agent", KeybindingCommand::AppToggleAgentSidebar),
+            ("Toggle terminal", KeybindingCommand::ViewToggleTerminal),
+            ("Settings", KeybindingCommand::AppOpenSettings),
+        ]
+        .into_iter()
+        .filter_map(|(label, command)| Some((label, chord(command)?)))
+        .collect()
+    }
+
     fn draw_tree(&mut self, ui: &mut egui::Ui) {
         let scroll_to_selected = self.tree_focused
             && !ui.ctx().egui_wants_keyboard_input()
@@ -11302,6 +11596,7 @@ impl EditorApp {
             && self.tree_keyboard(ui);
         let output = self.tree_surface.show(
             ui,
+            &self.tree.root,
             &self.tree.visible,
             self.tree.selected_index,
             scroll_to_selected,
@@ -11742,10 +12037,15 @@ impl EditorApp {
             });
         let Some(index) = active_tab else {
             ui.painter()
-                .rect_filled(ui.max_rect(), 0.0, EDITOR_BACKGROUND);
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Select a file to begin editing").weak());
-            });
+                .rect_filled(ui.max_rect(), 0.0, editor_background());
+            let project = self
+                .tree
+                .root
+                .file_name()
+                .unwrap_or(self.tree.root.as_os_str())
+                .to_string_lossy()
+                .into_owned();
+            draw_editor_empty_state(ui, &project, &self.keybinding_hints());
             return;
         };
         let diagnostics = self
@@ -11935,8 +12235,8 @@ impl EditorApp {
                     .fixed_pos(pointer + egui::vec2(12.0, 16.0))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::new()
-                            .fill(SURFACE_RAISED)
-                            .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+                            .fill(theme::surface().raised)
+                            .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
                             .corner_radius(7)
                             .inner_margin(egui::Margin::same(10))
                             .show(ui, |ui| {
@@ -12140,7 +12440,7 @@ impl EditorApp {
         let mut refresh = false;
         let remaining = MAX_PROMPT_ATTACHMENTS
             .saturating_sub(attached_count.saturating_add(picker.selected.len()));
-        let frame = dialog_frame(ctx).inner_margin(0);
+        let frame = popover_frame().inner_margin(0);
         egui::Window::new("Add context")
             .id(Id::new("agent_file_picker"))
             .fixed_pos(position)
@@ -12164,10 +12464,11 @@ impl EditorApp {
                 let rail =
                     egui::Rect::from_min_size(body.min, egui::vec2(rail_width, body.height()));
                 let content = egui::Rect::from_min_max(rail.right_top(), body.right_bottom());
-                let divider = egui::Stroke::new(1.0, Color32::from_white_alpha(18));
+                let divider = egui::Stroke::new(1.0, theme::border::hairline_color());
 
-                ui.painter().rect_filled(rail, 0.0, CANVAS);
-                ui.painter().rect_filled(footer, 0.0, CANVAS);
+                ui.painter().rect_filled(rail, 0.0, theme::surface().chrome);
+                ui.painter()
+                    .rect_filled(footer, 0.0, theme::surface().chrome);
                 ui.painter()
                     .hline(header.x_range(), header.bottom(), divider);
                 ui.painter().vline(rail.right(), rail.y_range(), divider);
@@ -12180,31 +12481,25 @@ impl EditorApp {
                     |ui| {
                         ui.label(
                             RichText::new("Add context")
-                                .size(15.5)
+                                .size(theme::typography::TITLE_SIZE)
                                 .strong()
-                                .color(TEXT_PRIMARY),
+                                .color(theme::text().primary),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             close |= icon_button(
                                 ui,
                                 "Close (Esc)",
                                 egui::vec2(40.0, 40.0),
-                                TEXT_MUTED,
+                                theme::text().muted,
                                 |painter, rect, color| {
-                                    let stroke = egui::Stroke::new(1.4, color);
-                                    painter.line_segment(
-                                        [
-                                            rect.center() + egui::vec2(-3.5, -3.5),
-                                            rect.center() + egui::vec2(3.5, 3.5),
-                                        ],
-                                        stroke,
-                                    );
-                                    painter.line_segment(
-                                        [
-                                            rect.center() + egui::vec2(-3.5, 3.5),
-                                            rect.center() + egui::vec2(3.5, -3.5),
-                                        ],
-                                        stroke,
+                                    icons::paint(
+                                        painter,
+                                        Icon::Close,
+                                        egui::Rect::from_center_size(
+                                            rect.center(),
+                                            egui::Vec2::splat(icons::GRID * 0.85),
+                                        ),
+                                        color,
                                     );
                                 },
                             )
@@ -12220,9 +12515,9 @@ impl EditorApp {
                     |ui| {
                         ui.label(
                             RichText::new("LOCATIONS")
-                                .size(9.5)
+                                .size(theme::typography::MICRO_SIZE)
                                 .strong()
-                                .color(TEXT_DISABLED),
+                                .color(theme::text_disabled()),
                         );
                         ui.add_space(8.0);
                         if agent_file_picker_location_row(
@@ -12258,7 +12553,8 @@ impl EditorApp {
                     egui::Rect::from_min_max(columns.left_bottom(), content.right_bottom());
                 ui.painter()
                     .hline(toolbar.x_range(), toolbar.bottom(), divider);
-                ui.painter().rect_filled(columns, 0.0, CANVAS);
+                ui.painter()
+                    .rect_filled(columns, 0.0, theme::surface().chrome);
                 ui.painter()
                     .hline(columns.x_range(), columns.bottom(), divider);
 
@@ -12276,28 +12572,16 @@ impl EditorApp {
                                 ui,
                                 "Parent folder",
                                 egui::vec2(40.0, 40.0),
-                                TEXT_MUTED,
+                                theme::text().muted,
                                 |painter, rect, color| {
-                                    let center = rect.center();
-                                    let stroke = egui::Stroke::new(1.4, color);
-                                    painter.line_segment(
-                                        [
-                                            center + egui::vec2(-4.0, 1.5),
-                                            center + egui::vec2(0.0, -2.5),
-                                        ],
-                                        stroke,
-                                    );
-                                    painter.line_segment(
-                                        [
-                                            center + egui::vec2(0.0, -2.5),
-                                            center + egui::vec2(4.0, 1.5),
-                                        ],
-                                        stroke,
-                                    );
-                                    painter.vline(
-                                        center.x,
-                                        (center.y - 2.0)..=(center.y + 5.0),
-                                        stroke,
+                                    icons::paint(
+                                        painter,
+                                        Icon::ArrowUp,
+                                        egui::Rect::from_center_size(
+                                            rect.center(),
+                                            egui::Vec2::splat(icons::GRID * 0.85),
+                                        ),
+                                        color,
                                     );
                                 },
                             )
@@ -12322,24 +12606,16 @@ impl EditorApp {
                             ui,
                             "Refresh folder",
                             egui::vec2(40.0, 40.0),
-                            TEXT_MUTED,
+                            theme::text().muted,
                             |painter, rect, color| {
-                                let center = rect.center();
-                                let stroke = egui::Stroke::new(1.3, color);
-                                painter.circle_stroke(center, 6.0, stroke);
-                                painter.line_segment(
-                                    [
-                                        center + egui::vec2(3.0, -6.0),
-                                        center + egui::vec2(6.5, -6.0),
-                                    ],
-                                    stroke,
-                                );
-                                painter.line_segment(
-                                    [
-                                        center + egui::vec2(6.5, -6.0),
-                                        center + egui::vec2(6.5, -2.5),
-                                    ],
-                                    stroke,
+                                icons::paint(
+                                    painter,
+                                    Icon::Refresh,
+                                    egui::Rect::from_center_size(
+                                        rect.center(),
+                                        egui::Vec2::splat(icons::GRID),
+                                    ),
+                                    color,
                                 );
                             },
                         )
@@ -12355,7 +12631,8 @@ impl EditorApp {
                     ),
                     egui::pos2(refresh_rect.left() - 6.0, toolbar.bottom() - 10.0),
                 );
-                ui.painter().rect_filled(search_rect, 5.0, CANVAS);
+                ui.painter()
+                    .rect_filled(search_rect, 5.0, theme::surface().chrome);
                 let search_response = ui
                     .scope_builder(
                         UiBuilder::new()
@@ -12367,7 +12644,7 @@ impl EditorApp {
                                 TextEdit::singleline(&mut picker.query)
                                     .id(Id::new("agent_file_picker_search"))
                                     .hint_text("Filter files")
-                                    .font(FontId::proportional(12.0))
+                                    .font(theme::typography::small())
                                     .frame(egui::Frame::NONE),
                             )
                         },
@@ -12379,9 +12656,9 @@ impl EditorApp {
                     egui::Stroke::new(
                         1.0,
                         if search_response.has_focus() {
-                            ACCENT
+                            theme::accent()
                         } else {
-                            Color32::from_white_alpha(18)
+                            theme::border::hairline_color()
                         },
                     ),
                     egui::StrokeKind::Inside,
@@ -12404,23 +12681,23 @@ impl EditorApp {
                     folder_rect.left_center(),
                     Align2::LEFT_CENTER,
                     folder_name,
-                    FontId::proportional(12.5),
-                    TEXT_SECONDARY,
+                    theme::typography::small(),
+                    theme::text().secondary,
                 );
 
                 ui.painter().text(
                     egui::pos2(columns.left() + 14.0, columns.center().y),
                     Align2::LEFT_CENTER,
                     "NAME",
-                    FontId::proportional(9.5),
-                    TEXT_DISABLED,
+                    theme::typography::micro(),
+                    theme::text_disabled(),
                 );
                 ui.painter().text(
                     egui::pos2(columns.right() - 14.0, columns.center().y),
                     Align2::RIGHT_CENTER,
                     "TYPE",
-                    FontId::proportional(9.5),
-                    TEXT_DISABLED,
+                    theme::typography::micro(),
+                    theme::text_disabled(),
                 );
 
                 ui.scope_builder(
@@ -12443,8 +12720,8 @@ impl EditorApp {
                                             } else {
                                                 "No matching files"
                                             })
-                                            .size(12.0)
-                                            .color(TEXT_DISABLED),
+                                            .size(theme::typography::SMALL_SIZE)
+                                            .color(theme::text_disabled()),
                                         );
                                     });
                                 }
@@ -12479,11 +12756,11 @@ impl EditorApp {
                     egui::pos2(footer.left() + 16.0, footer.center().y),
                     Align2::LEFT_CENTER,
                     status,
-                    FontId::proportional(11.5),
+                    theme::typography::micro(),
                     if picker.error.is_some() {
-                        Color32::from_rgb(244, 139, 145)
+                        theme::ink(theme::semantic().danger)
                     } else {
-                        TEXT_MUTED
+                        theme::text().muted
                     },
                 );
                 ui.scope_builder(
@@ -12498,11 +12775,13 @@ impl EditorApp {
                         attach |= ui
                             .add_enabled(
                                 !picker.selected.is_empty(),
-                                egui::Button::new(RichText::new(label).strong().color(ACCENT_INK))
-                                    .fill(ACCENT)
-                                    .stroke(egui::Stroke::NONE)
-                                    .corner_radius(6)
-                                    .min_size(egui::vec2(104.0, 40.0)),
+                                egui::Button::new(
+                                    RichText::new(label).strong().color(theme::text().on_accent),
+                                )
+                                .fill(theme::accent())
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(6)
+                                .min_size(egui::vec2(104.0, 40.0)),
                             )
                             .clicked();
                         close |= ui
@@ -12547,29 +12826,35 @@ impl EditorApp {
                 Some(TreePromptAction::Rename) => "Rename",
                 None => "File Operation",
             };
-            let mut submit = false;
-            let mut cancel = false;
-            dialog_window(ctx, title, "tree_name_dialog").show(ctx, |ui| {
-                begin_dialog(ui, title);
-                ui.label("Name");
-                if let Some(prompt) = self.tree_prompt.as_mut() {
-                    let response = ui.add(
-                        TextEdit::singleline(&mut prompt.name)
-                            .id(Id::new("tree_name_input"))
-                            .desired_width(360.0),
+            let mut submitted_by_return = false;
+            let empty = self
+                .tree_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.name.trim().is_empty());
+            let outcome = Dialog::new("tree_name_dialog", title)
+                .primary(title)
+                .primary_enabled(!empty)
+                .show_with(ctx, |ui| {
+                    ui.add_space(theme::space::TIGHT);
+                    ui.label(
+                        RichText::new("Name")
+                            .font(theme::typography::small())
+                            .color(theme::text().muted),
                     );
-                    if std::mem::take(&mut prompt.focus) {
-                        response.request_focus();
+                    if let Some(prompt) = self.tree_prompt.as_mut() {
+                        let response = ui.add(
+                            TextEdit::singleline(&mut prompt.name)
+                                .id(Id::new("tree_name_input"))
+                                .desired_width(ui.available_width()),
+                        );
+                        if std::mem::take(&mut prompt.focus) {
+                            response.request_focus();
+                        }
+                        submitted_by_return = response.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter));
                     }
-                    submit =
-                        response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-                }
-                dialog_actions(ui, |ui| {
-                    submit |= ui.add(dialog_button(title, true)).clicked();
-                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
                 });
-            });
-            if submit {
+            if (outcome == Outcome::Primary || submitted_by_return) && !empty {
                 match self.finish_tree_prompt() {
                     Ok((path, TreePromptAction::NewFile)) => {
                         self.refresh_tree(Some(path.clone()));
@@ -12578,96 +12863,88 @@ impl EditorApp {
                     Ok((path, _)) => self.refresh_tree(Some(path)),
                     Err(error) => self.show_error(error),
                 }
-            } else if cancel {
+            } else if matches!(outcome, Outcome::Cancel | Outcome::Dismissed) {
                 self.tree_prompt = None;
             }
         }
         if let Some(path) = self.tree_delete.clone() {
-            let mut delete = false;
-            let mut cancel = false;
-            dialog_window(ctx, "Delete", "tree_delete_dialog").show(ctx, |ui| {
-                begin_dialog(ui, "Delete");
-                ui.label(format!(
-                    "Permanently delete {}? This cannot be undone.",
-                    path.display()
-                ));
-                dialog_actions(ui, |ui| {
-                    let button = egui::Button::new(
-                        RichText::new("Delete").color(Color32::from_rgb(224, 156, 160)),
-                    )
-                    .fill(Color32::from_rgb(40, 34, 37))
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(6)
-                    .min_size(egui::vec2(78.0, 40.0));
-                    delete = ui.add(button).clicked();
-                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
-                });
-            });
-            if delete {
-                self.tree_delete = None;
-                if let Err(error) = self.delete_tree_entry(&path) {
-                    self.show_error(error);
+            let outcome = Dialog::new("tree_delete_dialog", "Delete")
+                .severity(Severity::Danger)
+                .body("This cannot be undone.")
+                .path(&path)
+                .destructive("Delete")
+                .show(ctx);
+            match outcome {
+                Outcome::Destructive => {
+                    self.tree_delete = None;
+                    if let Err(error) = self.delete_tree_entry(&path) {
+                        self.show_error(error);
+                    }
                 }
-            } else if cancel {
-                self.tree_delete = None;
+                Outcome::Cancel | Outcome::Dismissed => self.tree_delete = None,
+                _ => {}
             }
         }
         if self.pending_agent_prompt {
-            let mut save_and_run = false;
-            let mut cancel = false;
-            dialog_window(ctx, "Save before running Agent", "agent_save_dialog").show(ctx, |ui| {
-                begin_dialog(ui, "Save before running Agent");
-                ui.label(format!(
-                    "{} Agent reads files from disk. Save the current buffer first?",
-                    provider_descriptor(self.selected_provider).display_name
-                ));
-                dialog_actions(ui, |ui| {
-                    save_and_run = ui.add(dialog_button("Save and Run", true)).clicked();
-                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
-                });
-            });
-            if save_and_run && self.save(None) {
-                self.pending_agent_prompt = false;
-                self.send_agent_prompt();
-            } else if cancel {
-                self.pending_agent_prompt = false;
+            let provider = provider_descriptor(self.selected_provider).display_name;
+            let buffer = self.buffer().map(|buffer| buffer.path.clone());
+            let title = format!("Save before running {provider} Agent");
+            let mut dialog = Dialog::new("agent_save_dialog", &title)
+                .severity(Severity::Info)
+                .body("The agent reads files from disk, so unsaved edits are invisible to it.")
+                .primary("Save and Run");
+            if let Some(path) = buffer.as_deref() {
+                dialog = dialog.path(path);
+            }
+            match dialog.show(ctx) {
+                Outcome::Primary => {
+                    if self.save(None) {
+                        self.pending_agent_prompt = false;
+                        self.send_agent_prompt();
+                    }
+                }
+                Outcome::Cancel | Outcome::Dismissed => self.pending_agent_prompt = false,
+                _ => {}
             }
         }
         if self.pending.is_some() && !self.conflict && self.save_as.is_none() {
-            dialog_window(ctx, "Unsaved changes", "unsaved_dialog").show(ctx, |ui| {
-                begin_dialog(ui, "Unsaved changes");
-                ui.label(RichText::new("Save your changes before continuing?").color(TEXT_MUTED));
-                ui.add_space(18.0);
-                dialog_actions(ui, |ui| {
-                    if ui.add(dialog_button("Save", true)).clicked() && self.save(None) {
+            let path = self.buffer().map(|buffer| buffer.path.clone());
+            let mut dialog = Dialog::new("unsaved_dialog", "Unsaved changes")
+                .severity(Severity::Warning)
+                .body("Save your changes before continuing?")
+                .destructive("Discard")
+                .primary("Save");
+            if let Some(path) = path.as_deref() {
+                dialog = dialog.path(path);
+            }
+            match dialog.show(ctx) {
+                Outcome::Primary => {
+                    if self.save(None) {
                         self.finish_pending();
                     }
-                    let discard = egui::Button::new(
-                        RichText::new("Discard").color(Color32::from_rgb(224, 156, 160)),
-                    )
-                    .fill(Color32::from_rgb(40, 34, 37))
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(6)
-                    .min_size(egui::vec2(78.0, 40.0));
-                    if ui.add(discard).clicked() {
-                        self.discard_pending();
-                    }
-                    if ui.add(dialog_button("Cancel", false)).clicked() {
-                        self.pending = None;
-                        self.tree
-                            .select(self.buffer().map(|buffer| buffer.path.clone()));
-                    }
-                });
-            });
+                }
+                Outcome::Destructive => self.discard_pending(),
+                Outcome::Cancel | Outcome::Dismissed => {
+                    self.pending = None;
+                    self.tree
+                        .select(self.buffer().map(|buffer| buffer.path.clone()));
+                }
+                _ => {}
+            }
         }
         if self.conflict {
-            dialog_window(ctx, "File changed on disk", "conflict_dialog").show(ctx, |ui| {
-                begin_dialog(ui, "File changed on disk");
-                ui.label("The file changed outside Editur. It was not overwritten.");
-                dialog_actions(ui, |ui| {
-                    if ui.add(dialog_button("Reload", true)).clicked()
-                        && let Some(index) = self.active_tab
-                    {
+            let path = self.buffer().map(|buffer| buffer.path.clone());
+            let mut dialog = Dialog::new("conflict_dialog", "File changed on disk")
+                .severity(Severity::Warning)
+                .body("The file changed outside Editur and was not overwritten. Reloading discards the edits in this buffer.")
+                .neutral("Save As…")
+                .primary("Reload");
+            if let Some(path) = path.as_deref() {
+                dialog = dialog.path(path);
+            }
+            match dialog.show(ctx) {
+                Outcome::Primary => {
+                    if let Some(index) = self.active_tab {
                         let path = self.tabs[index].buffer.path.clone();
                         match load_buffer(&path) {
                             Ok(buffer) => {
@@ -12681,48 +12958,69 @@ impl EditorApp {
                             Err(error) => self.show_error(error),
                         }
                     }
-                    if ui.add(dialog_button("Save As…", false)).clicked() {
-                        let suggestion = self.buffer().map_or_else(String::new, |buffer| {
-                            format!("{}.editur-copy", buffer.path.display())
-                        });
-                        self.save_as = Some(suggestion);
-                        self.conflict = false;
-                    }
-                    if ui.add(dialog_button("Cancel", false)).clicked() {
-                        self.conflict = false;
-                        self.pending = None;
-                    }
-                });
-            });
+                }
+                Outcome::Neutral => {
+                    let suggestion = self.buffer().map_or_else(String::new, |buffer| {
+                        format!("{}.editur-copy", buffer.path.display())
+                    });
+                    self.save_as = Some(suggestion);
+                    self.conflict = false;
+                }
+                Outcome::Cancel | Outcome::Dismissed => {
+                    self.conflict = false;
+                    self.pending = None;
+                }
+                _ => {}
+            }
         }
         if self.save_as.is_some() {
-            let mut save_clicked = false;
-            let mut cancel_clicked = false;
-            dialog_window(ctx, "Save As", "save_as_dialog").show(ctx, |ui| {
-                begin_dialog(ui, "Save As");
-                ui.label("Destination path");
-                if let Some(path) = self.save_as.as_mut() {
-                    ui.text_edit_singleline(path);
-                }
-                dialog_actions(ui, |ui| {
-                    if ui.add(dialog_button("Save", true)).clicked() {
-                        save_clicked = true;
+            let destination = self.save_as.clone().unwrap_or_default();
+            let trimmed = destination.trim();
+            let parent_missing = (!trimmed.is_empty())
+                .then(|| PathBuf::from(trimmed))
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .is_some_and(|parent| !parent.as_os_str().is_empty() && !parent.is_dir());
+            let outcome = Dialog::new("save_as_dialog", "Save As")
+                .primary("Save")
+                .primary_enabled(!trimmed.is_empty() && !parent_missing)
+                .show_with(ctx, |ui| {
+                    ui.add_space(theme::space::TIGHT);
+                    ui.label(
+                        RichText::new("Destination path")
+                            .font(theme::typography::small())
+                            .color(theme::text().muted),
+                    );
+                    if let Some(path) = self.save_as.as_mut() {
+                        let response = ui.add(
+                            TextEdit::singleline(path)
+                                .id(Id::new("save_as_input"))
+                                .font(theme::typography::code_small())
+                                .desired_width(ui.available_width()),
+                        );
+                        if !response.has_focus() && ui.memory(|memory| memory.focused()).is_none() {
+                            response.request_focus();
+                        }
                     }
-                    if ui.add(dialog_button("Cancel", false)).clicked() {
-                        cancel_clicked = true;
+                    if parent_missing {
+                        ui.label(
+                            RichText::new("That folder does not exist.")
+                                .font(theme::typography::small())
+                                .color(theme::semantic().danger),
+                        );
                     }
                 });
-            });
-            if save_clicked {
-                if let Some(path) = self.save_as.clone()
-                    && self.save(Some(PathBuf::from(path)))
-                {
-                    self.save_as = None;
-                    self.finish_pending();
+            match outcome {
+                Outcome::Primary => {
+                    if self.save(Some(PathBuf::from(trimmed))) {
+                        self.save_as = None;
+                        self.finish_pending();
+                    }
                 }
-            } else if cancel_clicked {
-                self.save_as = None;
-                self.conflict = true;
+                Outcome::Cancel | Outcome::Dismissed => {
+                    self.save_as = None;
+                    self.conflict = true;
+                }
+                _ => {}
             }
         }
     }
@@ -13133,7 +13431,7 @@ impl ApplicationHandler<()> for ProjectChooserShell {
 
 fn project_chooser_window_attributes() -> Result<winit::window::WindowAttributes, String> {
     let (pixels, width, height) = application_icon_rgba();
-    let icon = Icon::from_rgba(pixels.to_vec(), width, height)
+    let icon = WindowIcon::from_rgba(pixels.to_vec(), width, height)
         .map_err(|error| format!("cannot load application icon: {error}"))?;
     let attributes = Window::default_attributes()
         .with_title("Editur")
@@ -13147,22 +13445,24 @@ fn project_chooser_window_attributes() -> Result<winit::window::WindowAttributes
 
 fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<WindowAction>) {
     let screen = ui.max_rect();
-    ui.painter().rect_filled(screen, 0.0, CANVAS);
+    ui.painter()
+        .rect_filled(screen, 0.0, theme::surface().chrome);
     #[cfg(target_os = "macos")]
     let window_action = {
         let titlebar = screen.with_max_y((screen.top() + TITLEBAR_HEIGHT).min(screen.bottom()));
-        ui.painter().rect_filled(titlebar, 0.0, SURFACE);
+        ui.painter()
+            .rect_filled(titlebar, 0.0, theme::surface().chrome);
         ui.painter().hline(
             titlebar.x_range(),
             titlebar.bottom() - 0.5,
-            egui::Stroke::new(1.0, BORDER_SUBTLE),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         ui.painter().text(
             titlebar.center(),
             Align2::CENTER_CENTER,
             "Choose a project",
-            FontId::proportional(12.5),
-            TEXT_SECONDARY,
+            theme::typography::small(),
+            theme::text().secondary,
         );
         let mut action = macos_titlebar_controls(ui, titlebar, "project_chooser");
         let drag = titlebar.with_min_x(titlebar.left() + 72.0);
@@ -13186,15 +13486,15 @@ fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<W
             ui.add_space(13.0);
             ui.label(
                 RichText::new("EDITUR")
-                    .size(25.0)
+                    .size(theme::typography::DISPLAY_SIZE)
                     .strong()
-                    .color(TEXT_PRIMARY),
+                    .color(theme::text().primary),
             );
             ui.add_space(5.0);
             ui.label(
                 RichText::new("Choose where you want to work")
-                    .size(14.0)
-                    .color(TEXT_MUTED),
+                    .size(theme::typography::BODY_SIZE)
+                    .color(theme::text().muted),
             );
             ui.add_space(28.0);
             let (card, response) = ui.allocate_exact_size(egui::vec2(width, 86.0), Sense::click());
@@ -13210,15 +13510,22 @@ fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<W
                 card,
                 10.0,
                 if hovered {
-                    SURFACE_HOVER
+                    theme::state::hover()
                 } else {
-                    SURFACE_RAISED
+                    theme::surface().raised
                 },
             );
             ui.painter().rect_stroke(
                 card,
                 10.0,
-                egui::Stroke::new(1.0, if hovered { ACCENT } else { BORDER_SUBTLE }),
+                egui::Stroke::new(
+                    1.0,
+                    if hovered {
+                        theme::accent()
+                    } else {
+                        theme::border::hairline_color()
+                    },
+                ),
                 egui::StrokeKind::Inside,
             );
             let folder = egui::Rect::from_center_size(
@@ -13228,43 +13535,54 @@ fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<W
             paint_project_folder(
                 ui.painter(),
                 folder,
-                if hovered { ACCENT } else { TEXT_SECONDARY },
+                if hovered {
+                    theme::accent()
+                } else {
+                    theme::text().secondary
+                },
             );
             ui.painter().text(
                 egui::pos2(card.left() + 82.0, card.center().y - 10.0),
                 Align2::LEFT_CENTER,
                 "Open project",
-                FontId::proportional(15.0),
-                TEXT_PRIMARY,
+                theme::typography::title(),
+                theme::text().primary,
             );
             ui.painter().text(
                 egui::pos2(card.left() + 82.0, card.center().y + 13.0),
                 Align2::LEFT_CENTER,
                 "Select an existing folder",
-                FontId::proportional(12.0),
-                TEXT_MUTED,
+                theme::typography::small(),
+                theme::text().muted,
             );
-            let arrow = egui::pos2(card.right() - 28.0, card.center().y);
-            let stroke = egui::Stroke::new(1.5, if hovered { ACCENT } else { TEXT_MUTED });
-            ui.painter()
-                .line_segment([arrow - egui::vec2(4.0, 4.0), arrow], stroke);
-            ui.painter()
-                .line_segment([arrow, arrow - egui::vec2(4.0, -4.0)], stroke);
+            icons::paint(
+                ui.painter(),
+                Icon::ChevronRight,
+                egui::Rect::from_center_size(
+                    egui::pos2(card.right() - 28.0, card.center().y),
+                    egui::Vec2::splat(icons::GRID * 0.75),
+                ),
+                if hovered {
+                    theme::accent()
+                } else {
+                    theme::text().muted
+                },
+            );
             if response.clicked() {
                 browse = true;
             }
             ui.add_space(17.0);
             ui.label(
                 RichText::new("or drop a project folder anywhere in this window")
-                    .size(11.5)
-                    .color(TEXT_DISABLED),
+                    .size(theme::typography::MICRO_SIZE)
+                    .color(theme::text_disabled()),
             );
             if let Some(error) = error {
                 ui.add_space(13.0);
                 ui.label(
                     RichText::new(error)
-                        .size(12.0)
-                        .color(Color32::from_rgb(232, 112, 122)),
+                        .size(theme::typography::SMALL_SIZE)
+                        .color(theme::ink(theme::semantic().danger)),
                 );
             }
         });
@@ -13272,9 +13590,90 @@ fn project_chooser_ui(ui: &mut egui::Ui, error: Option<&str>) -> (bool, Option<W
     (browse, window_action)
 }
 
+/// What the window says when nothing is open: what project this is, and the
+/// five keys worth knowing. Unbound commands are simply absent rather than
+/// shown with a blank chord.
+fn draw_editor_empty_state(ui: &mut egui::Ui, project: &str, hints: &[(&'static str, String)]) {
+    let rows = hints.len() as f32;
+    let block = egui::Rect::from_center_size(
+        ui.max_rect().center(),
+        egui::vec2(
+            320.0,
+            48.0 + theme::space::LARGE
+                + theme::typography::DISPLAY_LINE
+                + theme::space::XWIDE
+                + rows * theme::control::ROW,
+        ),
+    );
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt("editor_empty_state")
+            .max_rect(block),
+        |ui| {
+            ui.vertical_centered(|ui| {
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(48.0), Sense::hover());
+                paint_editur_mark(ui.painter(), mark);
+                ui.add_space(theme::space::LARGE);
+                ui.label(
+                    RichText::new(project)
+                        .font(theme::typography::display())
+                        .color(theme::text().primary),
+                );
+                ui.add_space(theme::space::XWIDE);
+            });
+            for (label, chord) in hints {
+                let (row, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), theme::control::ROW),
+                    Sense::hover(),
+                );
+                ui.painter().text(
+                    egui::pos2(row.left(), row.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    theme::typography::small(),
+                    theme::text().secondary,
+                );
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        chord.clone(),
+                        theme::typography::code_small(),
+                        theme::text().muted,
+                    )
+                    .size()
+                    .x;
+                let key = egui::Rect::from_min_max(
+                    egui::pos2(
+                        row.right() - width - theme::space::MEDIUM,
+                        row.center().y - theme::control::COMPACT * 0.5 + theme::space::TIGHT,
+                    ),
+                    egui::pos2(
+                        row.right(),
+                        row.center().y + theme::control::COMPACT * 0.5 - theme::space::TIGHT,
+                    ),
+                );
+                ui.painter().rect(
+                    key,
+                    theme::corner(theme::radius::ROW),
+                    theme::surface().input,
+                    theme::border::hairline(),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    key.center(),
+                    Align2::CENTER_CENTER,
+                    chord,
+                    theme::typography::code_small(),
+                    theme::text().muted,
+                );
+            }
+        },
+    );
+}
+
 fn paint_editur_mark(painter: &egui::Painter, rect: egui::Rect) {
-    painter.rect_filled(rect, 12.0, ACCENT);
-    let stroke = egui::Stroke::new(3.0, ACCENT_INK);
+    painter.rect_filled(rect, 12.0, theme::accent());
+    let stroke = egui::Stroke::new(3.0, theme::text().on_accent);
     let left = rect.left() + 14.0;
     for y in [rect.top() + 14.0, rect.center().y, rect.bottom() - 14.0] {
         painter.line_segment(
@@ -13285,26 +13684,7 @@ fn paint_editur_mark(painter: &egui::Painter, rect: egui::Rect) {
 }
 
 fn paint_project_folder(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-    painter.rect_stroke(
-        rect,
-        3.0,
-        egui::Stroke::new(1.6, color),
-        egui::StrokeKind::Inside,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + 2.0, rect.top()),
-            egui::pos2(rect.left() + 8.0, rect.top() - 5.0),
-        ],
-        egui::Stroke::new(1.6, color),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + 8.0, rect.top() - 5.0),
-            egui::pos2(rect.left() + 14.0, rect.top()),
-        ],
-        egui::Stroke::new(1.6, color),
-    );
+    icons::paint(painter, Icon::Folder, rect, color);
 }
 
 #[cfg(target_os = "macos")]
@@ -13800,7 +14180,7 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             return;
         }
         let (pixels, width, height) = application_icon_rgba();
-        let icon = match Icon::from_rgba(pixels.to_vec(), width, height) {
+        let icon = match WindowIcon::from_rgba(pixels.to_vec(), width, height) {
             Ok(icon) => icon,
             Err(error) => {
                 self.fail(event_loop, format!("cannot load application icon: {error}"));
@@ -14257,53 +14637,51 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
     })
 }
 
+/// A composer selector: a segmented chip rather than bare text with a chevron,
+/// so the thing that opens a menu looks like a control.
 fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
-    let idle_color = TEXT_SECONDARY;
-    let idle_galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), idle_color);
-    let width = (idle_galley.size().x + 20.0).max(40.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 30.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    let text_color = if response.hovered() {
-        TEXT_PRIMARY
-    } else {
-        idle_color
-    };
-    let galley = if response.hovered() {
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), text_color)
-    } else {
-        idle_galley
-    };
-    let content_center_y = rect.center().y + 2.0;
-    ui.painter().galley(
-        egui::pos2(rect.left(), content_center_y - galley.size().y * 0.5),
-        galley,
-        text_color,
-    );
-    let tip = egui::pos2(rect.right() - 5.5, content_center_y + 2.0);
-    let arrow_color = if response.hovered() {
-        TEXT_PRIMARY
-    } else {
-        TEXT_SECONDARY
-    };
-    let stroke = egui::Stroke::new(1.4, arrow_color);
-    ui.painter()
-        .line_segment([tip + egui::vec2(-3.5, -3.0), tip], stroke);
-    ui.painter()
-        .line_segment([tip, tip + egui::vec2(3.5, -3.0)], stroke);
-    response.on_hover_text(tooltip)
+    segment(ui, label, false, Some(Icon::ChevronDown)).on_hover_text(tooltip)
 }
 
 fn agent_send_button_colors(ready: bool) -> (Color32, Color32) {
     if ready {
-        (ACCENT, ACCENT_INK)
+        (theme::accent(), theme::text().on_accent)
     } else {
-        (SURFACE_SELECTED, TEXT_DISABLED)
+        (theme::state::hover(), theme::text_disabled())
     }
+}
+
+/// Send and stop: one solid 32 px control, filled by state rather than drawn
+/// as a bare glyph, because it is the panel's primary action.
+fn agent_composer_action(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    fill: Color32,
+    color: Color32,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::Vec2::splat(theme::control::STANDARD), Sense::click());
+    let response = response.on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let fill = if enabled && response.hovered() {
+        theme::composite(theme::state::hover(), fill)
+    } else {
+        fill
+    };
+    ui.painter()
+        .rect_filled(rect, theme::corner(theme::radius::CONTROL), fill);
+    icons::paint(
+        ui.painter(),
+        icon,
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(icons::GRID)),
+        color,
+    );
+    if response.has_focus() {
+        icons::focus_ring(ui.painter(), rect, theme::radius::CONTROL);
+    }
+    response
 }
 
 fn is_model_config(id: &str, name: &str) -> bool {
@@ -14393,7 +14771,7 @@ fn provider_menu_option(
         egui::pos2(rect.left() + 39.0, rect.center().y),
         Align2::LEFT_CENTER,
         provider.display_name,
-        FontId::proportional(13.0),
+        theme::typography::body(),
         name_color,
     );
     response
@@ -14410,7 +14788,7 @@ fn agent_menu_option(
         egui::pos2(row.rect.left() + 9.0, row.rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.5),
+        theme::typography::small(),
         row.foreground,
     );
     row.response
@@ -14423,25 +14801,32 @@ fn agent_toggle_row(ui: &mut egui::Ui, label: &str, enabled: bool, height: f32) 
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), enabled, label)
     });
     if response.hovered() {
-        ui.painter().rect_filled(rect, 5.0, SURFACE_HOVER);
+        ui.painter().rect_filled(rect, 5.0, theme::state::hover());
     }
     ui.painter().text(
         egui::pos2(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.5),
+        theme::typography::small(),
         if response.hovered() {
-            TEXT_PRIMARY
+            theme::text().primary
         } else {
-            TEXT_SECONDARY
+            theme::text().secondary
         },
     );
     let track = egui::Rect::from_center_size(
         egui::pos2(rect.right() - 19.0, rect.center().y),
         egui::vec2(26.0, 14.0),
     );
-    ui.painter()
-        .rect_filled(track, 7.0, if enabled { ACCENT } else { BORDER_STRONG });
+    ui.painter().rect_filled(
+        track,
+        7.0,
+        if enabled {
+            theme::accent()
+        } else {
+            theme::border::strong_color()
+        },
+    );
     ui.painter().circle_filled(
         egui::pos2(
             if enabled {
@@ -14452,42 +14837,33 @@ fn agent_toggle_row(ui: &mut egui::Ui, label: &str, enabled: bool, height: f32) 
             track.center().y,
         ),
         5.0,
-        if enabled { ACCENT_INK } else { TEXT_SECONDARY },
+        if enabled {
+            theme::text().on_accent
+        } else {
+            theme::text().secondary
+        },
     );
     response
 }
 
 fn draw_agentic_project_header(ui: &mut egui::Ui, name: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
-    let color = TEXT_SECONDARY;
-    let folder = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 1.0, rect.center().y - 4.5),
-        egui::vec2(14.0, 10.0),
-    );
-    ui.painter().rect_stroke(
-        folder,
-        2.0,
-        egui::Stroke::new(1.2, color),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(folder.left() + 2.0, folder.top()),
-            egui::pos2(folder.left() + 5.0, folder.top() - 2.5),
-        ],
-        egui::Stroke::new(1.2, color),
-    );
-    ui.painter().hline(
-        (folder.left() + 5.0)..=(folder.left() + 10.0),
-        folder.top() - 2.5,
-        egui::Stroke::new(1.2, color),
+    let color = theme::text().secondary;
+    icons::paint(
+        ui.painter(),
+        Icon::Folder,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 8.0, rect.center().y),
+            egui::Vec2::splat(icons::GRID),
+        ),
+        color,
     );
     ui.painter().text(
         egui::pos2(rect.left() + 23.0, rect.center().y),
         Align2::LEFT_CENTER,
         name,
-        FontId::proportional(12.5),
-        TEXT_PRIMARY,
+        theme::typography::small(),
+        theme::text().primary,
     );
 }
 
@@ -14543,18 +14919,18 @@ fn agent_session_row(
         )
     });
     if selected {
-        ui.painter().rect_filled(row, 6.0, SURFACE_SELECTED);
+        ui.painter().rect_filled(row, 6.0, theme::state::selected());
     } else if open_response.hovered() {
-        ui.painter().rect_filled(row, 6.0, SURFACE_HOVER);
+        ui.painter().rect_filled(row, 6.0, theme::state::hover());
     }
     if remove_response.hovered() {
         ui.painter()
-            .rect_filled(remove, 4.0, Color32::from_rgb(63, 37, 42));
+            .rect_filled(remove, 4.0, theme::callout(theme::semantic().danger).fill);
     }
     let color = if selected || open_response.hovered() {
-        TEXT_PRIMARY
+        theme::text().primary
     } else {
-        TEXT_SECONDARY
+        theme::text().secondary
     };
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
@@ -14575,11 +14951,11 @@ fn agent_session_row(
             remove.center(),
             Align2::CENTER_CENTER,
             "×",
-            FontId::proportional(16.0),
+            theme::typography::title(),
             if remove_response.hovered() {
-                Color32::from_rgb(236, 145, 150)
+                theme::ink(theme::semantic().danger)
             } else {
-                TEXT_MUTED
+                theme::text().muted
             },
         );
     }
@@ -14594,7 +14970,7 @@ fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
         text,
         0.0,
         TextFormat {
-            font_id: FontId::monospace(14.0),
+            font_id: theme::typography::code_editor(),
             color: Color32::LIGHT_GRAY,
             ..TextFormat::default()
         },
@@ -14610,7 +14986,7 @@ fn draw_markdown_preview(
     pane: PaneId,
 ) {
     let rect = ui.available_rect_before_wrap();
-    ui.painter().rect_filled(rect, 0.0, SURFACE);
+    ui.painter().rect_filled(rect, 0.0, theme::surface().editor);
     let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
     let side = ((rect.width() - content_width) * 0.5).max(0.0);
     let key = (revision, content_width.round().to_bits());
@@ -14753,8 +15129,54 @@ const fn matching_bracket(character: char) -> char {
     }
 }
 
+/// A group only announces itself when it has something in it, and it always
+/// says how much, so the reader can tell a short list from a truncated one.
+fn search_group_header(ui: &mut egui::Ui, label: &str, count: usize) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(theme::typography::micro())
+                .color(theme::text().muted),
+        );
+        ui.label(
+            RichText::new(count.to_string())
+                .font(theme::typography::micro())
+                .color(theme::text_disabled()),
+        );
+    });
+}
+
+/// The filename result, with the part the query matched picked out — the same
+/// treatment the content results already get.
+fn file_result_job(relative: &str, query: &str, wrap_width: f32) -> LayoutJob {
+    let font_id = theme::typography::code_small();
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.wrap.break_anywhere = true;
+    let normal = TextFormat {
+        font_id: font_id.clone(),
+        color: theme::text().secondary,
+        ..TextFormat::default()
+    };
+    let highlighted = TextFormat {
+        font_id,
+        color: theme::accent(),
+        background: theme::state::selected(),
+        ..TextFormat::default()
+    };
+    job.append("  ", 0.0, normal.clone());
+    let mut cursor = 0;
+    for span in match_spans(relative, query) {
+        job.append(&relative[cursor..span.start], 0.0, normal.clone());
+        job.append(&relative[span.clone()], 0.0, highlighted.clone());
+        cursor = span.end;
+    }
+    job.append(&relative[cursor..], 0.0, normal);
+    job
+}
+
 fn content_result_job(hit: &SearchHit, query: &str, wrap_width: f32) -> LayoutJob {
-    let font_id = FontId::monospace(13.0);
+    let font_id = theme::typography::code_small();
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
     job.wrap.break_anywhere = true;
@@ -14763,19 +15185,19 @@ fn content_result_job(hit: &SearchHit, query: &str, wrap_width: f32) -> LayoutJo
         0.0,
         TextFormat {
             font_id: font_id.clone(),
-            color: TEXT_SECONDARY,
+            color: theme::text().secondary,
             ..TextFormat::default()
         },
     );
     let normal = TextFormat {
         font_id: font_id.clone(),
-        color: TEXT_SECONDARY,
+        color: theme::text().secondary,
         ..TextFormat::default()
     };
     let highlighted = TextFormat {
         font_id,
-        color: ACCENT,
-        background: SURFACE_SELECTED,
+        color: theme::accent(),
+        background: theme::state::selected(),
         ..TextFormat::default()
     };
     let mut cursor = 0;
@@ -14823,9 +15245,9 @@ fn find_highlighted_job(
             if start < end {
                 let mut format = section.format.clone();
                 format.background = if current_match == active {
-                    SURFACE_SELECTED
+                    theme::state::selected()
                 } else {
-                    SURFACE_HOVER
+                    theme::state::hover()
                 };
                 highlighted.append(&base.text[start..end], leading_space, format);
                 leading_space = 0.0;
@@ -14863,8 +15285,8 @@ fn bracket_highlighted_job(
             .iter()
             .any(|span| range.start < span.end && span.start < range.end)
         {
-            section.format.background = SURFACE_SELECTED;
-            section.format.underline = egui::Stroke::new(1.0, ACCENT);
+            section.format.background = theme::state::selected();
+            section.format.underline = egui::Stroke::new(1.0, theme::accent());
         }
     }
     highlighted
@@ -14995,10 +15417,10 @@ fn active_diagnostic_severity(active: [usize; 4]) -> Option<crate::lsp::Diagnost
 
 fn diagnostic_color(severity: crate::lsp::DiagnosticSeverity) -> Color32 {
     match severity {
-        crate::lsp::DiagnosticSeverity::Error => Color32::from_rgb(235, 91, 91),
-        crate::lsp::DiagnosticSeverity::Warning => Color32::from_rgb(224, 174, 76),
+        crate::lsp::DiagnosticSeverity::Error => theme::semantic().danger,
+        crate::lsp::DiagnosticSeverity::Warning => theme::semantic().warning,
         crate::lsp::DiagnosticSeverity::Information | crate::lsp::DiagnosticSeverity::Hint => {
-            Color32::from_rgb(104, 155, 207)
+            theme::semantic().info
         }
     }
 }
@@ -15044,24 +15466,25 @@ fn settings_preset_matches(preset: &crate::lsp::Preset, query: &str) -> bool {
 mod tests {
     use super::{
         AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, CompletionPopup, DropZone,
-        EDITOR_BACKGROUND, EditorApp, PANE_FOCUS_BORDER, PANE_TAB_HEIGHT, PaneId, PaneLayout,
-        PendingAction, RESIZE_SETTLE_DELAY, TAB_DRAG_GHOST_PAINT_KEY, TITLEBAR_HEIGHT,
-        TITLEBAR_PAINT_KEY, TabDrop, TreeState, WINDOW_CORNER_RADIUS, agent_collapsing_header,
-        agent_composer_content, agent_composer_height, agent_diff_preview, agent_markdown_galley,
-        agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
-        agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        EditorApp, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId, PaneLayout, PendingAction,
+        RESIZE_SETTLE_DELAY, TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH,
+        TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState, WINDOW_CORNER_RADIUS,
+        agent_collapsing_header, agent_composer_content, agent_composer_height, agent_diff_preview,
+        agent_markdown_galley, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
+        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agent_transcript_fade_mesh, allowed_tab_drop_zone, build_agent_diff, cached_agent_diff,
         child_path, completion_word_range, copy_tree_entry, defer_resize,
         diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_diff,
-        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
-        editor_column_content, find_highlighted_job, install_repaint_wake,
-        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
-        next_find_match, pane_header_and_content, plain_text_job, presentation_job,
-        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
-        resize_divider_stroke, run_everything_state, search_needs_polling,
-        search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
-        slash_command_query, split_agent_sidebar, split_agentic_workspace, split_bottom_panel,
-        split_pane_content, split_workspace, stable_tab_drop_zone, unique_copy_path,
+        draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
+        draw_tab_drag_ghost, editor_background, editor_column_content, file_result_job,
+        find_highlighted_job, install_repaint_wake, launch_in_current_process, match_bracket_pair,
+        match_spans, model_display_name, next_find_match, pane_header_and_content, plain_text_job,
+        presentation_job, provider_selector_visible, repaint_deadline,
+        repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
+        search_group_header, search_needs_polling, search_selection_after_navigation,
+        should_show_project_chooser, skip_transition_render, slash_command_query,
+        split_agent_sidebar, split_agentic_workspace, split_bottom_panel, split_pane_content,
+        split_workspace, stable_tab_drop_zone, tab_width, unique_copy_path,
     };
 
     #[test]
@@ -15109,7 +15532,7 @@ mod tests {
 
     #[test]
     fn foreground_menu_mesh_is_not_cached_as_retained_content() {
-        let menu_color = Color32::from_rgb(7, 19, 23);
+        let menu_color = theme::color::sentinel();
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -15117,7 +15540,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         crate::theme::apply(&context);
         let menu_rect = Rect::from_min_size(pos2(100.0, 100.0), egui::vec2(220.0, 24.0));
         let output = context.run_ui(
@@ -15172,10 +15595,7 @@ mod tests {
         lsp::{CompletionItem, DefinitionLocation, Diagnostic, DiagnosticSeverity, RequestTag},
         settings::Settings,
         syntax::{Highlighter, SyntaxManager},
-        theme::{
-            ACCENT, ACCENT_INK, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT, SURFACE_RAISED,
-            SURFACE_SELECTED, TEXT_PRIMARY, TEXT_SECONDARY,
-        },
+        theme,
     };
 
     #[test]
@@ -15207,7 +15627,7 @@ mod tests {
             anchor: Rect::NOTHING,
             bounds: Rect::EVERYTHING,
         });
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let _ = context.run_ui(
             RawInput {
                 events: vec![Event::Key {
@@ -15310,7 +15730,7 @@ mod tests {
         app.settings_error = None;
         app.settings_open = true;
         app.settings_search = "rust".into();
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -15341,13 +15761,22 @@ mod tests {
                     if text.pos.x < 270.0
                         && matches!(
                             text.galley.text(),
-                            "←  Back to app" | "Back to app" | "Language Servers"
+                            "←  Back to app"
+                                | "Back to app"
+                                | "Appearance"
+                                | "Keybindings"
+                                | "Language Servers"
                         ) =>
                 {
                     labels.push(text.visual_bounding_rect());
                 }
                 Shape::Rect(rect)
-                    if matches!(rect.fill, SURFACE_INPUT | SURFACE_SELECTED | SURFACE_HOVER) =>
+                    if [
+                        theme::surface().input,
+                        theme::state::selected(),
+                        theme::state::hover(),
+                    ]
+                    .contains(&rect.fill) =>
                 {
                     fills.push((rect.rect, rect.fill));
                 }
@@ -15368,7 +15797,7 @@ mod tests {
         })
         .unwrap();
         app.settings_open = true;
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     Default::default(),
@@ -15384,11 +15813,15 @@ mod tests {
             .iter()
             .for_each(|shape| collect(&shape.shape, &mut labels, &mut fills));
 
-        assert_eq!(labels.len(), 2);
+        assert!(
+            labels.len() >= 2,
+            "the rail has to name Back and at least one section"
+        );
         assert!(
             labels
                 .iter()
-                .all(|label| { fills.iter().all(|(fill, _)| !fill.contains_rect(*label)) })
+                .all(|label| fills.iter().all(|(fill, _)| !fill.contains_rect(*label))),
+            "navigation rows stay text, never chip-backed"
         );
     }
 
@@ -15412,7 +15845,7 @@ mod tests {
         })
         .unwrap();
         app.settings_open = true;
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     Default::default(),
@@ -15467,7 +15900,7 @@ mod tests {
 
     #[test]
     fn moving_the_drag_ghost_invalidates_its_retained_geometry() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |pointer| {
             let output = context.run_ui(
                 RawInput {
@@ -15586,7 +16019,7 @@ mod tests {
         .unwrap();
         app.open_tab(paths[1].clone(), false);
         app.drop_tab(1, PaneId(0), DropZone::Right);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             context.run_ui(
                 RawInput {
@@ -15899,7 +16332,7 @@ mod tests {
         })
         .unwrap();
         app.open_tab(paths[1].clone(), false);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         disable_transient_egui_debug_overlays(&context);
         let draw = |app: &mut EditorApp, events| {
             context.run_ui(
@@ -15961,7 +16394,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
 
         let output = context.run_ui(
             RawInput {
@@ -16020,7 +16453,7 @@ mod tests {
         .unwrap();
         app.open_tab(paths[1].clone(), false);
         app.drop_tab(1, PaneId(0), DropZone::Bottom);
-        let context = egui::Context::default();
+        let context = theme::test_context();
 
         let _ = context.run_ui(
             RawInput {
@@ -16053,7 +16486,7 @@ mod tests {
     #[test]
     fn provider_selector_uses_a_drawn_chevron() {
         let mut selector = Rect::NOTHING;
-        let output = egui::Context::default().run_ui(RawInput::default(), |ui| {
+        let output = theme::test_context().run_ui(RawInput::default(), |ui| {
             selector = draw_provider_selector_identity(ui, ProviderId::Cursor, true).rect;
         });
         let glyph = output.shapes.iter().any(|shape| match &shape.shape {
@@ -16070,36 +16503,16 @@ mod tests {
                 _ => None,
             })
             .expect("provider label");
-        let strokes = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                Shape::LineSegment { points, stroke }
-                    if points.iter().all(|point| selector.contains(*point)) =>
-                {
-                    Some((*points, stroke.width))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let chevron_left = strokes
-            .iter()
-            .flat_map(|(points, _)| points)
-            .map(|point| point.x)
-            .min_by(f32::total_cmp)
-            .expect("chevron left");
-        let chevron_right = strokes
-            .iter()
-            .flat_map(|(points, _)| points)
-            .map(|point| point.x)
-            .max_by(f32::total_cmp)
-            .expect("chevron right");
+        let trailing = selector.intersect(Rect::everything_right_of(label.right()));
+        let chevron = crate::icons::probe::bounds(&output.shapes, trailing, theme::text().primary)
+            .expect("drawn chevron");
+        let chevron_left = chevron.left();
+        let chevron_right = chevron.right();
 
         assert!(!glyph);
-        assert_eq!(strokes.len(), 2);
+        assert!(chevron.width() > 4.0);
         assert!(chevron_left - label.right() >= 10.0);
         assert!(chevron_right - chevron_left >= 8.0);
-        assert!(strokes.iter().all(|(_, width)| *width >= 1.5));
     }
 
     #[test]
@@ -16126,7 +16539,7 @@ mod tests {
                 vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
             app.agent.connection = ConnectionState::Ready;
             app.agent.session_ready = true;
-            let context = egui::Context::default();
+            let context = theme::test_context();
             let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
             let draw = |app: &mut EditorApp, events| {
                 context.run_ui(
@@ -16197,7 +16610,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp| {
             let _ = context.run_ui(
                 RawInput {
@@ -16303,7 +16716,7 @@ mod tests {
             app.agent
                 .transcript
                 .push_back(TranscriptItem::Assistant("Provider response".into()));
-            let context = egui::Context::default();
+            let context = theme::test_context();
             let input = || RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -16394,7 +16807,7 @@ mod tests {
             ),
             can_authenticate: false,
         }]);
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -16481,7 +16894,7 @@ mod tests {
         })
         .unwrap();
         app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
-        let context = egui::Context::default();
+        let context = theme::test_context();
 
         app.request_provider_switch(ProviderId::Claude, &context);
 
@@ -16530,7 +16943,7 @@ mod tests {
     fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
         let button = Rect::from_center_size(pos2(50.0, 17.0), Vec2::new(34.0, 34.0));
         let draw = |open, panel_on_right| {
-            let context = egui::Context::default();
+            let context = theme::test_context();
             let output = context.run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(100.0, 34.0))),
@@ -16563,7 +16976,7 @@ mod tests {
             active.map(|icon| icon.0 - button.center()),
             inactive.map(|icon| icon.0 - button.center())
         );
-        assert_eq!(active.map(|icon| icon.1), [TEXT_PRIMARY; 2]);
+        assert_eq!(active.map(|icon| icon.1), [theme::text().primary; 2]);
     }
 
     #[test]
@@ -16576,7 +16989,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
 
         let _ = context.run_ui(
             RawInput {
@@ -16611,7 +17024,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
         let _ = context.run_ui(
             RawInput {
@@ -16634,15 +17047,12 @@ mod tests {
         );
 
         assert!(!output.shapes.iter().any(|shape| match &shape.shape {
-            Shape::Rect(rect) => rect.rect == button && rect.fill == SURFACE_HOVER,
+            Shape::Rect(rect) => rect.rect == button && rect.fill == theme::state::hover(),
             _ => false,
         }));
-        assert!(output.shapes.iter().any(|shape| match &shape.shape {
-            Shape::LineSegment { points, stroke } => {
-                stroke.color == TEXT_PRIMARY && points.iter().all(|point| button.contains(*point))
-            }
-            _ => false,
-        }));
+        assert!(
+            crate::icons::probe::bounds(&output.shapes, button, theme::text().primary).is_some()
+        );
     }
 
     #[test]
@@ -16688,7 +17098,7 @@ mod tests {
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
         app.agent.title = Some("Landing Page Builder".into());
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp| {
             context.run_ui(
                 RawInput {
@@ -16750,7 +17160,7 @@ mod tests {
             })
             .unwrap();
             app.agentic_mode = agentic_mode;
-            let context = egui::Context::default();
+            let context = theme::test_context();
             let output = context.run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -16788,7 +17198,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let _ = context.run_ui(
             RawInput {
@@ -16812,10 +17222,10 @@ mod tests {
         fn inspect(shape: &Shape, button: Rect, bright: &mut bool, background: &mut bool) {
             match shape {
                 Shape::Text(text) if text.galley.text() == "Agent" => {
-                    *bright = text.galley.job.sections[0].format.color == TEXT_PRIMARY;
+                    *bright = text.galley.job.sections[0].format.color == theme::text().primary;
                 }
                 Shape::Rect(rect)
-                    if rect.fill == SURFACE_SELECTED
+                    if rect.fill == theme::state::selected()
                         && button.contains(rect.rect.left_top())
                         && button.contains(rect.rect.right_bottom()) =>
                 {
@@ -16842,10 +17252,10 @@ mod tests {
         let (ready_fill, ready_icon) = agent_send_button_colors(true);
         let (disabled_fill, disabled_icon) = agent_send_button_colors(false);
 
-        assert_eq!(ready_fill, ACCENT);
-        assert_eq!(ready_icon, ACCENT_INK);
-        assert_eq!(disabled_fill, SURFACE_SELECTED);
-        assert_eq!(disabled_icon, Color32::from_rgb(126, 126, 130));
+        assert_eq!(ready_fill, theme::accent());
+        assert_eq!(ready_icon, theme::text().on_accent);
+        assert_eq!(disabled_fill, theme::state::hover());
+        assert_eq!(disabled_icon, theme::text_disabled());
     }
 
     #[test]
@@ -16853,12 +17263,15 @@ mod tests {
         fn inspect(shape: &Shape) {
             match shape {
                 Shape::Rect(rect) => {
+                    // Only opaque paint is a surface. Translucent state
+                    // overlays and subtle semantic rails are meant to carry a
+                    // hue, and they read against whatever is beneath them.
                     for (role, color) in [("fill", rect.fill), ("stroke", rect.stroke.color)] {
                         let [red, green, blue, alpha] = color.to_array();
-                        if alpha > 0 && red.max(green).max(blue) <= 100 {
+                        if alpha == 255 && red.max(green).max(blue) <= 100 {
                             let spread = red.max(green).max(blue) - red.min(green).min(blue);
                             assert!(
-                                spread <= 4,
+                                spread <= 6,
                                 "{role} is a tinted dark instead of neutral: {color:?}"
                             );
                         }
@@ -16886,7 +17299,7 @@ mod tests {
         app.agent
             .transcript
             .push_back(TranscriptItem::Assistant("Understood".into()));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -16901,7 +17314,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_selector_hover_brightens_foreground_without_adding_a_surface() {
+    fn a_composer_selector_reads_as_a_control_rather_than_as_bare_text() {
         fn draw(context: &egui::Context, pointer: Option<egui::Pos2>) -> (egui::FullOutput, Rect) {
             let mut rect = None;
             let output = context.run_ui(
@@ -16916,25 +17329,25 @@ mod tests {
             );
             (output, rect.unwrap())
         }
-        fn selector_text(shape: &Shape) -> Option<(Color32, f32, f32)> {
+        fn selector_text(shape: &Shape) -> Option<Color32> {
             match shape {
-                Shape::Text(text) if text.galley.text() == "Ask" => Some((
-                    text.galley.job.sections[0].format.color,
-                    text.pos.y,
-                    text.galley.size().y,
-                )),
+                Shape::Text(text) if text.galley.text() == "Ask" => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
                 Shape::Vec(shapes) => shapes.iter().find_map(selector_text),
                 _ => None,
             }
         }
-        fn has_hover_surface(shape: &Shape) -> bool {
+        fn hover_surface(shape: &Shape, rect: Rect) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == Color32::from_white_alpha(10),
-                Shape::Vec(shapes) => shapes.iter().any(has_hover_surface),
+                Shape::Rect(fill) => {
+                    fill.fill == theme::state::hover() && fill.rect.contains(rect.center())
+                }
+                Shape::Vec(shapes) => shapes.iter().any(|shape| hover_surface(shape, rect)),
                 _ => false,
             }
         }
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let idle = draw(&context, None);
         let hovered = draw(&context, Some(pos2(10.0, 15.0)));
         let text = |output: &egui::FullOutput| {
@@ -16945,18 +17358,28 @@ mod tests {
                 .unwrap()
         };
 
-        assert_eq!(text(&idle.0).0, TEXT_SECONDARY);
-        assert_eq!(text(&hovered.0).0, TEXT_PRIMARY);
-        assert_eq!(
-            text(&idle.0).1 + text(&idle.0).2 * 0.5,
-            idle.1.center().y + 2.0
-        );
+        assert_eq!(text(&idle.0), theme::text().secondary);
+        assert_eq!(text(&hovered.0), theme::text().primary);
         assert!(
-            !hovered
+            !idle
                 .0
                 .shapes
                 .iter()
-                .any(|shape| has_hover_surface(&shape.shape))
+                .any(|shape| hover_surface(&shape.shape, idle.1)),
+            "an untouched selector is quiet"
+        );
+        assert!(
+            hovered
+                .0
+                .shapes
+                .iter()
+                .any(|shape| hover_surface(&shape.shape, hovered.1)),
+            "a hovered selector has to show that it is a control"
+        );
+        assert!(
+            idle.1.height() == theme::control::COMPACT,
+            "selectors sit on the control scale: {:?}",
+            idle.1
         );
     }
 
@@ -16983,7 +17406,7 @@ mod tests {
             app.agent_sidebar_width,
         );
         let button = agent_new_session_rect(sidebar.with_max_y(TITLEBAR_HEIGHT));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen),
@@ -17002,7 +17425,9 @@ mod tests {
         fn has_hover_surface(shape: &Shape, button: Rect) -> bool {
             match shape {
                 Shape::Rect(rect) => {
-                    rect.rect == button && rect.fill == Color32::from_rgb(36, 36, 40)
+                    rect.rect == button
+                        && rect.fill
+                            == theme::composite(theme::state::hover(), theme::surface().chrome)
                 }
                 Shape::Vec(shapes) => shapes.iter().any(|shape| has_hover_surface(shape, button)),
                 _ => false,
@@ -17011,7 +17436,7 @@ mod tests {
         fn has_bright_icon(shape: &Shape, button: Rect) -> bool {
             match shape {
                 Shape::LineSegment { points, stroke } => {
-                    stroke.color == TEXT_PRIMARY
+                    stroke.color == theme::text().primary
                         && points.iter().all(|point| button.contains(*point))
                 }
                 Shape::Vec(shapes) => shapes.iter().any(|shape| has_bright_icon(shape, button)),
@@ -17031,45 +17456,21 @@ mod tests {
                 .iter()
                 .any(|shape| has_bright_icon(&shape.shape, button))
         );
-        let history_center = output
-            .shapes
-            .iter()
-            .find_map(|clipped| match &clipped.shape {
-                Shape::Circle(circle)
-                    if circle.radius == 6.0 && circle.stroke.color == TEXT_SECONDARY =>
-                {
-                    Some(circle.center)
-                }
-                _ => None,
-            });
-        let plus_center = output
-            .shapes
-            .iter()
-            .find_map(|clipped| match &clipped.shape {
-                Shape::LineSegment { points, stroke }
-                    if stroke.color == TEXT_PRIMARY && points[0].y == points[1].y =>
-                {
-                    Some(Rect::from_points(points).center())
-                }
-                _ => None,
-            });
-        let toggle_center = output
-            .shapes
-            .iter()
-            .find_map(|clipped| match &clipped.shape {
-                Shape::Rect(rect)
-                    if rect.stroke.color == TEXT_PRIMARY
-                        && rect.rect.size() == Vec2::new(16.0, 13.0) =>
-                {
-                    Some(rect.rect.center())
-                }
-                _ => None,
-            });
-        let history_center = history_center.expect("history icon");
-        let plus_center = plus_center.expect("new-session icon");
-        let toggle_center = toggle_center.expect("sidebar icon");
-        assert!(plus_center.x - history_center.x <= 30.5);
-        assert!(toggle_center.x - plus_center.x <= 33.5);
+        let glyph = |id: &str| {
+            let rect = context.read_response(Id::new(id)).expect(id).rect;
+            [
+                theme::text().primary,
+                theme::text().secondary,
+                theme::text().muted,
+            ]
+            .into_iter()
+            .find_map(|color| crate::icons::probe::bounds(&output.shapes, rect, color))
+            .map(|bounds: Rect| bounds.center())
+            .unwrap_or_else(|| panic!("{id} paints no glyph"))
+        };
+        let history_center = glyph("agent_sessions");
+        let plus_center = glyph("agent_new_session");
+        assert!(plus_center.x - history_center.x <= 34.0);
     }
 
     #[test]
@@ -17090,7 +17491,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |width| {
             let output = context.run_ui(
                 RawInput {
@@ -17138,7 +17539,7 @@ mod tests {
         })
         .unwrap();
         app.agent_sidebar = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |height| {
             let output = context.run_ui(
                 RawInput {
@@ -17183,7 +17584,7 @@ mod tests {
         })
         .unwrap();
         app.agent_sidebar = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let button = agent_toggle_rect(Rect::from_min_size(
             pos2(640.0, 0.0),
             Vec2::new(360.0, TITLEBAR_HEIGHT),
@@ -17242,7 +17643,7 @@ mod tests {
             app.open_tab(path.clone(), false);
         }
         app.agent_sidebar = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         disable_transient_egui_debug_overlays(&context);
         let draw = |app: &mut EditorApp| {
             context.run_ui(
@@ -17279,7 +17680,7 @@ mod tests {
         })
         .unwrap();
         app.open_tab(second, false);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         app.activate_tab(0);
         let _ = context.run_ui(
             RawInput {
@@ -17343,7 +17744,7 @@ mod tests {
     #[test]
     fn agent_transcript_fades_cover_both_scroll_edges() {
         let rect = Rect::from_min_size(pos2(10.0, 20.0), Vec2::new(300.0, 400.0));
-        let mesh = agent_transcript_fade_mesh(rect, CANVAS);
+        let mesh = agent_transcript_fade_mesh(rect, theme::surface().chrome);
 
         assert_eq!(mesh.vertices.len(), 8);
         assert_eq!(mesh.indices.len(), 12);
@@ -17398,7 +17799,7 @@ mod tests {
                 }),
             })
         }));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -17469,7 +17870,7 @@ mod tests {
 
     #[test]
     fn unchanged_agent_markdown_and_diffs_reuse_their_frame_work() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let syntaxes = SyntaxManager::built_in().unwrap();
         let highlighter = Highlighter::new().unwrap();
         let draw = |new_text: &str| {
@@ -17503,7 +17904,7 @@ mod tests {
         let mut galley = None;
         let syntaxes = SyntaxManager::built_in().unwrap();
         let highlighter = Highlighter::new().unwrap();
-        let _ = egui::Context::default().run_ui(RawInput::default(), |ui| {
+        let _ = theme::test_context().run_ui(RawInput::default(), |ui| {
             galley = Some(agent_markdown_galley(
                 ui,
                 Id::new("highlighted_markdown"),
@@ -17563,7 +17964,7 @@ mod tests {
                     output: None,
                 }),
             }));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -17634,7 +18035,7 @@ mod tests {
                     }),
                 }));
         }
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -17668,7 +18069,7 @@ mod tests {
     fn agent_diff_uses_detected_syntax() {
         let syntaxes = SyntaxManager::built_in().unwrap();
         let highlighter = Highlighter::new().unwrap();
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 300.0))),
                 ..RawInput::default()
@@ -17735,7 +18136,7 @@ mod tests {
                 paths: Vec::new(),
                 detail: None,
             }));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let input = || RawInput {
             screen_rect: Some(Rect::from_min_size(
                 pos2(0.0, 0.0),
@@ -17780,14 +18181,14 @@ mod tests {
         }
         fn removed_surface(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == Color32::from_rgb(55, 31, 37),
+                Shape::Rect(rect) => rect.fill == theme::diff::removed(),
                 Shape::Vec(shapes) => shapes.iter().any(removed_surface),
                 _ => false,
             }
         }
         fn diff_surface_right(shape: &Shape) -> Option<f32> {
             match shape {
-                Shape::Rect(rect) if rect.fill == SURFACE_INPUT => Some(rect.rect.right()),
+                Shape::Rect(rect) if rect.fill == theme::surface().input => Some(rect.rect.right()),
                 Shape::Vec(shapes) => shapes
                     .iter()
                     .filter_map(diff_surface_right)
@@ -17862,7 +18263,7 @@ mod tests {
             }),
             TranscriptItem::Assistant(response.into()),
         ]);
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
                 ..RawInput::default()
@@ -17883,7 +18284,7 @@ mod tests {
         }
         fn tool_card_rect(shape: &Shape) -> Option<Rect> {
             match shape {
-                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
+                Shape::Rect(rect) if rect.fill == theme::surface().raised => Some(rect.rect),
                 Shape::Vec(shapes) => shapes.iter().find_map(tool_card_rect),
                 _ => None,
             }
@@ -17921,7 +18322,7 @@ mod tests {
 
     #[test]
     fn tool_card_disclosure_is_optically_centered_and_radius_is_compact() {
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 100.0))),
                 ..RawInput::default()
@@ -17940,13 +18341,13 @@ mod tests {
         );
         let mut title_center = None;
         let mut chevron_bounds = Rect::NOTHING;
-        let mut chevron_segments = 0;
+        let mut chevron_paths = 0;
         let mut filled_triangle = false;
         let mut card_radius = None;
         let mut done_text = false;
         let mut completion_circle = false;
-        let mut completion_check_segments = 0;
-        let completion_color = Color32::from_rgb(105, 210, 157);
+        let mut completion_check = false;
+        let completion_color = theme::ink(theme::semantic().success);
         for clipped in output.shapes {
             match clipped.shape {
                 Shape::Text(text) if text.galley.text() == "python3 -c" => {
@@ -17959,13 +18360,16 @@ mod tests {
                 {
                     completion_circle = true;
                 }
-                Shape::LineSegment { stroke, .. } if stroke.color == completion_color => {
-                    completion_check_segments += 1;
+                Shape::Path(path)
+                    if !path.closed
+                        && path.stroke.color
+                            == egui::epaint::ColorMode::Solid(completion_color) =>
+                {
+                    completion_check = true;
                 }
-                Shape::LineSegment { points, .. } => {
-                    chevron_bounds.extend_with(points[0]);
-                    chevron_bounds.extend_with(points[1]);
-                    chevron_segments += 1;
+                Shape::Path(path) if !path.closed && path.points.len() == 3 => {
+                    chevron_bounds = chevron_bounds.union(path.visual_bounding_rect());
+                    chevron_paths += 1;
                 }
                 Shape::Path(path)
                     if path.closed
@@ -17987,20 +18391,20 @@ mod tests {
 
         let title_center = title_center.unwrap();
         assert!(
-            (chevron_bounds.center().y - title_center - 1.0).abs() < 0.1,
+            (chevron_bounds.center().y - title_center).abs() < 1.5,
             "chevron={chevron_bounds:?}, title={title_center}"
         );
-        assert_eq!(chevron_segments, 2);
+        assert_eq!(chevron_paths, 1, "the disclosure is one mitred path");
         assert!(!filled_triangle);
-        assert!(card_radius.unwrap() <= 5);
+        assert!(card_radius.unwrap() <= theme::radius::CONTROL);
         assert!(!done_text);
         assert!(completion_circle);
-        assert_eq!(completion_check_segments, 2);
+        assert!(completion_check);
     }
 
     #[test]
     fn overflowing_tool_path_marquees_on_hover_without_moving_the_action() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let path = "/Users/example/Documents/project/src/a-very-long-file-name.rs";
         let draw = |time| {
             context.run_ui(
@@ -18070,7 +18474,7 @@ mod tests {
             "# Result\n\n- **Done**\n- Run `cargo-test-with-an-unbroken-argument-that-is-much-wider-than-the-agent-sidebar`."
                 .into(),
         ));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
                 ..RawInput::default()
@@ -18125,7 +18529,7 @@ mod tests {
             .filter_map(|clipped| match &clipped.shape {
                 Shape::Path(path)
                     if path.closed
-                        && path.fill == TEXT_PRIMARY
+                        && path.fill == theme::text().primary
                         && (3..=4).contains(&path.points.len()) =>
                 {
                     Some(path.visual_bounding_rect())
@@ -18137,7 +18541,7 @@ mod tests {
                 (count + 1, bounds.union(path))
             });
         let (cursor_text, cursor_size, cursor_color) = cursor_metrics.expect("Cursor identity");
-        assert_eq!(cursor_color, TEXT_PRIMARY);
+        assert_eq!(cursor_color, theme::text().primary);
         assert!(cursor_size >= 13.0);
         assert_eq!(cursor_facets, 3);
         assert!(cursor_mark.height() >= 15.5);
@@ -18192,7 +18596,7 @@ mod tests {
                 selected: None,
             }),
         ]);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -18219,7 +18623,9 @@ mod tests {
         };
         fn permission_width(shape: &Shape) -> Option<f32> {
             match shape {
-                Shape::Rect(rect) if rect.fill == Color32::from_rgb(31, 30, 27) => {
+                Shape::Rect(rect)
+                    if rect.fill == theme::callout(theme::semantic().warning).fill =>
+                {
                     Some(rect.rect.width())
                 }
                 Shape::Vec(shapes) => shapes.iter().find_map(permission_width),
@@ -18279,7 +18685,7 @@ mod tests {
         app.agent_sidebar = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let pointer = pos2(800.0, 650.0);
         let _ = context.run_ui(
@@ -18365,7 +18771,7 @@ mod tests {
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
         app.agent_sidebar = true;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let input = || RawInput {
             screen_rect: Some(Rect::from_min_size(
                 pos2(0.0, 0.0),
@@ -18377,9 +18783,15 @@ mod tests {
         app.agent_sidebar = false;
         app.agentic_mode = true;
         let agentic = context.run_ui(input(), |root| app.ui(root));
+        // The attach control is the icon module's plus: two crossed strokes of
+        // equal length, which no other glyph in the composer draws.
         fn has_plus(shape: &Shape) -> bool {
             match shape {
-                Shape::Text(text) => text.galley.text() == "+",
+                Shape::Path(path) => {
+                    path.points.len() == 2
+                        && (path.points[0].x - path.points[1].x).abs() < 0.1
+                        && (path.points[0].y - path.points[1].y).abs() > 8.0
+                }
                 Shape::Vec(shapes) => shapes.iter().any(has_plus),
                 _ => false,
             }
@@ -18453,7 +18865,7 @@ mod tests {
         .unwrap();
         app.agent_sidebar = true;
         app.open_agent_file_picker();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -18499,7 +18911,7 @@ mod tests {
         .unwrap();
         app.agent_sidebar = true;
         app.open_agent_file_picker();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut positions = Vec::new();
 
         for pointer in [pos2(500.0, 350.0), pos2(650.0, 300.0), pos2(400.0, 240.0)] {
@@ -18547,7 +18959,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = app.agent.prompt.clone();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |events, time| {
             context.run_ui(
                 RawInput {
@@ -18615,7 +19027,7 @@ mod tests {
         app.agent.session_ready = true;
         app.agent.prompt = "ship it".into();
         app.tabs[app.active_tab.unwrap()].buffer.mark_changed();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         fn draw(
             context: &egui::Context,
             app: &mut EditorApp,
@@ -18696,7 +19108,7 @@ mod tests {
             TranscriptItem::User("second prompt".into()),
         ]);
         app.agent.prompt = "current draft".into();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         fn draw(context: &egui::Context, app: &mut EditorApp, key: Option<Key>) {
             let events = key
                 .map(|key| {
@@ -18766,7 +19178,7 @@ mod tests {
                 "transcript overflow line {line}: enough text to wrap in the narrow sidebar"
             ))
         }));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         fn draw(
             context: &egui::Context,
             app: &mut EditorApp,
@@ -18872,7 +19284,7 @@ mod tests {
             (0..80)
                 .map(|line| TranscriptItem::Assistant(format!("transcript overflow line {line}"))),
         );
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1600.0, 700.0));
         let (_, agent) = split_agentic_workspace(screen, app.sidebar);
         let pointer = pos2(agent.left() + 10.0, 250.0);
@@ -18919,8 +19331,8 @@ mod tests {
         );
         let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT);
 
-        assert_eq!(content.bottom(), composer.bottom() - 10.0);
-        assert_eq!(composer.right() - content.right(), 14.0);
+        assert_eq!(content.bottom(), composer.bottom() - theme::space::MEDIUM);
+        assert_eq!(composer.right() - content.right(), theme::space::MEDIUM);
         assert_eq!(menu.bottom(), selector.top() - 4.0);
         assert_eq!(menu.height(), 16.0 + 3.0 * AGENT_MENU_ROW_HEIGHT);
         assert!(menu.top() >= transcript.top());
@@ -19021,7 +19433,7 @@ mod tests {
                 options: Vec::new(),
             },
         ];
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp| {
             context.run_ui(
                 RawInput {
@@ -19061,16 +19473,24 @@ mod tests {
                 .find_map(|shape| text_rect(&shape.shape, label))
                 .unwrap()
         };
-        let attach = find("+");
+        // The attach control is an icon now, and an unhovered icon button paints
+        // only its glyph, so the control box is that glyph's 28 px target.
+        let attach = context
+            .read_response(Id::new("agent_attach"))
+            .expect("the composer lost its attach control")
+            .rect;
         let permissions = find("Ask");
         let mode = find("Agent");
         let model = find("Auto");
         for selector in [permissions, mode, model] {
-            assert!((selector.center().y - attach.center().y - 2.0).abs() < 0.1);
+            assert!(
+                (selector.center().y - attach.center().y).abs() <= 2.0,
+                "selector {selector:?} is off the attach control's line at {attach:?}"
+            );
         }
         fn composer_surface(shape: &Shape) -> Option<(Rect, u8)> {
             match shape {
-                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => {
+                Shape::Rect(rect) if rect.fill == theme::surface().raised => {
                     Some((rect.rect, rect.corner_radius.nw))
                 }
                 Shape::Vec(shapes) => shapes.iter().find_map(composer_surface),
@@ -19090,8 +19510,8 @@ mod tests {
             "attachment inset is uneven: left={left_gap}, bottom={bottom_gap}"
         );
         assert!(
-            mode.left() - permissions.right() >= 29.5 && model.left() - mode.right() >= 29.5,
-            "selectors are cramped: permissions={permissions:?}, mode={mode:?}, model={model:?}"
+            mode.left() > permissions.right() && model.left() > mode.right(),
+            "selectors overlap: permissions={permissions:?}, mode={mode:?}, model={model:?}"
         );
         assert!(
             output
@@ -19155,7 +19575,7 @@ mod tests {
             }],
         }];
         app.agent_menu = Some(super::AgentMenu::Config("effort".into()));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         context.all_styles_mut(|style| {
             style.interaction.tooltip_delay = 0.0;
             style.interaction.show_tooltips_only_when_still = false;
@@ -19208,7 +19628,7 @@ mod tests {
             updated_at: Some("2026-08-07T12:00:00Z".into()),
         }]);
         app.agent_menu = Some(super::AgentMenu::Sessions);
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -19263,7 +19683,7 @@ mod tests {
                 .collect(),
         );
         app.agent_menu = Some(super::AgentMenu::Sessions);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |events, time| {
             context.run_ui(
                 RawInput {
@@ -19329,7 +19749,7 @@ mod tests {
                 input_hint: None,
             })
             .collect();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         fn draw(
             context: &egui::Context,
             app: &mut EditorApp,
@@ -19352,7 +19772,7 @@ mod tests {
         fn popup_rect(output: &egui::FullOutput) -> Option<Rect> {
             fn find(shape: &Shape) -> Option<Rect> {
                 match shape {
-                    Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
+                    Shape::Rect(rect) if rect.fill == theme::surface().raised => Some(rect.rect),
                     Shape::Vec(shapes) => shapes.iter().find_map(find),
                     _ => None,
                 }
@@ -19426,7 +19846,7 @@ mod tests {
         );
         app.agent_follow_transcript = false;
         app.agent_menu = Some(super::AgentMenu::Config("model-id".into()));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |events, time| {
             context.run_ui(
                 RawInput {
@@ -19457,7 +19877,7 @@ mod tests {
         fn popup_rect(output: &egui::FullOutput) -> Option<Rect> {
             fn find(shape: &Shape) -> Option<Rect> {
                 match shape {
-                    Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
+                    Shape::Rect(rect) if rect.fill == theme::surface().raised => Some(rect.rect),
                     Shape::Vec(shapes) => shapes.iter().find_map(find),
                     _ => None,
                 }
@@ -19485,7 +19905,7 @@ mod tests {
         }
         fn has_selected_surface(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == SURFACE_SELECTED,
+                Shape::Rect(rect) => rect.fill == theme::state::selected(),
                 Shape::Vec(shapes) => shapes.iter().any(has_selected_surface),
                 _ => false,
             }
@@ -19496,7 +19916,7 @@ mod tests {
         let before_popup = popup_rect(&before).expect("model popup");
         assert_eq!(
             menu_text(&before, before_popup, "Model 00").map(|(_, size)| size),
-            Some(12.5)
+            Some(theme::typography::SMALL_SIZE)
         );
         assert!(
             before
@@ -19532,7 +19952,7 @@ mod tests {
 
     #[test]
     fn immediate_background_repaint_wakes_the_event_loop() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let (wake, woken) = std::sync::mpsc::channel();
         install_repaint_wake(&context, move || {
             let _ = wake.send(());
@@ -19682,6 +20102,37 @@ mod tests {
     }
 
     #[test]
+    fn a_palette_group_announces_itself_only_when_it_has_results() {
+        let context = theme::test_context();
+        let empty = context.run_ui(RawInput::default(), |ui| {
+            search_group_header(ui, "FILES", 0);
+        });
+        let nonempty = context.run_ui(RawInput::default(), |ui| {
+            search_group_header(ui, "FILES", 3);
+        });
+        let painted = |shapes: &[egui::epaint::ClippedShape], text: &str| {
+            shapes.iter().any(|shape| match &shape.shape {
+                Shape::Text(painted) => painted.galley.text() == text,
+                _ => false,
+            })
+        };
+        assert!(painted(&empty.shapes, "FILES"));
+        assert!(painted(&empty.shapes, "0"));
+        assert!(painted(&nonempty.shapes, "3"));
+        // The empty group still has a header when asked; the caller is what
+        // decides whether to ask. The invariant is that the count is always
+        // present when the header is.
+        assert_eq!(
+            file_result_job("src/app.rs", "app", 200.0)
+                .sections
+                .iter()
+                .filter(|section| section.format.color == theme::accent())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn finds_every_case_insensitive_ascii_match_for_palette_highlighting() {
         assert_eq!(
             match_spans("Cargo cargo CARGO", "cargo"),
@@ -19726,7 +20177,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let input = |time| RawInput {
             screen_rect: Some(Rect::from_min_size(
                 pos2(0.0, 0.0),
@@ -19740,7 +20191,7 @@ mod tests {
                 Shape::Rect(rect) => {
                     rect.rect.width() > 650.0
                         && height.contains(&rect.rect.height())
-                        && rect.fill == SURFACE
+                        && rect.fill == theme::surface().raised
                 }
                 Shape::Vec(shapes) => shapes
                     .iter()
@@ -19812,7 +20263,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         context.set_pixels_per_point(2.0);
         let _ = context.run_ui(
             RawInput {
@@ -19842,7 +20293,9 @@ mod tests {
         );
         fn active_divider_width(shape: &Shape) -> Option<f32> {
             match shape {
-                Shape::LineSegment { stroke, .. } if stroke.color == ACCENT => Some(stroke.width),
+                Shape::LineSegment { stroke, .. } if stroke.color == theme::accent() => {
+                    Some(stroke.width)
+                }
                 Shape::Vec(shapes) => shapes.iter().find_map(active_divider_width),
                 _ => None,
             }
@@ -19850,7 +20303,7 @@ mod tests {
         fn contains_editor_header(shape: &Shape) -> bool {
             match shape {
                 Shape::Rect(rect) => {
-                    rect.fill == SURFACE
+                    rect.fill == theme::surface().chrome
                         && rect.rect.contains(pos2(500.0, 20.0))
                         && rect.rect.height() == TITLEBAR_HEIGHT
                 }
@@ -19879,7 +20332,7 @@ mod tests {
 
     #[test]
     fn active_resize_dividers_change_color_without_becoming_thicker() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         context.set_pixels_per_point(2.0);
         let mut strokes = None;
         let _ = context.run_ui(RawInput::default(), |_| {
@@ -19890,8 +20343,11 @@ mod tests {
         });
         let (active, inactive) = strokes.unwrap();
 
-        assert_eq!(active, egui::Stroke::new(0.5, ACCENT));
-        assert_eq!(inactive, egui::Stroke::new(0.5, super::BORDER_STRONG));
+        assert_eq!(active, egui::Stroke::new(0.5, theme::accent()));
+        assert_eq!(
+            inactive,
+            egui::Stroke::new(0.5, super::theme::border::strong_color())
+        );
     }
 
     #[test]
@@ -19905,7 +20361,7 @@ mod tests {
             })
             .unwrap();
             app.agent_sidebar = true;
-            let context = egui::Context::default();
+            let context = theme::test_context();
             let mut draw = |events| {
                 let _ = context.run_ui(
                     RawInput {
@@ -19947,7 +20403,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut draw = |events| {
             let _ = context.run_ui(
                 RawInput {
@@ -19987,7 +20443,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let draw = |app: &mut EditorApp, events| {
             let _ = context.run_ui(
@@ -20052,7 +20508,7 @@ mod tests {
         let text = "needle then needle";
         let base = egui::text::LayoutJob::simple(
             text.into(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             400.0,
         );
@@ -20085,7 +20541,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             let input = RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -20128,7 +20584,7 @@ mod tests {
         })
         .unwrap();
         app.sidebar = false;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let command = Modifiers {
             command: true,
             ..Modifiers::NONE
@@ -20225,7 +20681,7 @@ mod tests {
         app.sidebar = false;
         app.open_tab(paths[1].clone(), false);
         app.drop_tab(1, PaneId(0), DropZone::Right);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let command = Modifiers {
             command: true,
             ..Modifiers::NONE
@@ -20268,7 +20724,7 @@ mod tests {
         })
         .unwrap();
         app.sidebar = false;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
         let command = Modifiers {
             command: true,
@@ -20325,7 +20781,7 @@ mod tests {
         app.sidebar = false;
         app.open_tab(paths[1].clone(), false);
         app.drop_tab(1, PaneId(0), DropZone::Right);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let command = Modifiers {
             command: true,
             ..Modifiers::NONE
@@ -20404,7 +20860,7 @@ mod tests {
             })
             .unwrap();
             app.sidebar = false;
-            let output = egui::Context::default().run_ui(
+            let output = theme::test_context().run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         Default::default(),
@@ -20416,7 +20872,7 @@ mod tests {
             );
 
             assert!(!output.shapes.iter().any(|shape| match &shape.shape {
-                Shape::Rect(rect) => rect.stroke.color == PANE_FOCUS_BORDER,
+                Shape::Rect(rect) => rect.stroke.color == theme::border::focus_color(),
                 _ => false,
             }));
         }
@@ -20426,7 +20882,9 @@ mod tests {
     fn editor_pane_does_not_paint_over_the_window_right_or_bottom_border() {
         fn paints_outer_editor_edge(shape: &Shape, window: Rect) -> bool {
             match shape {
-                Shape::LineSegment { points, stroke } if stroke.color == super::BORDER_STRONG => {
+                Shape::LineSegment { points, stroke }
+                    if stroke.color == super::theme::border::strong_color() =>
+                {
                     points
                         .iter()
                         .all(|point| (point.x - (window.right() - 0.5)).abs() < 0.01)
@@ -20449,7 +20907,7 @@ mod tests {
         })
         .unwrap();
         let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(window),
                 ..RawInput::default()
@@ -20482,7 +20940,7 @@ mod tests {
         app.sidebar = false;
         app.open_tab(paths[1].clone(), false);
         app.drop_tab(1, PaneId(0), DropZone::Right);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
         let draw = |app: &mut EditorApp, events| {
             context.run_ui(
@@ -20515,7 +20973,8 @@ mod tests {
             .iter()
             .find_map(|shape| match &shape.shape {
                 Shape::Rect(rect)
-                    if rect.stroke.color == PANE_FOCUS_BORDER && rect.stroke.width == 1.0 =>
+                    if rect.stroke.color == theme::border::focus_color()
+                        && rect.stroke.width == 1.0 =>
                 {
                     Some(rect)
                 }
@@ -20603,7 +21062,7 @@ mod tests {
         .unwrap();
         app.open_tab(second.clone(), false);
         app.activate_tab(0);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             let _ = context.run_ui(
                 RawInput {
@@ -20664,7 +21123,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             let _ = context.run_ui(
                 RawInput {
@@ -20737,7 +21196,7 @@ mod tests {
             title: Some("Build the agentic workspace".into()),
             updated_at: None,
         }]);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
         let output = context.run_ui(
             RawInput {
@@ -20761,7 +21220,7 @@ mod tests {
         }
         fn has_background(shape: &Shape, expected: Rect) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.rect == expected && rect.fill == EDITOR_BACKGROUND,
+                Shape::Rect(rect) => rect.rect == expected && rect.fill == editor_background(),
                 Shape::Vec(shapes) => shapes.iter().any(|shape| has_background(shape, expected)),
                 _ => false,
             }
@@ -20800,7 +21259,7 @@ mod tests {
         .unwrap();
         app.agentic_mode = true;
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(520.0, 700.0));
-        let context = egui::Context::default();
+        let context = theme::test_context();
 
         let _ = context.run_ui(
             RawInput {
@@ -20861,7 +21320,7 @@ mod tests {
                 _ => false,
             }
         }
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let agentic = context.run_ui(input(), |root| app.ui(root));
         app.agentic_mode = false;
         let ide = context.run_ui(input(), |root| app.ui(root));
@@ -20899,7 +21358,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -20950,7 +21409,7 @@ mod tests {
             title: Some("Polish the agentic workspace".into()),
             updated_at: None,
         }]);
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -20989,7 +21448,7 @@ mod tests {
             title: Some("Compact session".into()),
             updated_at: None,
         }]);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -21033,7 +21492,7 @@ mod tests {
             .apply(crate::agent::controller::Event::ActiveSessionChanged(
                 "session-1".into(),
             ));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -21045,7 +21504,7 @@ mod tests {
         );
         fn has_selected_fill(shape: &Shape) -> bool {
             match shape {
-                Shape::Rect(rect) => rect.fill == SURFACE_SELECTED,
+                Shape::Rect(rect) => rect.fill == theme::state::selected(),
                 Shape::Vec(shapes) => shapes.iter().any(has_selected_fill),
                 _ => false,
             }
@@ -21072,7 +21531,7 @@ mod tests {
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
-        let output = egui::Context::default().run_ui(
+        let output = theme::test_context().run_ui(
             RawInput {
                 screen_rect: Some(screen),
                 ..RawInput::default()
@@ -21081,7 +21540,7 @@ mod tests {
         );
         fn composer_rect(shape: &Shape) -> Option<Rect> {
             match shape {
-                Shape::Rect(rect) if rect.fill == SURFACE_RAISED => Some(rect.rect),
+                Shape::Rect(rect) if rect.fill == theme::surface().raised => Some(rect.rect),
                 Shape::Vec(shapes) => shapes.iter().find_map(composer_rect),
                 _ => None,
             }
@@ -21108,7 +21567,7 @@ mod tests {
         })
         .unwrap();
         app.sidebar_width = 120.0;
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -21145,7 +21604,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tab_underline_spans_the_full_tab_width() {
+    fn the_active_tab_is_marked_edge_to_edge_and_continues_the_document_below_it() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let file = root.join("current.rs");
@@ -21157,7 +21616,7 @@ mod tests {
         })
         .unwrap();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(screen),
@@ -21165,34 +21624,231 @@ mod tests {
             },
             |root| app.ui(root),
         );
-        fn cyan_underline(shape: &Shape) -> Option<[egui::Pos2; 2]> {
+        fn accent_bar(shape: &Shape) -> Option<[egui::Pos2; 2]> {
             match shape {
                 Shape::LineSegment { points, stroke }
-                    if stroke.width == 2.0 && stroke.color == ACCENT =>
+                    if stroke.width == 2.0 && stroke.color == theme::accent() =>
                 {
                     Some(*points)
                 }
-                Shape::Vec(shapes) => shapes.iter().find_map(cyan_underline),
+                Shape::Vec(shapes) => shapes.iter().find_map(accent_bar),
                 _ => None,
             }
         }
-        let underline = output
+        let bar = output
             .shapes
             .iter()
-            .find_map(|shape| cyan_underline(&shape.shape))
-            .expect("active tab underline");
+            .find_map(|shape| accent_bar(&shape.shape))
+            .expect("active tab marker");
         let tab = context
             .read_response(Id::new(("file_tab", file.display().to_string())))
             .expect("file tab")
             .rect;
 
         assert_eq!(
-            underline,
+            bar,
             [
-                pos2(tab.left(), tab.bottom() - 1.0),
-                pos2(tab.right(), tab.bottom() - 1.0),
-            ]
+                pos2(tab.left(), tab.top() + 1.0),
+                pos2(tab.right(), tab.top() + 1.0),
+            ],
+            "the marker sits on the top edge so the bottom flows into the document"
         );
+        let continuous = output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Rect(rect) => rect.rect == tab && rect.fill == theme::surface().editor,
+            _ => false,
+        });
+        assert!(continuous, "the active tab carries the document's own fill");
+    }
+
+    #[test]
+    fn the_empty_editor_names_the_project_and_lists_only_bound_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let app = EditorApp::new(OpenTarget {
+            root: root.clone(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let hints = app.keybinding_hints();
+        assert!(hints.iter().all(|(_, chord)| !chord.is_empty()));
+        assert!(
+            hints.iter().all(|(label, _)| *label != "Open agent"),
+            "a command with no chord in this profile has no hint to show: {hints:?}"
+        );
+        assert_eq!(hints.len(), 4, "{hints:?}");
+
+        let project = root.file_name().unwrap().to_string_lossy().into_owned();
+        let context = theme::test_context();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 600.0))),
+                ..RawInput::default()
+            },
+            |ui| draw_editor_empty_state(ui, &project, &hints[..2]),
+        );
+
+        let painted = |text: &str| {
+            output.shapes.iter().any(|shape| match &shape.shape {
+                Shape::Text(painted) => painted.galley.text() == text,
+                _ => false,
+            })
+        };
+        assert!(painted(&project), "the window says what is open");
+        for (label, chord) in &hints[..2] {
+            assert!(painted(label), "{label} is missing");
+            assert!(painted(chord), "{chord} is missing");
+        }
+        assert!(
+            !painted(hints[3].0),
+            "a command that was not passed must not appear"
+        );
+    }
+
+    #[test]
+    fn the_pane_header_states_what_is_wrong_in_the_color_of_the_problem() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("broken.rs");
+        fs::write(&file, "text\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(file.clone()),
+            create: false,
+        })
+        .unwrap();
+        let diagnostic = |severity| crate::lsp::Diagnostic {
+            range: 0..1,
+            line: 0,
+            severity,
+            source: None,
+            code: None,
+            message: "broken".to_owned(),
+        };
+        app.lsp_diagnostics.insert(
+            file,
+            LspDiagnosticsState {
+                revision: 0,
+                stale: false,
+                generation: 1,
+                diagnostics: vec![
+                    diagnostic(crate::lsp::DiagnosticSeverity::Error),
+                    diagnostic(crate::lsp::DiagnosticSeverity::Error),
+                    diagnostic(crate::lsp::DiagnosticSeverity::Warning),
+                ],
+            },
+        );
+        let context = theme::test_context();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let pill = |name: &str, text: &str| {
+            let rect = context
+                .read_response(Id::new((name, app.active_pane.0)))
+                .unwrap_or_else(|| panic!("{name} pill"))
+                .rect;
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                Shape::Text(painted)
+                    if painted.galley.text() == text && rect.contains(painted.pos) =>
+                {
+                    Some(painted.fallback_color)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            pill("pane_errors", "2"),
+            Some(theme::callout(theme::semantic().danger).text)
+        );
+        assert_eq!(
+            pill("pane_warnings", "1"),
+            Some(theme::callout(theme::semantic().warning).text)
+        );
+    }
+
+    #[test]
+    fn a_tab_is_as_wide_as_its_name_between_a_floor_and_a_ceiling() {
+        let context = theme::test_context();
+        let mut measured = Vec::new();
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            measured = ["a.rs", "settings.rs", &"n".repeat(120)]
+                .map(|label| tab_width(ui, label))
+                .to_vec();
+        });
+
+        let [short, middle, long] = measured[..] else {
+            unreachable!()
+        };
+        assert_eq!(short, TAB_MIN_WIDTH);
+        assert_eq!(long, TAB_MAX_WIDTH);
+        assert!(middle > short && middle < long, "{middle}");
+    }
+
+    #[test]
+    fn a_tab_label_starts_at_the_same_inset_however_wide_its_neighbours_are() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let names = ["a.rs", "a_considerably_longer_module_name.rs"];
+        let paths = names.map(|name| root.join(name));
+        for path in &paths {
+            fs::write(path, "text\n").unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: Some(paths[0].clone()),
+            create: false,
+        })
+        .unwrap();
+        app.open_tab(paths[1].clone(), false);
+        let context = theme::test_context();
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let insets = names.map(|name| {
+            let tab = context
+                .read_response(Id::new(("file_tab", root_path(&app, name))))
+                .expect("tab")
+                .rect;
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == name && tab.contains(text.pos) => {
+                        Some(text.pos.x)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} has no label in its tab"));
+            let close = context
+                .read_response(Id::new(("file_tab_close", root_path(&app, name))))
+                .expect("close control")
+                .rect;
+            assert!(tab.contains_rect(close), "{name} loses its close target");
+            assert_eq!(close.width(), TAB_CLOSE);
+            label - tab.left()
+        });
+
+        assert_eq!(insets[0], insets[1]);
+    }
+
+    fn root_path(app: &EditorApp, name: &str) -> String {
+        app.tree.root.join(name).display().to_string()
     }
 
     #[test]
@@ -21215,7 +21871,7 @@ mod tests {
             app.open_tab(path.clone(), false);
         }
         app.activate_tab(0);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events, time| {
             let _ = context.run_ui(
                 RawInput {
@@ -21300,7 +21956,7 @@ mod tests {
         .unwrap();
         app.open_tab(paths[1].clone(), false);
         app.open_tab(paths[2].clone(), false);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             let _ = context.run_ui(
                 RawInput {
@@ -21367,7 +22023,7 @@ mod tests {
         })
         .unwrap();
         app.open_tab(paths[1].clone(), false);
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let draw = |app: &mut EditorApp, events| {
             let _ = context.run_ui(
                 RawInput {
@@ -21437,7 +22093,7 @@ mod tests {
             command: true,
             ..Modifiers::NONE
         };
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -21475,7 +22131,7 @@ mod tests {
             create: false,
         })
         .unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let command = Modifiers {
             command: true,
             ..Modifiers::NONE
@@ -21529,7 +22185,7 @@ mod tests {
             .set_active(crate::keybindings::BUILTIN_VIM)
             .unwrap();
         app.rebuild_keybinding_resolver().unwrap();
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let screen = Some(Rect::from_min_size(
             pos2(0.0, 0.0),
             Vec2::new(1000.0, 700.0),

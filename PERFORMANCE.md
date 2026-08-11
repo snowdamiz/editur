@@ -117,3 +117,15 @@ cargo run --release --locked --example benchmark_resize
 ```
 
 Metal was launched and rendered on the reference Mac with the custom borderless chrome. The DX12 and Vulkan modules pass cross-target Clippy with warnings denied; their native runtime builds remain encoded in CI. Vulkan host checking used a metadata-only `pkg-config` shim because macOS has no Linux Wayland sysroot. Native keyboard-only GUI smoke tests and complete resource baselines remain release-approval checks on Windows and Linux.
+
+## Design token layer
+
+Measured 2026-08-10 after landing the token module, Inter SemiBold, and JetBrains Mono.
+
+| Metric | Result | Target | Status |
+| --- | ---: | ---: | --- |
+| Stripped arm64 binary growth from two subset faces | expect ≤ +0.6 MiB | well inside 30 MiB | Recorded at next release smoke |
+| Idle CPU with motion idle | 0.1% | ≤ 0.1% | Pass (motion requests no frame when settled) |
+| `theme::motion::animate` quantized steps | 64 | bounded retained revisions | Pass |
+
+Appearance settings (`theme`, `density`, `editorFontSize`, `lineHeight`, `reducedMotion`) round-trip through `settings.json` and apply without a restart. Both dark and light palettes share the same contrast test suite.

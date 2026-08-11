@@ -1,5 +1,6 @@
+use crate::theme;
 use egui::{
-    Color32, FontId, TextFormat,
+    Color32, TextFormat,
     text::{LayoutJob, LayoutSection},
 };
 use std::path::Path;
@@ -83,43 +84,43 @@ struct CachedLine {
 
 impl Highlighter {
     pub fn new() -> Result<Self, String> {
-        let foreground = Color {
-            r: 210,
-            g: 215,
-            b: 225,
-            a: 255,
-        };
+        let roles = theme::syntax();
+        let foreground = color(roles.foreground);
         let scopes = [
-            ("comment", color(107, 116, 136), FontStyle::ITALIC),
-            ("string", color(152, 195, 121), FontStyle::empty()),
-            ("keyword", color(198, 120, 221), FontStyle::empty()),
+            ("comment", color(roles.comment), FontStyle::ITALIC),
+            ("string", color(roles.string), FontStyle::empty()),
+            ("keyword", color(roles.keyword), FontStyle::empty()),
             (
                 "storage.type, entity.name.type",
-                color(97, 175, 239),
+                color(roles.declared_type),
                 FontStyle::empty(),
             ),
             (
                 "entity.name.macro",
-                color(229, 192, 123),
+                color(roles.macro_name),
                 FontStyle::empty(),
             ),
             (
                 "constant.character.escape",
-                color(86, 182, 194),
+                color(roles.escape),
                 FontStyle::empty(),
             ),
-            ("markup.heading", color(97, 175, 239), FontStyle::empty()),
-            ("markup.raw", color(152, 195, 121), FontStyle::empty()),
-            ("markup.bold", color(229, 192, 123), FontStyle::BOLD),
-            ("markup.italic", color(198, 120, 221), FontStyle::ITALIC),
+            (
+                "markup.heading",
+                color(roles.declared_type),
+                FontStyle::empty(),
+            ),
+            ("markup.raw", color(roles.string), FontStyle::empty()),
+            ("markup.bold", color(roles.macro_name), FontStyle::BOLD),
+            ("markup.italic", color(roles.keyword), FontStyle::ITALIC),
             (
                 "markup.underline.link, string.other.link",
-                color(86, 182, 194),
+                color(roles.link),
                 FontStyle::empty(),
             ),
             (
                 "punctuation.definition.heading, punctuation.definition.list",
-                color(86, 182, 194),
+                color(roles.escape),
                 FontStyle::empty(),
             ),
         ]
@@ -143,7 +144,7 @@ impl Highlighter {
                 author: None,
                 settings: ThemeSettings {
                     foreground: Some(foreground),
-                    background: Some(color(30, 33, 39)),
+                    background: Some(color(theme::surface().editor)),
                     ..ThemeSettings::default()
                 },
                 scopes,
@@ -295,20 +296,22 @@ impl Highlighter {
 
 fn text_format(style: Style) -> TextFormat {
     TextFormat {
-        font_id: FontId::monospace(14.0),
-        color: Color32::from_rgba_unmultiplied(
-            style.foreground.r,
-            style.foreground.g,
-            style.foreground.b,
-            style.foreground.a,
-        ),
+        font_id: theme::typography::code_editor(),
+        color: theme::color::literal(style.foreground.r, style.foreground.g, style.foreground.b),
         italics: style.font_style.contains(FontStyle::ITALIC),
         ..TextFormat::default()
     }
 }
 
-const fn color(r: u8, g: u8, b: u8) -> Color {
-    Color { r, g, b, a: 255 }
+/// syntect carries its own color type, so a palette role has to cross over
+/// once on the way in and once on the way out.
+fn color(color: Color32) -> Color {
+    Color {
+        r: color.r(),
+        g: color.g(),
+        b: color.b(),
+        a: 255,
+    }
 }
 
 #[cfg(test)]
@@ -473,7 +476,7 @@ mod tests {
         let string = color_at(source.find("Editur").unwrap());
         let keyword = color_at(source.rfind("pub").unwrap());
         assert_ne!(string, keyword);
-        assert_eq!(keyword, Color32::from_rgb(198, 120, 221));
+        assert_eq!(keyword, theme::syntax().keyword);
     }
 
     #[test]

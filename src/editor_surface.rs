@@ -1,27 +1,38 @@
 use egui::{
-    Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Modifiers, OutputCommand, Pos2, Rect,
+    Color32, CursorIcon, Event, EventFilter, Id, Key, Modifiers, OutputCommand, Pos2, Rect,
     Response, Sense, Stroke, TextFormat, Ui, Vec2,
     epaint::text::{Galley, LayoutJob},
     text::{ByteIndex, CCursor, CCursorRange, LayoutSection},
 };
 use std::{ops::Range, sync::Arc, time::Duration};
 
-use crate::{
-    keybindings::Command,
-    renderer::mark_retained,
-    theme::{ACCENT, BORDER_STRONG, SURFACE, TEXT_DISABLED},
-};
+use crate::{keybindings::Command, renderer::mark_retained, theme};
 
-const LINE_HEIGHT: f32 = 18.0;
 const TEXT_LEFT_PADDING: f32 = 8.0;
 const TEXT_TOP_PADDING: f32 = 6.0;
 const CARET_BLINK_INTERVAL: f64 = 0.7;
-pub(crate) const EDITOR_BACKGROUND: Color32 = SURFACE;
+/// One tab stop, in characters. Indent guides land on these.
+const INDENT_WIDTH: usize = 4;
+/// A wrapped continuation is pushed past its own indent by this much, so the
+/// eye can tell a soft wrap from a new statement.
+const WRAP_INDENT_CHARS: f32 = 2.0;
+
+/// The editor's line box, which the Appearance setting drives.
+fn line_height() -> f32 {
+    theme::typography::code_line()
+}
+
+pub(crate) fn editor_background() -> Color32 {
+    theme::surface().editor
+}
 
 struct RetainedLine {
     job: LayoutJob,
     char_start: usize,
     character_len: usize,
+    /// Leading whitespace, in characters, which sets both the indent guides and
+    /// where a wrapped continuation resumes.
+    indent: usize,
     height: f32,
     galley: Option<Arc<Galley>>,
     revision: u64,
@@ -51,6 +62,7 @@ pub struct EditorSurface {
     offsets: Vec<f32>,
     visual_revision: Option<u64>,
     wrap_width: u32,
+    appearance: u64,
     caret_blink_started: f64,
     caret_was_focused: bool,
 }
@@ -387,7 +399,8 @@ impl EditorSurface {
         }) {
             ui.output_mut(|output| output.cursor_icon = CursorIcon::Text);
         }
-        let gutter_width = gutter_width(document.line_count);
+        let advance = digit_advance(ui);
+        let gutter_width = gutter_width(document.line_count, advance);
         let content = Rect::from_min_max(
             egui::pos2(
                 rect.left() + gutter_width,
@@ -396,7 +409,7 @@ impl EditorSurface {
             editor_rect.right_bottom(),
         );
         let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
-        self.sync_lines(highlighted, document.revision, wrap_width);
+        self.sync_lines(highlighted, document.revision, wrap_width, advance);
         self.clamp_selection(document.character_len);
         let cursor_before_input = self.cursor;
 
@@ -526,15 +539,33 @@ impl EditorSurface {
         }
     }
 
-    fn sync_lines(&mut self, highlighted: &LayoutJob, revision: u64, wrap_width: f32) {
+    fn sync_lines(
+        &mut self,
+        highlighted: &LayoutJob,
+        revision: u64,
+        wrap_width: f32,
+        advance: f32,
+    ) {
         let width = wrap_width.round().to_bits();
+        let appearance = theme::appearance();
+        if self.appearance != appearance {
+            // Font size, line height, and palette are all baked into a galley.
+            self.appearance = appearance;
+            self.visual_revision = None;
+            self.line_numbers.clear();
+            for line in &mut self.lines {
+                line.galley = None;
+                line.height = estimated_height(line.character_len, wrap_width, advance);
+            }
+            self.rebuild_offsets();
+        }
         if self.visual_revision == Some(revision) {
             if self.wrap_width == width {
                 return;
             }
             for line in &mut self.lines {
-                line.job.wrap.max_width = wrap_width;
-                line.height = estimated_height(line.character_len, wrap_width);
+                line.job.wrap.max_width = wrap_line_width(wrap_width, line.indent, advance);
+                line.height = estimated_height(line.character_len, wrap_width, advance);
                 line.galley = None;
             }
             self.wrap_width = width;
@@ -575,11 +606,14 @@ impl EditorSurface {
                     line.char_start = spec.char_start;
                     line
                 } else {
+                    let mut job = spec.job;
+                    job.wrap.max_width = wrap_line_width(wrap_width, spec.indent, advance);
                     RetainedLine {
-                        height: estimated_height(spec.character_len, wrap_width),
-                        job: spec.job,
+                        height: estimated_height(spec.character_len, wrap_width, advance),
+                        job,
                         char_start: spec.char_start,
                         character_len: spec.character_len,
+                        indent: spec.indent,
                         galley: None,
                         revision,
                     }
@@ -597,7 +631,7 @@ impl EditorSurface {
         let mut y = 0.0;
         self.offsets.push(y);
         for line in &self.lines {
-            y += line.height.max(LINE_HEIGHT);
+            y += line.height.max(line_height());
             self.offsets.push(y);
         }
     }
@@ -623,12 +657,14 @@ impl EditorSurface {
         if !indexes.contains(&cursor_line) && cursor_line < self.lines.len() {
             indexes.push(cursor_line);
         }
+        let advance = digit_advance(ui);
         let mut changed_height = false;
         for index in indexes {
             let line = &mut self.lines[index];
             if line.galley.is_none() {
-                let galley = ui.fonts_mut(|fonts| fonts.layout_job(line.job.clone()));
-                let height = galley.size().y.max(LINE_HEIGHT);
+                let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(line.job.clone()));
+                indent_wrapped_rows(&mut galley, line.indent, advance);
+                let height = galley.size().y.max(line_height());
                 changed_height |= (height - line.height).abs() > f32::EPSILON;
                 line.height = height;
                 line.galley = Some(galley);
@@ -637,11 +673,13 @@ impl EditorSurface {
                 self.line_numbers.resize(index + 1, None);
             }
             if self.line_numbers[index].is_none() {
+                // Laid out uncolored so one cached galley can serve both the
+                // active line and every other one.
                 self.line_numbers[index] = Some(ui.fonts_mut(|fonts| {
                     fonts.layout_no_wrap(
                         (index + 1).to_string(),
-                        FontId::monospace(12.0),
-                        TEXT_DISABLED,
+                        theme::typography::code_small(),
+                        Color32::PLACEHOLDER,
                     )
                 }));
             }
@@ -670,16 +708,25 @@ impl EditorSurface {
             0x1000_0000_0000_0000,
             u64::from(rect.width().to_bits()) << 32 | u64::from(rect.height().to_bits()),
         );
-        painter.rect_filled(rect, 0.0, EDITOR_BACKGROUND);
-        painter.line_segment(
-            [
-                egui::pos2(content.left(), rect.top()),
-                egui::pos2(content.left(), rect.bottom()),
-            ],
-            Stroke::new(1.0, BORDER_STRONG),
-        );
+        painter.rect_filled(rect, 0.0, editor_background());
         let selection = self.selection();
+        let has_selection = !selection.is_empty();
         let cursor_line = self.line_for_character(self.cursor);
+        let advance =
+            ui.fonts_mut(|fonts| fonts.glyph_width(&theme::typography::code_editor(), '0'));
+        let line_height = line_height();
+        // The block that encloses the caret owns the one guide that is allowed
+        // to be an accent.
+        let active_guide = self
+            .lines
+            .get(cursor_line)
+            .map(|line| line.indent.saturating_sub(INDENT_WIDTH) / INDENT_WIDTH * INDENT_WIDTH)
+            .filter(|_| {
+                self.lines
+                    .get(cursor_line)
+                    .is_some_and(|line| line.indent > 0)
+            });
+        let mut inherited_indent = 0;
         for index in self.visible_lines(content.height()) {
             let line = &self.lines[index];
             let Some(base_galley) = &line.galley else {
@@ -694,37 +741,72 @@ impl EditorSurface {
             let state = horizontal_geometry
                 ^ u64::from(y.to_bits())
                 ^ selection_state.unwrap_or(0)
-                ^ u64::from(index == cursor_line && focused);
+                ^ u64::from(index == cursor_line && focused)
+                ^ (has_selection as u64) << 1
+                ^ (line.indent as u64).rotate_left(9);
             mark_retained(
                 &painter,
                 rect,
                 0x2000_0000_0000_0000 | index as u64,
                 line.revision ^ state,
             );
-            if index == cursor_line && focused {
+            let is_cursor_line = index == cursor_line && focused;
+            if is_cursor_line && !has_selection {
                 painter.rect_filled(
                     Rect::from_min_size(
                         egui::pos2(content.left(), y),
                         egui::vec2(content.width(), line.height),
                     ),
                     0.0,
-                    Color32::from_white_alpha(6),
+                    theme::editor::line_active(),
                 );
+            }
+            // A blank line belongs to the block around it, so it borrows that
+            // indent rather than dropping every guide for one row.
+            let indent = if line.character_len == 0 {
+                inherited_indent
+            } else {
+                inherited_indent = line.indent;
+                line.indent
+            };
+            let mut column = 0;
+            while column + INDENT_WIDTH <= indent {
+                let active = active_guide == Some(column) && is_cursor_line;
+                painter.vline(
+                    content.left() + TEXT_LEFT_PADDING + column as f32 * advance,
+                    y..=(y + line.height),
+                    Stroke::new(
+                        theme::stroke::DIVIDER,
+                        if active {
+                            theme::editor::indent_guide_active()
+                        } else {
+                            theme::editor::indent_guide()
+                        },
+                    ),
+                );
+                column += INDENT_WIDTH;
             }
             if let Some(number) = self.line_numbers.get(index).and_then(Option::as_ref) {
                 painter.galley(
                     egui::pos2(
-                        content.left() - 5.0 - number.size().x,
-                        y + (LINE_HEIGHT - number.size().y) * 0.5,
+                        content.left() - theme::space::SNUG - number.size().x,
+                        y + (line_height - number.size().y) * 0.5,
                     ),
                     Arc::clone(number),
-                    TEXT_DISABLED,
+                    if is_cursor_line {
+                        theme::text().primary
+                    } else {
+                        theme::text().muted
+                    },
                 );
             }
             if let Some((_, color)) = line_markers.iter().find(|(line, _)| *line == index) {
-                painter.circle_filled(
-                    egui::pos2(content.left() - 4.0, y + LINE_HEIGHT * 0.5),
-                    2.5,
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        egui::pos2(content.left() - 3.0, y + (line_height - 6.0) * 0.5),
+                        egui::vec2(3.0, 6.0),
+                    ),
+                    theme::corner(2),
                     *color,
                 );
             }
@@ -734,9 +816,13 @@ impl EditorSurface {
                     CCursor::new(selected.start - line.char_start),
                     CCursor::new(selected.end - line.char_start),
                 );
+                let mut visuals = ui.visuals().clone();
+                if !focused {
+                    visuals.selection.bg_fill = theme::editor::selection_inactive();
+                }
                 egui::text_selection::visuals::paint_text_selection(
                     &mut galley,
-                    &ui.visuals().clone(),
+                    &visuals,
                     &relative,
                     None,
                 );
@@ -744,7 +830,7 @@ impl EditorSurface {
             painter.galley(
                 egui::pos2(content.left() + TEXT_LEFT_PADDING, y),
                 galley,
-                Color32::LIGHT_GRAY,
+                theme::syntax().foreground,
             );
         }
         let caret_visible = focused
@@ -763,12 +849,12 @@ impl EditorSurface {
                     painter.rect_filled(
                         Rect::from_min_size(caret.left_top(), egui::vec2(8.0, caret.height())),
                         0.0,
-                        ACCENT.gamma_multiply(0.65),
+                        theme::accent().gamma_multiply(0.65),
                     );
                 } else {
                     painter.line_segment(
                         [caret.left_top(), caret.left_bottom()],
-                        Stroke::new(1.5, ACCENT),
+                        Stroke::new(1.5, theme::accent()),
                     );
                 }
             }
@@ -1006,7 +1092,7 @@ impl EditorSurface {
         ));
         Some(Rect::from_min_size(
             translated.min,
-            egui::vec2(translated.width(), translated.height().max(LINE_HEIGHT)),
+            egui::vec2(translated.width(), translated.height().max(line_height())),
         ))
     }
 
@@ -1052,6 +1138,15 @@ struct LineSpec {
     job: LayoutJob,
     char_start: usize,
     character_len: usize,
+    indent: usize,
+}
+
+/// Leading whitespace in characters, with a tab counted as one tab stop.
+fn indent_of(text: &str) -> usize {
+    text.chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .map(|character| if character == '\t' { INDENT_WIDTH } else { 1 })
+        .sum()
 }
 
 fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
@@ -1078,10 +1173,12 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
                 let start = section.byte_range.start.0.max(range.start);
                 let end = section.byte_range.end.0.min(range.end);
                 if start < end {
+                    let mut format = section.format.clone();
+                    format.font_id = theme::typography::code_editor();
                     sections.push(LayoutSection {
                         leading_space: section.leading_space,
                         byte_range: ByteIndex(start - range.start)..ByteIndex(end - range.start),
-                        format: section.format.clone(),
+                        format,
                     });
                 }
             }
@@ -1090,8 +1187,8 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
                     leading_space: 0.0,
                     byte_range: ByteIndex(0)..ByteIndex(text.len()),
                     format: TextFormat {
-                        font_id: FontId::monospace(14.0),
-                        color: Color32::LIGHT_GRAY,
+                        font_id: theme::typography::code_editor(),
+                        color: theme::syntax().foreground,
                         ..TextFormat::default()
                     },
                 });
@@ -1113,23 +1210,61 @@ fn split_layout_job(highlighted: &LayoutJob, wrap_width: f32) -> Vec<LineSpec> {
                 },
                 char_start: line_start,
                 character_len,
+                indent: indent_of(text),
             }
         })
         .collect()
 }
 
-fn estimated_height(character_len: usize, wrap_width: f32) -> f32 {
-    let width = character_len as f32 * 8.4;
-    LINE_HEIGHT * (width / wrap_width.max(1.0)).ceil().max(1.0)
+fn estimated_height(character_len: usize, wrap_width: f32, advance: f32) -> f32 {
+    let width = character_len as f32 * advance;
+    line_height() * (width / wrap_width.max(1.0)).ceil().max(1.0)
 }
 
 fn line_count(text: &str) -> usize {
     text.bytes().filter(|byte| *byte == b'\n').count() + 1
 }
 
-fn gutter_width(lines: usize) -> f32 {
+/// Measured from the code face's own digit advance, so the gutter stays correct
+/// at every font size rather than at the one it was tuned for.
+fn gutter_width(lines: usize, advance: f32) -> f32 {
     let digits = lines.max(1).ilog10() + 1;
-    (digits as f32 * 7.0 + 11.0).max(22.0)
+    digits as f32 * advance + theme::space::MEDIUM
+}
+
+fn digit_advance(ui: &Ui) -> f32 {
+    ui.fonts_mut(|fonts| fonts.glyph_width(&theme::typography::code_editor(), '0'))
+}
+
+/// How much of a line's own indent a wrapped continuation keeps.
+fn wrap_indent(indent: usize, advance: f32) -> f32 {
+    if indent == 0 {
+        0.0
+    } else {
+        (indent as f32 + WRAP_INDENT_CHARS) * advance
+    }
+}
+
+/// A line that will be pushed right when it wraps has to wrap earlier, or the
+/// continuation runs off the edge it was measured against.
+fn wrap_line_width(wrap_width: f32, indent: usize, advance: f32) -> f32 {
+    (wrap_width - wrap_indent(indent, advance)).max(advance * 4.0)
+}
+
+/// Moves every continuation row of a soft-wrapped line under its own indent.
+/// egui lays a wrapped line out flush, and `Galley` hit-testing reads the same
+/// row origins that painting does, so shifting them keeps the caret honest.
+fn indent_wrapped_rows(galley: &mut Arc<Galley>, indent: usize, advance: f32) {
+    let offset = wrap_indent(indent, advance);
+    if offset <= 0.0 || galley.rows.len() < 2 {
+        return;
+    }
+    let galley = Arc::make_mut(galley);
+    for row in galley.rows.iter_mut().skip(1) {
+        row.pos.x += offset;
+    }
+    galley.rect.max.x += offset;
+    galley.mesh_bounds.max.x += offset;
 }
 
 fn text_line_start(text: &str, cursor: usize) -> usize {
@@ -1204,11 +1339,11 @@ fn byte_index(text: &str, character: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job,
+        EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job, theme,
     };
     use egui::{
-        Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2,
-        pos2, text::LayoutJob,
+        Color32, CursorIcon, Event, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2, pos2,
+        text::LayoutJob,
     };
     use std::time::{Duration, Instant};
 
@@ -1216,9 +1351,10 @@ mod tests {
         primitives
             .iter()
             .any(|primitive| match &primitive.primitive {
-                egui::epaint::Primitive::Mesh(mesh) => {
-                    mesh.vertices.iter().any(|vertex| vertex.color == ACCENT)
-                }
+                egui::epaint::Primitive::Mesh(mesh) => mesh
+                    .vertices
+                    .iter()
+                    .any(|vertex| vertex.color == theme::accent()),
                 egui::epaint::Primitive::Callback(_) => false,
             })
     }
@@ -1251,8 +1387,12 @@ mod tests {
                     token,
                     0.0,
                     TextFormat {
-                        font_id: FontId::monospace(14.0),
-                        color: Color32::from_gray(180 + index as u8),
+                        font_id: theme::typography::code_editor(),
+                        color: theme::mix(
+                            theme::text().primary,
+                            theme::syntax().keyword,
+                            index as f32 * 0.25,
+                        ),
                         ..TextFormat::default()
                     },
                 );
@@ -1274,19 +1414,19 @@ mod tests {
     fn width_only_resize_reuses_retained_line_storage() {
         let job = LayoutJob::simple(
             "first\nsecond\nthird".to_owned(),
-            FontId::monospace(14.0),
+            theme::typography::code_editor(),
             Color32::WHITE,
             400.0,
         );
         let mut editor = EditorSurface::default();
-        editor.sync_lines(&job, 1, 400.0);
+        editor.sync_lines(&job, 1, 400.0, 8.0);
         let allocations = editor
             .lines
             .iter()
             .map(|line| line.job.text.as_ptr())
             .collect::<Vec<_>>();
 
-        editor.sync_lines(&job, 1, 800.0);
+        editor.sync_lines(&job, 1, 800.0, 8.0);
 
         assert_eq!(
             allocations,
@@ -1299,20 +1439,38 @@ mod tests {
     }
 
     #[test]
-    fn line_number_gutter_stays_compact_and_grows_with_digit_count() {
-        assert_eq!(gutter_width(9), 22.0);
-        assert_eq!(gutter_width(999), 32.0);
+    fn the_gutter_is_measured_from_the_code_face_rather_than_guessed() {
+        let context = theme::test_context();
+        let mut advance = 0.0;
+        let _ = context.run_ui(RawInput::default(), |ui| advance = super::digit_advance(ui));
+
+        assert!(advance > 0.0, "the code face has to report a digit advance");
+        // Every extra digit costs exactly one advance, whatever the font size.
+        assert!((gutter_width(999, advance) - gutter_width(99, advance) - advance).abs() < 0.01);
+        for digits in [1usize, 2, 3, 5] {
+            let lines = 10usize.pow(digits as u32 - 1);
+            let width = gutter_width(lines, advance);
+            assert!(
+                width >= digits as f32 * advance,
+                "{digits} digits do not fit in {width}"
+            );
+        }
     }
 
     #[test]
     fn requested_character_stays_in_view_when_the_caret_is_elsewhere() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = (0..40)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         let target = text.chars().count() - 2;
-        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 180.0);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            180.0,
+        );
 
         let _ = context.run_ui(
             RawInput {
@@ -1329,10 +1487,15 @@ mod tests {
 
     #[test]
     fn first_code_line_is_inset_from_the_editor_top() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
-        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 200.0);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            200.0,
+        );
         let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
@@ -1359,13 +1522,354 @@ mod tests {
     }
 
     #[test]
+    fn configured_font_size_overrides_a_stale_highlight_job() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let configured = theme::typography::code_size();
+        let stale = LayoutJob::simple(
+            text.clone(),
+            egui::FontId::monospace(configured - 2.0),
+            Color32::WHITE,
+            200.0,
+        );
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                editor.show(ui, &mut text, &stale, 1, false, None);
+            },
+        );
+        let painted = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "text" => {
+                    Some(text.galley.job.sections[0].format.font_id.size)
+                }
+                _ => None,
+            })
+            .expect("painted code line");
+
+        assert_eq!(painted, configured);
+    }
+
+    #[test]
+    fn appearance_change_rebuilds_retained_font_metrics() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "text".to_owned();
+        let configured = theme::typography::code_size();
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            200.0,
+        );
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(input(), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        editor.lines[0].job.sections[0].format.font_id.size = configured - 2.0;
+        editor.appearance ^= 1;
+
+        let output = context.run_ui(input(), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        let painted = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "text" => {
+                    Some(text.galley.job.sections[0].format.font_id.size)
+                }
+                _ => None,
+            })
+            .expect("painted code line");
+
+        assert_eq!(painted, configured);
+    }
+
+    /// One document, painted twice so the second frame has laid-out lines, which
+    /// is what every reading-affordance test below looks at.
+    fn paint_document(
+        text: &str,
+        selection: Option<(usize, usize)>,
+    ) -> (Vec<egui::epaint::ClippedShape>, Vec<egui::ClippedPrimitive>) {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = text.to_owned();
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            600.0,
+        );
+        if let Some((anchor, cursor)) = selection {
+            editor.set_selection(anchor, cursor);
+        }
+        let mut shapes = Vec::new();
+        let mut primitives = Vec::new();
+        for _ in 0..2 {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(640.0, 300.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    editor.show(ui, &mut text, &job, 1, true, None);
+                },
+            );
+            shapes = output.shapes.clone();
+            primitives = context.tessellate(output.shapes, output.pixels_per_point);
+        }
+        (shapes, primitives)
+    }
+
+    fn painted(primitives: &[egui::ClippedPrimitive], color: Color32) -> bool {
+        primitives
+            .iter()
+            .any(|primitive| match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    mesh.vertices.iter().any(|vertex| vertex.color == color)
+                }
+                egui::epaint::Primitive::Callback(_) => false,
+            })
+    }
+
+    fn fills(shapes: &[egui::epaint::ClippedShape], color: Color32) -> Vec<Rect> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == color => Some(rect.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_selection_is_unmistakable_against_the_document_and_still_readable() {
+        let editor = theme::surface().editor;
+        let selection = theme::composite(theme::editor::selection(), editor);
+
+        assert!(
+            theme::contrast_ratio(selection, editor) >= 1.5,
+            "the 1.1:1 selection that made a dragged paragraph invisible is back"
+        );
+        assert!(theme::contrast_ratio(theme::text().primary, selection) >= 4.5);
+
+        let (_, selected) = paint_document("first line\nsecond line", Some((0, 8)));
+        assert!(
+            painted(&selected, theme::editor::selection()),
+            "a selected range has to paint something behind the glyphs"
+        );
+        let (_, unselected) = paint_document("first line\nsecond line", Some((0, 0)));
+        assert!(!painted(&unselected, theme::editor::selection()));
+    }
+
+    #[test]
+    fn the_active_line_is_visible_and_yields_to_a_selection() {
+        let (with_caret, _) = paint_document("first line\nsecond line", Some((3, 3)));
+        let active = theme::editor::line_active();
+
+        assert_eq!(
+            fills(&with_caret, active).len(),
+            1,
+            "exactly the caret's line gets the active fill"
+        );
+        assert!(
+            theme::composite(active, theme::surface().editor).r()
+                >= theme::surface().editor.r() + 8,
+            "the active line is back to being invisible"
+        );
+
+        let (with_selection, _) = paint_document("first line\nsecond line", Some((0, 8)));
+        assert!(
+            fills(&with_selection, active).is_empty(),
+            "the active line must step aside while a selection is showing"
+        );
+    }
+
+    #[test]
+    fn the_caret_line_number_is_the_only_emphasized_one() {
+        let (shapes, _) = paint_document("one\ntwo\nthree", Some((5, 5)));
+        let numbers: Vec<_> = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text().chars().all(char::is_numeric)
+                        && !text.galley.text().is_empty() =>
+                {
+                    Some((text.galley.text().to_owned(), text.fallback_color))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(numbers.len(), 3, "one number per line: {numbers:?}");
+        assert_eq!(
+            numbers
+                .iter()
+                .filter(|(_, color)| *color == theme::text().primary)
+                .count(),
+            1
+        );
+        assert_eq!(
+            numbers
+                .iter()
+                .find(|(_, color)| *color == theme::text().primary)
+                .map(|(label, _): &(String, Color32)| label.as_str()),
+            Some("2"),
+            "the emphasized number has to be the caret's own"
+        );
+    }
+
+    #[test]
+    fn no_rule_divides_the_gutter_from_the_text_anymore() {
+        let (shapes, _) = paint_document("fn main() {\n    let value = 1;\n}", None);
+        let full_height_rules = shapes
+            .iter()
+            .filter(|clipped| match &clipped.shape {
+                egui::epaint::Shape::LineSegment { points, .. } => {
+                    (points[0].x - points[1].x).abs() < 0.01 && (points[1].y - points[0].y) > 200.0
+                }
+                _ => false,
+            })
+            .count();
+
+        assert_eq!(
+            full_height_rules, 0,
+            "the gutter rule is still splitting the reading surface"
+        );
+    }
+
+    #[test]
+    fn indent_guides_appear_only_where_a_line_is_actually_indented() {
+        let (shapes, _) = paint_document("fn main() {\n    let value = 1;\n}", None);
+        let guides: Vec<_> = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::epaint::Shape::LineSegment { points, stroke }
+                    if stroke.color == theme::editor::indent_guide() =>
+                {
+                    Some(points[0].x)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            guides.len(),
+            1,
+            "only the one indented line owns a guide: {guides:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_continuation_resumes_under_its_own_indent() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = format!("    {}", "word ".repeat(60));
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            240.0,
+        );
+        let mut rows = Vec::new();
+        for _ in 0..2 {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(240.0, 300.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    editor.show(ui, &mut text, &job, 1, true, None);
+                },
+            );
+            rows = editor.lines[0]
+                .galley
+                .as_ref()
+                .map(|galley| galley.rows.iter().map(|row| row.pos.x).collect())
+                .unwrap_or_default();
+        }
+
+        assert!(rows.len() > 1, "the line under test never wrapped");
+        assert!(
+            rows[1..].iter().all(|x| *x > rows[0]),
+            "a soft wrap still resumes in column zero: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_reads_as_a_bar_at_the_gutter_edge_rather_than_a_dot() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "broken line".to_owned();
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            400.0,
+        );
+        let danger = theme::semantic().danger;
+        let character_len = text.chars().count();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 200.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    editor.show_document_with_options(
+                        ui,
+                        &mut text,
+                        &job,
+                        super::DocumentMetrics {
+                            revision: 1,
+                            line_count: 1,
+                            character_len,
+                        },
+                        super::EditorShowOptions {
+                            request_focus: false,
+                            scroll_to_character: None,
+                            id: Id::new("editor"),
+                            line_markers: &[(0, danger)],
+                            text_input: super::TextInputMode::Standard,
+                            native_keybindings: true,
+                            block_caret: false,
+                        },
+                    );
+                },
+            );
+            shapes = output.shapes;
+        }
+        let marker = fills(&shapes, danger)
+            .into_iter()
+            .next()
+            .expect("a diagnostic marker");
+
+        assert!(
+            marker.height() > marker.width(),
+            "a bar is taller than it is wide"
+        );
+        assert!(marker.height() >= 6.0);
+    }
+
+    #[test]
     fn caret_at_line_start_is_inset_from_the_gutter_edge() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1385,13 +1889,13 @@ mod tests {
 
     #[test]
     fn caret_on_an_empty_line_has_visible_height() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text\n".to_owned();
         editor.set_selection(text.chars().count(), text.chars().count());
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1406,17 +1910,17 @@ mod tests {
         );
         let content = Rect::from_min_max(pos2(22.0, 0.0), pos2(200.0, 200.0));
 
-        assert!(editor.cursor_rect(content).unwrap().height() >= 18.0);
+        assert!(editor.cursor_rect(content).unwrap().height() >= super::line_height());
     }
 
     #[test]
     fn focused_caret_is_painted_during_the_former_hidden_blink_phase() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1437,12 +1941,12 @@ mod tests {
 
     #[test]
     fn focused_caret_blinks_on_a_slow_cadence() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1488,12 +1992,12 @@ mod tests {
 
     #[test]
     fn arrow_navigation_paints_the_caret_at_its_new_position() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1532,13 +2036,13 @@ mod tests {
 
     #[test]
     fn vertical_arrows_preserve_the_column_across_logical_lines() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         editor.set_selection(1, 1);
         let mut text = "one\ntwo".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );
@@ -1593,10 +2097,15 @@ mod tests {
 
     #[test]
     fn moving_the_editor_horizontally_invalidates_retained_line_geometry() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "fn main() {}".to_owned();
-        let job = LayoutJob::simple(text.clone(), FontId::monospace(14.0), Color32::WHITE, 300.0);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            300.0,
+        );
         let mut draw = |left| {
             let output = context.run_ui(
                 RawInput {
@@ -1636,12 +2145,12 @@ mod tests {
 
     #[test]
     fn hovering_the_editor_uses_the_native_text_cursor() {
-        let context = egui::Context::default();
+        let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
         let job = egui::text::LayoutJob::simple(
             text.clone(),
-            egui::FontId::monospace(14.0),
+            crate::theme::typography::code_editor(),
             egui::Color32::WHITE,
             200.0,
         );

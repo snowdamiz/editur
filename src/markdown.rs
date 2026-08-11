@@ -6,7 +6,7 @@ use egui::{
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::theme::{ACCENT, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY};
+use crate::theme;
 
 pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension()
@@ -123,7 +123,7 @@ fn layout_with_code_highlighting(
                         job.sections
                             .extend(highlighted.sections.into_iter().map(|section| {
                                 let mut format = section.format;
-                                format.background = crate::theme::SURFACE_SELECTED;
+                                format.background = theme::state::selected();
                                 LayoutSection {
                                     leading_space: section.leading_space,
                                     byte_range: (start + section.byte_range.start.0).into()
@@ -220,26 +220,26 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
     });
     let code = inline_code || style.code_block > 0;
     let color = if style.link > 0 {
-        ACCENT
+        theme::accent()
     } else if style.strong > 0 || style.heading.is_some() {
-        TEXT_PRIMARY
+        theme::text().primary
     } else if style.quote > 0 {
-        TEXT_MUTED
+        theme::text().muted
     } else {
-        TEXT_SECONDARY
+        theme::text().secondary
     };
     job.append(
         text,
         0.0,
         TextFormat {
             font_id: if code {
-                FontId::monospace(13.5)
+                theme::typography::code_small()
             } else {
                 FontId::proportional(heading_size)
             },
             color,
             background: if code {
-                crate::theme::SURFACE_SELECTED
+                theme::state::selected()
             } else {
                 Color32::TRANSPARENT
             },
@@ -289,7 +289,7 @@ mod tests {
         let title = job.sections.first().expect("title formatting");
         assert!(title.format.font_id.size > 20.0);
         assert!(job.sections.iter().any(|section| {
-            section.format.font_id == FontId::monospace(13.5)
+            section.format.font_id == theme::typography::code_small()
                 && section.format.background != Color32::TRANSPARENT
         }));
     }

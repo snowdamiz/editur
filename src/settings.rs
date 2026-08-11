@@ -16,10 +16,97 @@ const MAX_COMMAND_BYTES: usize = 32 * 1024;
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
+    #[serde(skip_serializing_if = "AppearanceSettings::is_default")]
+    pub appearance: AppearanceSettings,
     #[serde(skip_serializing_if = "LanguageServerSettings::is_default")]
     pub language_servers: LanguageServerSettings,
     #[serde(skip_serializing_if = "KeybindingSettings::is_default")]
     pub keybindings: KeybindingSettings,
+}
+
+/// Theme, density, editor face, and motion preference. Every field is a named
+/// token rather than a free float so a settings file cannot invent a size the
+/// type scale does not know.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AppearanceSettings {
+    pub theme: ThemePreference,
+    pub density: DensityPreference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_font_family: Option<String>,
+    pub editor_font_size: f32,
+    pub line_height: LineHeightPreference,
+    pub reduced_motion: bool,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::Dark,
+            density: DensityPreference::Comfortable,
+            editor_font_family: None,
+            editor_font_size: 14.0,
+            line_height: LineHeightPreference::Default,
+            reduced_motion: false,
+        }
+    }
+}
+
+impl AppearanceSettings {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.editor_font_size = self.editor_font_size.clamp(10.0, 24.0).round();
+        if let Some(family) = self.editor_font_family.as_mut() {
+            let trimmed = family.trim().to_owned();
+            if trimmed.is_empty() {
+                self.editor_font_family = None;
+            } else {
+                *family = trimmed;
+            }
+        }
+        self
+    }
+}
+
+impl Eq for AppearanceSettings {}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DensityPreference {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineHeightPreference {
+    Compact,
+    #[default]
+    Default,
+    Comfortable,
+}
+
+impl LineHeightPreference {
+    pub fn ratio(self) -> f32 {
+        match self {
+            Self::Compact => 1.30,
+            Self::Default => 1.43,
+            Self::Comfortable => 1.60,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,6 +183,13 @@ pub fn load(path: &Path) -> Result<Settings, String> {
 }
 
 fn validate(settings: &Settings) -> Result<(), String> {
+    let appearance = settings.appearance.clone().normalized();
+    if appearance.editor_font_size != settings.appearance.editor_font_size {
+        return Err(format!(
+            "editorFontSize must be between 10 and 24, got {}",
+            settings.appearance.editor_font_size
+        ));
+    }
     keybindings::validate_settings(&settings.keybindings)?;
     for (preset, override_) in &settings.language_servers.servers {
         if override_.args.len() > MAX_ARGUMENTS {
@@ -208,6 +302,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         let settings = Settings {
+            appearance: AppearanceSettings::default(),
             language_servers: LanguageServerSettings {
                 enabled: true,
                 servers: [(
@@ -282,6 +377,7 @@ mod tests {
         let path = directory.path().join("settings.json");
         fs::write(&path, b"old settings").unwrap();
         let settings = Settings {
+            appearance: AppearanceSettings::default(),
             language_servers: LanguageServerSettings {
                 enabled: true,
                 servers: [(
@@ -311,6 +407,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
 
         let settings = Settings {
+            appearance: AppearanceSettings::default(),
             language_servers: LanguageServerSettings {
                 enabled: true,
                 servers: [
@@ -340,6 +437,54 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "{\n  \"languageServers\": {\n    \"servers\": {\n      \"pyright\": {\n        \"mode\": \"off\"\n      }\n    }\n  }\n}"
         );
+    }
+
+    #[test]
+    fn appearance_settings_round_trip_including_unknown_key_tolerance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let settings = Settings {
+            appearance: AppearanceSettings {
+                theme: ThemePreference::Light,
+                density: DensityPreference::Compact,
+                editor_font_family: Some("Menlo".into()),
+                editor_font_size: 16.0,
+                line_height: LineHeightPreference::Comfortable,
+                reduced_motion: true,
+            },
+            ..Settings::default()
+        };
+        save(&path, &settings).unwrap();
+        assert_eq!(load(&path).unwrap(), settings);
+
+        // Unknown keys are ignored so a future editor can add fields without
+        // breaking older builds that share the same file.
+        fs::write(
+            &path,
+            r#"{
+  "appearance": {
+    "theme": "system",
+    "density": "comfortable",
+    "editorFontSize": 13,
+    "lineHeight": "compact",
+    "reducedMotion": false,
+    "futureKnob": true
+  }
+}"#,
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.appearance.theme, ThemePreference::System);
+        assert_eq!(loaded.appearance.line_height, LineHeightPreference::Compact);
+        assert_eq!(loaded.appearance.editor_font_size, 13.0);
+    }
+
+    #[test]
+    fn out_of_range_editor_font_sizes_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"appearance":{"editorFontSize":48}}"#).unwrap();
+        assert!(load(&path).unwrap_err().contains("editorFontSize"));
     }
 
     #[test]

@@ -1,66 +1,19 @@
-use egui::{Align, Align2, Color32, Id, Layout, Rect, Response, RichText, Sense, Ui, Vec2};
+use egui::{Align2, Color32, Rect, Response, Sense, Ui, Vec2};
 
-use crate::theme::{
-    ACCENT, ACCENT_INK, BORDER_STRONG, SURFACE_HOVER, SURFACE_RAISED, SURFACE_SELECTED, TEXT_MUTED,
-    TEXT_PRIMARY, TEXT_SECONDARY,
+use crate::{
+    icons::{self, Icon},
+    theme,
 };
 
-pub(crate) fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
-    egui::Frame::window(&ctx.style_of(ctx.theme()))
-        .fill(SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(24)))
-        .inner_margin(18)
-        .corner_radius(12)
-        .shadow(egui::Shadow {
-            offset: [0, 10],
-            blur: 32,
-            spread: 2,
-            color: Color32::from_black_alpha(170),
-        })
-}
-
-pub(crate) fn dialog_window<'a>(
-    ctx: &egui::Context,
-    title: impl egui::IntoAtoms<'a>,
-    id: &'static str,
-) -> egui::Window<'a> {
-    egui::Window::new(title)
-        .id(Id::new(id))
-        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .title_bar(false)
-        .fade_in(false)
-        .collapsible(false)
-        .resizable(false)
-        .movable(false)
-        .frame(dialog_frame(ctx))
-}
-
-pub(crate) fn begin_dialog(ui: &mut Ui, title: &str) {
-    ui.set_min_width(340.0);
-    ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
-    ui.label(RichText::new(title).size(16.0).strong().color(TEXT_PRIMARY));
-}
-
-pub(crate) fn dialog_button(label: &'static str, primary: bool) -> egui::Button<'static> {
-    let (text, fill) = if primary {
-        (ACCENT_INK, ACCENT)
-    } else {
-        (TEXT_PRIMARY, SURFACE_SELECTED)
-    };
-    egui::Button::new(RichText::new(label).color(text).strong())
-        .fill(fill)
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(6)
-        .min_size(egui::vec2(72.0, 40.0))
-}
-
-pub(crate) fn dialog_actions<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), 40.0),
-        Layout::right_to_left(Align::Center),
-        add_contents,
-    )
-    .inner
+/// The shared popover frame: menus, the palette, and the agent file picker are
+/// all this, so the product has exactly two overlay species.
+pub(crate) fn popover_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::surface().raised)
+        .stroke(theme::border::strong())
+        .inner_margin(theme::space::SMALL as i8)
+        .corner_radius(theme::corner(theme::radius::CARD))
+        .shadow(theme::shadow::popover())
 }
 
 pub(crate) struct SelectableRow {
@@ -87,17 +40,22 @@ pub(crate) fn selectable_row(
     });
     let fill = selection_fill(selected, response.hovered());
     if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 5.0, fill);
+        ui.painter()
+            .rect_filled(rect, theme::corner(theme::radius::ROW), fill);
     }
     let foreground = if !ui.is_enabled() {
-        TEXT_MUTED
+        theme::text_disabled()
     } else if selected || response.hovered() {
-        TEXT_PRIMARY
+        theme::text().primary
     } else {
-        TEXT_SECONDARY
+        theme::text().secondary
     };
     if selected {
-        paint_checkmark(ui, egui::pos2(rect.right() - 13.0, rect.center().y));
+        let box_rect = Rect::from_center_size(
+            egui::pos2(rect.right() - theme::space::MEDIUM, rect.center().y),
+            Vec2::splat(icons::GRID),
+        );
+        icons::paint(ui.painter(), Icon::Check, box_rect, theme::accent());
     }
     SelectableRow {
         rect,
@@ -113,8 +71,11 @@ pub(crate) fn selectable_content_row(
     add_contents: impl FnOnce(&mut Ui),
 ) -> Response {
     let mut row = egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(9, 6))
-        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(
+            theme::space::SMALL as i8,
+            theme::space::SNUG as i8,
+        ))
+        .corner_radius(theme::corner(theme::radius::CONTROL))
         .begin(ui);
     row.content_ui
         .set_min_width(row.content_ui.available_width());
@@ -138,13 +99,16 @@ pub(crate) fn icon_button(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 5.0, Color32::from_white_alpha(14));
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
     }
     let color = if !ui.is_enabled() {
-        BORDER_STRONG
+        theme::text_disabled()
     } else if response.hovered() {
-        TEXT_PRIMARY
+        theme::text().primary
     } else {
         idle_color
     };
@@ -153,73 +117,125 @@ pub(crate) fn icon_button(
 }
 
 pub(crate) fn chevron_icon_button(ui: &mut Ui, upward: bool, label: &str) -> Response {
-    icon_button(
+    let icon = if upward {
+        Icon::ChevronUp
+    } else {
+        Icon::ChevronDown
+    };
+    icons::button_sized(
         ui,
+        icon,
         label,
-        egui::vec2(30.0, 26.0),
-        TEXT_SECONDARY,
-        |painter, rect, color| {
-            let center = rect.center();
-            let direction = if upward { -1.0 } else { 1.0 };
-            let tip = center + egui::vec2(0.0, 3.0 * direction);
-            let stroke = egui::Stroke::new(1.5, color);
-            painter.line_segment([center + egui::vec2(-4.0, -2.0 * direction), tip], stroke);
-            painter.line_segment([tip, center + egui::vec2(4.0, -2.0 * direction)], stroke);
-        },
+        theme::text().secondary,
+        egui::vec2(theme::control::STANDARD, theme::control::COMPACT + 2.0),
     )
 }
 
 pub(crate) fn close_icon_button(ui: &mut Ui) -> Response {
-    icon_button(
+    icons::button_sized(
         ui,
+        Icon::Close,
         "Close (Esc)",
-        egui::vec2(30.0, 26.0),
-        TEXT_SECONDARY,
-        |painter, rect, color| {
-            let center = rect.center();
-            let stroke = egui::Stroke::new(1.5, color);
-            painter.line_segment(
-                [
-                    center + egui::vec2(-3.5, -3.5),
-                    center + egui::vec2(3.5, 3.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + egui::vec2(-3.5, 3.5),
-                    center + egui::vec2(3.5, -3.5),
-                ],
-                stroke,
-            );
-        },
+        theme::text().secondary,
+        egui::vec2(theme::control::STANDARD, theme::control::COMPACT + 2.0),
     )
+}
+
+/// A key cap, a mode, a provider: one small piece of state rendered as a solid
+/// token rather than as bare text.
+pub(crate) fn chip(ui: &mut Ui, label: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        theme::typography::code_small(),
+        theme::text().primary,
+    );
+    let size = egui::vec2(
+        galley.size().x + theme::space::MEDIUM,
+        theme::control::COMPACT,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        theme::corner(theme::radius::ROW),
+        theme::state::selected(),
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        theme::text().primary,
+    );
+    response
+}
+
+/// A segmented control cell, for the agent panel's provider and mode pickers.
+pub(crate) fn segment(
+    ui: &mut Ui,
+    label: &str,
+    selected: bool,
+    trailing: Option<Icon>,
+) -> Response {
+    let font = theme::typography::small();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, theme::text().secondary);
+    let glyph = if trailing.is_some() {
+        icons::GRID * 0.75 + theme::space::TIGHT
+    } else {
+        0.0
+    };
+    let size = egui::vec2(
+        galley.size().x + glyph + theme::space::MEDIUM,
+        theme::control::COMPACT,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    let fill = if selected {
+        theme::state::selected()
+    } else if response.hovered() {
+        theme::state::hover()
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(rect, theme::corner(theme::radius::CONTROL), fill);
+    }
+    let color = if selected || response.hovered() {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + theme::space::SNUG, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::typography::small(),
+        color,
+    );
+    if let Some(icon) = trailing {
+        let box_rect = Rect::from_center_size(
+            egui::pos2(
+                rect.right() - theme::space::SNUG - icons::GRID * 0.375,
+                rect.center().y,
+            ),
+            Vec2::splat(icons::GRID * 0.75),
+        );
+        icons::paint(ui.painter(), icon, box_rect, color);
+    }
+    response
 }
 
 fn selection_fill(selected: bool, hovered: bool) -> Color32 {
     if selected {
-        SURFACE_SELECTED
+        theme::state::selected()
     } else if hovered {
-        SURFACE_HOVER
+        theme::state::hover()
     } else {
         Color32::TRANSPARENT
     }
-}
-
-fn paint_checkmark(ui: &Ui, center: egui::Pos2) {
-    let stroke = egui::Stroke::new(1.4, ACCENT);
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(-4.0, 0.0),
-            center + egui::vec2(-1.0, 3.0),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(-1.0, 3.0),
-            center + egui::vec2(4.0, -3.0),
-        ],
-        stroke,
-    );
 }

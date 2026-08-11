@@ -1,4 +1,5 @@
-use egui::{Color32, Id, Rect, Sense, Ui, pos2};
+use crate::theme;
+use egui::{Id, Rect, Sense, Ui, pos2};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
@@ -166,16 +167,16 @@ pub(crate) fn show(
     );
     painter.rect_filled(
         layout.track,
-        3.0,
-        Color32::from_black_alpha(32).gamma_multiply(opacity),
+        theme::corner(theme::radius::ROW),
+        theme::state::scrollbar::track().gamma_multiply(opacity),
     );
     painter.rect_filled(
         layout.thumb,
-        3.0,
+        theme::corner(theme::radius::ROW),
         if active {
-            Color32::from_rgb(116, 116, 122)
+            theme::state::scrollbar::thumb_active()
         } else {
-            Color32::from_rgb(82, 82, 88)
+            theme::state::scrollbar::thumb()
         }
         .gamma_multiply(opacity),
     );
@@ -188,7 +189,7 @@ mod tests {
     use egui::{Id, RawInput, Rect, Vec2, pos2};
 
     fn retained_scrollbar(viewport: Rect) -> crate::renderer::RetainedPaint {
-        let context = egui::Context::default();
+        let context = crate::theme::test_context();
         let mut scroll_y = 100.0;
         let mut state = super::State::default();
         let output = context.run_ui(
