@@ -7769,6 +7769,17 @@ impl EditorApp {
         if self.handle_lsp_popup_keys(ctx) {
             return;
         }
+        let save_quit = ctx.input(|input| {
+            input.modifiers.command
+                && ((input.key_pressed(Key::Q) && input.key_down(Key::S))
+                    || (input.key_pressed(Key::S) && input.key_down(Key::Q)))
+        });
+        if save_quit {
+            if self.save(None) {
+                self.request_close();
+            }
+            return;
+        }
         let events = ctx.input(|input| input.events.clone());
         let special_copy = events
             .iter()
