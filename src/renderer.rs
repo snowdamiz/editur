@@ -10,6 +10,8 @@ pub(crate) struct RetainedPaint {
     pub revision: u64,
 }
 
+struct RetainedPaintEnd;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RetainedUpload {
     pub revision: u64,
@@ -26,16 +28,28 @@ pub(crate) fn mark_retained(painter: &Painter, rect: Rect, key: u64, revision: u
     });
 }
 
+pub(crate) fn end_retained(painter: &Painter, rect: Rect) {
+    painter.add(PaintCallback {
+        rect,
+        callback: Arc::new(RetainedPaintEnd),
+    });
+}
+
 pub(crate) fn retained_paint(primitive: &Primitive) -> Result<Option<RetainedPaint>, String> {
     let Primitive::Callback(callback) = primitive else {
         return Ok(None);
     };
-    callback
+    if let Some(paint) = callback.callback.downcast_ref::<RetainedPaint>() {
+        Ok(Some(*paint))
+    } else if callback
         .callback
-        .downcast_ref::<RetainedPaint>()
-        .copied()
-        .map(Some)
-        .ok_or_else(|| "unsupported egui paint callback".to_owned())
+        .downcast_ref::<RetainedPaintEnd>()
+        .is_some()
+    {
+        Ok(None)
+    } else {
+        Err("unsupported egui paint callback".to_owned())
+    }
 }
 
 pub(crate) fn upload_required(current: Option<&RetainedUpload>, next: RetainedUpload) -> bool {

@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::IsTerminal,
@@ -9,6 +10,85 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+fn unique_copy_path(source: &Path, directory: &Path) -> Result<PathBuf, String> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", source.display()))?;
+    let (stem, extension) = if source.is_dir() {
+        (name, None)
+    } else {
+        (source.file_stem().unwrap_or(name), source.extension())
+    };
+    for number in 1.. {
+        let mut name = OsString::from(stem);
+        name.push(if number == 1 {
+            " copy".into()
+        } else {
+            format!(" copy {number}")
+        });
+        if let Some(extension) = extension {
+            name.push(".");
+            name.push(extension);
+        }
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    unreachable!()
+}
+
+fn copy_tree_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("cannot copy symlink {}", source.display()));
+    }
+    if metadata.is_file() {
+        fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+        return Ok(());
+    }
+    fs::create_dir(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        copy_tree_entry(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn child_path(directory: &Path, name: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => Ok(directory.join(name)),
+        _ => Err("enter a single file or folder name".into()),
+    }
+}
+
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg("-R").arg(path).status();
+    #[cfg(target_os = "windows")]
+    let status = Command::new("explorer").arg("/select,").arg(path).status();
+    #[cfg(target_os = "linux")]
+    let status = Command::new("xdg-open")
+        .arg(if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        })
+        .status();
+    let status = status.map_err(|error| format!("cannot open the file manager: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "the file manager could not reveal the selected path".into())
+}
 
 use egui::{
     Align, Align2, Color32, CursorIcon, FontId, Id, Key, Label, Layout, RichText, ScrollArea,
@@ -233,7 +313,15 @@ fn primary_modifiers() -> egui::Modifiers {
         }
     }
 }
-const PANE_FOCUS_BORDER: Color32 = Color32::from_rgb(75, 101, 128);
+pub(crate) const PANE_FOCUS_BORDER: Color32 = Color32::from_rgb(75, 101, 128);
+
+pub(crate) fn resize_divider_stroke(ctx: &egui::Context, active: bool) -> egui::Stroke {
+    egui::Stroke::new(
+        ctx.input(|input| input.physical_pixel_size()),
+        if active { ACCENT } else { BORDER_STRONG },
+    )
+}
+
 const WINDOW_CORNER_RADIUS: u8 = 10;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
@@ -1592,6 +1680,17 @@ impl PaneLayout {
         }
     }
 
+    pub(crate) fn insert_at_split(&mut self, target: u64) -> Option<PaneId> {
+        let new = PaneId(self.next_id);
+        if self.root.insert_at_split(target, new, self.next_split_id) {
+            self.next_id += 1;
+            self.next_split_id += 1;
+            Some(new)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn rects(&self, available: egui::Rect) -> Vec<(PaneId, egui::Rect)> {
         let mut rects = Vec::new();
         self.root.append_rects(available, &mut rects);
@@ -1616,6 +1715,36 @@ impl PaneLayout {
 
     pub(crate) fn resize(&mut self, id: u64, bounds: egui::Rect, pointer: egui::Pos2) -> bool {
         self.root.resize(id, bounds, pointer)
+    }
+
+    pub(crate) fn resize_adjacent(
+        &mut self,
+        id: u64,
+        available: egui::Rect,
+        pointer: egui::Pos2,
+    ) -> bool {
+        let handles = self.split_handles(available);
+        let Some(target) = handles.iter().find(|handle| handle.id == id) else {
+            return false;
+        };
+        let preserved = handles
+            .iter()
+            .filter(|handle| handle.id != id && handle.axis == target.axis)
+            .map(|handle| (handle.id, handle.hit_rect.center()))
+            .collect::<Vec<_>>();
+        if !self.resize(id, target.bounds, pointer) {
+            return false;
+        }
+        for (preserved_id, center) in preserved {
+            if let Some(handle) = self
+                .split_handles(available)
+                .into_iter()
+                .find(|handle| handle.id == preserved_id)
+            {
+                self.resize(preserved_id, handle.bounds, center);
+            }
+        }
+        true
     }
 
     pub(crate) fn remove(&mut self, target: PaneId) -> bool {
@@ -1655,6 +1784,44 @@ impl PaneNode {
             Self::Split { first, second, .. } => {
                 first.split(target, new, zone, split_id)
                     || second.split(target, new, zone, split_id)
+            }
+            Self::Leaf(_) => false,
+        }
+    }
+
+    fn insert_at_split(&mut self, target: u64, new: PaneId, split_id: u64) -> bool {
+        match self {
+            Self::Split { id, .. } if *id == target => {
+                let Self::Split {
+                    id,
+                    axis,
+                    fraction,
+                    first,
+                    second,
+                } = std::mem::replace(self, Self::Leaf(new))
+                else {
+                    unreachable!()
+                };
+                let first_fraction = fraction * 2.0 / 3.0;
+                let middle_fraction = (1.0 / 3.0) / (1.0 - first_fraction);
+                *self = Self::Split {
+                    id,
+                    axis,
+                    fraction: first_fraction,
+                    first,
+                    second: Box::new(Self::Split {
+                        id: split_id,
+                        axis,
+                        fraction: middle_fraction,
+                        first: Box::new(Self::Leaf(new)),
+                        second,
+                    }),
+                };
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.insert_at_split(target, new, split_id)
+                    || second.insert_at_split(target, new, split_id)
             }
             Self::Leaf(_) => false,
         }
@@ -2306,6 +2473,46 @@ enum AgentMenu {
     Config(String),
 }
 
+#[derive(Clone, Copy)]
+enum TreePromptAction {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+#[derive(Clone)]
+struct TreePrompt {
+    action: TreePromptAction,
+    directory: PathBuf,
+    original: Option<PathBuf>,
+    name: String,
+    focus: bool,
+}
+
+#[derive(Clone)]
+struct TreeClipboard {
+    path: PathBuf,
+    cut: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TreeContextAction {
+    Open,
+    NewFile,
+    NewFolder,
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Rename,
+    Delete,
+    CopyPath,
+    CopyRelativePath,
+    Reveal,
+    OpenTerminal,
+    Refresh,
+}
+
 struct TreeState {
     root: PathBuf,
     children: HashMap<PathBuf, Vec<TreeEntry>>,
@@ -2392,6 +2599,17 @@ impl TreeState {
         if self.expanded.remove(path) {
             self.refresh_visible();
         }
+    }
+
+    fn reload(&mut self) -> Result<(), String> {
+        let mut children = HashMap::from([(self.root.clone(), read_directory(&self.root)?)]);
+        self.expanded.retain(|path| path.is_dir());
+        for path in &self.expanded {
+            children.insert(path.clone(), read_directory(path)?);
+        }
+        self.children = children;
+        self.refresh_visible();
+        Ok(())
     }
 
     fn select(&mut self, path: Option<PathBuf>) {
@@ -2990,6 +3208,9 @@ pub struct EditorApp {
     pending_agent_prompt: bool,
     focus_editor: bool,
     tree_focused: bool,
+    tree_prompt: Option<TreePrompt>,
+    tree_delete: Option<PathBuf>,
+    tree_clipboard: Option<TreeClipboard>,
     cursor: (usize, usize),
     pending: Option<PendingAction>,
     conflict: bool,
@@ -3334,6 +3555,9 @@ impl EditorApp {
             pending_agent_prompt: false,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
+            tree_prompt: None,
+            tree_delete: None,
+            tree_clipboard: None,
             cursor: (1, 1),
             pending: None,
             conflict: false,
@@ -3645,6 +3869,11 @@ impl EditorApp {
     }
 
     pub fn ui(&mut self, root: &mut egui::Ui) {
+        self.draw_ui(root);
+        crate::renderer::end_retained(root.painter(), root.max_rect());
+    }
+
+    fn draw_ui(&mut self, root: &mut egui::Ui) {
         theme::apply_to(root.style_mut());
         self.scrollbar_activity.style_egui(root);
         let ctx = root.ctx().clone();
@@ -3866,7 +4095,6 @@ impl EditorApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let divider_stroke_width = ctx.input(|input| input.physical_pixel_size());
         if self.tab_drag.is_none() {
             for handle in self.pane_layout.split_handles(editor) {
                 let response = root.interact(
@@ -3898,13 +4126,8 @@ impl EditorApp {
                         egui::pos2(center.x, handle.hit_rect.bottom()),
                     ],
                 };
-                root.painter().line_segment(
-                    line,
-                    egui::Stroke::new(
-                        if active { 2.0 } else { divider_stroke_width },
-                        if active { ACCENT } else { BORDER_STRONG },
-                    ),
-                );
+                root.painter()
+                    .line_segment(line, resize_divider_stroke(&ctx, active));
             }
         }
         if let Some(sidebar) = sidebar {
@@ -3940,10 +4163,7 @@ impl EditorApp {
             );
             root.painter().line_segment(
                 [divider.center_top(), divider.center_bottom()],
-                egui::Stroke::new(
-                    divider_stroke_width,
-                    if active { ACCENT } else { BORDER_STRONG },
-                ),
+                resize_divider_stroke(&ctx, active),
             );
         }
         if self.agent_sidebar {
@@ -3979,10 +4199,7 @@ impl EditorApp {
             );
             root.painter().line_segment(
                 [divider.center_top(), divider.center_bottom()],
-                egui::Stroke::new(
-                    divider_stroke_width,
-                    if active { ACCENT } else { BORDER_STRONG },
-                ),
+                resize_divider_stroke(&ctx, active),
             );
         }
         if let Some(drop) = self.tab_drop.filter(|drop| drop.zone == DropZone::Center) {
@@ -5021,10 +5238,7 @@ impl EditorApp {
         ui.painter().hline(
             terminal.x_range(),
             terminal.top(),
-            egui::Stroke::new(
-                if active { 2.0 } else { 1.0 },
-                if active { ACCENT } else { BORDER_STRONG },
-            ),
+            resize_divider_stroke(ui.ctx(), active),
         );
     }
 
@@ -7207,6 +7421,8 @@ impl EditorApp {
             || self.save_as.is_some()
             || self.error.is_some()
             || self.agent_file_picker.is_some()
+            || self.tree_prompt.is_some()
+            || self.tree_delete.is_some()
         {
             return;
         }
@@ -11093,6 +11309,96 @@ impl EditorApp {
         if output.response.clicked() {
             self.tree_focused = true;
         }
+        if let Some(index) = output.context_requested {
+            let path = self.tree.visible[index].entry.path.clone();
+            self.tree.select(Some(path));
+            self.tree_focused = true;
+            self.focus_editor = false;
+            ui.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
+        }
+        let entry = self.tree.selected.as_ref().and_then(|path| {
+            self.tree
+                .visible
+                .iter()
+                .find(|row| &row.entry.path == path)
+                .map(|row| row.entry.clone())
+        });
+        let mut context_action = None;
+        if entry.is_some()
+            && (output.context_requested.is_some() || output.response.context_menu_opened())
+        {
+            let can_paste = self.tree_clipboard.is_some();
+            output.response.context_menu(|ui| {
+                ui.set_min_width(220.0);
+                if ui.button("Open").clicked() {
+                    context_action = Some(TreeContextAction::Open);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("New File…").clicked() {
+                    context_action = Some(TreeContextAction::NewFile);
+                    ui.close();
+                }
+                if ui.button("New Folder…").clicked() {
+                    context_action = Some(TreeContextAction::NewFolder);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Cut").clicked() {
+                    context_action = Some(TreeContextAction::Cut);
+                    ui.close();
+                }
+                if ui.button("Copy").clicked() {
+                    context_action = Some(TreeContextAction::Copy);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(can_paste, egui::Button::new("Paste"))
+                    .clicked()
+                {
+                    context_action = Some(TreeContextAction::Paste);
+                    ui.close();
+                }
+                if ui.button("Duplicate").clicked() {
+                    context_action = Some(TreeContextAction::Duplicate);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Rename…").clicked() {
+                    context_action = Some(TreeContextAction::Rename);
+                    ui.close();
+                }
+                if ui.button("Delete…").clicked() {
+                    context_action = Some(TreeContextAction::Delete);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Copy Path").clicked() {
+                    context_action = Some(TreeContextAction::CopyPath);
+                    ui.close();
+                }
+                if ui.button("Copy Relative Path").clicked() {
+                    context_action = Some(TreeContextAction::CopyRelativePath);
+                    ui.close();
+                }
+                if ui.button("Reveal in File Manager").clicked() {
+                    context_action = Some(TreeContextAction::Reveal);
+                    ui.close();
+                }
+                if ui.button("Open in Integrated Terminal").clicked() {
+                    context_action = Some(TreeContextAction::OpenTerminal);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Refresh").clicked() {
+                    context_action = Some(TreeContextAction::Refresh);
+                    ui.close();
+                }
+            });
+        }
+        if let (Some(action), Some(entry)) = (context_action, entry) {
+            self.execute_tree_context_action(action, entry, ui.ctx());
+        }
         if let Some(index) = output.drag_started {
             let entry = &self.tree.visible[index].entry;
             self.tab_drag = Some(entry.path.clone());
@@ -11113,6 +11419,225 @@ impl EditorApp {
                 self.request(PendingAction::Open(entry.path));
             }
         }
+    }
+
+    fn execute_tree_context_action(
+        &mut self,
+        action: TreeContextAction,
+        entry: TreeEntry,
+        ctx: &egui::Context,
+    ) {
+        let directory = if entry.is_dir {
+            entry.path.clone()
+        } else {
+            entry.path.parent().unwrap_or(&self.tree.root).to_path_buf()
+        };
+        match action {
+            TreeContextAction::Open if entry.is_dir => {
+                if let Err(error) = self.tree.toggle(&entry.path) {
+                    self.show_error(error);
+                }
+            }
+            TreeContextAction::Open => self.request(PendingAction::Open(entry.path)),
+            TreeContextAction::NewFile | TreeContextAction::NewFolder => {
+                self.tree_prompt = Some(TreePrompt {
+                    action: if matches!(action, TreeContextAction::NewFile) {
+                        TreePromptAction::NewFile
+                    } else {
+                        TreePromptAction::NewFolder
+                    },
+                    directory,
+                    original: None,
+                    name: String::new(),
+                    focus: true,
+                });
+            }
+            TreeContextAction::Rename => {
+                self.tree_prompt = Some(TreePrompt {
+                    action: TreePromptAction::Rename,
+                    directory,
+                    original: Some(entry.path.clone()),
+                    name: entry.name.to_string_lossy().into_owned(),
+                    focus: true,
+                });
+            }
+            TreeContextAction::Cut | TreeContextAction::Copy => {
+                self.tree_clipboard = Some(TreeClipboard {
+                    path: entry.path,
+                    cut: matches!(action, TreeContextAction::Cut),
+                });
+            }
+            TreeContextAction::Paste => match self.paste_tree_entry(&directory) {
+                Ok(path) => self.refresh_tree(Some(path)),
+                Err(error) => self.show_error(error),
+            },
+            TreeContextAction::Duplicate => {
+                let result = entry
+                    .path
+                    .parent()
+                    .ok_or_else(|| format!("{} has no parent", entry.path.display()))
+                    .and_then(|parent| unique_copy_path(&entry.path, parent))
+                    .and_then(|destination| {
+                        copy_tree_entry(&entry.path, &destination).map(|()| destination)
+                    });
+                match result {
+                    Ok(path) => self.refresh_tree(Some(path)),
+                    Err(error) => self.show_error(error),
+                }
+            }
+            TreeContextAction::Delete => {
+                if self
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.buffer.dirty && tab.buffer.path.starts_with(&entry.path))
+                {
+                    self.show_error("save or close modified files before deleting them".into());
+                } else {
+                    self.tree_delete = Some(entry.path);
+                }
+            }
+            TreeContextAction::CopyPath => {
+                ctx.copy_text(entry.path.to_string_lossy().into_owned());
+            }
+            TreeContextAction::CopyRelativePath => {
+                let path = entry
+                    .path
+                    .strip_prefix(&self.tree.root)
+                    .unwrap_or(&entry.path);
+                ctx.copy_text(path.to_string_lossy().into_owned());
+            }
+            TreeContextAction::Reveal => {
+                if let Err(error) = reveal_in_file_manager(&entry.path) {
+                    self.show_error(error);
+                }
+            }
+            TreeContextAction::OpenTerminal => match self.terminal.open_at(&directory, ctx) {
+                Ok(()) => self.terminal_open = true,
+                Err(error) => self.show_error(error),
+            },
+            TreeContextAction::Refresh => self.refresh_tree(Some(entry.path)),
+        }
+        ctx.request_repaint();
+    }
+
+    fn paste_tree_entry(&mut self, directory: &Path) -> Result<PathBuf, String> {
+        let clipboard = self
+            .tree_clipboard
+            .clone()
+            .ok_or_else(|| "nothing has been copied or cut".to_owned())?;
+        let source = clipboard
+            .path
+            .canonicalize()
+            .map_err(|error| format!("cannot access {}: {error}", clipboard.path.display()))?;
+        let directory = directory
+            .canonicalize()
+            .map_err(|error| format!("cannot access {}: {error}", directory.display()))?;
+        if directory.starts_with(&source) {
+            return Err("cannot paste a folder inside itself".into());
+        }
+        if clipboard.cut && source.parent() == Some(directory.as_path()) {
+            self.tree_clipboard = None;
+            return Ok(source);
+        }
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("{} has no file name", source.display()))?;
+        let candidate = directory.join(name);
+        let destination = if candidate.exists() {
+            unique_copy_path(&source, &directory)?
+        } else {
+            candidate
+        };
+        if clipboard.cut {
+            fs::rename(&source, &destination)
+                .map_err(|error| format!("cannot move {}: {error}", source.display()))?;
+            self.rebase_open_paths(&source, &destination);
+            self.tree_clipboard = None;
+        } else {
+            copy_tree_entry(&source, &destination)?;
+        }
+        Ok(destination)
+    }
+
+    fn refresh_tree(&mut self, selected: Option<PathBuf>) {
+        match self.tree.reload() {
+            Ok(()) => self.tree.select(selected),
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    fn rebase_open_paths(&mut self, old: &Path, new: &Path) {
+        for tab in &mut self.tabs {
+            if let Ok(relative) = tab.buffer.path.strip_prefix(old) {
+                tab.buffer.path = new.join(relative);
+                tab.highlight_cache.valid = false;
+            }
+        }
+        for path in self.pane_active_tabs.values_mut() {
+            if let Ok(relative) = path.strip_prefix(old) {
+                *path = new.join(relative);
+            }
+        }
+        self.lsp_sync_needed = true;
+    }
+
+    fn delete_tree_entry(&mut self, path: &Path) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+        .map_err(|error| format!("cannot delete {}: {error}", path.display()))?;
+        let mut tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| tab.buffer.path.starts_with(path).then_some(index))
+            .collect::<Vec<_>>();
+        tabs.reverse();
+        for index in tabs {
+            self.close_tab(index);
+        }
+        self.refresh_tree(None);
+        Ok(())
+    }
+
+    fn finish_tree_prompt(&mut self) -> Result<(PathBuf, TreePromptAction), String> {
+        let prompt = self
+            .tree_prompt
+            .clone()
+            .ok_or_else(|| "no file operation is pending".to_owned())?;
+        let destination = child_path(&prompt.directory, prompt.name.trim())?;
+        match prompt.action {
+            TreePromptAction::NewFile => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)
+                    .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+            }
+            TreePromptAction::NewFolder => fs::create_dir(&destination)
+                .map_err(|error| format!("cannot create {}: {error}", destination.display()))?,
+            TreePromptAction::Rename => {
+                let original = prompt
+                    .original
+                    .as_ref()
+                    .ok_or_else(|| "the original path for this rename is unavailable".to_owned())?;
+                if destination != *original {
+                    if destination.exists() {
+                        return Err(format!("{} already exists", destination.display()));
+                    }
+                    fs::rename(original, &destination).map_err(|error| {
+                        format!("cannot rename {}: {error}", original.display())
+                    })?;
+                    self.rebase_open_paths(original, &destination);
+                }
+            }
+        }
+        self.tree_prompt = None;
+        Ok((destination, prompt.action))
     }
 
     fn tree_keyboard(&mut self, ui: &egui::Ui) -> bool {
@@ -12014,6 +12539,79 @@ impl EditorApp {
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
         self.draw_agent_file_picker(ctx);
+        if self.tree_prompt.is_some() {
+            let action = self.tree_prompt.as_ref().map(|prompt| prompt.action);
+            let title = match action {
+                Some(TreePromptAction::NewFile) => "New File",
+                Some(TreePromptAction::NewFolder) => "New Folder",
+                Some(TreePromptAction::Rename) => "Rename",
+                None => "File Operation",
+            };
+            let mut submit = false;
+            let mut cancel = false;
+            dialog_window(ctx, title, "tree_name_dialog").show(ctx, |ui| {
+                begin_dialog(ui, title);
+                ui.label("Name");
+                if let Some(prompt) = self.tree_prompt.as_mut() {
+                    let response = ui.add(
+                        TextEdit::singleline(&mut prompt.name)
+                            .id(Id::new("tree_name_input"))
+                            .desired_width(360.0),
+                    );
+                    if std::mem::take(&mut prompt.focus) {
+                        response.request_focus();
+                    }
+                    submit =
+                        response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                }
+                dialog_actions(ui, |ui| {
+                    submit |= ui.add(dialog_button(title, true)).clicked();
+                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
+                });
+            });
+            if submit {
+                match self.finish_tree_prompt() {
+                    Ok((path, TreePromptAction::NewFile)) => {
+                        self.refresh_tree(Some(path.clone()));
+                        self.request(PendingAction::Open(path));
+                    }
+                    Ok((path, _)) => self.refresh_tree(Some(path)),
+                    Err(error) => self.show_error(error),
+                }
+            } else if cancel {
+                self.tree_prompt = None;
+            }
+        }
+        if let Some(path) = self.tree_delete.clone() {
+            let mut delete = false;
+            let mut cancel = false;
+            dialog_window(ctx, "Delete", "tree_delete_dialog").show(ctx, |ui| {
+                begin_dialog(ui, "Delete");
+                ui.label(format!(
+                    "Permanently delete {}? This cannot be undone.",
+                    path.display()
+                ));
+                dialog_actions(ui, |ui| {
+                    let button = egui::Button::new(
+                        RichText::new("Delete").color(Color32::from_rgb(224, 156, 160)),
+                    )
+                    .fill(Color32::from_rgb(40, 34, 37))
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(78.0, 40.0));
+                    delete = ui.add(button).clicked();
+                    cancel = ui.add(dialog_button("Cancel", false)).clicked();
+                });
+            });
+            if delete {
+                self.tree_delete = None;
+                if let Err(error) = self.delete_tree_entry(&path) {
+                    self.show_error(error);
+                }
+            } else if cancel {
+                self.tree_delete = None;
+            }
+        }
         if self.pending_agent_prompt {
             let mut save_and_run = false;
             let mut cancel = false;
@@ -14453,16 +15051,17 @@ mod tests {
         agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
         agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agent_transcript_fade_mesh, allowed_tab_drop_zone, build_agent_diff, cached_agent_diff,
-        completion_word_range, defer_resize, diagnostic_highlighted_job,
-        disable_transient_egui_debug_overlays, draw_agent_diff, draw_provider_selector_identity,
-        draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_column_content, find_highlighted_job,
-        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, pane_header_and_content, plain_text_job,
-        presentation_job, provider_selector_visible, repaint_deadline,
-        repaint_delay_after_texture_update, run_everything_state, search_needs_polling,
+        child_path, completion_word_range, copy_tree_entry, defer_resize,
+        diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_diff,
+        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
+        editor_column_content, find_highlighted_job, install_repaint_wake,
+        launch_in_current_process, match_bracket_pair, match_spans, model_display_name,
+        next_find_match, pane_header_and_content, plain_text_job, presentation_job,
+        provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
+        resize_divider_stroke, run_everything_state, search_needs_polling,
         search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
         slash_command_query, split_agent_sidebar, split_agentic_workspace, split_bottom_panel,
-        split_pane_content, split_workspace, stable_tab_drop_zone,
+        split_pane_content, split_workspace, stable_tab_drop_zone, unique_copy_path,
     };
 
     #[test]
@@ -14470,6 +15069,96 @@ mod tests {
         assert_eq!(completion_word_range("let pri_value = 1", 7), 4..13);
         assert_eq!(completion_word_range("café", 4), 0..4);
         assert_eq!(completion_word_range("value.", 6), 6..6);
+    }
+
+    #[test]
+    fn duplicate_paths_use_the_first_available_copy_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("main.rs");
+        fs::write(&source, "fn main() {}\n").unwrap();
+        fs::write(temp.path().join("main copy.rs"), "occupied\n").unwrap();
+
+        assert_eq!(
+            unique_copy_path(&source, temp.path()).unwrap(),
+            temp.path().join("main copy 2.rs")
+        );
+    }
+
+    #[test]
+    fn copied_folders_keep_nested_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file.txt"), "copied").unwrap();
+
+        copy_tree_entry(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
+            "copied"
+        );
+    }
+
+    #[test]
+    fn tree_names_cannot_escape_the_selected_folder() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert!(child_path(temp.path(), "../outside").is_err());
+    }
+
+    #[test]
+    fn foreground_menu_mesh_is_not_cached_as_retained_content() {
+        let menu_color = Color32::from_rgb(7, 19, 23);
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = egui::Context::default();
+        crate::theme::apply(&context);
+        let menu_rect = Rect::from_min_size(pos2(100.0, 100.0), egui::vec2(220.0, 24.0));
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| {
+                app.ui(root);
+                context
+                    .layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        Id::new("test_context_menu"),
+                    ))
+                    .rect_filled(menu_rect, 0.0, menu_color);
+            },
+        );
+        let mut retained = None;
+        let mut menu_mesh = false;
+        for primitive in context.tessellate(output.shapes, output.pixels_per_point) {
+            match &primitive.primitive {
+                egui::epaint::Primitive::Callback(_) => {
+                    retained = crate::renderer::retained_paint(&primitive.primitive).unwrap();
+                }
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    if mesh
+                        .vertices
+                        .iter()
+                        .any(|vertex| vertex.color == menu_color)
+                    {
+                        menu_mesh = true;
+                        assert_eq!(retained, None, "foreground menu inherited retained paint");
+                    }
+                    retained = None;
+                }
+            }
+        }
+        assert!(menu_mesh);
     }
     use crate::{
         agent::controller::{
@@ -14836,6 +15525,48 @@ mod tests {
                 (PaneId(0), available.with_max_x(600.0)),
                 (right, available.with_min_x(600.0)),
             ]
+        );
+    }
+
+    #[test]
+    fn adjacent_resize_keeps_non_neighboring_panes_the_same_width() {
+        let mut layout = PaneLayout::default();
+        let right = layout.split(PaneId(0), DropZone::Right).unwrap();
+        let middle = layout.split(right, DropZone::Left).unwrap();
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1200.0, 600.0));
+        let root_handle = layout.split_handles(available)[0];
+
+        assert!(layout.resize_adjacent(root_handle.id, available, pos2(700.0, 300.0)));
+
+        let rects = layout.rects(available);
+        assert_eq!(
+            rects[1],
+            (
+                middle,
+                Rect::from_min_max(pos2(700.0, 0.0), pos2(900.0, 600.0))
+            )
+        );
+        assert_eq!(rects[2].1.width(), 300.0);
+    }
+
+    #[test]
+    fn inserting_at_a_divider_places_an_equal_pane_between_two_existing_panes() {
+        let mut layout = PaneLayout::default();
+        let right = layout.split(PaneId(0), DropZone::Right).unwrap();
+        let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1200.0, 600.0));
+        let divider = layout.split_handles(available)[0];
+
+        let middle = layout.insert_at_split(divider.id).unwrap();
+
+        let rects = layout.rects(available);
+        assert_eq!(
+            rects.iter().map(|(pane, _)| *pane).collect::<Vec<_>>(),
+            [PaneId(0), middle, right]
+        );
+        assert!(
+            rects
+                .iter()
+                .all(|(_, rect)| (rect.width() - 400.0).abs() < 0.01)
         );
     }
 
@@ -19144,6 +19875,23 @@ mod tests {
             .expect("active sidebar divider");
         assert_eq!(width, 0.5);
         assert!(divider_index > header_index);
+    }
+
+    #[test]
+    fn active_resize_dividers_change_color_without_becoming_thicker() {
+        let context = egui::Context::default();
+        context.set_pixels_per_point(2.0);
+        let mut strokes = None;
+        let _ = context.run_ui(RawInput::default(), |_| {
+            strokes = Some((
+                resize_divider_stroke(&context, true),
+                resize_divider_stroke(&context, false),
+            ));
+        });
+        let (active, inactive) = strokes.unwrap();
+
+        assert_eq!(active, egui::Stroke::new(0.5, ACCENT));
+        assert_eq!(inactive, egui::Stroke::new(0.5, super::BORDER_STRONG));
     }
 
     #[test]

@@ -12,7 +12,8 @@ use egui::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::app::{
-    DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, stable_tab_drop_zone, tab_drop_preview,
+    DropZone, PANE_FOCUS_BORDER, PaneId, PaneLayout, SplitAxis, TabDrop, resize_divider_stroke,
+    stable_tab_drop_zone, tab_drop_preview,
 };
 use crate::theme::{
     ACCENT, BORDER_STRONG, BORDER_SUBTLE, CANVAS, SURFACE, SURFACE_HOVER, SURFACE_INPUT,
@@ -36,6 +37,7 @@ pub(crate) struct TerminalPanel {
     focus_active: bool,
     tab_drag: Option<u64>,
     tab_drop: Option<TabDrop>,
+    tab_drop_split: Option<u64>,
 }
 
 pub(crate) struct TerminalOutput {
@@ -68,6 +70,7 @@ impl Default for TerminalPanel {
             focus_active: false,
             tab_drag: None,
             tab_drop: None,
+            tab_drop_split: None,
         }
     }
 }
@@ -81,6 +84,12 @@ impl TerminalPanel {
         if self.sessions.is_empty() {
             self.add(root, ctx)?;
         }
+        self.focus_active = true;
+        Ok(())
+    }
+
+    pub(crate) fn open_at(&mut self, directory: &Path, ctx: &egui::Context) -> Result<(), String> {
+        self.add(directory, ctx)?;
         self.focus_active = true;
         Ok(())
     }
@@ -112,12 +121,12 @@ impl TerminalPanel {
         ui.painter().rect_filled(rect, 0.0, CANVAS);
         let mut error = None;
         let mut panes = self.pane_layout.rects(rect);
-        if self.update_tab_drag(ui.ctx(), &panes) {
+        if self.update_tab_drag(ui.ctx(), rect, &panes) {
             panes = self.pane_layout.rects(rect);
         }
         let request_focus = std::mem::take(&mut self.focus_active);
         let mut clicked = None;
-        for (pane, pane_rect) in panes {
+        for (pane, pane_rect) in panes.iter().copied() {
             let header =
                 pane_rect.with_max_y((pane_rect.top() + HEADER_HEIGHT).min(pane_rect.bottom()));
             let content = pane_rect.with_min_y(header.bottom());
@@ -160,6 +169,16 @@ impl TerminalPanel {
         }
         if let Some(index) = clicked {
             self.activate_tab(index);
+        }
+        if panes.len() > 1
+            && let Some((_, pane)) = panes.iter().find(|(pane, _)| *pane == self.active_pane)
+        {
+            ui.painter().rect_stroke(
+                *pane,
+                0.0,
+                egui::Stroke::new(1.0, PANE_FOCUS_BORDER),
+                egui::StrokeKind::Inside,
+            );
         }
         self.draw_split_handles(ui, rect);
         if let Some(drop) = self.tab_drop {
@@ -341,59 +360,93 @@ impl TerminalPanel {
         }
     }
 
-    fn update_tab_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) -> bool {
+    fn update_tab_drag(
+        &mut self,
+        ctx: &egui::Context,
+        available: egui::Rect,
+        panes: &[(PaneId, egui::Rect)],
+    ) -> bool {
         let Some(id) = self.tab_drag else {
             self.tab_drop = None;
+            self.tab_drop_split = None;
             return false;
         };
         let index = self.sessions.iter().position(|session| session.id == id);
         let previous = self.tab_drop;
-        self.tab_drop = ctx.pointer_hover_pos().and_then(|pointer| {
-            panes.iter().find_map(|(target, rect)| {
-                rect.contains(pointer).then(|| {
-                    let previous = previous
-                        .filter(|drop| drop.target == *target)
-                        .map(|drop| drop.zone);
-                    let zone = if pointer.y <= rect.top() + HEADER_HEIGHT
-                        && previous.unwrap_or(DropZone::Center) == DropZone::Center
-                    {
-                        DropZone::Center
-                    } else {
-                        stable_tab_drop_zone(*rect, pointer, previous)
-                    };
-                    TabDrop {
-                        target: *target,
-                        zone,
-                        preview: tab_drop_preview(*rect, zone),
-                    }
-                })
-            })
+        let pointer = ctx.pointer_hover_pos();
+        let split = pointer.and_then(|pointer| {
+            self.pane_layout
+                .split_handles(available)
+                .into_iter()
+                .find(|handle| handle.hit_rect.expand(8.0).contains(pointer))
         });
+        if let Some(handle) = split {
+            self.tab_drop_split = Some(handle.id);
+            self.tab_drop = Some(TabDrop {
+                target: self.active_pane,
+                zone: DropZone::Center,
+                preview: split_insert_preview(handle.axis, handle.bounds, handle.hit_rect.center()),
+            });
+        } else {
+            self.tab_drop_split = None;
+            self.tab_drop = pointer.and_then(|pointer| {
+                panes.iter().find_map(|(target, rect)| {
+                    rect.contains(pointer).then(|| {
+                        let previous = previous
+                            .filter(|drop| drop.target == *target)
+                            .map(|drop| drop.zone);
+                        let zone = if pointer.y <= rect.top() + HEADER_HEIGHT
+                            && previous.unwrap_or(DropZone::Center) == DropZone::Center
+                        {
+                            DropZone::Center
+                        } else {
+                            stable_tab_drop_zone(*rect, pointer, previous)
+                        };
+                        TabDrop {
+                            target: *target,
+                            zone,
+                            preview: tab_drop_preview(*rect, zone),
+                        }
+                    })
+                })
+            });
+        }
         if index.is_some_and(|index| {
-            self.tab_drop.is_some_and(|drop| {
-                drop.zone != DropZone::Center
-                    && drop.target == self.sessions[index].pane
-                    && self
-                        .sessions
-                        .iter()
-                        .filter(|session| session.pane == drop.target)
-                        .count()
-                        == 1
-            })
+            let source = self.sessions[index].pane;
+            let only_tab = self
+                .sessions
+                .iter()
+                .filter(|session| session.pane == source)
+                .count()
+                == 1;
+            only_tab
+                && (self.tab_drop_split.is_some()
+                    || self
+                        .tab_drop
+                        .is_some_and(|drop| drop.zone != DropZone::Center && drop.target == source))
         }) {
             self.tab_drop = None;
+            self.tab_drop_split = None;
         }
         let released = ctx.input(|input| input.pointer.primary_released());
         if released {
             let drop = self.tab_drop.take();
+            let split = self.tab_drop_split.take();
             self.tab_drag = None;
-            if let (Some(index), Some(drop)) = (index, drop) {
-                self.drop_tab(index, drop.target, drop.zone);
-                return true;
+            if let Some(index) = index {
+                if let Some(split) = split {
+                    self.drop_tab_at_split(index, split);
+                    return true;
+                }
+                if let Some(drop) = drop {
+                    self.drop_tab(index, drop.target, drop.zone);
+                    return true;
+                }
             }
         } else if !ctx.input(|input| input.pointer.primary_down()) {
             self.tab_drag = None;
             self.tab_drop = None;
+            self.tab_drop_split = None;
         } else {
             ctx.request_repaint();
         }
@@ -419,7 +472,7 @@ impl TerminalPanel {
             }
             if response.dragged()
                 && let Some(pointer) = ui.ctx().pointer_interact_pos()
-                && self.pane_layout.resize(handle.id, handle.bounds, pointer)
+                && self.pane_layout.resize_adjacent(handle.id, rect, pointer)
             {
                 ui.ctx().request_repaint();
             }
@@ -434,13 +487,8 @@ impl TerminalPanel {
                     egui::pos2(center.x, handle.hit_rect.bottom()),
                 ],
             };
-            ui.painter().line_segment(
-                line,
-                egui::Stroke::new(
-                    if active { 2.0 } else { 1.0 },
-                    if active { ACCENT } else { BORDER_STRONG },
-                ),
-            );
+            ui.painter()
+                .line_segment(line, resize_divider_stroke(ui.ctx(), active));
         }
     }
 
@@ -551,7 +599,6 @@ impl TerminalPanel {
         {
             return;
         }
-        let moved_id = self.sessions[index].id;
         let destination = if zone == DropZone::Center {
             target
         } else if let Some(pane) = self.pane_layout.split(target, zone) {
@@ -559,6 +606,30 @@ impl TerminalPanel {
         } else {
             return;
         };
+        self.move_tab_to_pane(index, destination);
+    }
+
+    fn drop_tab_at_split(&mut self, index: usize, split: u64) {
+        let Some(source) = self.sessions.get(index).map(|session| session.pane) else {
+            return;
+        };
+        if self
+            .sessions
+            .iter()
+            .filter(|session| session.pane == source)
+            .count()
+            == 1
+        {
+            return;
+        }
+        if let Some(destination) = self.pane_layout.insert_at_split(split) {
+            self.move_tab_to_pane(index, destination);
+        }
+    }
+
+    fn move_tab_to_pane(&mut self, index: usize, destination: PaneId) {
+        let source = self.sessions[index].pane;
+        let moved_id = self.sessions[index].id;
         self.sessions[index].pane = destination;
         self.active = index;
         self.active_pane = destination;
@@ -816,7 +887,32 @@ fn pty_size((rows, cols): (u16, u16)) -> PtySize {
     }
 }
 
+fn split_insert_preview(axis: SplitAxis, bounds: egui::Rect, center: egui::Pos2) -> egui::Rect {
+    match axis {
+        SplitAxis::Horizontal => {
+            let half = bounds.height() / 6.0;
+            bounds
+                .with_min_y(center.y - half)
+                .with_max_y(center.y + half)
+        }
+        SplitAxis::Vertical => {
+            let half = bounds.width() / 6.0;
+            bounds
+                .with_min_x(center.x - half)
+                .with_max_x(center.x + half)
+        }
+    }
+}
+
 fn key_sequence(key: Key, modifiers: Modifiers, application_cursor: bool) -> Option<Vec<u8>> {
+    if key == Key::Backspace {
+        if modifiers.mac_cmd {
+            return Some(vec![21]);
+        }
+        if modifiers.alt || modifiers.ctrl {
+            return Some(vec![23]);
+        }
+    }
     if modifiers.ctrl
         && !modifiers.mac_cmd
         && let Some(byte) = control_byte(key)
@@ -937,7 +1033,7 @@ mod tests {
     use egui::{Key, Modifiers};
     use portable_pty::CommandBuilder;
 
-    use crate::app::{DropZone, PaneId};
+    use crate::app::{DropZone, PANE_FOCUS_BORDER, PaneId};
 
     use super::{TerminalPanel, TerminalSession, key_sequence};
 
@@ -987,6 +1083,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_tab_can_be_inserted_between_two_existing_panes() {
+        let ctx = egui::Context::default();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+        panel.add(Path::new("."), &ctx).unwrap();
+        let available = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0));
+        let divider = panel.pane_layout.split_handles(available)[0];
+
+        panel.drop_tab_at_split(2, divider.id);
+
+        let panes = panel
+            .pane_layout
+            .rects(available)
+            .into_iter()
+            .map(|(pane, _)| {
+                panel
+                    .sessions
+                    .iter()
+                    .find(|session| session.pane == pane)
+                    .unwrap()
+                    .id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(panes, [1, 3, 2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_terminal_pane_draws_the_editor_focus_outline() {
+        let ctx = egui::Context::default();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                panel.show(ui, ui.max_rect(), Path::new("."));
+            },
+        );
+
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::Shape::Rect(rect) if rect.stroke.color == PANE_FOCUS_BORDER
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn closing_a_panes_last_terminal_collapses_the_pane() {
         let ctx = egui::Context::default();
         let mut panel = TerminalPanel::default();
@@ -1012,6 +1168,32 @@ mod tests {
     #[test]
     fn control_keys_use_ascii_control_codes() {
         assert_eq!(key_sequence(Key::C, Modifiers::CTRL, false), Some(vec![3]));
+    }
+
+    #[test]
+    fn mac_command_backspace_deletes_to_the_prompt_start() {
+        let modifiers = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        assert_eq!(
+            key_sequence(Key::Backspace, modifiers, false),
+            Some(vec![21])
+        );
+    }
+
+    #[test]
+    fn option_or_control_backspace_deletes_the_previous_word() {
+        assert_eq!(
+            key_sequence(Key::Backspace, Modifiers::ALT, false),
+            Some(vec![23])
+        );
+        assert_eq!(
+            key_sequence(Key::Backspace, Modifiers::CTRL, false),
+            Some(vec![23])
+        );
     }
 
     #[test]

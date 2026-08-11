@@ -34,6 +34,7 @@ pub struct TreeOutput {
     pub response: Response,
     pub clicked: Option<usize>,
     pub drag_started: Option<usize>,
+    pub context_requested: Option<usize>,
 }
 
 impl TreeSurface {
@@ -47,15 +48,19 @@ impl TreeSurface {
         let (id, rect) = ui.allocate_space(ui.available_size());
         let content = rect;
         let response = ui.interact(content, id.with("tree"), Sense::click_and_drag());
-        let pointer = ui
-            .input(|input| input.pointer.hover_pos())
+        let accepts_pointer = !response.context_menu_opened();
+        let pointer = accepts_pointer
+            .then(|| ui.input(|input| input.pointer.hover_pos()))
+            .flatten()
             .filter(|pointer| content.contains(*pointer));
-        let scrolling = ui.input(|input| {
-            input
-                .pointer
-                .hover_pos()
-                .is_some_and(|pointer| rect.contains(pointer))
-        }) && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+        let scrolling = accepts_pointer
+            && ui.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|pointer| rect.contains(pointer))
+            })
+            && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
         if scrolling {
             self.scroll_y -= ui.input(|input| input.smooth_scroll_delta.y);
         }
@@ -64,9 +69,13 @@ impl TreeSurface {
         }
         self.clamp_scroll(rows.len(), rect.height());
         self.hovered = pointer.and_then(|pointer| self.row_at(pointer.y, rect, rows.len()));
-        let clicked = response.clicked().then_some(self.hovered).flatten();
-        let drag_started = response
-            .drag_started()
+        let clicked = (accepts_pointer && response.clicked())
+            .then_some(self.hovered)
+            .flatten();
+        let context_requested = (accepts_pointer && response.secondary_clicked())
+            .then_some(self.hovered)
+            .flatten();
+        let drag_started = (accepts_pointer && response.drag_started())
             .then(|| {
                 ui.input(|input| input.pointer.press_origin())
                     .filter(|pointer| content.contains(*pointer))
@@ -232,6 +241,7 @@ impl TreeSurface {
             response,
             clicked,
             drag_started,
+            context_requested,
         }
     }
 
@@ -416,6 +426,117 @@ mod tests {
 
         assert_eq!(surface.hovered, Some(1));
         assert_eq!(drag_started, Some(0));
+    }
+
+    #[test]
+    fn right_click_reports_the_target_row() {
+        let context = egui::Context::default();
+        let mut surface = TreeSurface::default();
+        let rows = [TreeRow {
+            entry: TreeEntry {
+                name: OsString::from("main.rs"),
+                path: PathBuf::from("main.rs"),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: "main.rs".into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        }];
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0)));
+        let mut draw = |events| {
+            let mut requested = None;
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| requested = surface.show(ui, &rows, None, false).context_requested,
+            );
+            requested
+        };
+
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(pos2(100.0, 11.0)),
+            Event::PointerButton {
+                pos: pos2(100.0, 11.0),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+
+        assert_eq!(
+            draw(vec![Event::PointerButton {
+                pos: pos2(100.0, 11.0),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn open_context_menu_blocks_tree_hover_underneath() {
+        let context = egui::Context::default();
+        let mut surface = TreeSurface::default();
+        let rows = ["main.rs", "lib.rs"].map(|name| TreeRow {
+            entry: TreeEntry {
+                name: OsString::from(name),
+                path: PathBuf::from(name),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: name.into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        });
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0)));
+        let mut draw = |events| {
+            let mut menu_open = false;
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    let output = surface.show(ui, &rows, None, false);
+                    menu_open = output.response.context_menu_opened();
+                    output.response.context_menu(|ui| {
+                        let _ = ui.button("Action");
+                    });
+                },
+            );
+            menu_open
+        };
+
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(pos2(100.0, 11.0)),
+            Event::PointerButton {
+                pos: pos2(100.0, 11.0),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        draw(vec![Event::PointerButton {
+            pos: pos2(100.0, 11.0),
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert!(draw(vec![Event::PointerMoved(pos2(100.0, 37.0))]));
+        assert_eq!(surface.hovered, None);
     }
 
     #[test]
