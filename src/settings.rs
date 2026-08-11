@@ -301,6 +301,7 @@ mod tests {
     fn valid_overrides_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
+        let command = directory.path().join("rust-analyzer");
         let settings = Settings {
             appearance: AppearanceSettings::default(),
             language_servers: LanguageServerSettings {
@@ -309,7 +310,7 @@ mod tests {
                     "rust-analyzer".into(),
                     ServerOverride {
                         mode: ServerMode::Custom,
-                        command: Some("/opt/tools/rust-analyzer".into()),
+                        command: Some(command.to_string_lossy().into_owned()),
                         args: vec!["--log-file".into(), "path with spaces".into()],
                     },
                 )]
