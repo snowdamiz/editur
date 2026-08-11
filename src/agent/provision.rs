@@ -1835,13 +1835,15 @@ mod tests {
     use std::io::{Cursor, Write};
 
     #[cfg(unix)]
+    use super::VersionProbe;
+    #[cfg(unix)]
     use super::provision_from_bytes;
     use super::{
         ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, PackageProbe, ProviderId,
-        ReleaseSpec, SidecarManifest, VersionProbe, cleanup_obsolete_versions,
-        development_archive_environment, embedded_manifest, ensure, extract_archive, installed,
-        provision_from_bytes_with, provision_from_development_archive, verify_archive,
-        verify_installed, verify_package_metadata,
+        ReleaseSpec, SidecarManifest, cleanup_obsolete_versions, development_archive_environment,
+        embedded_manifest, ensure, extract_archive, installed, provision_from_bytes_with,
+        provision_from_development_archive, verify_archive, verify_installed,
+        verify_package_metadata,
     };
     #[cfg(feature = "network")]
     use super::{valid_archive_uri, valid_cursor_archive_uri};

@@ -196,6 +196,7 @@ fn ink_for(palette: &Palette, color: Color32) -> Color32 {
 /// The macOS window buttons. These are platform values rather than product
 /// ones: they have to match the system's own fills, so they do not move with
 /// the palette, only their unfocused gray does.
+#[cfg(target_os = "macos")]
 pub(crate) mod traffic {
     use egui::Color32;
 

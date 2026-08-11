@@ -9,10 +9,12 @@ pub(crate) mod typography;
 
 #[cfg(test)]
 pub(crate) use color::contrast_ratio;
+#[cfg(target_os = "macos")]
+pub(crate) use color::traffic;
 #[allow(unused_imports)] // public token surface; consumers arrive over time
 pub(crate) use color::{
     accent, ansi, composite, ink, mix, semantic, set_light, subtle, surface, syntax, text,
-    text_disabled, traffic,
+    text_disabled,
 };
 pub(crate) use metrics::{
     Density, chrome, control, corner, density, radius, set_density, shadow, space, stroke,

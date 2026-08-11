@@ -1005,6 +1005,7 @@ fn terminal_color(color: vt100::Color, foreground: bool) -> Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         io::Write as _,
         path::Path,
@@ -1012,12 +1013,17 @@ mod tests {
     };
 
     use egui::{Key, Modifiers};
+    #[cfg(unix)]
     use portable_pty::CommandBuilder;
 
+    #[cfg(unix)]
     use crate::app::{DropZone, PaneId};
+    #[cfg(unix)]
     use crate::theme;
 
-    use super::{TerminalPanel, TerminalSession, key_sequence};
+    use super::key_sequence;
+    #[cfg(unix)]
+    use super::{TerminalPanel, TerminalSession};
 
     #[cfg(unix)]
     #[test]

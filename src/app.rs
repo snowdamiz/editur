@@ -13208,13 +13208,13 @@ impl ProjectChooserShell {
         }
     }
 
-    fn resize(&mut self, event_loop: &ActiveEventLoop, size: winit::dpi::PhysicalSize<u32>) {
-        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
+    fn resize(&mut self, _event_loop: &ActiveEventLoop, size: winit::dpi::PhysicalSize<u32>) {
+        let (Some(_window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
         #[cfg(target_os = "macos")]
-        if let Err(error) = renderer.resize(window, size) {
-            self.fail(event_loop, error);
+        if let Err(error) = renderer.resize(_window, size) {
+            self.fail(_event_loop, error);
             return;
         }
         #[cfg(not(target_os = "macos"))]
