@@ -225,7 +225,7 @@ fn streamed_unicode_is_trimmed_only_at_character_boundaries() {
 }
 
 #[test]
-fn raw_tool_details_are_evicted_before_visible_messages() {
+fn transcript_trimming_never_leaves_hollow_tool_cards() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("keep me".into()));
     for id in 0..17 {
@@ -243,18 +243,19 @@ fn raw_tool_details_are_evicted_before_visible_messages() {
         }));
     }
 
+    assert!(matches!(
+        state.transcript.front(),
+        Some(TranscriptItem::Truncated)
+    ));
     assert!(
-        state
+        !state
             .transcript
             .iter()
-            .any(|item| matches!(item, TranscriptItem::Assistant(text) if text == "keep me"))
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.detail.is_none()))
     );
-    assert!(
-        state
-            .transcript
-            .iter()
-            .any(|item| { matches!(item, TranscriptItem::Tool(tool) if tool.detail.is_none()) })
-    );
+    assert!(state.transcript.iter().any(|item| {
+        matches!(item, TranscriptItem::Tool(tool) if tool.id == "16" && tool.detail.is_some())
+    }));
 }
 
 #[test]
@@ -469,7 +470,7 @@ fn diff_line_stats_accumulate_without_double_counting_streamed_updates() {
 }
 
 #[test]
-fn diff_line_stats_survive_tool_detail_eviction() {
+fn diff_line_stats_survive_transcript_trimming() {
     let mut state = AgentState::default();
     state.apply(Event::ToolCallUpdated(ToolActivity {
         id: "early-edit".into(),
@@ -487,7 +488,7 @@ fn diff_line_stats_survive_tool_detail_eviction() {
             output: None,
         }),
     }));
-    // Blow the transcript byte budget so the early tool's detail is evicted.
+    // Blow the transcript byte budget so the early tool is trimmed.
     for id in 0..40 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
             id: format!("big-{id}"),
@@ -503,11 +504,12 @@ fn diff_line_stats_survive_tool_detail_eviction() {
         }));
     }
 
-    let early_detail = state.transcript.iter().find_map(|item| match item {
-        TranscriptItem::Tool(tool) if tool.id == "early-edit" => Some(tool.detail.is_some()),
-        _ => None,
-    });
-    assert_eq!(early_detail, Some(false), "the diff text was evicted");
+    assert!(
+        !state
+            .transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "early-edit"))
+    );
     assert_eq!(
         state.changed_paths.get(std::path::Path::new("/w/early.rs")),
         Some(&FileChange {

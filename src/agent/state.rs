@@ -59,8 +59,7 @@ pub struct UsageState {
 
 /// Added/removed line counts for one file, accumulated across every diff the
 /// agent produced for it this session. Kept beside the transcript rather than
-/// derived from it, because `trim()` evicts tool details (and their diff
-/// text) long before the session ends.
+/// derived from it, because `trim()` eventually evicts old transcript items.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileChange {
     pub added: u64,
@@ -91,8 +90,8 @@ pub struct AgentState {
     /// The content each changed file had before the agent's first recorded
     /// edit this session (`None` inside an entry = the agent created the
     /// file). Captured from the first diff per path and kept beside
-    /// `changed_paths` so the diff view survives `trim()` evicting the tool
-    /// details. Oversized files are skipped, never truncated.
+    /// `changed_paths` so the diff view survives `trim()` evicting old tool
+    /// cards. Oversized files are skipped, never truncated.
     pub baselines: HashMap<PathBuf, Option<String>>,
     /// Bytes currently held in `baselines`, enforcing the retention cap.
     baseline_bytes: usize,
@@ -596,15 +595,6 @@ impl AgentState {
         }
         let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
         while self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES {
-            if let Some(tool) = self.transcript.iter_mut().find_map(|item| match item {
-                TranscriptItem::Tool(tool) if tool.detail.is_some() => Some(tool),
-                _ => None,
-            }) {
-                let before = tool_size(tool);
-                tool.detail = None;
-                bytes = bytes.saturating_sub(before - tool_size(tool));
-                continue;
-            }
             if let Some(item) = self.transcript.pop_front() {
                 bytes = bytes.saturating_sub(item_size(&item));
                 removed = true;

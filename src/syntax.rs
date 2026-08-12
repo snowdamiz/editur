@@ -3,6 +3,7 @@ use egui::{
     Color32, TextFormat,
     text::{LayoutJob, LayoutSection},
 };
+use std::cell::{Ref, RefCell};
 use std::path::Path;
 use std::str::FromStr;
 use syntect::easy::HighlightLines;
@@ -64,11 +65,12 @@ impl SyntaxManager {
 }
 
 pub struct Highlighter {
-    theme: Theme,
+    theme: RefCell<(u64, Theme)>,
 }
 
 #[derive(Default)]
 pub struct IncrementalHighlightCache {
+    appearance: u64,
     syntax: String,
     lines: Vec<CachedLine>,
 }
@@ -139,17 +141,28 @@ impl Highlighter {
         })
         .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            theme: Theme {
-                name: Some("Editur".into()),
-                author: None,
-                settings: ThemeSettings {
-                    foreground: Some(foreground),
-                    background: Some(color(theme::surface().editor)),
-                    ..ThemeSettings::default()
+            theme: RefCell::new((
+                theme::appearance(),
+                Theme {
+                    name: Some("Editur".into()),
+                    author: None,
+                    settings: ThemeSettings {
+                        foreground: Some(foreground),
+                        background: Some(color(theme::surface().editor)),
+                        ..ThemeSettings::default()
+                    },
+                    scopes,
                 },
-                scopes,
-            },
+            )),
         })
+    }
+
+    fn theme(&self) -> Result<Ref<'_, Theme>, String> {
+        let appearance = theme::appearance();
+        if self.theme.borrow().0 != appearance {
+            self.theme.replace(Self::new()?.theme.into_inner());
+        }
+        Ok(Ref::map(self.theme.borrow(), |cached| &cached.1))
     }
 
     pub fn highlight_job(
@@ -159,7 +172,8 @@ impl Highlighter {
         set: &SyntaxSet,
         wrap_width: f32,
     ) -> Result<LayoutJob, String> {
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let theme = self.theme()?;
+        let mut highlighter = HighlightLines::new(syntax, &theme);
         let mut job = LayoutJob::default();
         job.wrap.max_width = wrap_width;
         for line in LinesWithEndings::from(text) {
@@ -181,10 +195,13 @@ impl Highlighter {
         wrap_width: f32,
         cache: &mut IncrementalHighlightCache,
     ) -> Result<LayoutJob, String> {
-        if cache.syntax != syntax.name {
+        let appearance = theme::appearance();
+        if cache.syntax != syntax.name || cache.appearance != appearance {
             cache.lines.clear();
             cache.syntax.clone_from(&syntax.name);
+            cache.appearance = appearance;
         }
+        let theme = self.theme()?;
 
         let new_lines: Vec<_> = LinesWithEndings::from(text).collect();
         let mut old: Vec<_> = std::mem::take(&mut cache.lines)
@@ -214,7 +231,7 @@ impl Highlighter {
         }
         let (mut parse, mut highlight) = lines.last().map_or_else(
             || {
-                let highlighter = SyntectHighlighter::new(&self.theme);
+                let highlighter = SyntectHighlighter::new(&theme);
                 (
                     ParseState::new(syntax),
                     HighlightState::new(&highlighter, ScopeStack::new()),
@@ -222,7 +239,7 @@ impl Highlighter {
             },
             |line| (line.parse_end.clone(), line.highlight_end.clone()),
         );
-        let highlighter = SyntectHighlighter::new(&self.theme);
+        let highlighter = SyntectHighlighter::new(&theme);
         let new_suffix_start = new_lines.len() - suffix;
         let old_suffix_start = old.len() - suffix;
 
@@ -477,6 +494,41 @@ mod tests {
         let keyword = color_at(source.rfind("pub").unwrap());
         assert_ne!(string, keyword);
         assert_eq!(keyword, theme::syntax().keyword);
+    }
+
+    #[test]
+    fn highlighter_follows_palette_changes_after_construction() {
+        let _flag = theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        theme::set_light(false);
+        let highlighter = Highlighter::new().unwrap();
+        theme::set_light(true);
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let source = "[package]\nname = \"editur\"\n";
+        let job = highlighter
+            .highlight_job(
+                source,
+                syntaxes.detect(Path::new("Cargo.toml"), false),
+                syntaxes.set(),
+                800.0,
+            )
+            .unwrap();
+        let offset = source.find("name").unwrap();
+        let foreground = job
+            .sections
+            .iter()
+            .find(|section| section.byte_range.contains(&offset.into()))
+            .unwrap()
+            .format
+            .color;
+
+        let expected = theme::syntax().foreground;
+        let contrast = theme::contrast_ratio(foreground, theme::surface().editor);
+        theme::set_light(false);
+
+        assert_eq!(foreground, expected);
+        assert!(contrast >= 4.5);
     }
 
     #[test]

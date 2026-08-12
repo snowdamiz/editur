@@ -1658,6 +1658,7 @@ fn agent_collapsing_header(
     status: Option<&str>,
     width: f32,
     search: Option<(&str, Option<usize>)>,
+    has_body: bool,
     default_open: bool,
     add_body: impl FnOnce(&mut egui::Ui),
 ) {
@@ -1667,7 +1668,7 @@ fn agent_collapsing_header(
         id,
         default_open,
     );
-    if search.is_some() {
+    if has_body && search.is_some() {
         state.set_open(true);
     }
     let title_line = title
@@ -1697,7 +1698,9 @@ fn agent_collapsing_header(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.spacing_mut().icon_width = 24.0;
-                    state.show_toggle_button(ui, paint_agent_disclosure);
+                    if has_body {
+                        state.show_toggle_button(ui, paint_agent_disclosure);
+                    }
                     let status_width = if completed {
                         24.0
                     } else if label.is_empty() {
@@ -1714,7 +1717,7 @@ fn agent_collapsing_header(
                         (ui.available_width() - status_width - status_spacing).max(0.0);
                     let response = agent_tool_title(ui, id, title_line, title_width, search)
                         .on_hover_text(title);
-                    if response.clicked() {
+                    if has_body && response.clicked() {
                         state.toggle(ui);
                     }
                     if completed {
@@ -1748,26 +1751,28 @@ fn agent_collapsing_header(
                     }
                 });
             });
-        state.show_body_unindented(ui, |ui| {
-            ui.set_width((card_right - ui.cursor().left()).max(0.0));
-            ui.painter().hline(
-                ui.available_rect_before_wrap().x_range(),
-                ui.cursor().top(),
-                egui::Stroke::new(1.0, theme::border::hairline_color()),
-            );
-            if default_open {
-                add_body(ui);
-            } else {
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(9, 8))
-                    .show(ui, |ui| {
-                        let width = ui.available_width();
-                        ui.set_width(width);
-                        ui.set_max_width(width);
-                        add_body(ui);
-                    });
-            }
-        });
+        if has_body {
+            state.show_body_unindented(ui, |ui| {
+                ui.set_width((card_right - ui.cursor().left()).max(0.0));
+                ui.painter().hline(
+                    ui.available_rect_before_wrap().x_range(),
+                    ui.cursor().top(),
+                    egui::Stroke::new(1.0, theme::border::hairline_color()),
+                );
+                if default_open {
+                    add_body(ui);
+                } else {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(9, 8))
+                        .show(ui, |ui| {
+                            let width = ui.available_width();
+                            ui.set_width(width);
+                            ui.set_max_width(width);
+                            add_body(ui);
+                        });
+                }
+            });
+        }
     });
 }
 
@@ -3914,6 +3919,7 @@ impl TreeState {
 
 #[derive(Default)]
 struct HighlightCache {
+    appearance: u64,
     revision: u64,
     syntax: String,
     job: LayoutJob,
@@ -3933,6 +3939,7 @@ struct HighlightCache {
 
 #[derive(Clone, PartialEq)]
 struct GalleyKey {
+    appearance: u64,
     revision: u64,
     syntax: String,
     find: Option<(String, usize)>,
@@ -12069,6 +12076,8 @@ impl EditorApp {
                                                 .is_some_and(|kind| kind.eq_ignore_ascii_case("Edit"));
                                         let contains_diff = tool_contains_diff(tool);
                                         let is_subagent = tool_is_subagent(tool);
+                                        let has_body = tool.detail.is_some()
+                                            || (!title_includes_paths && !tool.paths.is_empty());
                                         agent_collapsing_header(
                                             ui,
                                             ("tool", &tool.id, contains_diff),
@@ -12076,6 +12085,7 @@ impl EditorApp {
                                             tool.status.as_deref(),
                                             transcript_width,
                                             item_search,
+                                            has_body,
                                             is_subagent || (contains_diff && !is_file_edit),
                                             |ui| {
                                                 if is_subagent {
@@ -14871,7 +14881,8 @@ impl EditorApp {
         let large_file = buffer.large_file_warning;
         let mut highlight_error = None;
         let wrap_width = ui.available_width().max(1.0);
-        if !cache.valid || cache.revision != revision {
+        let appearance = theme::appearance();
+        if !cache.valid || cache.revision != revision || cache.appearance != appearance {
             let syntax = syntaxes.detect(&buffer.path, large_file);
             if large_file {
                 cache.job = plain_text_job(&buffer.text, wrap_width);
@@ -14891,6 +14902,7 @@ impl EditorApp {
                     }
                 }
             }
+            cache.appearance = appearance;
             cache.revision = revision;
             cache.syntax.clone_from(&syntax.name);
             cache.valid = true;
@@ -14914,6 +14926,7 @@ impl EditorApp {
             &cache.job
         };
         let galley_key = GalleyKey {
+            appearance,
             revision,
             syntax: syntax_name,
             find: (find_open && !find_matches.is_empty())
@@ -22153,6 +22166,70 @@ mod tests {
     }
 
     #[test]
+    fn detail_less_tool_cards_are_not_expandable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "edit".into(),
+                title: Some("Edit /tmp/validate.py".into()),
+                status: Some("Completed".into()),
+                kind: Some("Edit".into()),
+                paths: vec!["/tmp/validate.py".into()],
+                detail: None,
+            }));
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let title = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == "/tmp/validate.py" => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .expect("tool title");
+        let card = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Rect(rect)
+                    if rect.fill == theme::surface().raised
+                        && rect.rect.contains(title.center()) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("tool card");
+        let has_disclosure = output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Path(path) if !path.closed && path.points.len() == 3 => {
+                let center = path.visual_bounding_rect().center();
+                card.contains(center) && center.x < title.left()
+            }
+            _ => false,
+        });
+
+        assert!(!has_disclosure, "an empty tool card offered a disclosure");
+    }
+
+    #[test]
     fn tool_card_disclosure_is_optically_centered_and_radius_is_compact() {
         let output = theme::test_context().run_ui(
             RawInput {
@@ -22167,6 +22244,7 @@ mod tests {
                     Some("Completed"),
                     340.0,
                     None,
+                    true,
                     false,
                     |_| {},
                 );
@@ -22255,6 +22333,7 @@ mod tests {
                         Some("Completed"),
                         260.0,
                         None,
+                        false,
                         false,
                         |_| {},
                     );
@@ -24390,6 +24469,48 @@ mod tests {
         let job = plain_text_job("large document", 320.0);
 
         assert_eq!(job.sections[0].format.color, theme::syntax().foreground);
+    }
+
+    #[test]
+    fn open_editor_rehighlights_when_palette_changes() {
+        let _flag = theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        theme::set_light(false);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Cargo.toml");
+        fs::write(&path, "[package]\nname = \"editur\"\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(path),
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 500.0))),
+            ..RawInput::default()
+        };
+        app.settings.appearance.theme = crate::settings::ThemePreference::Dark;
+        let _ = context.run_ui(input(), |root| app.ui(root));
+        app.settings.appearance.theme = crate::settings::ThemePreference::Light;
+        let output = context.run_ui(input(), |root| app.ui(root));
+        let foreground = output.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) => {
+                let offset = text.galley.text().find("name")?;
+                text.galley
+                    .job
+                    .sections
+                    .iter()
+                    .find(|section| section.byte_range.contains(&offset.into()))
+                    .map(|section| section.format.color)
+            }
+            _ => None,
+        });
+        let expected = theme::syntax().foreground;
+        theme::set_light(false);
+
+        assert_eq!(foreground, Some(expected));
     }
 
     #[test]
