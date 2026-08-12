@@ -12,8 +12,8 @@ use egui::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::app::{
-    DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, resize_divider_stroke, stable_tab_drop_zone,
-    tab_drop_preview,
+    DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, paint_pane_resize_handles,
+    resize_dragged_pane_handle, stable_tab_drop_zone, tab_drop_preview,
 };
 use crate::theme;
 
@@ -117,10 +117,20 @@ impl TerminalPanel {
     ) -> TerminalOutput {
         ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
         let mut error = None;
-        let mut panes = self.pane_layout.rects(rect);
-        if self.update_tab_drag(ui.ctx(), rect, &panes) {
-            panes = self.pane_layout.rects(rect);
-        }
+        let panes = self.pane_layout.rects(rect);
+        self.update_tab_drag(ui.ctx(), rect, &panes);
+        let resize_handles = if self.tab_drag.is_none() {
+            resize_dragged_pane_handle(
+                ui.ctx(),
+                &mut self.pane_layout,
+                rect,
+                "terminal_pane_divider",
+                true,
+            )
+        } else {
+            Vec::new()
+        };
+        let panes = self.pane_layout.rects(rect);
         let request_focus = std::mem::take(&mut self.focus_active);
         let mut clicked = None;
         for (pane, pane_rect) in panes.iter().copied() {
@@ -178,7 +188,7 @@ impl TerminalPanel {
                 egui::StrokeKind::Inside,
             );
         }
-        self.draw_split_handles(ui, rect);
+        paint_pane_resize_handles(ui, &resize_handles, "terminal_pane_divider");
         if let Some(drop) = self.tab_drop {
             let preview = drop.preview.shrink(4.0);
             ui.painter()
@@ -451,45 +461,6 @@ impl TerminalPanel {
             ctx.request_repaint();
         }
         false
-    }
-
-    fn draw_split_handles(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        if self.tab_drag.is_some() {
-            return;
-        }
-        for handle in self.pane_layout.split_handles(rect) {
-            let response = ui.interact(
-                handle.hit_rect,
-                Id::new(("terminal_pane_divider", handle.id)),
-                Sense::drag(),
-            );
-            let active = response.hovered() || response.dragged();
-            if active {
-                ui.ctx().set_cursor_icon(match handle.axis {
-                    SplitAxis::Horizontal => CursorIcon::ResizeVertical,
-                    SplitAxis::Vertical => CursorIcon::ResizeHorizontal,
-                });
-            }
-            if response.dragged()
-                && let Some(pointer) = ui.ctx().pointer_interact_pos()
-                && self.pane_layout.resize_adjacent(handle.id, rect, pointer)
-            {
-                ui.ctx().request_repaint();
-            }
-            let center = handle.hit_rect.center();
-            let line = match handle.axis {
-                SplitAxis::Horizontal => [
-                    egui::pos2(handle.hit_rect.left(), center.y),
-                    egui::pos2(handle.hit_rect.right(), center.y),
-                ],
-                SplitAxis::Vertical => [
-                    egui::pos2(center.x, handle.hit_rect.top()),
-                    egui::pos2(center.x, handle.hit_rect.bottom()),
-                ],
-            };
-            ui.painter()
-                .line_segment(line, resize_divider_stroke(ui.ctx(), active));
-        }
     }
 
     fn add(&mut self, root: &Path, ctx: &egui::Context) -> Result<(), String> {

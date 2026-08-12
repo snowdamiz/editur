@@ -148,8 +148,8 @@ use crate::{
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
     settings::{
-        self, DensityPreference, LineHeightPreference, ServerMode, ServerOverride, Settings,
-        ThemePreference,
+        self, DensityPreference, LineHeightPreference, LineWrapPreference, ServerMode,
+        ServerOverride, Settings, ThemePreference,
     },
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
     terminal::TerminalPanel,
@@ -349,7 +349,6 @@ const AGENT_TRANSCRIPT_EDGE_PADDING: i8 = 14;
 const AGENT_TRANSCRIPT_EDGE_FADE: f32 = 28.0;
 const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
-const AGENTIC_SESSION_RAIL_WIDTH: f32 = 248.0;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENTIC_EMPTY_STATE_HEIGHT: f32 = 124.0;
@@ -2170,11 +2169,12 @@ fn split_workspace(
 fn split_agentic_workspace(
     content: egui::Rect,
     sidebar_open: bool,
+    sidebar_width: f32,
 ) -> (Option<egui::Rect>, egui::Rect) {
     if !sidebar_open {
         return (None, content);
     }
-    let rail_width = AGENTIC_SESSION_RAIL_WIDTH
+    let rail_width = sidebar_width
         .min(content.width() * 0.36)
         .max(SIDEBAR_MIN_WIDTH.min(content.width()));
     let sessions = content.with_max_x(content.left() + rail_width);
@@ -2419,6 +2419,64 @@ impl PaneLayout {
             .without(target)
             .expect("another pane remains after removing a split leaf");
         true
+    }
+}
+
+pub(crate) fn resize_dragged_pane_handle(
+    ctx: &egui::Context,
+    layout: &mut PaneLayout,
+    available: egui::Rect,
+    id_salt: &'static str,
+    resize_adjacent: bool,
+) -> Vec<PaneSplitHandle> {
+    if ctx.input(|input| input.pointer.primary_down())
+        && let Some(pointer) = ctx.pointer_interact_pos()
+    {
+        for handle in layout.split_handles(available) {
+            if !ctx.is_being_dragged(Id::new((id_salt, handle.id))) {
+                continue;
+            }
+            if resize_adjacent {
+                layout.resize_adjacent(handle.id, available, pointer);
+            } else {
+                layout.resize(handle.id, handle.bounds, pointer);
+            }
+        }
+    }
+    layout.split_handles(available)
+}
+
+pub(crate) fn paint_pane_resize_handles(
+    ui: &mut egui::Ui,
+    handles: &[PaneSplitHandle],
+    id_salt: &'static str,
+) {
+    for handle in handles {
+        let response = ui.interact(
+            handle.hit_rect,
+            Id::new((id_salt, handle.id)),
+            Sense::drag(),
+        );
+        let active = response.hovered() || response.dragged();
+        if active {
+            ui.ctx().set_cursor_icon(match handle.axis {
+                SplitAxis::Horizontal => CursorIcon::ResizeVertical,
+                SplitAxis::Vertical => CursorIcon::ResizeHorizontal,
+            });
+        }
+        let center = handle.hit_rect.center();
+        let line = match handle.axis {
+            SplitAxis::Horizontal => [
+                egui::pos2(handle.hit_rect.left(), center.y),
+                egui::pos2(handle.hit_rect.right(), center.y),
+            ],
+            SplitAxis::Vertical => [
+                egui::pos2(center.x, handle.hit_rect.top()),
+                egui::pos2(center.x, handle.hit_rect.bottom()),
+            ],
+        };
+        ui.painter()
+            .line_segment(line, resize_divider_stroke(ui.ctx(), active));
     }
 }
 
@@ -5112,11 +5170,13 @@ impl EditorApp {
 
         let window = root.max_rect();
         if self.agentic_mode {
+            self.update_agentic_sidebar_resize(&ctx, window);
             self.draw_agentic_workspace(root, window);
             self.draw_dialogs(&ctx);
             self.draw_error(&ctx);
             return;
         }
+        self.update_sidebar_resizes(&ctx, window);
         let agent_sidebar_at_frame_start = self.agent_sidebar;
         let (sidebar, editor_column, agent) = split_workspace(
             window,
@@ -5126,6 +5186,7 @@ impl EditorApp {
             self.agent_sidebar_width,
         );
         let workspace = egui::Rect::from_min_max(editor_column.left_top(), window.right_bottom());
+        self.update_terminal_resize(&ctx, workspace);
         let (workspace, terminal) =
             split_bottom_panel(workspace, self.terminal_open, self.terminal_height);
         let editor_column = editor_column.with_max_y(workspace.bottom());
@@ -5138,10 +5199,20 @@ impl EditorApp {
             );
         }
         self.lsp_caret = None;
+        let pane_rects = self.pane_layout.rects(editor);
+        self.update_tab_drag(&ctx, &pane_rects);
+        let pane_resize_handles = if self.tab_drag.is_none() {
+            resize_dragged_pane_handle(
+                &ctx,
+                &mut self.pane_layout,
+                editor,
+                "pane_split_divider",
+                false,
+            )
+        } else {
+            Vec::new()
+        };
         let mut pane_rects = self.pane_layout.rects(editor);
-        if self.update_tab_drag(&ctx, &pane_rects) {
-            pane_rects = self.pane_layout.rects(editor);
-        }
         let mut dragged_pane = None;
         if let (Some(path), Some(drop)) = (self.tab_drag.as_deref(), self.tab_drop)
             && let Some((preview, pane)) = self.tab_drag_preview(editor, path, drop)
@@ -5273,7 +5344,7 @@ impl EditorApp {
             if let Some(error) = output.error {
                 self.show_error(error);
             }
-            self.draw_terminal_resize(root, workspace, terminal);
+            self.draw_terminal_resize(root, terminal);
         }
         self.draw_titlebar(
             root,
@@ -5298,41 +5369,7 @@ impl EditorApp {
                 egui::StrokeKind::Inside,
             );
         }
-        if self.tab_drag.is_none() {
-            for handle in self.pane_layout.split_handles(editor) {
-                let response = root.interact(
-                    handle.hit_rect,
-                    Id::new(("pane_split_divider", handle.id)),
-                    Sense::drag(),
-                );
-                let active = response.hovered() || response.dragged();
-                if active {
-                    ctx.set_cursor_icon(match handle.axis {
-                        SplitAxis::Horizontal => CursorIcon::ResizeVertical,
-                        SplitAxis::Vertical => CursorIcon::ResizeHorizontal,
-                    });
-                }
-                if response.dragged()
-                    && let Some(pointer) = ctx.pointer_interact_pos()
-                    && self.pane_layout.resize(handle.id, handle.bounds, pointer)
-                {
-                    ctx.request_repaint();
-                }
-                let center = handle.hit_rect.center();
-                let line = match handle.axis {
-                    SplitAxis::Horizontal => [
-                        egui::pos2(handle.hit_rect.left(), center.y),
-                        egui::pos2(handle.hit_rect.right(), center.y),
-                    ],
-                    SplitAxis::Vertical => [
-                        egui::pos2(center.x, handle.hit_rect.top()),
-                        egui::pos2(center.x, handle.hit_rect.bottom()),
-                    ],
-                };
-                root.painter()
-                    .line_segment(line, resize_divider_stroke(&ctx, active));
-            }
-        }
+        paint_pane_resize_handles(root, &pane_resize_handles, "pane_split_divider");
         if let Some(sidebar) = sidebar {
             let divider = egui::Rect::from_center_size(
                 egui::pos2(sidebar.right(), sidebar.center().y),
@@ -5340,18 +5377,6 @@ impl EditorApp {
             );
             let pointer = ctx.pointer_hover_pos();
             let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
-            if hovered && ctx.input(|input| input.pointer.primary_pressed()) {
-                self.sidebar_dragging = true;
-            }
-            if !ctx.input(|input| input.pointer.primary_down()) {
-                self.sidebar_dragging = false;
-            }
-            if self.sidebar_dragging
-                && let Some(pointer) = pointer
-            {
-                self.sidebar_width = (pointer.x - window.left()).clamp(SIDEBAR_MIN_WIDTH, 500.0);
-                ctx.request_repaint();
-            }
             if hovered || self.sidebar_dragging {
                 ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
@@ -5376,18 +5401,6 @@ impl EditorApp {
             );
             let pointer = ctx.pointer_hover_pos();
             let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
-            if hovered && ctx.input(|input| input.pointer.primary_pressed()) {
-                self.agent_sidebar_dragging = true;
-            }
-            if !ctx.input(|input| input.pointer.primary_down()) {
-                self.agent_sidebar_dragging = false;
-            }
-            if self.agent_sidebar_dragging
-                && let Some(pointer) = pointer
-            {
-                self.agent_sidebar_width = (window.right() - pointer.x).clamp(320.0, 720.0);
-                ctx.request_repaint();
-            }
             if hovered || self.agent_sidebar_dragging {
                 ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
@@ -5432,8 +5445,86 @@ impl EditorApp {
         self.draw_error(&ctx);
     }
 
+    fn update_sidebar_resizes(&mut self, ctx: &egui::Context, window: egui::Rect) {
+        let (sidebar, _, agent) = split_workspace(
+            window,
+            self.sidebar,
+            self.sidebar_width,
+            self.agent_sidebar,
+            self.agent_sidebar_width,
+        );
+        let pointer = ctx.pointer_hover_pos();
+        let (pressed, down) = ctx.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+            )
+        });
+        if let Some(sidebar) = sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(sidebar.right(), sidebar.center().y),
+                egui::vec2(5.0, sidebar.height()),
+            );
+            if pressed && pointer.is_some_and(|pointer| divider.contains(pointer)) {
+                self.sidebar_dragging = true;
+            }
+        }
+        if self.agent_sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(agent.left(), agent.center().y),
+                egui::vec2(5.0, agent.height()),
+            );
+            if pressed && pointer.is_some_and(|pointer| divider.contains(pointer)) {
+                self.agent_sidebar_dragging = true;
+            }
+        }
+        if !down {
+            self.sidebar_dragging = false;
+            self.agent_sidebar_dragging = false;
+        } else if let Some(pointer) = pointer {
+            if self.sidebar_dragging {
+                self.sidebar_width = (pointer.x - window.left()).clamp(SIDEBAR_MIN_WIDTH, 500.0);
+            }
+            if self.agent_sidebar_dragging {
+                self.agent_sidebar_width = (window.right() - pointer.x).clamp(320.0, 720.0);
+            }
+        }
+    }
+
+    fn update_agentic_sidebar_resize(&mut self, ctx: &egui::Context, window: egui::Rect) {
+        let (Some(sidebar), _) =
+            split_agentic_workspace(window, self.sidebar, self.sidebar_width)
+        else {
+            self.sidebar_dragging = false;
+            return;
+        };
+        let divider = egui::Rect::from_center_size(
+            sidebar.right_center(),
+            egui::vec2(5.0, sidebar.height()),
+        );
+        let pointer = ctx.pointer_hover_pos();
+        let (pressed, down) = ctx.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+            )
+        });
+        if pressed && pointer.is_some_and(|pointer| divider.contains(pointer)) {
+            self.sidebar_dragging = true;
+        }
+        if !down {
+            self.sidebar_dragging = false;
+        } else if self.sidebar_dragging
+            && let Some(pointer) = pointer
+        {
+            self.sidebar_width = pointer.x - window.left();
+        }
+    }
+
     fn draw_agentic_workspace(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        let (sessions, agent_column) = split_agentic_workspace(window, self.sidebar);
+        let (sessions, agent_column) =
+            split_agentic_workspace(window, self.sidebar, self.sidebar_width);
+        self.update_terminal_resize(root.ctx(), agent_column);
         let (content, terminal) =
             split_bottom_panel(agent_column, self.terminal_open, self.terminal_height);
         let (agent, diff_panel) = split_agentic_diff(content, self.agentic_diff.is_some());
@@ -5443,11 +5534,6 @@ impl EditorApp {
                     .id_salt("agentic_sessions")
                     .max_rect(sessions),
                 |ui| self.draw_agentic_sessions(ui),
-            );
-            root.painter().vline(
-                sessions.right(),
-                sessions.y_range(),
-                egui::Stroke::new(1.0, theme::border::hairline_color()),
             );
         }
         root.scope_builder(
@@ -5549,7 +5635,7 @@ impl EditorApp {
             if let Some(error) = output.error {
                 self.show_error(error);
             }
-            self.draw_terminal_resize(root, content, terminal);
+            self.draw_terminal_resize(root, terminal);
         }
         self.draw_agentic_titlebar(
             root,
@@ -5558,6 +5644,25 @@ impl EditorApp {
             sessions,
             diff_panel.map(|rect| rect.left()),
         );
+        if let Some(sessions) = sessions {
+            let divider = egui::Rect::from_center_size(
+                sessions.right_center(),
+                egui::vec2(5.0, sessions.height()),
+            );
+            let hovered = root
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|pointer| divider.contains(pointer));
+            let active = hovered || self.sidebar_dragging;
+            if active {
+                root.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            root.painter().vline(
+                sessions.right(),
+                sessions.y_range(),
+                resize_divider_stroke(root.ctx(), active),
+            );
+        }
     }
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
@@ -6596,28 +6701,46 @@ impl EditorApp {
         ctx.request_repaint();
     }
 
-    fn draw_terminal_resize(&mut self, ui: &mut egui::Ui, main: egui::Rect, terminal: egui::Rect) {
+    fn update_terminal_resize(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
+        if !self.terminal_open {
+            self.terminal_dragging = false;
+            return;
+        }
+        let (_, Some(terminal)) = split_bottom_panel(bounds, true, self.terminal_height) else {
+            return;
+        };
+        let divider = egui::Rect::from_center_size(
+            egui::pos2(terminal.center().x, terminal.top()),
+            egui::vec2(terminal.width(), 7.0),
+        );
+        let pointer = ctx.pointer_hover_pos();
+        let (pressed, down) = ctx.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+            )
+        });
+        if pressed && pointer.is_some_and(|pointer| divider.contains(pointer)) {
+            self.terminal_dragging = true;
+        }
+        if !down {
+            self.terminal_dragging = false;
+        } else if self.terminal_dragging
+            && let Some(pointer) = pointer
+        {
+            let max_height = (bounds.height() - WORKSPACE_MIN_HEIGHT).max(0.0);
+            let min_height = TERMINAL_MIN_HEIGHT.min(max_height);
+            self.terminal_height = (bounds.bottom() - pointer.y).clamp(min_height, max_height);
+        }
+    }
+
+    fn draw_terminal_resize(&mut self, ui: &mut egui::Ui, terminal: egui::Rect) {
         let divider = egui::Rect::from_center_size(
             egui::pos2(terminal.center().x, terminal.top()),
             egui::vec2(terminal.width(), 7.0),
         );
         let pointer = ui.ctx().pointer_hover_pos();
         let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
-        if hovered && ui.input(|input| input.pointer.primary_pressed()) {
-            self.terminal_dragging = true;
-        }
-        if !ui.input(|input| input.pointer.primary_down()) {
-            self.terminal_dragging = false;
-        }
-        if self.terminal_dragging
-            && let Some(pointer) = pointer
-        {
-            let total_height = terminal.bottom() - main.top();
-            let max_height = (total_height - WORKSPACE_MIN_HEIGHT).max(0.0);
-            let min_height = TERMINAL_MIN_HEIGHT.min(max_height);
-            self.terminal_height = (terminal.bottom() - pointer.y).clamp(min_height, max_height);
-            ui.ctx().request_repaint();
-        }
         let active = hovered || self.terminal_dragging;
         if active {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
@@ -7054,6 +7177,17 @@ impl EditorApp {
                     (LineHeightPreference::Compact, "Compact"),
                     (LineHeightPreference::Default, "Default"),
                     (LineHeightPreference::Comfortable, "Comfortable"),
+                ],
+            );
+            ui.separator();
+            dirty |= settings_choice_row(
+                ui,
+                "Line wrapping",
+                "Wrap long lines to the editor width or scroll horizontally.",
+                &mut appearance.line_wrap,
+                [
+                    (LineWrapPreference::NoWrap, "No wrap"),
+                    (LineWrapPreference::Wrap, "Wrap"),
                 ],
             );
         });
@@ -13789,6 +13923,7 @@ impl EditorApp {
                 text_input,
                 native_keybindings: false,
                 block_caret: vim_enabled && !vim.text_input_enabled(),
+                wrap: self.settings.appearance.line_wrap == LineWrapPreference::Wrap,
             },
         );
         if vim_enabled && (output.response.clicked() || output.response.dragged()) {
@@ -17857,12 +17992,17 @@ mod tests {
         let dark = find("Dark");
         let light = find("Light");
         let system = find("System");
+        let line_wrapping = find("Line wrapping");
+        let no_wrap = find("No wrap");
+        let wrap = find("Wrap");
         let label_center = (title.top() + detail.bottom()) * 0.5;
 
         assert!((label_center - dark.center().y).abs() < 3.0);
         assert!(dark.right() < light.left());
         assert!(light.right() < system.left());
         assert!(title.right() < dark.left());
+        assert!(line_wrapping.right() < no_wrap.left());
+        assert!(no_wrap.right() < wrap.left());
     }
 
     #[test]
@@ -18099,7 +18239,7 @@ mod tests {
     #[test]
     fn terminal_panel_stays_beside_the_agentic_session_rail() {
         let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
-        let (sessions, agent) = split_agentic_workspace(window, true);
+        let (sessions, agent) = split_agentic_workspace(window, true, 248.0);
 
         let (_, terminal) = split_bottom_panel(agent, true, 240.0);
 
@@ -22151,7 +22291,7 @@ mod tests {
         );
         let context = theme::test_context();
         let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1600.0, 700.0));
-        let (_, agent) = split_agentic_workspace(screen, app.sidebar);
+        let (_, agent) = split_agentic_workspace(screen, app.sidebar, app.sidebar_width);
         let pointer = pos2(agent.left() + 10.0, 250.0);
 
         for time in [0.0, 1.0] {
@@ -23299,6 +23439,210 @@ mod tests {
         assert_eq!(app.sidebar_width, 320.0);
     }
 
+    #[test]
+    fn sidebar_resize_paints_the_current_pointer_position_in_the_same_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let _ = draw(Vec::new());
+        let _ = draw(vec![
+            Event::PointerMoved(pos2(249.0, 100.0)),
+            Event::PointerButton {
+                pos: pos2(249.0, 100.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let output = draw(vec![Event::PointerMoved(pos2(320.0, 100.0))]);
+        let divider_x = output.shapes.iter().find_map(|shape| match shape.shape {
+            Shape::LineSegment { points, stroke } if stroke.color == theme::accent() => {
+                Some(points[0].x)
+            }
+            _ => None,
+        });
+
+        assert_eq!(divider_x, Some(320.0));
+    }
+
+    #[test]
+    fn pane_resize_paints_the_current_pointer_position_in_the_same_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.pane_layout.split(PaneId(0), DropZone::Right);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (_, editor, _) = split_workspace(
+            screen,
+            app.sidebar,
+            app.sidebar_width,
+            app.agent_sidebar,
+            app.agent_sidebar_width,
+        );
+        let start = app.pane_layout.split_handles(editor_column_content(editor))[0]
+            .hit_rect
+            .center();
+        let context = theme::test_context();
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let _ = draw(Vec::new());
+        let _ = draw(vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let output = draw(vec![Event::PointerMoved(pos2(700.0, start.y))]);
+        let divider_x = output.shapes.iter().find_map(|shape| match shape.shape {
+            Shape::LineSegment { points, stroke }
+                if stroke.color == theme::accent() && points[0].x == points[1].x =>
+            {
+                Some(points[0].x)
+            }
+            _ => None,
+        });
+
+        assert_eq!(divider_x, Some(700.0));
+    }
+
+    #[test]
+    fn terminal_resize_paints_the_current_pointer_position_in_the_same_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        app.terminal.open(&app.tree.root, &context).unwrap();
+        app.terminal_open = true;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let (_, editor, _) = split_workspace(
+            screen,
+            app.sidebar,
+            app.sidebar_width,
+            app.agent_sidebar,
+            app.agent_sidebar_width,
+        );
+        let workspace = Rect::from_min_max(editor.left_top(), screen.right_bottom());
+        let (_, terminal) = split_bottom_panel(workspace, true, app.terminal_height);
+        let start = terminal.unwrap().center_top();
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let _ = draw(Vec::new());
+        let _ = draw(vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let output = draw(vec![Event::PointerMoved(pos2(start.x, 400.0))]);
+        let divider_y = output.shapes.iter().find_map(|shape| match shape.shape {
+            Shape::LineSegment { points, stroke }
+                if stroke.color == theme::accent() && points[0].y == points[1].y =>
+            {
+                Some(points[0].y)
+            }
+            _ => None,
+        });
+
+        assert_eq!(divider_y, Some(400.0));
+    }
+
+    #[test]
+    fn agentic_sidebar_resize_paints_the_current_pointer_position_in_the_same_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let start = split_agentic_workspace(screen, true, app.sidebar_width)
+            .0
+            .expect("agentic sidebar")
+            .right_center();
+        let context = theme::test_context();
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let _ = draw(Vec::new());
+        let _ = draw(vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let output = draw(vec![Event::PointerMoved(pos2(340.0, start.y))]);
+        let divider_x = output.shapes.iter().find_map(|shape| match shape.shape {
+            Shape::LineSegment { points, stroke }
+                if stroke.color == theme::accent() && points[0].x == points[1].x =>
+            {
+                Some(points[0].x)
+            }
+            _ => None,
+        });
+
+        assert_eq!(divider_x, Some(340.0));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn file_tree_sidebar_cannot_shrink_past_its_titlebar_controls() {
@@ -24119,7 +24463,7 @@ mod tests {
             .read_response(Id::new("agentic_mode_toggle"))
             .expect("agentic mode toggle")
             .rect;
-        let (sessions, agent) = split_agentic_workspace(screen, true);
+        let (sessions, agent) = split_agentic_workspace(screen, true, app.sidebar_width);
         let sessions = sessions.expect("open agentic sidebar");
         fn has_text(shape: &Shape, expected: &str) -> bool {
             match shape {
@@ -24179,7 +24523,7 @@ mod tests {
             |root| app.ui(root),
         );
 
-        let sessions = split_agentic_workspace(screen, true)
+        let sessions = split_agentic_workspace(screen, true, app.sidebar_width)
             .0
             .expect("agentic session sidebar");
         let settings = context
@@ -24298,10 +24642,10 @@ mod tests {
                 .find_map(|shape| text_rect(&shape.shape, expected))
         };
         let provider = find("Cursor").expect("provider");
-        let projects_header = find("Projects").expect("projects header");
+        let projects_header = find("PROJECTS").expect("projects header");
         let project = find(&project).expect("open project row");
         let recent_row = find("other-project").expect("recent project row");
-        let sessions_header = find("Sessions").expect("sessions header");
+        let sessions_header = find("SESSIONS").expect("sessions header");
 
         assert!(projects_header.top() >= provider.bottom());
         assert!(project.top() >= projects_header.bottom());

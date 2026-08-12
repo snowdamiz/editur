@@ -52,7 +52,9 @@ pub struct EditorSurface {
     anchor: usize,
     cursor: usize,
     h_pos: Option<f32>,
+    scroll_x: f32,
     scroll_y: f32,
+    horizontal_scrollbar: crate::scrollbar::State,
     scrollbar: crate::scrollbar::State,
     undo: Vec<Vec<Edit>>,
     redo: Vec<Vec<Edit>>,
@@ -86,6 +88,7 @@ pub(crate) struct EditorShowOptions<'a> {
     pub text_input: TextInputMode,
     pub native_keybindings: bool,
     pub block_caret: bool,
+    pub wrap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,6 +369,7 @@ impl EditorSurface {
                 text_input: TextInputMode::Standard,
                 native_keybindings: true,
                 block_caret: false,
+                wrap: false,
             },
         )
     }
@@ -386,6 +390,7 @@ impl EditorSurface {
             text_input,
             native_keybindings,
             block_caret,
+            wrap,
         } = options;
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
@@ -408,7 +413,11 @@ impl EditorSurface {
             ),
             editor_rect.right_bottom(),
         );
-        let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
+        let wrap_width = if wrap {
+            (content.width() - TEXT_LEFT_PADDING).max(1.0)
+        } else {
+            f32::INFINITY
+        };
         self.sync_lines(highlighted, document.revision, wrap_width, advance);
         self.clamp_selection(document.character_len);
         let cursor_before_input = self.cursor;
@@ -416,23 +425,48 @@ impl EditorSurface {
         if request_focus {
             response.request_focus();
         }
-        let scrolling = ui.input(|input| {
+        let pointer_over_editor = ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
                 .is_some_and(|pointer| rect.contains(pointer))
-        }) && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+        });
+        let (scroll_delta, shift) =
+            ui.input(|input| (input.smooth_scroll_delta, input.modifiers.shift));
+        let horizontal_delta = if scroll_delta.x != 0.0 {
+            scroll_delta.x
+        } else if !wrap && shift {
+            scroll_delta.y
+        } else {
+            0.0
+        };
+        let horizontal_scrolling = pointer_over_editor && !wrap && horizontal_delta != 0.0;
+        let scrolling = pointer_over_editor
+            && scroll_delta.y != 0.0
+            && !(horizontal_scrolling && scroll_delta.x == 0.0);
         if scrolling {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            self.scroll_y -= scroll;
+            self.scroll_y -= scroll_delta.y;
+        }
+        if horizontal_scrolling {
+            self.scroll_x -= horizontal_delta;
+        }
+        if wrap {
+            self.scroll_x = 0.0;
         }
         self.clamp_scroll(content.height());
 
         self.layout_visible_lines(ui, content);
+        let mut document_width = self.document_width(advance).max(content.width());
+        self.clamp_horizontal_scroll(content.width(), document_width);
         let mut ensure_cursor_visible = request_focus;
         if let Some(character) = scroll_to_character {
             self.scroll_character_into_view(character, content.height());
             self.layout_visible_lines(ui, content);
+            document_width = self.document_width(advance).max(content.width());
+            if !wrap {
+                self.scroll_character_horizontally_into_view(character, content.width());
+            }
+            self.clamp_horizontal_scroll(content.width(), document_width);
         }
 
         if response.clicked() || response.drag_started() {
@@ -457,6 +491,19 @@ impl EditorSurface {
                 self.scroll_y += delta;
                 self.clamp_scroll(content.height());
                 ui.ctx().request_repaint();
+            }
+            if !wrap {
+                let delta = selection_drag_scroll_delta(
+                    pointer.x,
+                    content.left(),
+                    content.right(),
+                    ui.input(|input| input.stable_dt),
+                );
+                if delta != 0.0 {
+                    self.scroll_x += delta;
+                    self.clamp_horizontal_scroll(content.width(), document_width);
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
@@ -488,6 +535,10 @@ impl EditorSurface {
         self.clamp_selection(document.character_len);
         if ensure_cursor_visible {
             self.scroll_character_into_view(self.cursor, content.height());
+            if !wrap {
+                self.scroll_character_horizontally_into_view(self.cursor, content.width());
+                self.clamp_horizontal_scroll(content.width(), document_width);
+            }
         }
         let focused = response.has_focus();
         let time = ui.input(|input| input.time);
@@ -523,6 +574,20 @@ impl EditorSurface {
             self.clamp_scroll(content.height());
             ui.ctx().request_repaint();
         }
+        if !wrap
+            && crate::scrollbar::show_horizontal(
+                ui,
+                editor_id.with("horizontal_scrollbar"),
+                content,
+                document_width,
+                &mut self.scroll_x,
+                &mut self.horizontal_scrollbar,
+                horizontal_scrolling,
+            )
+        {
+            self.clamp_horizontal_scroll(content.width(), document_width);
+            ui.ctx().request_repaint();
+        }
 
         EditorOutput {
             response,
@@ -535,7 +600,7 @@ impl EditorSurface {
                 .map(|pointer| self.character_at(pointer, content)),
             last_inserted,
             inserted_text,
-            scrolled: scrolling,
+            scrolled: scrolling || horizontal_scrolling,
         }
     }
 
@@ -700,8 +765,10 @@ impl EditorSurface {
         line_markers: &[(usize, Color32)],
     ) {
         let painter = ui.painter_at(rect);
+        let text_painter = painter.with_clip_rect(content);
         let horizontal_geometry = u64::from(content.left().to_bits())
-            ^ u64::from(content.width().to_bits()).rotate_left(32);
+            ^ u64::from(content.width().to_bits()).rotate_left(32)
+            ^ u64::from(self.scroll_x.to_bits()).rotate_left(16);
         mark_retained(
             &painter,
             rect,
@@ -714,6 +781,7 @@ impl EditorSurface {
         let cursor_line = self.line_for_character(self.cursor);
         let advance =
             ui.fonts_mut(|fonts| fonts.glyph_width(&theme::typography::code_editor(), '0'));
+        let text_left = content.left() + TEXT_LEFT_PADDING - self.scroll_x;
         let line_height = line_height();
         // The block that encloses the caret owns the one guide that is allowed
         // to be an accent.
@@ -772,8 +840,8 @@ impl EditorSurface {
             let mut column = 0;
             while column + INDENT_WIDTH <= indent {
                 let active = active_guide == Some(column) && is_cursor_line;
-                painter.vline(
-                    content.left() + TEXT_LEFT_PADDING + column as f32 * advance,
+                text_painter.vline(
+                    text_left + column as f32 * advance,
                     y..=(y + line.height),
                     Stroke::new(
                         theme::stroke::DIVIDER,
@@ -827,11 +895,7 @@ impl EditorSurface {
                     None,
                 );
             }
-            painter.galley(
-                egui::pos2(content.left() + TEXT_LEFT_PADDING, y),
-                galley,
-                theme::syntax().foreground,
-            );
+            text_painter.galley(egui::pos2(text_left, y), galley, theme::syntax().foreground);
         }
         let caret_visible = focused
             && (((ui.input(|input| input.time) - self.caret_blink_started).max(0.0)
@@ -846,13 +910,13 @@ impl EditorSurface {
             );
             if let Some(caret) = self.cursor_rect(content) {
                 if block_caret {
-                    painter.rect_filled(
+                    text_painter.rect_filled(
                         Rect::from_min_size(caret.left_top(), egui::vec2(8.0, caret.height())),
                         0.0,
                         theme::accent().gamma_multiply(0.65),
                     );
                 } else {
-                    painter.line_segment(
+                    text_painter.line_segment(
                         [caret.left_top(), caret.left_bottom()],
                         Stroke::new(1.5, theme::accent()),
                     );
@@ -1074,7 +1138,7 @@ impl EditorSurface {
             return line.char_start;
         };
         let local = egui::vec2(
-            pointer.x - content.left() - TEXT_LEFT_PADDING,
+            pointer.x - content.left() - TEXT_LEFT_PADDING + self.scroll_x,
             document_y - self.offsets[line_index],
         );
         line.char_start + galley.cursor_from_pos(local).index.0
@@ -1087,7 +1151,7 @@ impl EditorSurface {
         let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
         let local = galley.pos_from_cursor(relative);
         let translated = local.translate(egui::vec2(
-            content.left() + TEXT_LEFT_PADDING,
+            content.left() + TEXT_LEFT_PADDING - self.scroll_x,
             content.top() + self.offsets[line_index] - self.scroll_y,
         ));
         Some(Rect::from_min_size(
@@ -1111,6 +1175,24 @@ impl EditorSurface {
         self.clamp_scroll(viewport_height);
     }
 
+    fn scroll_character_horizontally_into_view(&mut self, character: usize, viewport_width: f32) {
+        let index = self.line_for_character(character);
+        let Some(line) = self.lines.get(index) else {
+            return;
+        };
+        let Some(galley) = &line.galley else {
+            return;
+        };
+        let relative = CCursor::new(character.saturating_sub(line.char_start));
+        let cursor = galley.pos_from_cursor(relative);
+        let visible_width = (viewport_width - TEXT_LEFT_PADDING).max(1.0);
+        if cursor.left() < self.scroll_x {
+            self.scroll_x = cursor.left();
+        } else if cursor.right() > self.scroll_x + visible_width {
+            self.scroll_x = cursor.right() - visible_width;
+        }
+    }
+
     fn clamp_selection(&mut self, character_len: usize) {
         self.anchor = self.anchor.min(character_len);
         self.cursor = self.cursor.min(character_len);
@@ -1119,6 +1201,26 @@ impl EditorSurface {
     fn clamp_scroll(&mut self, viewport_height: f32) {
         let total = self.offsets.last().copied().unwrap_or(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, (total - viewport_height).max(0.0));
+    }
+
+    fn document_width(&self, advance: f32) -> f32 {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.galley
+                    .as_ref()
+                    .map_or(line.character_len as f32 * advance, |galley| {
+                        galley.size().x
+                    })
+            })
+            .fold(0.0, f32::max)
+            + TEXT_LEFT_PADDING
+    }
+
+    fn clamp_horizontal_scroll(&mut self, viewport_width: f32, document_width: f32) {
+        self.scroll_x = self
+            .scroll_x
+            .clamp(0.0, (document_width - viewport_width).max(0.0));
     }
 
     fn update_ime(&self, ui: &Ui, rect: Rect, content: Rect) {
@@ -1342,8 +1444,8 @@ mod tests {
         EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job, theme,
     };
     use egui::{
-        Color32, CursorIcon, Event, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2, pos2,
-        text::LayoutJob,
+        Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, RawInput, Rect, TextFormat,
+        TouchPhase, Vec2, pos2, text::LayoutJob,
     };
     use std::time::{Duration, Instant};
 
@@ -1771,6 +1873,69 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_do_not_wrap_by_default() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "word ".repeat(60);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            240.0,
+        );
+        for _ in 0..2 {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(240.0, 300.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    editor.show(ui, &mut text, &job, 1, true, None);
+                },
+            );
+        }
+
+        assert_eq!(editor.lines[0].galley.as_ref().unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn long_lines_scroll_horizontally() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "word ".repeat(60);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            240.0,
+        );
+        let input = |events| RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(240.0, 300.0))),
+            events,
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(input(Vec::new()), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        let _ = context.run_ui(
+            input(vec![
+                Event::PointerMoved(pos2(120.0, 120.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Line,
+                    delta: Vec2::new(-8.0, 0.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            },
+        );
+
+        assert!(editor.scroll_x > 0.0);
+    }
+
+    #[test]
     fn a_wrapped_continuation_resumes_under_its_own_indent() {
         let context = theme::test_context();
         let mut editor = EditorSurface::default();
@@ -1789,7 +1954,27 @@ mod tests {
                     ..RawInput::default()
                 },
                 |ui| {
-                    editor.show(ui, &mut text, &job, 1, true, None);
+                    let character_len = text.chars().count();
+                    editor.show_document_with_options(
+                        ui,
+                        &mut text,
+                        &job,
+                        super::DocumentMetrics {
+                            revision: 1,
+                            line_count: 1,
+                            character_len,
+                        },
+                        super::EditorShowOptions {
+                            request_focus: true,
+                            scroll_to_character: None,
+                            id: Id::new("editor"),
+                            line_markers: &[],
+                            text_input: super::TextInputMode::Standard,
+                            native_keybindings: true,
+                            block_caret: false,
+                            wrap: true,
+                        },
+                    );
                 },
             );
             rows = editor.lines[0]
@@ -1844,6 +2029,7 @@ mod tests {
                             text_input: super::TextInputMode::Standard,
                             native_keybindings: true,
                             block_caret: false,
+                            wrap: false,
                         },
                     );
                 },

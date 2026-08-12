@@ -22,6 +22,10 @@ pub(crate) use metrics::{
 pub(crate) use state::{border, callout, diff, editor};
 
 use egui::{Context, Stroke, Style, style::WidgetVisuals};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+#[cfg(test)]
+pub(crate) static PALETTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn apply(context: &Context) {
     install_fonts(context);
@@ -36,11 +40,12 @@ fn install_fonts(context: &Context) {
 /// One number that changes whenever anything the retained caches baked in has
 /// moved: the palette, the editor's metrics, or the density.
 pub(crate) fn appearance() -> u64 {
-    let light = u64::from(!color::palette().dark);
-    let compact = u64::from(density() == Density::Compact);
-    let size = u64::from(typography::code_size().to_bits());
-    let ratio = u64::from(typography::code_ratio().to_bits());
-    light | compact << 1 | size << 8 | ratio.rotate_left(40)
+    let mut hasher = DefaultHasher::new();
+    color::palette().dark.hash(&mut hasher);
+    (density() == Density::Compact).hash(&mut hasher);
+    typography::code_size().to_bits().hash(&mut hasher);
+    typography::code_ratio().to_bits().hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -137,12 +142,6 @@ mod tests {
     use super::{
         accent, apply, color, editor, radius, set_light, space, surface, text, typography,
     };
-    use std::sync::Mutex;
-
-    /// The active palette is process-global, so the test that flips it and the
-    /// test that reads it through `apply` must not interleave.
-    static PALETTE_FLAG: Mutex<()> = Mutex::new(());
-
     /// The one test that keeps this plan from unwinding: a color built outside
     /// the theme module is a color that will drift away from every other color.
     #[test]
@@ -180,7 +179,7 @@ mod tests {
 
     #[test]
     fn theme_switching_does_not_require_a_restart() {
-        let _flag = PALETTE_FLAG
+        let _flag = super::PALETTE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = super::test_context();
@@ -199,7 +198,7 @@ mod tests {
 
     #[test]
     fn apply_wires_the_token_layer_into_every_egui_style() {
-        let _flag = PALETTE_FLAG
+        let _flag = super::PALETTE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = egui::Context::default();

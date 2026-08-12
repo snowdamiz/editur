@@ -22,6 +22,7 @@ pub(crate) struct RetainedUpload {
 }
 
 pub(crate) fn mark_retained(painter: &Painter, rect: Rect, key: u64, revision: u64) {
+    let revision = revision ^ crate::theme::appearance().rotate_left(23);
     painter.add(PaintCallback {
         rect,
         callback: Arc::new(RetainedPaint { key, revision }),
@@ -130,8 +131,8 @@ mod tests {
         upload_required,
     };
     use egui::{
-        Color32, ColorImage, Rect, TextureId, TextureOptions, TexturesDelta, epaint::ImageDelta,
-        pos2,
+        Color32, ColorImage, RawInput, Rect, TextureId, TextureOptions, TexturesDelta, Vec2,
+        epaint::ImageDelta, pos2,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -173,6 +174,41 @@ mod tests {
                 ..upload
             }
         ));
+    }
+
+    #[test]
+    fn retained_paint_changes_revision_with_the_theme() {
+        let _flag = crate::theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::theme::set_light(false);
+        let context = crate::theme::test_context();
+        let draw = || {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(100.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    super::mark_retained(ui.painter(), ui.max_rect(), 1, 7);
+                },
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .find_map(|primitive| super::retained_paint(&primitive.primitive).unwrap())
+                .unwrap()
+                .revision
+        };
+
+        let dark = draw();
+        crate::theme::set_light(true);
+        crate::theme::apply(&context);
+        let light = draw();
+        crate::theme::set_light(false);
+        crate::theme::apply(&context);
+
+        assert_ne!(dark, light);
     }
 
     #[test]

@@ -36,6 +36,7 @@ struct LabelKey {
     width: u32,
     selected: bool,
     hovered: bool,
+    appearance: u64,
 }
 
 #[derive(Default)]
@@ -201,6 +202,7 @@ impl TreeSurface {
                 width: available.to_bits(),
                 selected: is_selected,
                 hovered: is_hovered,
+                appearance: theme::appearance(),
             };
             let label = self.labels.entry(key).or_insert_with(|| {
                 let color = if is_selected || is_hovered {
@@ -456,6 +458,50 @@ mod tests {
         );
 
         assert_eq!(surface.hovered, Some(0));
+    }
+
+    #[test]
+    fn theme_switch_rebuilds_a_previously_hovered_label() {
+        let _flag = theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        theme::set_light(false);
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows = [TreeRow {
+            entry: TreeEntry {
+                name: OsString::from("main.rs"),
+                path: PathBuf::from("main.rs"),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: "main.rs".into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        }];
+        let mut draw = || {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                    events: vec![Event::PointerMoved(pos2(100.0, 42.0))],
+                    ..RawInput::default()
+                },
+                |ui| {
+                    surface.show(ui, Path::new("/tmp/project"), &rows, None, false);
+                },
+            );
+        };
+
+        draw();
+        theme::set_light(true);
+        theme::apply(&context);
+        draw();
+        theme::set_light(false);
+        theme::apply(&context);
+
+        assert_eq!(surface.labels.len(), 2);
     }
 
     #[test]

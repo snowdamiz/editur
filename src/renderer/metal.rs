@@ -34,7 +34,7 @@ use winit::{
 
 use super::{buffer_capacity, choose_adapter};
 
-const FRAMES_IN_FLIGHT: usize = 3;
+const FRAMES_IN_FLIGHT: usize = 2;
 
 #[cfg(editur_precompiled_metal)]
 const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.metallib"));
@@ -163,6 +163,7 @@ impl Renderer {
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
         layer.set_presents_with_transaction(false);
+        layer.set_maximum_drawable_count(FRAMES_IN_FLIGHT as u64);
         attach_layer(window, &mut layer)?;
         let size = window.inner_size();
         let scale_factor = window.scale_factor();

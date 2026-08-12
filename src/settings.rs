@@ -36,6 +36,7 @@ pub struct AppearanceSettings {
     pub editor_font_family: Option<String>,
     pub editor_font_size: f32,
     pub line_height: LineHeightPreference,
+    pub line_wrap: LineWrapPreference,
     pub reduced_motion: bool,
 }
 
@@ -47,6 +48,7 @@ impl Default for AppearanceSettings {
             editor_font_family: None,
             editor_font_size: 14.0,
             line_height: LineHeightPreference::Default,
+            line_wrap: LineWrapPreference::NoWrap,
             reduced_motion: false,
         }
     }
@@ -97,6 +99,14 @@ pub enum LineHeightPreference {
     #[default]
     Default,
     Comfortable,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineWrapPreference {
+    #[default]
+    NoWrap,
+    Wrap,
 }
 
 impl LineHeightPreference {
@@ -294,6 +304,10 @@ mod tests {
         let path = directory.path().join("settings.json");
 
         assert_eq!(load(&path).unwrap(), Settings::default());
+        assert_eq!(
+            Settings::default().appearance.line_wrap,
+            LineWrapPreference::NoWrap
+        );
         assert!(!path.exists());
     }
 
@@ -451,6 +465,7 @@ mod tests {
                 editor_font_family: Some("Menlo".into()),
                 editor_font_size: 16.0,
                 line_height: LineHeightPreference::Comfortable,
+                line_wrap: LineWrapPreference::Wrap,
                 reduced_motion: true,
             },
             ..Settings::default()
