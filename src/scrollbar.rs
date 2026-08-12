@@ -194,6 +194,8 @@ pub(crate) fn show_horizontal(
     )
 }
 
+// The shared renderer keeps vertical and horizontal axis state explicit.
+#[expect(clippy::too_many_arguments)]
 fn show_axis(
     ui: &mut Ui,
     id: Id,

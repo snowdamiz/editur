@@ -91,8 +91,8 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
 }
 
 use egui::{
-    Align, Align2, Color32, CursorIcon, Id, Key, Label, Layout, RichText, ScrollArea,
-    Sense, TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
+    Align, Align2, Color32, CursorIcon, Id, Key, Label, Layout, RichText, ScrollArea, Sense,
+    TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
 };
 use winit::{
     application::ApplicationHandler,
@@ -1152,19 +1152,16 @@ fn draw_agent_working(ui: &mut egui::Ui, provider: ProviderId) -> egui::Response
     );
 
     let label = format!("{} is working", provider.display_name);
-    let galley = ui.painter().layout_no_wrap(
-        label,
-        theme::typography::small(),
-        theme::text().secondary,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label, theme::typography::small(), theme::text().secondary);
     let text_pos = egui::pos2(rect.left() + 36.0, rect.center().y - galley.size().y * 0.5);
     let dots_left = text_pos.x + galley.size().x + 10.0;
     ui.painter()
         .galley(text_pos, galley, theme::text().secondary);
     for index in 0..3 {
         let wave = (0.5
-            + 0.5
-                * ((time * 2.4 - f64::from(index) * 0.18) * std::f64::consts::TAU).sin())
+            + 0.5 * ((time * 2.4 - f64::from(index) * 0.18) * std::f64::consts::TAU).sin())
             as f32;
         ui.painter().circle_filled(
             egui::pos2(dots_left + index as f32 * 7.0, rect.center().y - wave * 2.0),
@@ -1652,6 +1649,8 @@ fn agent_tool_title(
     response
 }
 
+// Keeping the header's layout inputs explicit avoids a one-off parameter type.
+#[expect(clippy::too_many_arguments)]
 fn agent_collapsing_header(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
@@ -6084,16 +6083,13 @@ impl EditorApp {
     }
 
     fn update_agentic_sidebar_resize(&mut self, ctx: &egui::Context, window: egui::Rect) {
-        let (Some(sidebar), _) =
-            split_agentic_workspace(window, self.sidebar, self.sidebar_width)
+        let (Some(sidebar), _) = split_agentic_workspace(window, self.sidebar, self.sidebar_width)
         else {
             self.sidebar_dragging = false;
             return;
         };
-        let divider = egui::Rect::from_center_size(
-            sidebar.right_center(),
-            egui::vec2(5.0, sidebar.height()),
-        );
+        let divider =
+            egui::Rect::from_center_size(sidebar.right_center(), egui::vec2(5.0, sidebar.height()));
         let pointer = ctx.pointer_hover_pos();
         let (pressed, down) = ctx.input(|input| {
             (
@@ -10892,12 +10888,11 @@ impl EditorApp {
 
     fn draw_agent_find(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         if self.agent_find.dirty {
-            self.agent_find.matches =
-                agent_search_matches(
-                    &self.agent.transcript,
-                    &self.agent.changed_paths,
-                    &self.agent_find.query,
-                );
+            self.agent_find.matches = agent_search_matches(
+                &self.agent.transcript,
+                &self.agent.changed_paths,
+                &self.agent_find.query,
+            );
             self.agent_find.selected = self
                 .agent_find
                 .selected
@@ -10965,12 +10960,11 @@ impl EditorApp {
             self.agent_find.focus = false;
         }
         if changed {
-            self.agent_find.matches =
-                agent_search_matches(
-                    &self.agent.transcript,
-                    &self.agent.changed_paths,
-                    &self.agent_find.query,
-                );
+            self.agent_find.matches = agent_search_matches(
+                &self.agent.transcript,
+                &self.agent.changed_paths,
+                &self.agent_find.query,
+            );
             self.agent_find.selected = 0;
             self.agent_find.scroll_to_match = !self.agent_find.matches.is_empty();
             self.agent_find.dirty = false;
@@ -15774,7 +15768,10 @@ impl EditorApp {
                                 egui::Button::new(
                                     RichText::new("Cancel").color(theme::text().primary),
                                 )
-                                .fill(theme::composite(theme::state::hover(), theme::surface().raised))
+                                .fill(theme::composite(
+                                    theme::state::hover(),
+                                    theme::surface().raised,
+                                ))
                                 .stroke(theme::border::hairline())
                                 .corner_radius(theme::corner(theme::radius::CONTROL))
                                 .min_size(egui::vec2(84.0, theme::control::STANDARD)),
@@ -17920,7 +17917,10 @@ fn agentic_section_header(
     action: Option<(&'static str, &'static str)>,
 ) -> bool {
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), theme::control::COMPACT + theme::space::TIGHT),
+        egui::vec2(
+            ui.available_width(),
+            theme::control::COMPACT + theme::space::TIGHT,
+        ),
         Sense::hover(),
     );
     ui.painter().text(
@@ -17972,7 +17972,10 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
         .unwrap_or(root.as_os_str())
         .to_string_lossy();
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), theme::control::ROW + theme::space::TIGHT),
+        egui::vec2(
+            ui.available_width(),
+            theme::control::ROW + theme::space::TIGHT,
+        ),
         Sense::hover(),
     );
     let response = ui
@@ -17986,11 +17989,17 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
         )
     });
     if selected {
-        ui.painter()
-            .rect_filled(rect, theme::corner(theme::radius::CONTROL), theme::state::selected());
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::selected(),
+        );
     } else if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, theme::corner(theme::radius::CONTROL), theme::state::hover());
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
     }
     icons::paint(
         ui.painter(),
@@ -18071,11 +18080,17 @@ fn agent_session_row(
         )
     });
     if selected {
-        ui.painter()
-            .rect_filled(row, theme::corner(theme::radius::CONTROL), theme::state::selected());
+        ui.painter().rect_filled(
+            row,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::selected(),
+        );
     } else if open_response.hovered() {
-        ui.painter()
-            .rect_filled(row, theme::corner(theme::radius::CONTROL), theme::state::hover());
+        ui.painter().rect_filled(
+            row,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
     }
     if remove_response.hovered() {
         ui.painter().rect_filled(
@@ -18100,14 +18115,16 @@ fn agent_session_row(
     };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     let text_padding = theme::space::SMALL;
-    ui.painter().with_clip_rect(open.shrink2(egui::vec2(theme::space::TIGHT, 0.0))).galley(
-        egui::pos2(
-            open.left() + text_padding,
-            open.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        color,
-    );
+    ui.painter()
+        .with_clip_rect(open.shrink2(egui::vec2(theme::space::TIGHT, 0.0)))
+        .galley(
+            egui::pos2(
+                open.left() + text_padding,
+                open.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            color,
+        );
     if !compact || open_response.hovered() || remove_response.hovered() {
         ui.painter().text(
             remove.center(),

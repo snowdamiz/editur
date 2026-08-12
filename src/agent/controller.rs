@@ -354,7 +354,9 @@ impl ToolActivity {
             self.title.as_deref(),
             self.kind.as_deref(),
             &self.paths,
-            self.detail.as_ref().and_then(|detail| detail.input.as_deref()),
+            self.detail
+                .as_ref()
+                .and_then(|detail| detail.input.as_deref()),
         )
     }
 }
@@ -3276,9 +3278,9 @@ fn humanize_machine_tool_title(
         }
         other if other.bytes().all(|byte| byte.is_ascii_lowercase()) => {
             let mut chars = other.chars();
-            chars.next().map(|first| {
-                format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
-            })
+            chars
+                .next()
+                .map(|first| format!("{}{}", first.to_ascii_uppercase(), chars.as_str()))
         }
         _ => None,
     };
