@@ -1,0 +1,88 @@
+---
+import CopyCommand from "./CopyCommand.astro";
+import Section from "./Section.astro";
+import { UNIX_INSTALL, WIN_INSTALL } from "../lib/commands";
+---
+
+<Section
+  id="install"
+  index="install.sh"
+  title="One line from the shell."
+  lede="Both installers download from the continuous release and verify its SHA-256 checksum before installing anything."
+>
+  <div class="rise min-w-0 max-w-2xl" style="--i:3">
+    <div class="mb-4 flex items-center gap-3">
+      <span
+        class="grid size-6 place-items-center rounded-full border border-line-2 font-mono text-[11px] text-ink-3"
+      >
+        1
+      </span>
+      <p class="text-[15px] text-ink-2">Run the installer for your platform.</p>
+    </div>
+
+    <div class="flex gap-1" role="tablist" aria-label="Platform">
+      <button
+        class="tab-btn rounded-md border border-transparent px-3 py-1.5 font-mono text-xs text-ink-3 transition-colors hover:text-ink aria-selected:border-line-2 aria-selected:bg-raised aria-selected:text-ink"
+        type="button"
+        role="tab"
+        id="tab-unix"
+        aria-controls="panel-unix"
+        aria-selected="true"
+      >
+        macOS · Linux
+      </button>
+      <button
+        class="tab-btn rounded-md border border-transparent px-3 py-1.5 font-mono text-xs text-ink-3 transition-colors hover:text-ink aria-selected:border-line-2 aria-selected:bg-raised aria-selected:text-ink"
+        type="button"
+        role="tab"
+        id="tab-win"
+        aria-controls="panel-win"
+        aria-selected="false"
+      >
+        Windows
+      </button>
+    </div>
+
+    <div class="mt-3">
+      <div id="panel-unix" role="tabpanel" aria-labelledby="tab-unix">
+        <CopyCommand command={UNIX_INSTALL} id="cmd-unix" />
+      </div>
+      <div id="panel-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+        <CopyCommand command={WIN_INSTALL} id="cmd-win" />
+      </div>
+    </div>
+
+    <ol class="mt-8 space-y-4">
+      <li class="flex items-start gap-3">
+        <span
+          class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full border border-line-2 font-mono text-[11px] text-ink-3"
+        >
+          2
+        </span>
+        <p class="text-[15px] text-ink-2">
+          Open a new terminal if the installer asks you to, then open a project with
+          <code class="rounded-md bg-raised px-1.5 py-0.5 font-mono text-[13px] text-ink">editur .</code>
+        </p>
+      </li>
+      <li class="flex items-start gap-3">
+        <span
+          class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full border border-line-2 font-mono text-[11px] text-ink-3"
+        >
+          3
+        </span>
+        <p class="text-[15px] text-ink-2">
+          Update the installed binary at any time with
+          <code class="rounded-md bg-raised px-1.5 py-0.5 font-mono text-[13px] text-ink">editur update</code>.
+          It refuses to discard unsaved work.
+        </p>
+      </li>
+    </ol>
+
+    <p class="mt-8 max-w-[62ch] text-sm leading-relaxed text-ink-3">
+      macOS installs the native <code class="text-ink-2">Editur.app</code> bundle to
+      <code class="text-ink-2">~/Applications</code> with a CLI symlink. Windows installs the
+      icon-bearing executable and a Start menu entry. Linux installs the native executable.
+      Release assets carry GitHub artifact attestations.
+    </p>
+  </div>
+</Section>

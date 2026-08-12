@@ -1,0 +1,63 @@
+---
+import Section from "./Section.astro";
+
+const cells = [
+  {
+    key: "VS Code profile",
+    title: "Only the commands that exist",
+    body: "Platform conventions for save, search, panes, and sidebar. Nothing is bound to a feature Editur doesn't implement.",
+  },
+  {
+    key: "Vim profile",
+    title: "Practical modal editing",
+    body: "Normal, Insert, Replace, Visual character and line, and Operator-pending, with counts, text objects, registers, and a safe Ex subset.",
+  },
+  {
+    key: "Recorder",
+    title: "Up to four strokes",
+    body: "Record logical chords and opt a single stroke into physical-key-position matching when layout matters.",
+  },
+];
+---
+
+<Section
+  id="keys"
+  index="keybindings.json"
+  title="VS Code muscle memory, or real modal editing."
+  lede="Two immutable profiles ship with the editor. Customize derives an editable profile from either one without copying the preset, and every change is saved atomically without touching your buffers or undo history."
+>
+  <div class="rise grid gap-px overflow-hidden rounded-xl border border-line bg-line md:grid-cols-3" style="--i:3">
+    {
+      cells.map((cell) => (
+        <div class="bg-editor p-6">
+          <p class="font-mono text-[11px] text-accent">{cell.key}</p>
+          <h3 class="mt-3 text-base font-semibold text-ink">{cell.title}</h3>
+          <p class="mt-2 text-sm leading-relaxed text-ink-2">{cell.body}</p>
+        </div>
+      ))
+    }
+  </div>
+
+  <div class="rise mt-8 overflow-hidden rounded-xl border border-line-2 bg-raised shadow-(--shadow-lift)" style="--i:4">
+    <div class="flex items-center gap-2 border-b border-line px-3.5 py-2.5 font-mono text-[12px] text-ink-2">
+      <svg class="size-3.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M4 2.5h5.5L12.5 6v7.5H4z" stroke="currentColor"></path>
+      </svg>
+      keybindings.json
+      <span class="ml-auto text-ink-3">Custom profile</span>
+    </div>
+    <pre class="m-0 overflow-x-auto bg-editor p-4 font-mono text-[13px] leading-5"><code>{"{"}
+  <span class="text-syn-type">"profile"</span>: <span class="text-syn-string">"vscode+"</span>,
+  <span class="text-syn-type">"bindings"</span>: [
+    {"{"} <span class="text-syn-type">"key"</span>: <span class="text-syn-string">"cmd+k cmd+s"</span>, <span class="text-syn-type">"command"</span>: <span class="text-syn-string">"application.openKeyboardShortcuts"</span> {"}"},
+    {"{"} <span class="text-syn-type">"key"</span>: <span class="text-syn-string">"cmd+shift+f"</span>, <span class="text-syn-type">"command"</span>: <span class="text-syn-string">"search.searchProject"</span> {"}"},
+    {"{"} <span class="text-syn-type">"key"</span>: <span class="text-syn-string">"f12"</span>,          <span class="text-syn-type">"command"</span>: <span class="text-syn-string">"editor.goToDefinition"</span> {"}"}
+  ]
+{"}"}</code></pre>
+  </div>
+
+  <p class="rise mt-8 max-w-[62ch] text-sm leading-relaxed text-ink-3" style="--i:5">
+    Command palettes, multi-cursor editing, folding, refactoring, and arbitrary
+    <code class="text-ink-2">when</code> expressions are intentionally absent. Terminal control keys fall through to the PTY unless you explicitly override one.
+  </p>
+</Section>

@@ -1,0 +1,19 @@
+---
+import icon from "../assets/editur-icon.png";
+
+interface Props {
+  size?: number;
+  alt?: string;
+  class?: string;
+}
+
+const { size = 28, alt = "", class: className = "" } = Astro.props;
+---
+
+<img
+  src={icon.src}
+  width={size}
+  height={size}
+  alt={alt}
+  class:list={[className]}
+/>

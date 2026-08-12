@@ -1,0 +1,89 @@
+---
+import Logo from "./Logo.astro";
+import { REPO } from "../lib/commands";
+import { withBase } from "../lib/paths";
+
+const home = withBase("/");
+const links = [
+  { href: "#install", label: "Install" },
+  { href: "#editor", label: "Editor" },
+  { href: "#search", label: "Search" },
+  { href: "#agent", label: "Agent" },
+  { href: "#measured", label: "Measured" },
+];
+---
+
+<header
+  class="sticky top-0 z-40 border-b border-line bg-sunken/80 backdrop-blur-md"
+>
+  <div class="mx-auto flex h-14 max-w-6xl items-center gap-4 px-6">
+    <a href={home} class="flex items-center gap-2.5 text-ink no-underline">
+      <Logo size={28} class="rounded-[7px]" />
+      <span class="text-[15px] font-semibold tracking-tight">Editur</span>
+    </a>
+
+    <nav class="ml-2 hidden items-center gap-1 md:flex" aria-label="Sections">
+      {
+        links.map((link) => (
+          <a
+            href={link.href}
+            data-spy
+            class="rounded-md px-2.5 py-1 text-[13px] text-ink-3 no-underline transition-colors hover:text-ink aria-[current=page]:text-ink"
+          >
+            {link.label}
+          </a>
+        ))
+      }
+    </nav>
+
+    <div class="ml-auto flex items-center gap-1.5">
+      <button
+        id="theme-toggle"
+        type="button"
+        class="grid size-9 grid-cols-1 grid-rows-1 place-items-center rounded-md text-ink-2 transition-colors hover:bg-ink/5 hover:text-ink"
+        aria-label="Switch to light theme"
+      >
+        <svg class="icon-sun col-start-1 row-start-1 size-4" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="8" cy="8" r="3.25" stroke="currentColor"></circle>
+          <path
+            d="M8 1.5v1.25M8 13.25V14.5M1.5 8h1.25M13.25 8H14.5M3.22 3.22l.88.88M11.9 11.9l.88.88M3.22 12.78l.88-.88M11.9 4.1l.88-.88"
+            stroke="currentColor"
+            stroke-linecap="round"></path>
+        </svg>
+        <svg class="icon-moon col-start-1 row-start-1 size-4" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M13.5 9.2A5.5 5.5 0 1 1 6.8 2.5 4.5 4.5 0 0 0 13.5 9.2Z"
+            stroke="currentColor"
+            stroke-linejoin="round"></path>
+        </svg>
+      </button>
+      <a
+        href={REPO}
+        class="inline-flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] text-ink-2 no-underline transition-colors hover:bg-ink/5 hover:text-ink"
+      >
+        <svg class="size-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path
+            d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.68 7.68 0 0 1 8 3.5c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+          ></path>
+        </svg>
+        <span class="hidden sm:inline">Source</span>
+      </a>
+    </div>
+  </div>
+  <nav
+    class="flex gap-1 overflow-x-auto border-t border-line px-4 py-1 md:hidden"
+    aria-label="Sections"
+  >
+    {
+      links.map((link) => (
+        <a
+          href={link.href}
+          data-spy
+          class="shrink-0 rounded-md px-2.5 py-1.5 text-[13px] text-ink-3 no-underline aria-[current=page]:text-ink"
+        >
+          {link.label}
+        </a>
+      ))
+    }
+  </nav>
+</header>

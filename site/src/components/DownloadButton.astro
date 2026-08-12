@@ -1,0 +1,29 @@
+---
+import { DOWNLOADS } from "../lib/downloads";
+
+interface Props {
+  class?: string;
+}
+
+const fallback = DOWNLOADS["macos-arm"];
+const { class: className = "" } = Astro.props;
+---
+
+<a
+  data-download
+  href={fallback.href}
+  class:list={[
+    "inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-[15px] font-semibold text-on-accent no-underline transition-transform hover:-translate-y-px motion-reduce:hover:translate-y-0",
+    className,
+  ]}
+>
+  <span data-download-label>{fallback.label}</span>
+  <svg class="size-4" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="M8 2.5v8M4.5 7.5 8 11l3.5-3.5M3 13.5h10"
+      stroke="currentColor"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"></path>
+  </svg>
+</a>

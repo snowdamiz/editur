@@ -1,0 +1,78 @@
+---
+import Section from "./Section.astro";
+
+const facts = [
+  {
+    title: "Cursor and Codex, pinned.",
+    body: "Release builds ship one attested provider bundle at an exact version, never a mutable package tag or a global install.",
+  },
+  {
+    title: "Exact permission choices.",
+    body: "Tool activity, supplied diffs, and cancellation are rendered as the agent reports them.",
+  },
+  {
+    title: "No telemetry, no stored transcript.",
+    body: "Editur adds neither, and it never asks for or stores provider credentials.",
+  },
+  {
+    title: "Your buffer stays yours.",
+    body: "A dirty file must be saved before a prompt, and an external edit never overwrites unsaved work.",
+  },
+];
+---
+
+<Section
+  id="agent"
+  index="agent.acp"
+  title="An agent sidebar that costs nothing until you open it."
+  lede="Nothing provider-related is inspected, provisioned, or launched until Agent is opened for the first time. Normal startup builds one titlebar toggle and stops there."
+>
+  <div class="grid items-start gap-10 lg:grid-cols-2">
+    <ul class="rise space-y-5" style="--i:3">
+      {
+        facts.map((fact) => (
+          <li class="grid grid-cols-[auto_minmax(0,1fr)] gap-3 text-[15px] leading-relaxed text-ink-2">
+            <svg class="mt-1 size-4 text-accent" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+            <span>
+              <strong class="font-semibold text-ink">{fact.title}</strong>{" "}
+              {fact.body}
+            </span>
+          </li>
+        ))
+      }
+    </ul>
+
+    <div class="rise overflow-hidden rounded-xl border border-line-2 bg-raised shadow-(--shadow-lift)" style="--i:4">
+      <div class="flex items-center gap-2 border-b border-line px-3.5 py-2.5 font-mono text-[12px] text-ink-2">
+        <span class="size-1.5 rounded-full bg-success" aria-hidden="true"></span>
+        Agent
+        <span class="ml-auto text-ink-3">ACP v1</span>
+      </div>
+      <div class="bg-editor p-4 font-mono text-[13px] leading-6">
+        <div><span class="text-ink-3">→</span> <span class="text-accent">initialize</span></div>
+        <div>
+          <span class="text-ink-3">←</span> protocol <span class="text-syn-string">"v1"</span>, capabilities [
+        </div>
+        <div class="pl-6 text-ink-2">load-session, mcp/http, image,</div>
+        <div class="pl-6 text-ink-2">
+          session-list, <span class="text-syn-macro">cursor_login</span>
+        </div>
+        <div class="text-ink-2">]</div>
+        <div>
+          <span class="text-ink-3">→</span> session/new
+          <span class="text-syn-comment">{"  // project scoped"}</span>
+        </div>
+        <div>
+          <span class="text-ink-3">←</span> ready <span class="text-ink-3">in</span>
+          <span class="text-accent"> 291 ms</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="rise mt-10 max-w-[62ch] text-sm leading-relaxed text-ink-3" style="--i:5">
+    Permission cards reduce accidental execution, but they are not an operating-system sandbox. Prompts and relevant project code are sent to the provider you select, under that provider's own terms and billing.
+  </p>
+</Section>

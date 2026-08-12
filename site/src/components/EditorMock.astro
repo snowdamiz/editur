@@ -1,0 +1,162 @@
+<div
+  class="editor-mock overflow-hidden rounded-[12px] border border-line bg-chrome shadow-(--shadow-lift)"
+>
+  <div class="flex h-[34px] items-stretch border-b border-line">
+    <div
+      class="hidden w-[220px] shrink-0 items-center gap-0.5 border-r border-line pr-1 pl-[14px] md:flex"
+      aria-hidden="true"
+    >
+      <div class="mr-2 flex gap-2">
+        <span class="size-3 rounded-full bg-[#ff5f57]"></span>
+        <span class="size-3 rounded-full bg-[#febc2e]"></span>
+        <span class="size-3 rounded-full bg-[#28c840]"></span>
+      </div>
+      <span class="grid size-[34px] place-items-center text-ink" title="Files">
+        <svg class="h-[13px] w-4" viewBox="0 0 16 13" fill="none">
+          <rect x="0.6" y="0.6" width="14.8" height="11.8" rx="2" stroke="currentColor" stroke-width="1.2"></rect>
+          <path d="M4.5 0.6v11.8" stroke="currentColor" stroke-width="1.2"></path>
+          <rect x="0.6" y="0.6" width="3.9" height="11.8" rx="1" fill="currentColor" fill-opacity="0.22"></rect>
+        </svg>
+      </span>
+      <span class="grid size-[34px] place-items-center text-ink-3" title="Terminal">
+        <svg class="size-4" viewBox="0 0 16 16" fill="none">
+          <rect x="2.2" y="3.4" width="11.6" height="9.2" rx="1.2" stroke="currentColor" stroke-width="1.25"></rect>
+          <path d="M4.8 6.6 7 8.4 4.8 10.2M8.4 10.2h3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </span>
+      <span class="grid size-[34px] place-items-center text-ink-3" title="Settings">
+        <svg class="size-4" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.25"></circle>
+          <path
+            d="M8 2.5v1.4M8 12.1V13.5M2.5 8h1.4M12.1 8H13.5M4.05 4.05l.99.99M11 11l.99.99M4.05 11.95l.99-.99M11 5.04l.99-.99"
+            stroke="currentColor"
+            stroke-width="1.25"
+            stroke-linecap="round"></path>
+        </svg>
+      </span>
+    </div>
+
+    <div class="flex min-w-0 flex-1 items-stretch">
+      <div class="flex items-center gap-2 pl-3 md:hidden" aria-hidden="true">
+        <span class="size-3 rounded-full bg-[#ff5f57]"></span>
+        <span class="size-3 rounded-full bg-[#febc2e]"></span>
+        <span class="size-3 rounded-full bg-[#28c840]"></span>
+      </div>
+      <div
+        class="relative z-10 -mb-px flex min-w-[120px] items-center gap-2 bg-editor px-3 text-[12px] font-semibold text-ink"
+      >
+        save.rs
+        <span class="text-[11px] font-normal text-ink-3" aria-hidden="true">×</span>
+      </div>
+      <div class="flex min-w-[120px] items-center gap-2 px-3 text-[12px] text-ink-2">
+        main.rs
+        <span class="text-[11px] text-ink-3" aria-hidden="true">×</span>
+      </div>
+      <span class="ml-auto grid size-[34px] place-items-center text-ink-3" aria-hidden="true" title="Agent">
+        <svg class="size-4" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M6.4 2 7.7 5.5 11.2 6.8 7.7 8.1 6.4 11.6 5.1 8.1 1.6 6.8 5.1 5.5Z"></path>
+          <path d="M12 9.2 12.7 11.3 14.8 12 12.7 12.7 12 14.8 11.3 12.7 9.2 12 11.3 11.3Z"></path>
+        </svg>
+      </span>
+    </div>
+  </div>
+
+  <div class="grid min-h-[340px] grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)]">
+    <aside class="hidden border-r border-line bg-chrome md:block" aria-hidden="true">
+      <div class="flex h-7 items-center gap-1.5 px-3 text-[12px] font-semibold text-ink">
+        <svg class="size-4 text-ink-3" viewBox="0 0 16 16" fill="none">
+          <path d="M2.4 13V3.8h3.8l1.5 2h5.9V13Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+        </svg>
+        editur
+      </div>
+      <div class="relative px-1 pb-3 text-[12px] leading-7">
+        <div class="absolute top-0 bottom-3 left-[26px] w-px bg-line"></div>
+        <div class="flex h-7 items-center gap-1.5 pr-2 pl-4 font-semibold text-ink">
+          <svg class="size-3 text-ink-3" viewBox="0 0 16 16" fill="none">
+            <path d="M4 6.2 8 10.4 12 6.2" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+          <svg class="size-4 text-ink-3" viewBox="0 0 16 16" fill="none">
+            <path d="M2.4 13V3.8h3.8l1.5 2h5.9V13Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+          </svg>
+          src
+        </div>
+        <div class="ml-1 flex h-7 items-center gap-1.5 rounded-[4px] bg-accent/12 pr-2 pl-8 font-medium text-ink">
+          <svg class="size-4 text-accent" viewBox="0 0 16 16" fill="none">
+            <path d="M3.8 2.4h5.6L12.2 5.2v8.4H3.8Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+            <path d="M9.4 2.4v2.8h2.8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+          </svg>
+          save.rs
+        </div>
+        <div class="flex h-7 items-center gap-1.5 pr-2 pl-9 text-ink-2">
+          <svg class="size-4 text-ink-3/55" viewBox="0 0 16 16" fill="none">
+            <path d="M3.8 2.4h5.6L12.2 5.2v8.4H3.8Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+            <path d="M9.4 2.4v2.8h2.8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+          </svg>
+          main.rs
+        </div>
+        <div class="flex h-7 items-center gap-1.5 pr-2 pl-9 text-ink-2">
+          <svg class="size-4 text-ink-3/55" viewBox="0 0 16 16" fill="none">
+            <path d="M3.8 2.4h5.6L12.2 5.2v8.4H3.8Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+            <path d="M9.4 2.4v2.8h2.8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+          </svg>
+          theme.rs
+        </div>
+        <div class="flex h-7 items-center gap-1.5 pr-2 pl-5 text-ink-2">
+          <svg class="size-4 text-ink-3/55" viewBox="0 0 16 16" fill="none">
+            <path d="M3.8 2.4h5.6L12.2 5.2v8.4H3.8Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+            <path d="M9.4 2.4v2.8h2.8" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"></path>
+          </svg>
+          Cargo.toml
+        </div>
+      </div>
+    </aside>
+
+    <div class="bg-editor pt-1 pb-8 font-mono text-[14px] leading-5 [font-variant-ligatures:none]" aria-hidden="true">
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">1</span>
+        <span class="text-syn-comment">{"// The write is a rename, so a crash mid-save cannot"}</span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">2</span>
+        <span class="text-syn-comment">{"// leave a half-written file on disk."}</span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">3</span>
+        <span>
+          <span class="text-syn-keyword">let</span> stamp = <span class="text-syn-type">Metadata</span>::read(path)?;
+        </span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">4</span>
+        <span><span class="text-syn-keyword">if</span> stamp != opened_at {"{"}</span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">5</span>
+        <span>
+          &nbsp;&nbsp;<span class="text-syn-keyword">return</span>
+          <span class="text-syn-type"> Err</span>(<span class="text-syn-type">Conflict</span>::<span class="text-syn-macro">Changed</span>);
+        </span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">6</span>
+        <span>{"}"}</span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">7</span>
+        <span></span>
+      </div>
+      <div class="flex">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink-3">8</span>
+        <span>temp.write_all(buffer.as_bytes())?;</span>
+      </div>
+      <div class="flex bg-ink/5">
+        <span class="w-10 shrink-0 pr-3 text-right text-[12px] leading-5 text-ink">9</span>
+        <span>
+          temp.<span class="text-syn-macro">persist</span>(path)?;
+          <span class="text-syn-comment">{"  // atomic"}</span>
+          <span class="caret"></span>
+        </span>
+      </div>
+    </div>
+  </div>
+</div>

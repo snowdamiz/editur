@@ -1,0 +1,88 @@
+---
+import Section from "./Section.astro";
+import { PERFORMANCE } from "../lib/commands";
+
+const rows = [
+  {
+    metric: "Command to editable window, warm",
+    result: "181 ms",
+    target: "150 ms",
+    pass: false,
+  },
+  {
+    metric: "Open-request handoff to a running window, median",
+    result: "10.2 ms",
+    target: "25 ms · pass",
+    pass: true,
+  },
+  {
+    metric: "Incremental highlighting on 1 MiB, p95",
+    result: "4.30 ms",
+    target: "16 ms · pass",
+    pass: true,
+  },
+  {
+    metric: "Resize frame, p95",
+    result: "0.287 ms",
+    target: "10.6× faster",
+    pass: true,
+  },
+  {
+    metric: "Idle CPU",
+    result: "0.1%",
+    target: "<1% · pass",
+    pass: true,
+  },
+  {
+    metric: "Stripped arm64 binary",
+    result: "12.3 MiB",
+    target: "30 MiB · pass",
+    pass: true,
+  },
+];
+---
+
+<Section
+  id="measured"
+  index="benchmarks.md"
+  title="Measured, not asserted."
+  lede="Every number below comes from the stripped release build, recorded in the repository so you can reproduce it."
+>
+  <div class="rise overflow-x-auto rounded-xl border border-line" style="--i:3">
+    <table class="w-full min-w-[36rem] border-collapse text-left text-sm">
+      <caption class="sr-only">
+        Reference machine: Apple M4, 16 GB, macOS 26.5.2
+      </caption>
+      <thead class="bg-chrome font-mono text-[11px] tracking-[0.08em] text-ink-3 uppercase">
+        <tr>
+          <th class="px-4 py-3 font-medium" scope="col">Metric</th>
+          <th class="px-4 py-3 font-medium" scope="col">Result</th>
+          <th class="px-4 py-3 font-medium" scope="col">Target</th>
+        </tr>
+      </thead>
+      <tbody class="bg-editor">
+        {
+          rows.map((row) => (
+            <tr class="border-t border-line">
+              <th class="px-4 py-3 font-medium text-ink" scope="row">
+                {row.metric}
+              </th>
+              <td class="px-4 py-3 font-mono tabular-nums text-ink">{row.result}</td>
+              <td class:list={["px-4 py-3 font-mono tabular-nums", row.pass ? "text-success" : "text-ink-2"]}>
+                {row.target}
+              </td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+  <p class="mt-3 font-mono text-[11px] text-ink-3">
+    Reference machine: Apple M4, 16 GB, macOS 26.5.2
+  </p>
+
+  <p class="rise mt-8 max-w-[62ch] text-sm leading-relaxed text-ink-3" style="--i:4">
+    Windows and Linux runtime baselines still require their native release runners. The full table, its method, and the reproduction commands live in
+    <a class="text-accent underline decoration-accent/40 underline-offset-2" href={PERFORMANCE}>PERFORMANCE.md</a>.
+  </p>
+</Section>
