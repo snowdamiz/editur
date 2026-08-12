@@ -1058,9 +1058,7 @@ fn retry_denied_rename<T>(
     let mut remaining = attempts.max(1);
     loop {
         match rename() {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied && remaining > 1 =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && remaining > 1 => {
                 remaining -= 1;
                 sleep(std::time::Duration::from_millis(50));
             }
@@ -1895,33 +1893,45 @@ mod tests {
         let mut attempts = 0;
         let mut delays = Vec::new();
         assert!(
-            super::retry_denied_rename(5, |delay| delays.push(delay), || {
-                attempts += 1;
-                if attempts < 3 {
-                    Err(std::io::Error::from(ErrorKind::PermissionDenied))
-                } else {
-                    Ok(())
+            super::retry_denied_rename(
+                5,
+                |delay| delays.push(delay),
+                || {
+                    attempts += 1;
+                    if attempts < 3 {
+                        Err(std::io::Error::from(ErrorKind::PermissionDenied))
+                    } else {
+                        Ok(())
+                    }
                 }
-            })
+            )
             .is_ok()
         );
         assert_eq!(attempts, 3);
         assert_eq!(delays.len(), 2);
 
         attempts = 0;
-        let error = super::retry_denied_rename(5, |_| {}, || -> std::io::Result<()> {
-            attempts += 1;
-            Err(std::io::Error::from(ErrorKind::NotFound))
-        })
+        let error = super::retry_denied_rename(
+            5,
+            |_| {},
+            || -> std::io::Result<()> {
+                attempts += 1;
+                Err(std::io::Error::from(ErrorKind::NotFound))
+            },
+        )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
         assert_eq!(attempts, 1);
 
         attempts = 0;
-        let error = super::retry_denied_rename(3, |_| {}, || -> std::io::Result<()> {
-            attempts += 1;
-            Err(std::io::Error::from(ErrorKind::PermissionDenied))
-        })
+        let error = super::retry_denied_rename(
+            3,
+            |_| {},
+            || -> std::io::Result<()> {
+                attempts += 1;
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            },
+        )
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         assert_eq!(attempts, 3);
