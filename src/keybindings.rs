@@ -102,6 +102,8 @@ impl Scope {
 pub enum Command {
     AppOpenSettings,
     AppOpenKeybindings,
+    AppIncreaseUiScale,
+    AppDecreaseUiScale,
     AppCloseWindow,
     AppToggleAgentSidebar,
     AppToggleAgenticView,
@@ -310,6 +312,14 @@ pub static CATALOG: &[CommandInfo] = &[
         GLOBAL,
         false,
         false
+    ),
+    info!(
+        AppIncreaseUiScale,
+        "application.increaseUiScale", "Increase UI Scale", "Application", GLOBAL, false, false
+    ),
+    info!(
+        AppDecreaseUiScale,
+        "application.decreaseUiScale", "Decrease UI Scale", "Application", GLOBAL, false, false
     ),
     info!(
         AppCloseWindow,
@@ -1851,6 +1861,18 @@ pub fn vscode_bindings() -> Vec<BuiltinBinding> {
             vec![Stroke::primary(Key::K), Stroke::primary(Key::S)],
         ),
         builtin(
+            "vscode.application.increaseUiScale",
+            Command::AppIncreaseUiScale,
+            Scope::Global,
+            vec![Stroke::primary(Key::Plus).with_shift()],
+        ),
+        builtin(
+            "vscode.application.decreaseUiScale",
+            Command::AppDecreaseUiScale,
+            Scope::Global,
+            vec![Stroke::primary(Key::Minus).with_shift()],
+        ),
+        builtin(
             "vscode.editor.copy",
             Command::EditorCopy,
             Scope::DocumentEditor,
@@ -3307,6 +3329,36 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(result.command, Some(Command::SearchProject));
+    }
+
+    #[test]
+    fn interface_scale_shortcuts_are_global_and_customizable() {
+        let mut resolver = Resolver::new(
+            KeybindingSettings::default().effective_bindings().unwrap(),
+            Platform::Macos,
+        )
+        .unwrap();
+        let modifiers = Modifiers {
+            command: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+
+        let increase = resolver.resolve(
+            InputStroke::new(Key::Plus, Some(Key::Equals), modifiers),
+            &[Scope::Settings],
+            false,
+            Duration::ZERO,
+        );
+        let decrease = resolver.resolve(
+            InputStroke::new(Key::Minus, Some(Key::Minus), modifiers),
+            &[Scope::Terminal],
+            false,
+            Duration::ZERO,
+        );
+
+        assert_eq!(increase.command, Some(Command::AppIncreaseUiScale));
+        assert_eq!(decrease.command, Some(Command::AppDecreaseUiScale));
     }
 
     #[test]

@@ -68,12 +68,28 @@ pub(crate) mod border {
 
     /// Dialog, menu, and palette outlines.
     pub(crate) fn strong_color() -> Color32 {
-        super::overlay(36)
+        strong_color_for(color::palette())
+    }
+
+    pub(super) fn strong_color_for(palette: color::Palette) -> Color32 {
+        if palette.dark {
+            Color32::from_white_alpha(36)
+        } else {
+            Color32::from_black_alpha(112)
+        }
     }
 
     /// Keyboard focus ring, focused pane.
     pub(crate) fn focus_color() -> Color32 {
-        color::accent().gamma_multiply(0.55)
+        focus_color_for(color::palette())
+    }
+
+    pub(super) fn focus_color_for(palette: color::Palette) -> Color32 {
+        if palette.dark {
+            palette.accent.gamma_multiply(0.55)
+        } else {
+            palette.accent
+        }
     }
 
     pub(crate) fn hairline() -> Stroke {
@@ -134,21 +150,27 @@ pub(crate) fn callout(color: Color32) -> Callout {
     }
 }
 
-/// The diff colors. A diff row is the content under review rather than an
-/// annotation beside it, so it uses a dark semantic tint rather than the pale
-/// callout wash.
+/// The diff colors. Dark mode uses a deep tint; light mode uses the same pale
+/// semantic wash as callouts so green and red never become muddy blocks.
 pub(crate) mod diff {
     use egui::Color32;
 
     use super::super::color;
 
-    fn wash(color: Color32) -> Color32 {
-        let surface = color::surface();
-        color::mix(
-            color::mix(surface.editor, surface.sunken, 0.35),
-            color,
-            0.25,
-        )
+    pub(super) fn wash_for(palette: color::Palette, semantic: Color32) -> Color32 {
+        if palette.dark {
+            color::mix(
+                color::mix(palette.surface.editor, palette.surface.sunken, 0.35),
+                semantic,
+                0.25,
+            )
+        } else {
+            color::composite(color::subtle(semantic), palette.surface.editor)
+        }
+    }
+
+    fn wash(semantic: Color32) -> Color32 {
+        wash_for(color::palette(), semantic)
     }
 
     /// A syntax color on a tinted row: pushed toward the page the same way
@@ -220,7 +242,47 @@ pub(crate) mod editor {
 #[cfg(test)]
 mod tests {
     use super::super::color;
-    use super::{diff, fill, hover, selected_focus};
+    use super::{border, diff, fill, hover, selected_focus};
+
+    #[test]
+    fn light_focus_ring_clears_non_text_contrast() {
+        let rendered = color::composite(
+            border::focus_color_for(color::LIGHT),
+            color::LIGHT.surface.raised,
+        );
+
+        assert!(
+            color::contrast_ratio(rendered, color::LIGHT.surface.raised) >= 3.0,
+            "focus ring is not distinguishable on a light surface: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn light_strong_borders_clear_non_text_contrast() {
+        let rendered = color::composite(
+            border::strong_color_for(color::LIGHT),
+            color::LIGHT.surface.raised,
+        );
+
+        assert!(
+            color::contrast_ratio(rendered, color::LIGHT.surface.raised) >= 3.0,
+            "control border is not distinguishable on a light surface: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn light_diff_rows_use_pale_semantic_washes() {
+        let added = diff::wash_for(color::LIGHT, color::LIGHT.semantic.success);
+        let removed = diff::wash_for(color::LIGHT, color::LIGHT.semantic.danger);
+
+        assert!(
+            added.r() >= 200
+                && added.g() >= added.r() + 10
+                && removed.g() >= 200
+                && removed.r() >= removed.g() + 15,
+            "light semantic rows are muddy instead of pale: {added:?}, {removed:?}"
+        );
+    }
 
     #[test]
     fn diff_rows_stay_dark_without_losing_their_green_and_red_hues() {

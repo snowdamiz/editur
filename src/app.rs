@@ -149,7 +149,8 @@ use crate::{
     search::{SearchController, SearchHit, SearchResults},
     settings::{
         self, DensityPreference, LineHeightPreference, LineWrapPreference, ServerMode,
-        ServerOverride, Settings, ThemePreference,
+        ServerOverride, Settings, ThemePreference, UI_SCALE_MAX_PERCENT, UI_SCALE_MIN_PERCENT,
+        UI_SCALE_STEP_PERCENT,
     },
     syntax::{Highlighter, IncrementalHighlightCache, SyntaxManager},
     terminal::TerminalPanel,
@@ -3122,7 +3123,7 @@ fn agent_composer_content(composer: egui::Rect) -> egui::Rect {
         ),
         egui::pos2(
             composer.right() - theme::space::MEDIUM,
-            composer.bottom() - theme::space::LARGE,
+            composer.bottom() - (theme::space::LARGE - 5.0),
         ),
     )
 }
@@ -7117,6 +7118,25 @@ impl EditorApp {
                 ],
             );
             ui.separator();
+            settings_row(
+                ui,
+                "UI scale",
+                "Scales text, icons, spacing, panes, and hit targets together.",
+                |ui| {
+                    ui.spacing_mut().slider_width = 190.0;
+                    let before = appearance.ui_scale_percent;
+                    ui.add(
+                        egui::Slider::new(
+                            &mut appearance.ui_scale_percent,
+                            UI_SCALE_MIN_PERCENT..=UI_SCALE_MAX_PERCENT,
+                        )
+                        .step_by(f64::from(UI_SCALE_STEP_PERCENT))
+                        .suffix("%"),
+                    );
+                    dirty |= appearance.ui_scale_percent != before;
+                },
+            );
+            ui.separator();
             let reduced = settings_switch_row(
                 ui,
                 "Reduce motion",
@@ -8456,6 +8476,26 @@ impl EditorApp {
         }
     }
 
+    fn change_ui_scale(&mut self, increase: bool, ctx: &egui::Context) {
+        let current = self.settings.appearance.ui_scale_percent;
+        let next = if increase {
+            current
+                .saturating_add(UI_SCALE_STEP_PERCENT)
+                .min(UI_SCALE_MAX_PERCENT)
+        } else {
+            current
+                .saturating_sub(UI_SCALE_STEP_PERCENT)
+                .max(UI_SCALE_MIN_PERCENT)
+        };
+        if next == current {
+            return;
+        }
+        self.settings.appearance.ui_scale_percent = next;
+        self.persist_settings();
+        self.apply_appearance(ctx);
+        ctx.request_repaint();
+    }
+
     /// Pushes the Appearance settings into the live token layer so a change is
     /// visible on the next frame without a restart.
     fn apply_appearance(&self, ctx: &egui::Context) {
@@ -8479,6 +8519,8 @@ impl EditorApp {
         );
         theme::typography::set_code_family(appearance.editor_font_family.clone());
         theme::motion::set_reduced(ctx, appearance.reduced_motion);
+        ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        ctx.set_zoom_factor(f32::from(appearance.ui_scale_percent) / 100.0);
         theme::apply(ctx);
     }
 
@@ -9375,6 +9417,8 @@ impl EditorApp {
                 self.settings_section = SettingsSection::Keybindings;
                 self.open_settings();
             }
+            KeybindingCommand::AppIncreaseUiScale => self.change_ui_scale(true, ctx),
+            KeybindingCommand::AppDecreaseUiScale => self.change_ui_scale(false, ctx),
             KeybindingCommand::AppCloseWindow => self.request_close(),
             KeybindingCommand::AppToggleAgentSidebar => {
                 self.agent_sidebar = !self.agent_sidebar;
@@ -11498,7 +11542,10 @@ impl EditorApp {
                                                     "Rejected",
                                                     theme::diff::removed_ink(),
                                                 ),
-                                                _ => (selected.name.as_str(), Color32::GRAY),
+                                                _ => (
+                                                    selected.name.as_str(),
+                                                    theme::text().muted,
+                                                ),
                                             };
                                             egui::Frame::new()
                                             .fill(theme::surface().raised)
@@ -13819,7 +13866,7 @@ impl EditorApp {
         };
         if buffer.large_file_warning {
             ui.colored_label(
-                Color32::YELLOW,
+                theme::ink(theme::semantic().warning),
                 "Large file: syntax highlighting is disabled above 5 MiB.",
             );
         }
@@ -14965,7 +15012,7 @@ impl EditorApp {
                         ui.label(
                             RichText::new("That folder does not exist.")
                                 .font(theme::typography::small())
-                                .color(theme::semantic().danger),
+                                .color(theme::ink(theme::semantic().danger)),
                         );
                     }
                 });
@@ -17043,7 +17090,7 @@ fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {
         0.0,
         TextFormat {
             font_id: theme::typography::code_editor(),
-            color: Color32::LIGHT_GRAY,
+            color: theme::syntax().foreground,
             ..TextFormat::default()
         },
     );
@@ -22336,7 +22383,10 @@ mod tests {
         );
         let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT);
 
-        assert_eq!(content.bottom(), composer.bottom() - theme::space::LARGE);
+        assert_eq!(
+            content.bottom(),
+            composer.bottom() - (theme::space::LARGE - 5.0)
+        );
         assert_eq!(composer.right() - content.right(), theme::space::MEDIUM);
         assert_eq!(menu.bottom(), selector.top() - 4.0);
         assert_eq!(menu.height(), 16.0 + 3.0 * AGENT_MENU_ROW_HEIGHT);
@@ -22514,7 +22564,7 @@ mod tests {
         let left_gap = glyph_left - composer.left();
         let bottom_gap = composer.bottom() - attach.bottom();
         assert!((left_gap - theme::space::MEDIUM).abs() <= 2.0);
-        assert!((bottom_gap - theme::space::SMALL).abs() <= 2.0);
+        assert!((bottom_gap - (theme::space::SMALL - 5.0)).abs() <= 2.0);
         assert!(
             mode.left() > permissions.right() && model.left() > mode.right(),
             "selectors overlap: permissions={permissions:?}, mode={mode:?}, model={model:?}"
@@ -23155,6 +23205,13 @@ mod tests {
     }
 
     #[test]
+    fn plain_layout_uses_the_active_theme_foreground() {
+        let job = plain_text_job("large document", 320.0);
+
+        assert_eq!(job.sections[0].format.color, theme::syntax().foreground);
+    }
+
+    #[test]
     fn project_search_scrolls_only_when_keyboard_navigation_moves_selection() {
         assert_eq!(
             search_selection_after_navigation(12, 30, false, false),
@@ -23269,8 +23326,8 @@ mod tests {
             create: false,
         })
         .unwrap();
+        app.settings.appearance.ui_scale_percent = 200;
         let context = theme::test_context();
-        context.set_pixels_per_point(2.0);
         let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
