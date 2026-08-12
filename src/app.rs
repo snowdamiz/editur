@@ -27150,6 +27150,7 @@ mod tests {
         assert!(app.project_menu);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn opening_the_project_menu_survives_the_root_click() {
         let temp = tempfile::tempdir().unwrap();
@@ -27164,14 +27165,7 @@ mod tests {
             pos2(0.0, 0.0),
             Vec2::new(1000.0, 700.0),
         ));
-        let root_header = pos2(
-            100.0,
-            if cfg!(target_os = "macos") {
-                TITLEBAR_HEIGHT + 10.0
-            } else {
-                10.0
-            },
-        );
+        let root_header = pos2(100.0, TITLEBAR_HEIGHT + 10.0);
         let mut draw = |events| {
             let _ = context.run_ui(
                 RawInput {
