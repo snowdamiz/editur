@@ -1,6 +1,9 @@
 //! The palette. Every color in the product resolves through the active
 //! `Palette`, so a second theme is a data change rather than a refactor.
 
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::Color32;
@@ -135,18 +138,26 @@ pub(crate) const LIGHT: Palette = Palette {
 
 /// The window renders one palette at a time on one thread; a flag is enough,
 /// and it keeps every token a plain call instead of a threaded parameter.
+#[cfg(not(test))]
 static LIGHT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+std::thread_local! {
+    static LIGHT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 pub(crate) fn set_light(light: bool) {
+    #[cfg(not(test))]
     LIGHT_ACTIVE.store(light, Ordering::Relaxed);
+    #[cfg(test)]
+    LIGHT_ACTIVE.set(light);
 }
 
 pub(crate) fn palette() -> Palette {
-    if LIGHT_ACTIVE.load(Ordering::Relaxed) {
-        LIGHT
-    } else {
-        DARK
-    }
+    #[cfg(not(test))]
+    let light = LIGHT_ACTIVE.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let light = LIGHT_ACTIVE.get();
+    if light { LIGHT } else { DARK }
 }
 
 pub(crate) fn surface() -> Surfaces {
@@ -340,12 +351,40 @@ pub(crate) fn contrast_ratio(first: Color32, second: Color32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DARK, LIGHT, Palette, composite, contrast_ratio, subtle};
+    use super::{DARK, LIGHT, Palette, composite, contrast_ratio, palette, set_light, subtle};
     use crate::theme::state;
     use egui::Color32;
+    use std::sync::{Arc, Barrier};
 
     fn palettes() -> [Palette; 2] {
         [DARK, LIGHT]
+    }
+
+    #[test]
+    fn parallel_tests_keep_their_palette_local() {
+        let _flag = crate::theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_light(false);
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let thread = std::thread::spawn({
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            move || {
+                set_light(true);
+                ready.wait();
+                release.wait();
+            }
+        });
+
+        ready.wait();
+        let main_stayed_dark = palette().dark;
+        release.wait();
+        thread.join().unwrap();
+        set_light(false);
+
+        assert!(main_stayed_dark);
     }
 
     fn ramp(palette: &Palette) -> [Color32; 4] {
