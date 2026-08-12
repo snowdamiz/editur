@@ -18643,6 +18643,8 @@ fn settings_preset_matches(preset: &crate::lsp::Preset, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::picker_breadcrumb_segments;
     use super::{
         AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, AgenticDiff,
         CompletionPopup, DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT,
@@ -18660,14 +18662,13 @@ mod tests {
         draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
         editor_background, editor_column_content, file_result_job, find_highlighted_job,
         install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, pane_header_and_content, picker_breadcrumb_segments,
-        plain_text_job, presentation_job, project_chooser_ui, provider_selector_visible,
-        repaint_deadline, repaint_delay_after_texture_update, resize_divider_stroke,
-        run_everything_state, search_group_header, search_needs_polling,
-        search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
-        slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
-        split_bottom_panel, split_pane_content, split_workspace, stable_tab_drop_zone, tab_width,
-        unique_copy_path,
+        model_display_name, next_find_match, pane_header_and_content, plain_text_job,
+        presentation_job, project_chooser_ui, provider_selector_visible, repaint_deadline,
+        repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
+        search_group_header, search_needs_polling, search_selection_after_navigation,
+        should_show_project_chooser, skip_transition_render, slash_command_query,
+        split_agent_sidebar, split_agentic_diff, split_agentic_workspace, split_bottom_panel,
+        split_pane_content, split_workspace, stable_tab_drop_zone, tab_width, unique_copy_path,
     };
 
     #[test]
@@ -20346,9 +20347,10 @@ mod tests {
         Color32, CursorIcon, DroppedFile, Event, HoveredFile, Id, Key, Modifiers, MouseWheelUnit,
         PointerButton, RawInput, Rect, TouchPhase, Vec2, epaint::Shape, pos2,
     };
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
     use std::{
         fs,
-        path::{Path, PathBuf},
         time::{Duration, Instant},
     };
 
