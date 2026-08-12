@@ -858,8 +858,7 @@ pub fn ensure(
         .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
     let download = tempfile::tempdir_in(data_dir)
         .map_err(|error| format!("cannot stage ACP provider download: {error}"))?;
-    let mut response = ureq::get(&manifest.archive_url)
-        .call()
+    let mut response = crate::network::retry(|| crate::network::get(&manifest.archive_url))
         .map_err(|error| format!("cannot download {}: {error}", manifest.archive_url))?;
     if !valid_archive_uri(provider, response.get_uri()) {
         return Err(format!(

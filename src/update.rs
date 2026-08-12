@@ -133,9 +133,8 @@ fn advertised_checksum(checksum: &[u8]) -> Result<&str, String> {
 #[cfg(feature = "network")]
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     crate::network::retry(|| {
-        let mut response = ureq::get(url)
-            .call()
-            .map_err(|error| format!("cannot download {url}: {error}"))?;
+        let mut response =
+            crate::network::get(url).map_err(|error| format!("cannot download {url}: {error}"))?;
         response
             .body_mut()
             .with_config()

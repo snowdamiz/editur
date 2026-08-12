@@ -22,11 +22,25 @@ $releaseBase = 'https://github.com/snowdamiz/editur/releases/download/release'
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("editur-install-$([Guid]::NewGuid())")
 [IO.Directory]::CreateDirectory($temporary) | Out-Null
 
+function Get-EditurReleaseFile {
+    param([string]$Uri, [string]$OutFile)
+    $delays = @(1, 1, 3, 8)
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -UserAgent 'editur-install'
+            return
+        } catch {
+            if ($attempt -eq 4) { throw }
+            Start-Sleep -Seconds $delays[$attempt]
+        }
+    }
+}
+
 try {
     $binary = Join-Path $temporary $asset
     $checksum = "$binary.sha256"
-    Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset" -OutFile $binary
-    Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset.sha256" -OutFile $checksum
+    Get-EditurReleaseFile -Uri "$releaseBase/$asset" -OutFile $binary
+    Get-EditurReleaseFile -Uri "$releaseBase/$asset.sha256" -OutFile $checksum
 
     $expectedHash = (Get-Content -LiteralPath $checksum -Raw).Trim().ToLowerInvariant()
     if ($expectedHash -notmatch '^[0-9a-f]{64}$') {

@@ -27,10 +27,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-  "$release_base/$asset" --output "$download_dir/$asset"
-curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-  "$release_base/$asset.sha256" --output "$download_dir/$asset.sha256"
+download() {
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+    --retry 5 --retry-delay 1 --retry-all-errors --user-agent editur-install \
+    "$@"
+}
+
+download "$release_base/$asset" --output "$download_dir/$asset"
+download "$release_base/$asset.sha256" --output "$download_dir/$asset.sha256"
 
 expected_hash=$(tr -d '[:space:]' < "$download_dir/$asset.sha256" | tr 'A-F' 'a-f')
 case "$expected_hash" in

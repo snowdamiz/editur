@@ -9,7 +9,7 @@ It uses the host graphics API directly: Metal on macOS, Direct3D 12 on Windows 1
 Install on macOS or Linux:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh
+curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh
 ```
 
 Install on Windows from PowerShell:

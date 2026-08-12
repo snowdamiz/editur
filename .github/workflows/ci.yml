@@ -511,6 +511,34 @@ jobs:
               true,
             );
 
+      - name: Wait until release downloads are reachable
+        env:
+          RELEASE_TAG: ${{ github.ref == 'refs/heads/release' && 'release' || github.ref_name }}
+        run: |
+          set -eu
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          for asset in \
+            editur-linux-x86_64.sha256 \
+            editur-macos-aarch64.sha256 \
+            editur-macos-x86_64.sha256 \
+            editur-windows-x86_64.exe.sha256
+          do
+            ready=0
+            for _ in $(seq 1 30); do
+              if curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+                --max-time 20 --output /dev/null "$base/$asset"; then
+                echo "ready $asset"
+                ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "timed out waiting for $base/$asset" >&2
+              exit 1
+            fi
+          done
+
   verify-release:
     name: Verify ${{ matrix.platform }} bootstrap
     if: github.ref == 'refs/heads/release'

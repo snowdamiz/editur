@@ -1,5 +1,5 @@
 export const UNIX_INSTALL =
-  "curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh";
+  "curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh";
 
 export const WIN_INSTALL =
   "irm https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex";
