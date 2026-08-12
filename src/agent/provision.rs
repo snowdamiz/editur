@@ -1035,6 +1035,40 @@ fn provision_from_bytes_with(
     })
 }
 
+/// Windows briefly reports `Access is denied` when renaming a directory whose
+/// freshly extracted executable was just run for validation: antivirus scans
+/// and process teardown can still hold handles inside it. Retrying mirrors the
+/// staged-binary handoff in `update::finish_windows`.
+#[cfg(windows)]
+const ACTIVATION_RENAME_ATTEMPTS: u32 = 100;
+#[cfg(not(windows))]
+const ACTIVATION_RENAME_ATTEMPTS: u32 = 1;
+
+fn rename_for_activation(source: &Path, destination: &Path) -> std::io::Result<()> {
+    retry_denied_rename(ACTIVATION_RENAME_ATTEMPTS, std::thread::sleep, || {
+        fs::rename(source, destination)
+    })
+}
+
+fn retry_denied_rename<T>(
+    attempts: u32,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut rename: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut remaining = attempts.max(1);
+    loop {
+        match rename() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied && remaining > 1 =>
+            {
+                remaining -= 1;
+                sleep(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn provision_from_bytes_locked(
     manifest: &SidecarManifest,
     data_dir: &Path,
@@ -1095,10 +1129,10 @@ fn provision_from_bytes_locked(
             .tempdir_in(&versions)
             .map_err(|error| format!("cannot stage {display_name} repair: {error}"))?;
         let previous = replaced.path().join("previous");
-        fs::rename(&destination, &previous)
+        rename_for_activation(&destination, &previous)
             .map_err(|error| format!("cannot stage corrupt {display_name} for repair: {error}"))?;
-        if let Err(error) = fs::rename(&staged, &destination) {
-            let rollback = fs::rename(&previous, &destination);
+        if let Err(error) = rename_for_activation(&staged, &destination) {
+            let rollback = rename_for_activation(&previous, &destination);
             let _ = fs::remove_dir_all(&staged);
             return Err(match rollback {
                 Ok(()) => format!("cannot activate repaired {display_name}: {error}"),
@@ -1109,7 +1143,7 @@ fn provision_from_bytes_locked(
         }
         Some(replaced)
     } else {
-        if let Err(error) = fs::rename(&staged, &destination) {
+        if let Err(error) = rename_for_activation(&staged, &destination) {
             let _ = fs::remove_dir_all(&staged);
             return Err(format!("cannot activate {display_name}: {error}"));
         }
@@ -1853,6 +1887,45 @@ mod tests {
     };
     #[cfg(feature = "network")]
     use super::{valid_archive_uri, valid_cursor_archive_uri};
+
+    #[test]
+    fn activation_renames_retry_only_transient_access_denials() {
+        use std::io::ErrorKind;
+
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        assert!(
+            super::retry_denied_rename(5, |delay| delays.push(delay), || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_ok()
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(delays.len(), 2);
+
+        attempts = 0;
+        let error = super::retry_denied_rename(5, |_| {}, || -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::Error::from(ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+
+        attempts = 0;
+        let error = super::retry_denied_rename(3, |_| {}, || -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 3);
+    }
 
     fn manifest() -> SidecarManifest {
         SidecarManifest {
