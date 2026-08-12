@@ -35,6 +35,44 @@ pub(crate) fn selected_focus() -> Color32 {
     color::accent().gamma_multiply(0.16)
 }
 
+/// Search hits. A find highlight has to survive on any surface the document
+/// or transcript puts under it — including the red and green diff washes —
+/// so both chips are fully opaque: a translucent wash blended into a diff row
+/// turns into mud.
+pub(crate) mod find {
+    use egui::Color32;
+
+    use super::super::color;
+
+    /// Every match except the active one: a warm chip no interaction state
+    /// uses, so a hit cannot be misread as a hover or a selection. Opaque so
+    /// it looks identical over the editor, markdown, and diff rows.
+    pub(crate) fn match_fill() -> Color32 {
+        color::composite(
+            color::semantic().warning.gamma_multiply(0.45),
+            color::surface().editor,
+        )
+    }
+
+    /// The match the search is parked on: the full accent, no wash.
+    pub(crate) fn active_fill() -> Color32 {
+        color::accent()
+    }
+
+    /// The text on the active chip. The accent is a solid fill now, so the
+    /// original syntax color underneath can no longer be trusted to read.
+    pub(crate) fn active_ink() -> Color32 {
+        let fill = active_fill();
+        if color::contrast_ratio(Color32::BLACK, fill)
+            >= color::contrast_ratio(Color32::WHITE, fill)
+        {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        }
+    }
+}
+
 pub(crate) fn fill(selected_row: bool, focused: bool, hovered: bool, pressed: bool) -> Color32 {
     if selected_row {
         if focused {
@@ -242,7 +280,7 @@ pub(crate) mod editor {
 #[cfg(test)]
 mod tests {
     use super::super::color;
-    use super::{border, diff, fill, hover, selected_focus};
+    use super::{border, diff, fill, find, hover, selected_focus};
 
     #[test]
     fn light_focus_ring_clears_non_text_contrast() {
@@ -349,6 +387,44 @@ mod tests {
             "removed-row numbers vanish into the wash: {:?} on {:?}",
             diff::removed_number(),
             diff::removed()
+        );
+    }
+
+    #[test]
+    fn find_matches_shout_over_the_document_instead_of_whispering() {
+        let editor = color::surface().editor;
+        let matched = find::match_fill();
+        let active = find::active_fill();
+
+        // Opaque chips are the whole point: a translucent wash disappears
+        // into the red and green diff rows.
+        assert_eq!(matched.a(), 255, "the match chip must be opaque");
+        assert_eq!(active.a(), 255, "the active chip must be opaque");
+        assert!(
+            color::contrast_ratio(matched, editor) >= 1.8,
+            "a plain match barely rises off the page: {matched:?} on {editor:?}"
+        );
+        assert!(
+            color::contrast_ratio(active, matched) >= 1.4,
+            "the active match cannot be told from the other hits"
+        );
+        for wash in [diff::added(), diff::removed()] {
+            assert!(
+                color::contrast_ratio(matched, wash) >= 1.5,
+                "a match vanishes into the {wash:?} diff row: {matched:?}"
+            );
+            assert!(
+                color::contrast_ratio(active, wash) >= 3.0,
+                "the active match vanishes into the {wash:?} diff row: {active:?}"
+            );
+        }
+        assert!(
+            color::contrast_ratio(color::text().primary, matched) >= 4.5,
+            "highlighted text stops being readable on {matched:?}"
+        );
+        assert!(
+            color::contrast_ratio(find::active_ink(), active) >= 4.5,
+            "the active chip's ink stops being readable on {active:?}"
         );
     }
 

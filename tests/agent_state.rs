@@ -213,19 +213,19 @@ fn finished_turns_finalize_tools_that_never_completed() {
 }
 
 #[test]
-fn streamed_unicode_is_trimmed_only_at_character_boundaries() {
+fn streamed_unicode_is_retained_without_truncation() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("a".repeat(64 * 1024 - 1)));
     state.apply(Event::AssistantDelta("é".into()));
 
     assert!(matches!(
         state.transcript.back(),
-        Some(TranscriptItem::Assistant(text)) if text.len() <= 64 * 1024 && text.is_char_boundary(text.len())
+        Some(TranscriptItem::Assistant(text)) if text.len() == 64 * 1024 + 1 && text.ends_with('é')
     ));
 }
 
 #[test]
-fn transcript_trimming_never_leaves_hollow_tool_cards() {
+fn transcript_retains_every_large_tool_card() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("keep me".into()));
     for id in 0..17 {
@@ -243,19 +243,30 @@ fn transcript_trimming_never_leaves_hollow_tool_cards() {
         }));
     }
 
+    assert_eq!(state.transcript.len(), 18);
     assert!(matches!(
         state.transcript.front(),
-        Some(TranscriptItem::Truncated)
+        Some(TranscriptItem::Assistant(text)) if text == "keep me"
     ));
-    assert!(
-        !state
-            .transcript
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.detail.is_none()))
+}
+
+#[test]
+fn edit_tool_tracks_its_own_diff_totals() {
+    let mut state = AgentState::default();
+    state.apply(diff_event(
+        "edit",
+        "/w/lib.rs",
+        Some("keep\nremove\n"),
+        "keep\nadd one\nadd two\n",
+    ));
+
+    assert_eq!(
+        state.tool_change("edit"),
+        Some(FileChange {
+            added: 2,
+            removed: 1,
+        })
     );
-    assert!(state.transcript.iter().any(|item| {
-        matches!(item, TranscriptItem::Tool(tool) if tool.id == "16" && tool.detail.is_some())
-    }));
 }
 
 #[test]
@@ -325,7 +336,7 @@ fn split_tool_updates_preserve_input_and_structured_output() {
 }
 
 #[test]
-fn zero_detail_tools_and_changed_paths_are_bounded() {
+fn transcript_tools_are_retained_while_changed_paths_stay_bounded() {
     let mut state = AgentState::default();
     for id in 0..5_000 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
@@ -338,12 +349,8 @@ fn zero_detail_tools_and_changed_paths_are_bounded() {
         }));
     }
 
-    assert!(state.transcript.len() <= 2_049);
+    assert_eq!(state.transcript.len(), 5_000);
     assert!(state.changed_paths.len() <= 4_096);
-    assert!(matches!(
-        state.transcript.front(),
-        Some(TranscriptItem::Truncated)
-    ));
 }
 
 #[test]
@@ -470,7 +477,7 @@ fn diff_line_stats_accumulate_without_double_counting_streamed_updates() {
 }
 
 #[test]
-fn diff_line_stats_survive_transcript_trimming() {
+fn diff_line_stats_and_their_tool_survive_large_transcripts() {
     let mut state = AgentState::default();
     state.apply(Event::ToolCallUpdated(ToolActivity {
         id: "early-edit".into(),
@@ -488,7 +495,6 @@ fn diff_line_stats_survive_transcript_trimming() {
             output: None,
         }),
     }));
-    // Blow the transcript byte budget so the early tool is trimmed.
     for id in 0..40 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
             id: format!("big-{id}"),
@@ -505,7 +511,7 @@ fn diff_line_stats_survive_transcript_trimming() {
     }
 
     assert!(
-        !state
+        state
             .transcript
             .iter()
             .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "early-edit"))

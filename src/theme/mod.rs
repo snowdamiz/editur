@@ -13,8 +13,8 @@ pub(crate) use color::contrast_ratio;
 pub(crate) use color::traffic;
 #[allow(unused_imports)] // public token surface; consumers arrive over time
 pub(crate) use color::{
-    accent, ansi, composite, ink, mix, semantic, set_light, subtle, surface, syntax, text,
-    text_disabled,
+    accent, ansi, composite, ink, mix, semantic, set_light, settings, subtle, surface, syntax,
+    text, text_disabled,
 };
 pub(crate) use metrics::{
     Density, chrome, control, corner, density, radius, set_density, shadow, space, stroke,
@@ -58,8 +58,10 @@ pub(crate) fn test_context() -> Context {
 pub(crate) fn apply_to(style: &mut Style) {
     // Motion is explicit and quantized in `theme::motion`; nothing may rely on
     // egui's implicit per-widget animation, which the retained renderer cannot
-    // fold into a revision.
+    // fold into a revision. Programmatic scrolls (scroll_to_rect) jump for the
+    // same reason.
     style.animation_time = 0.0;
+    style.scroll_animation = egui::style::ScrollAnimation::none();
     style.text_styles = typography::text_styles();
     style.spacing.item_spacing = egui::vec2(space::SMALL, space::TIGHT);
     style.spacing.button_padding = egui::vec2(space::MEDIUM, space::SNUG);

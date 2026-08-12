@@ -32,6 +32,7 @@ pub(crate) enum Icon {
     Terminal,
     Gear,
     ArrowUp,
+    Download,
     Refresh,
     History,
     Warning,
@@ -156,6 +157,11 @@ const ARROW_UP: &[Segment] = &[
     Segment::Line(&[(8.0, 12.8), (8.0, 3.4)]),
     Segment::Line(&[(3.9, 7.5), (8.0, 3.4), (12.1, 7.5)]),
 ];
+const DOWNLOAD: &[Segment] = &[
+    Segment::Line(&[(8.0, 2.6), (8.0, 10.2)]),
+    Segment::Line(&[(4.2, 6.4), (8.0, 10.2), (11.8, 6.4)]),
+    Segment::Line(&[(3.2, 13.2), (12.8, 13.2)]),
+];
 const REFRESH: &[Segment] = &[
     Segment::Circle {
         center: (8.0, 8.0),
@@ -240,6 +246,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Terminal => TERMINAL,
         Icon::Gear => GEAR,
         Icon::ArrowUp => ARROW_UP,
+        Icon::Download => DOWNLOAD,
         Icon::Refresh => REFRESH,
         Icon::History => HISTORY,
         Icon::Warning => WARNING,
@@ -251,7 +258,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 24] = [
+pub(crate) const ALL: [Icon; 25] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -270,6 +277,7 @@ pub(crate) const ALL: [Icon; 24] = [
     Icon::Terminal,
     Icon::Gear,
     Icon::ArrowUp,
+    Icon::Download,
     Icon::Refresh,
     Icon::History,
     Icon::Warning,

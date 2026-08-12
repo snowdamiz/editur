@@ -22,6 +22,20 @@ pub(crate) struct Surfaces {
     pub(crate) input: Color32,
 }
 
+/// The settings page sits visually apart from the document: its column and
+/// cards are darker than the editor ramp, while the controls on those cards
+/// lift above them. Separate tokens so retuning settings never moves the
+/// editor, terminal, or menus.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingsSurfaces {
+    /// The content column behind the cards.
+    pub(crate) content: Color32,
+    /// A card grouping related settings rows.
+    pub(crate) card: Color32,
+    /// Buttons and closed dropdowns sitting on a card.
+    pub(crate) control: Color32,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TextRoles {
     /// Code, active tab, dialog titles, selected rows.
@@ -59,6 +73,7 @@ pub(crate) struct Palette {
     pub(crate) dark: bool,
     pub(crate) accent: Color32,
     pub(crate) surface: Surfaces,
+    pub(crate) settings: SettingsSurfaces,
     pub(crate) text: TextRoles,
     pub(crate) semantic: Semantics,
     pub(crate) syntax: SyntaxRoles,
@@ -75,6 +90,11 @@ pub(crate) const DARK: Palette = Palette {
         editor: Color32::from_rgb(27, 27, 31),
         raised: Color32::from_rgb(33, 33, 38),
         input: Color32::from_rgb(21, 21, 25),
+    },
+    settings: SettingsSurfaces {
+        content: Color32::from_rgb(22, 22, 26),
+        card: Color32::from_rgb(30, 30, 35),
+        control: Color32::from_rgb(40, 40, 46),
     },
     text: TextRoles {
         primary: Color32::from_rgb(233, 234, 238),
@@ -111,6 +131,11 @@ pub(crate) const LIGHT: Palette = Palette {
         editor: Color32::from_rgb(243, 243, 246),
         raised: Color32::from_rgb(255, 255, 255),
         input: Color32::from_rgb(236, 236, 240),
+    },
+    settings: SettingsSurfaces {
+        content: Color32::from_rgb(234, 234, 238),
+        card: Color32::from_rgb(247, 247, 250),
+        control: Color32::from_rgb(255, 255, 255),
     },
     text: TextRoles {
         primary: Color32::from_rgb(18, 19, 23),
@@ -162,6 +187,10 @@ pub(crate) fn palette() -> Palette {
 
 pub(crate) fn surface() -> Surfaces {
     palette().surface
+}
+
+pub(crate) fn settings() -> SettingsSurfaces {
+    palette().settings
 }
 
 pub(crate) fn text() -> TextRoles {
@@ -324,7 +353,6 @@ pub(crate) fn composite(overlay: Color32, base: Color32) -> Color32 {
     )
 }
 
-#[cfg(test)]
 fn relative_luminance(color: Color32) -> f32 {
     let channel = |value: u8| {
         let value = f32::from(value) / 255.0;
@@ -338,7 +366,6 @@ fn relative_luminance(color: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio between two opaque colors, from 1.0 to 21.0.
-#[cfg(test)]
 pub(crate) fn contrast_ratio(first: Color32, second: Color32) -> f32 {
     let (first, second) = (relative_luminance(first), relative_luminance(second));
     let (lighter, darker) = if first >= second {
@@ -467,6 +494,39 @@ mod tests {
                     ratio >= minimum,
                     "{color:?} code is only {ratio:.2}:1 against the document"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_surfaces_sit_darker_than_the_page_but_keep_text_legible() {
+        for palette in palettes() {
+            let settings = palette.settings;
+            assert!(
+                settings.content.r() > palette.surface.chrome.r(),
+                "the settings column has to sit slightly above the rail beside it"
+            );
+            assert!(
+                settings.content.r() < palette.surface.editor.r(),
+                "the settings column has to sit below the document surface"
+            );
+            assert!(settings.card.r() > settings.content.r());
+            assert!(
+                settings.control.r() > settings.card.r(),
+                "a button has to lift above the card it sits on"
+            );
+            for color in [
+                palette.text.primary,
+                palette.text.secondary,
+                palette.text.muted,
+            ] {
+                for surface in [settings.content, settings.card, settings.control] {
+                    let ratio = contrast_ratio(color, surface);
+                    assert!(
+                        ratio >= 4.5,
+                        "{color:?} on {surface:?} is only {ratio:.2}:1"
+                    );
+                }
             }
         }
     }

@@ -9,9 +9,7 @@ use super::controller::{
     PlanProposal, Question, QuestionOption, SessionChoice, ToolActivity, ToolDetail, ToolOutput,
 };
 
-const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
-const MAX_TRANSCRIPT_ITEMS: usize = 2_048;
 const MAX_CHANGED_PATHS: usize = 4_096;
 const MAX_CHOICES: usize = 128;
 const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
@@ -31,7 +29,6 @@ pub enum TranscriptItem {
     Permission(PermissionCard),
     Interaction(InteractionCard),
     Error(String),
-    Truncated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,8 +55,7 @@ pub struct UsageState {
 }
 
 /// Added/removed line counts for one file, accumulated across every diff the
-/// agent produced for it this session. Kept beside the transcript rather than
-/// derived from it, because `trim()` eventually evicts old transcript items.
+/// agent produced for it this session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileChange {
     pub added: u64,
@@ -72,6 +68,7 @@ struct SessionLoadBackup {
     baselines: HashMap<PathBuf, Option<String>>,
     baseline_bytes: usize,
     tool_credits: HashMap<(String, PathBuf), FileChange>,
+    tool_changes: HashMap<String, FileChange>,
     title: Option<String>,
     usage: Option<UsageState>,
 }
@@ -89,9 +86,8 @@ pub struct AgentState {
     pub changed_paths: HashMap<PathBuf, FileChange>,
     /// The content each changed file had before the agent's first recorded
     /// edit this session (`None` inside an entry = the agent created the
-    /// file). Captured from the first diff per path and kept beside
-    /// `changed_paths` so the diff view survives `trim()` evicting old tool
-    /// cards. Oversized files are skipped, never truncated.
+    /// file). Captured from the first diff per path. Oversized files are
+    /// skipped, never truncated.
     pub baselines: HashMap<PathBuf, Option<String>>,
     /// Bytes currently held in `baselines`, enforcing the retention cap.
     baseline_bytes: usize,
@@ -99,6 +95,8 @@ pub struct AgentState {
     /// that streams the same diff repeatedly replaces its contribution
     /// instead of double-counting it.
     tool_credits: HashMap<(String, PathBuf), FileChange>,
+    /// Added/removed totals by tool call, for individual edit card headers.
+    pub(crate) tool_changes: HashMap<String, FileChange>,
     /// Paths not yet reflected in the tree/search; drained by the refresh
     /// pass after each turn so `changed_paths` can persist for the UI.
     pub refresh_queue: HashSet<PathBuf>,
@@ -128,6 +126,7 @@ impl Default for AgentState {
             baselines: HashMap::new(),
             baseline_bytes: 0,
             tool_credits: HashMap::new(),
+            tool_changes: HashMap::new(),
             refresh_queue: HashSet::new(),
             current_mode: None,
             modes: Vec::new(),
@@ -186,6 +185,10 @@ impl AgentState {
         true
     }
 
+    pub fn tool_change(&self, tool_id: &str) -> Option<FileChange> {
+        self.tool_changes.get(tool_id).copied()
+    }
+
     pub fn apply(&mut self, event: Event) {
         match event {
             Event::ConnectionChanged(connection) => {
@@ -215,6 +218,7 @@ impl AgentState {
                 self.baselines.clear();
                 self.baseline_bytes = 0;
                 self.tool_credits.clear();
+                self.tool_changes.clear();
                 self.refresh_queue.clear();
                 self.session_id = None;
                 self.title = None;
@@ -238,6 +242,7 @@ impl AgentState {
                     baselines: std::mem::take(&mut self.baselines),
                     baseline_bytes: std::mem::take(&mut self.baseline_bytes),
                     tool_credits: std::mem::take(&mut self.tool_credits),
+                    tool_changes: std::mem::take(&mut self.tool_changes),
                     title: self.title.take(),
                     usage: self.usage.take(),
                 });
@@ -254,6 +259,7 @@ impl AgentState {
                     self.baselines = backup.baselines;
                     self.baseline_bytes = backup.baseline_bytes;
                     self.tool_credits = backup.tool_credits;
+                    self.tool_changes = backup.tool_changes;
                     self.title = backup.title;
                     self.usage = backup.usage;
                 }
@@ -307,35 +313,19 @@ impl AgentState {
                 self.active = true;
                 self.prompt.clear();
                 if !text.is_empty() {
-                    self.push(TranscriptItem::User(bounded(text)));
+                    self.push(TranscriptItem::User(text));
                 }
             }
             Event::AssistantDelta(text) => {
-                let text = bounded(text);
-                if let Some(TranscriptItem::Assistant(current)) = self.transcript.back_mut()
-                    && current.len() < MAX_ITEM_BYTES
-                {
-                    let remaining = MAX_ITEM_BYTES - current.len();
-                    let mut end = text.len().min(remaining);
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    current.push_str(&text[..end]);
+                if let Some(TranscriptItem::Assistant(current)) = self.transcript.back_mut() {
+                    current.push_str(&text);
                 } else {
                     self.push(TranscriptItem::Assistant(text));
                 }
             }
             Event::ThoughtDelta(text) => {
-                let text = bounded(text);
-                if let Some(TranscriptItem::Thought(current)) = self.transcript.back_mut()
-                    && current.len() < MAX_ITEM_BYTES
-                {
-                    let remaining = MAX_ITEM_BYTES - current.len();
-                    let mut end = text.len().min(remaining);
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    current.push_str(&text[..end]);
+                if let Some(TranscriptItem::Thought(current)) = self.transcript.back_mut() {
+                    current.push_str(&text);
                 } else {
                     self.push(TranscriptItem::Thought(text));
                 }
@@ -347,9 +337,8 @@ impl AgentState {
             Event::PlanUpdated(plan) => {
                 let plan = plan
                     .into_iter()
-                    .take(MAX_TRANSCRIPT_ITEMS)
                     .map(|item| PlanItem {
-                        content: bounded(item.content),
+                        content: item.content,
                         status: bounded(item.status),
                     })
                     .collect();
@@ -498,17 +487,16 @@ impl AgentState {
                 self.active = false;
                 self.finalize_running_tools(if cancelled { "Cancelled" } else { "Failed" });
             }
-            Event::Error(error) => self.push(TranscriptItem::Error(bounded(error))),
+            Event::Error(error) => self.push(TranscriptItem::Error(error)),
             Event::ProcessExited { error, diagnostics } => {
                 self.active = false;
                 self.session_ready = false;
                 self.connection = ConnectionState::Failed(error.clone());
-                self.diagnostics = (!diagnostics.is_empty()).then(|| bounded(diagnostics));
-                self.push(TranscriptItem::Error(bounded(error)));
+                self.diagnostics = (!diagnostics.is_empty()).then_some(diagnostics);
+                self.push(TranscriptItem::Error(error));
                 self.finalize_running_tools("Failed");
             }
         }
-        self.trim();
     }
 
     fn push(&mut self, item: TranscriptItem) {
@@ -573,6 +561,15 @@ impl AgentState {
         } else {
             return;
         };
+        let tool = self.tool_changes.entry(tool_id.to_owned()).or_default();
+        tool.added = tool
+            .added
+            .saturating_sub(previous.added)
+            .saturating_add(stats.added);
+        tool.removed = tool
+            .removed
+            .saturating_sub(previous.removed)
+            .saturating_add(stats.removed);
         if self.changed_paths.len() >= MAX_CHANGED_PATHS && !self.changed_paths.contains_key(&path)
         {
             return;
@@ -586,23 +583,6 @@ impl AgentState {
             .removed
             .saturating_sub(previous.removed)
             .saturating_add(stats.removed);
-    }
-
-    fn trim(&mut self) {
-        let mut removed = matches!(self.transcript.front(), Some(TranscriptItem::Truncated));
-        if removed {
-            self.transcript.pop_front();
-        }
-        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
-        while self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES {
-            if let Some(item) = self.transcript.pop_front() {
-                bytes = bytes.saturating_sub(item_size(&item));
-                removed = true;
-            }
-        }
-        if removed {
-            self.transcript.push_front(TranscriptItem::Truncated);
-        }
     }
 }
 
@@ -732,13 +712,12 @@ fn bounded_plan(item: PlanItem) -> PlanItem {
 
 fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
     ToolDetail {
-        input: detail.input.map(bounded),
+        input: detail.input,
         content: detail
             .content
             .into_iter()
-            .take(MAX_CHOICES)
             .map(|content| match content {
-                ToolOutput::Text(text) => ToolOutput::Text(bounded(text)),
+                ToolOutput::Text(text) => ToolOutput::Text(text),
                 ToolOutput::Content(content) => ToolOutput::Content(bounded_content(content)),
                 ToolOutput::Diff {
                     path,
@@ -746,8 +725,8 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     new_text,
                 } => ToolOutput::Diff {
                     path,
-                    old_text: old_text.map(bounded),
-                    new_text: bounded(new_text),
+                    old_text,
+                    new_text,
                 },
                 ToolOutput::Terminal(id) => ToolOutput::Terminal(bounded(id)),
                 ToolOutput::Todo {
@@ -756,7 +735,7 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     status,
                 } => ToolOutput::Todo {
                     id: bounded(id),
-                    content: bounded(content),
+                    content,
                     status: bounded(status),
                 },
                 ToolOutput::Task {
@@ -767,8 +746,8 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     agent_id,
                     duration_ms,
                 } => ToolOutput::Task {
-                    description: bounded(description),
-                    prompt: bounded(prompt),
+                    description,
+                    prompt,
                     subagent_type: bounded(subagent_type),
                     model: model.map(bounded),
                     agent_id: agent_id.map(bounded),
@@ -779,16 +758,13 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     file_path,
                     reference_image_paths,
                 } => ToolOutput::GeneratedImage {
-                    description: bounded(description),
+                    description,
                     file_path,
-                    reference_image_paths: reference_image_paths
-                        .into_iter()
-                        .take(MAX_CHOICES)
-                        .collect(),
+                    reference_image_paths,
                 },
             })
             .collect(),
-        output: detail.output.map(bounded),
+        output: detail.output,
     }
 }
 
@@ -832,7 +808,7 @@ fn bounded_content(content: DisplayContent) -> DisplayContent {
         } => DisplayContent::TextResource {
             uri: bounded(uri),
             mime_type: mime_type.map(bounded),
-            text: bounded(text),
+            text,
         },
         DisplayContent::BlobResource {
             uri,
@@ -892,172 +868,4 @@ fn bounded(mut text: String) -> String {
         text.push('…');
     }
     text
-}
-
-fn item_size(item: &TranscriptItem) -> usize {
-    match item {
-        TranscriptItem::User(text)
-        | TranscriptItem::Assistant(text)
-        | TranscriptItem::Thought(text)
-        | TranscriptItem::Error(text) => text.len(),
-        TranscriptItem::Content { content, .. } => display_content_size(content),
-        TranscriptItem::Plan(plan) => plan
-            .iter()
-            .map(|item| item.content.len() + item.status.len())
-            .sum(),
-        TranscriptItem::Tool(tool) => tool_size(tool),
-        TranscriptItem::Permission(card) => {
-            card.action.len()
-                + card.tool_call_id.len()
-                + card
-                    .options
-                    .iter()
-                    .map(|option| option.id.len() + option.name.len() + option.kind.len())
-                    .sum::<usize>()
-        }
-        TranscriptItem::Interaction(card) => interaction_size(&card.request),
-        TranscriptItem::Truncated => 0,
-    }
-}
-
-fn tool_size(tool: &ToolActivity) -> usize {
-    tool.id.len()
-        + tool.status.as_ref().map_or(0, String::len)
-        + tool.kind.as_ref().map_or(0, String::len)
-        + tool.detail.as_ref().map_or(0, tool_detail_size)
-        + tool.title.as_ref().map_or(0, String::len)
-        + tool
-            .paths
-            .iter()
-            .map(|tool_path| tool_path.path.as_os_str().as_encoded_bytes().len())
-            .sum::<usize>()
-}
-
-fn interaction_size(request: &InteractionRequest) -> usize {
-    request.tool_call_id.len()
-        + match &request.kind {
-            InteractionKind::Questions { title, questions } => {
-                title.len()
-                    + questions
-                        .iter()
-                        .map(|question| {
-                            question.id.len()
-                                + question.prompt.len()
-                                + question
-                                    .options
-                                    .iter()
-                                    .map(|option| option.id.len() + option.label.len())
-                                    .sum::<usize>()
-                        })
-                        .sum::<usize>()
-            }
-            InteractionKind::Plan(plan) => {
-                plan.name.as_ref().map_or(0, String::len)
-                    + plan.overview.as_ref().map_or(0, String::len)
-                    + plan.plan.len()
-                    + plan
-                        .todos
-                        .iter()
-                        .map(|todo| todo.content.len() + todo.status.len())
-                        .sum::<usize>()
-                    + plan
-                        .phases
-                        .iter()
-                        .map(|phase| {
-                            phase.name.len()
-                                + phase
-                                    .todos
-                                    .iter()
-                                    .map(|todo| todo.content.len() + todo.status.len())
-                                    .sum::<usize>()
-                        })
-                        .sum::<usize>()
-            }
-        }
-}
-
-fn tool_detail_size(detail: &ToolDetail) -> usize {
-    detail.input.as_ref().map_or(0, String::len)
-        + detail.output.as_ref().map_or(0, String::len)
-        + detail
-            .content
-            .iter()
-            .map(|content| match content {
-                ToolOutput::Text(text) | ToolOutput::Terminal(text) => text.len(),
-                ToolOutput::Content(content) => display_content_size(content),
-                ToolOutput::Diff {
-                    path,
-                    old_text,
-                    new_text,
-                } => {
-                    path.as_os_str().as_encoded_bytes().len()
-                        + old_text.as_ref().map_or(0, String::len)
-                        + new_text.len()
-                }
-                ToolOutput::Todo {
-                    id,
-                    content,
-                    status,
-                } => id.len() + content.len() + status.len(),
-                ToolOutput::Task {
-                    description,
-                    prompt,
-                    subagent_type,
-                    model,
-                    agent_id,
-                    ..
-                } => {
-                    description.len()
-                        + prompt.len()
-                        + subagent_type.len()
-                        + model.as_ref().map_or(0, String::len)
-                        + agent_id.as_ref().map_or(0, String::len)
-                }
-                ToolOutput::GeneratedImage {
-                    description,
-                    file_path,
-                    reference_image_paths,
-                } => {
-                    description.len()
-                        + file_path
-                            .as_ref()
-                            .map_or(0, |path| path.as_os_str().as_encoded_bytes().len())
-                        + reference_image_paths
-                            .iter()
-                            .map(|path| path.as_os_str().as_encoded_bytes().len())
-                            .sum::<usize>()
-                }
-            })
-            .sum::<usize>()
-}
-
-fn display_content_size(content: &DisplayContent) -> usize {
-    match content {
-        DisplayContent::Image { mime_type, uri, .. } => {
-            mime_type.len() + uri.as_ref().map_or(0, String::len)
-        }
-        DisplayContent::Audio { mime_type, .. } => mime_type.len(),
-        DisplayContent::BlobResource { mime_type, uri, .. } => {
-            mime_type.as_ref().map_or(0, String::len) + uri.len()
-        }
-        DisplayContent::ResourceLink {
-            name,
-            title,
-            uri,
-            description,
-            mime_type,
-            ..
-        } => {
-            name.len()
-                + title.as_ref().map_or(0, String::len)
-                + uri.len()
-                + description.as_ref().map_or(0, String::len)
-                + mime_type.as_ref().map_or(0, String::len)
-        }
-        DisplayContent::TextResource {
-            uri,
-            mime_type,
-            text,
-        } => uri.len() + mime_type.as_ref().map_or(0, String::len) + text.len(),
-    }
 }

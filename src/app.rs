@@ -348,26 +348,36 @@ const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_MENTION_ROW_HEIGHT: f32 = 32.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
 const AGENT_FOLLOW_THRESHOLD: f32 = 48.0;
-const AGENT_TRANSCRIPT_EDGE_PADDING: i8 = 14;
-const AGENT_TRANSCRIPT_EDGE_FADE: f32 = 28.0;
+const AGENT_TRANSCRIPT_TOP_PADDING: i8 = 14;
 const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENTIC_EMPTY_STATE_HEIGHT: f32 = 124.0;
-/// The floating composer's clearance around the panel. The composer strip is
-/// taller by exactly this sum, so the floating panel keeps the same inner
-/// text area as the docked composer.
-const AGENTIC_COMPOSER_TOP_MARGIN: f32 = theme::space::MEDIUM;
+/// Keep the panel flush with the transcript while retaining bottom window
+/// clearance. The strip stays taller by the bottom margin so the inner text
+/// area matches the docked composer.
+const AGENTIC_COMPOSER_TOP_MARGIN: f32 = 0.0;
 const AGENTIC_COMPOSER_BOTTOM_MARGIN: f32 = theme::space::LARGE;
 const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
 const AGENTIC_DIFF_MIN_CONVERSATION: f32 = 420.0;
 const AGENTIC_DIFF_MIN_PANEL: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = if cfg!(target_os = "macos") {
-    72.0 + 3.0 * 34.0 + AGENTIC_MODE_TOGGLE_WIDTH
+    72.0 + 2.0 * 34.0 + AGENTIC_MODE_TOGGLE_WIDTH
 } else {
     120.0
 };
+/// The Settings row pinned under the file tree and the agentic sessions rail.
+const SIDEBAR_SETTINGS_ROW_HEIGHT: f32 = 40.0;
+/// Diameter of the circular update button on the settings row.
+const UPDATE_BUTTON_SIZE: f32 = 22.0;
+/// How far past the visible transcript viewport items are still rendered
+/// rather than replaced by a spacer of their cached height.
+const AGENT_CULL_MARGIN: f32 = 200.0;
+/// Above this many highlighted lines per file side, an expanded diff renders
+/// as plain diff-inked text: syntect over a wholly rewritten file costs
+/// seconds on the frame that expands it.
+const AGENT_DIFF_HIGHLIGHT_MAX_LINES: usize = 1_000;
 const PANE_TAB_HEIGHT: f32 = theme::chrome::HEADER;
 const PANE_DIVIDER_HIT_WIDTH: f32 = 8.0;
 const MIN_EDITOR_PANE_WIDTH: f32 = 200.0;
@@ -380,38 +390,6 @@ const TAB_DRAG_GHOST_PAINT_KEY: u64 = 0xb000_0000_0000_0000;
 
 fn agent_near_bottom(offset: f32, max_offset: f32) -> bool {
     max_offset - offset <= AGENT_FOLLOW_THRESHOLD
-}
-
-fn agent_transcript_fade_mesh(rect: egui::Rect, opaque: Color32) -> egui::Mesh {
-    let mut mesh = egui::Mesh::default();
-    let height = AGENT_TRANSCRIPT_EDGE_FADE.min(rect.height() * 0.5);
-    for (position, color) in [
-        (rect.left_top(), opaque),
-        (rect.right_top(), opaque),
-        (
-            egui::pos2(rect.left(), rect.top() + height),
-            Color32::TRANSPARENT,
-        ),
-        (
-            egui::pos2(rect.right(), rect.top() + height),
-            Color32::TRANSPARENT,
-        ),
-        (
-            egui::pos2(rect.left(), rect.bottom() - height),
-            Color32::TRANSPARENT,
-        ),
-        (
-            egui::pos2(rect.right(), rect.bottom() - height),
-            Color32::TRANSPARENT,
-        ),
-        (rect.left_bottom(), opaque),
-        (rect.right_bottom(), opaque),
-    ] {
-        mesh.colored_vertex(position, color);
-    }
-    mesh.indices
-        .extend_from_slice(&[0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7]);
-    mesh
 }
 
 fn draw_agent_content(
@@ -578,6 +556,16 @@ struct AgentDiff {
     removed: usize,
     old_line_count: usize,
     new_line_count: usize,
+    /// Character count of the widest line, computed once at build time so the
+    /// renderer never rescans thousands of rows per frame for its width.
+    longest_chars: usize,
+    /// Sorted 1-based old/new line numbers the full diff needs highlighted,
+    /// computed once here instead of being rebuilt and re-sorted every frame.
+    needed_old: Vec<usize>,
+    needed_new: Vec<usize>,
+    /// Monotonic build counter; caches downstream compare this instead of
+    /// their megabyte-sized inputs.
+    version: u64,
 }
 
 fn build_agent_diff(old_text: Option<&str>, new_text: &str) -> AgentDiff {
@@ -753,6 +741,13 @@ fn build_agent_diff(old_text: Option<&str>, new_text: &str) -> AgentDiff {
     }
 
     let preview = agent_diff_preview(&compact);
+    let longest_chars = compact
+        .iter()
+        .map(|line| line.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let (needed_old, needed_new) = agent_diff_needed_lines(&compact);
+    static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     AgentDiff {
         lines: compact,
         preview,
@@ -760,7 +755,31 @@ fn build_agent_diff(old_text: Option<&str>, new_text: &str) -> AgentDiff {
         removed,
         old_line_count: old.len(),
         new_line_count: new.len(),
+        longest_chars,
+        needed_old,
+        needed_new,
+        version: VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// The sorted, deduplicated old/new line numbers a set of diff rows renders
+/// with syntax colors: removed rows read from the old file, added and context
+/// rows from the new one.
+fn agent_diff_needed_lines(lines: &[AgentDiffLine]) -> (Vec<usize>, Vec<usize>) {
+    let mut needed_old = Vec::new();
+    let mut needed_new = Vec::new();
+    for line in lines {
+        match line.kind {
+            AgentDiffKind::Removed => needed_old.extend(line.old_number),
+            AgentDiffKind::Added | AgentDiffKind::Context => needed_new.extend(line.new_number),
+            AgentDiffKind::Omitted => {}
+        }
+    }
+    for needed in [&mut needed_old, &mut needed_new] {
+        needed.sort_unstable();
+        needed.dedup();
+    }
+    (needed_old, needed_new)
 }
 
 #[derive(Clone, Default)]
@@ -1236,10 +1255,28 @@ fn draw_provider_selector_identity(
 /// toggling between them free instead of relayouting every item.
 const AGENT_GALLEY_WIDTH_SLOTS: usize = 2;
 
+/// The search-highlighted galley for one transcript item. Rebuilding these
+/// every frame meant re-parsing markdown and re-running syntect for every
+/// matched item, which is what made typing in the transcript search crawl.
+#[derive(Clone)]
+struct AgentFindGalley {
+    width: u32,
+    query: String,
+    active: usize,
+    galley: Arc<egui::Galley>,
+}
+
+impl AgentFindGalley {
+    fn matches(&self, width: u32, query: &str, active: usize) -> bool {
+        self.width == width && self.query == query && self.active == active
+    }
+}
+
 #[derive(Clone, Default)]
 struct AgentMarkdownCache {
     source: String,
     galleys: Vec<(u32, Arc<egui::Galley>)>,
+    find: Option<AgentFindGalley>,
 }
 
 #[derive(Clone, Default)]
@@ -1247,6 +1284,7 @@ struct AgentCodeCache {
     source: String,
     path: PathBuf,
     galleys: Vec<(u32, Arc<egui::Galley>)>,
+    find: Option<AgentFindGalley>,
 }
 
 #[derive(Clone)]
@@ -1259,9 +1297,7 @@ struct AgentSyntaxLines {
 
 #[derive(Clone, Default)]
 struct AgentSyntaxLinesCache {
-    source: String,
-    path: PathBuf,
-    needed: Vec<usize>,
+    version: (u64, usize),
     lines: Option<Arc<AgentSyntaxLines>>,
 }
 
@@ -1271,6 +1307,11 @@ struct AgentSyntaxLinesCache {
 /// preview needs about ten lines. The trade-off is that highlighting starts
 /// from a default parser state at the first rendered line, so a hunk opening
 /// mid-construct can color slightly differently than the editor.
+///
+/// Staleness is judged by `version` — the owning diff's build counter plus the
+/// needed-line count — instead of re-comparing megabytes of source and
+/// thousands of line numbers every frame.
+#[expect(clippy::too_many_arguments)]
 fn agent_syntax_lines(
     ui: &mut egui::Ui,
     id: Id,
@@ -1279,13 +1320,11 @@ fn agent_syntax_lines(
     needed: &[usize],
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    version: (u64, usize),
 ) -> Arc<AgentSyntaxLines> {
     let stale = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentSyntaxLinesCache>(id);
-        cache.lines.is_none()
-            || cache.path != path
-            || cache.needed != needed
-            || cache.source != source
+        cache.lines.is_none() || cache.version != version
     });
     if stale {
         let mut hunk = String::new();
@@ -1310,10 +1349,7 @@ fn agent_syntax_lines(
         let lines = Arc::new(AgentSyntaxLines { job, ranges });
         ui.data_mut(|data| {
             let cache = data.get_temp_mut_or_default::<AgentSyntaxLinesCache>(id);
-            cache.source.clear();
-            cache.source.push_str(source);
-            cache.path = path.to_path_buf();
-            cache.needed = needed.to_vec();
+            cache.version = version;
             cache.lines = Some(lines);
         });
     }
@@ -1352,7 +1388,15 @@ fn append_agent_syntax_line(
         );
         return;
     };
-    for section in &highlighted.job.sections {
+    // Sections are appended in byte order, so the first overlapping one can
+    // be found by bisection. Scanning all of them per row made every visible
+    // row of a big diff walk tens of thousands of sections each frame.
+    let sections = &highlighted.job.sections;
+    let first = sections.partition_point(|section| section.byte_range.end.0 <= range.start);
+    for section in &sections[first..] {
+        if section.byte_range.start.0 >= range.end {
+            break;
+        }
         let start = section.byte_range.start.0.max(range.start);
         let end = section.byte_range.end.0.min(range.end);
         if start < end {
@@ -1380,6 +1424,18 @@ fn agent_code_galley(
 ) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
     if let Some((query, active)) = search {
+        let active = active.unwrap_or(usize::MAX);
+        let cached = ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
+            (cache.path == path && cache.source == source)
+                .then_some(cache.find.as_ref())
+                .flatten()
+                .filter(|find| find.matches(width_key, query, active))
+                .map(|find| Arc::clone(&find.galley))
+        });
+        if let Some(galley) = cached {
+            return galley;
+        }
         let syntax = syntaxes.detect(path, false);
         let mut job = highlighter
             .highlight_job(source, syntax, syntaxes.set(), width)
@@ -1389,8 +1445,24 @@ fn agent_code_galley(
             section.format.font_id.size = 12.5;
         }
         let matches = match_spans(&job.text, query);
-        let job = find_highlighted_job(&job, &matches, active.unwrap_or(usize::MAX));
-        return ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let job = find_highlighted_job(&job, &matches, active);
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
+            if cache.path != path || cache.source != source {
+                cache.source.clear();
+                cache.source.push_str(source);
+                cache.path = path.to_path_buf();
+                cache.galleys.clear();
+            }
+            cache.find = Some(AgentFindGalley {
+                width: width_key,
+                query: query.to_owned(),
+                active,
+                galley: Arc::clone(&galley),
+            });
+        });
+        return galley;
     }
     let cached = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
@@ -1445,6 +1517,18 @@ fn agent_markdown_galley(
 ) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
     if let Some((query, active)) = search {
+        let active = active.unwrap_or(usize::MAX);
+        let cached = ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
+            (cache.source == source)
+                .then_some(cache.find.as_ref())
+                .flatten()
+                .filter(|find| find.matches(width_key, query, active))
+                .map(|find| Arc::clone(&find.galley))
+        });
+        if let Some(galley) = cached {
+            return galley;
+        }
         let job = markdown::compact_layout(source, width, |language, code| {
             let syntax = language
                 .map(|language| syntaxes.detect_token(language))
@@ -1454,8 +1538,23 @@ fn agent_markdown_galley(
                 .ok()
         });
         let matches = match_spans(&job.text, query);
-        let job = find_highlighted_job(&job, &matches, active.unwrap_or(usize::MAX));
-        return ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let job = find_highlighted_job(&job, &matches, active);
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
+            if cache.source != source {
+                cache.source.clear();
+                cache.source.push_str(source);
+                cache.galleys.clear();
+            }
+            cache.find = Some(AgentFindGalley {
+                width: width_key,
+                query: query.to_owned(),
+                active,
+                galley: Arc::clone(&galley),
+            });
+        });
+        return galley;
     }
     let cached = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
@@ -1656,6 +1755,7 @@ fn agent_collapsing_header(
     id_salt: impl egui::AsIdSalt,
     title: &str,
     status: Option<&str>,
+    change: Option<FileChange>,
     width: f32,
     search: Option<(&str, Option<usize>)>,
     has_body: bool,
@@ -1698,8 +1798,12 @@ fn agent_collapsing_header(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.spacing_mut().icon_width = 24.0;
-                    if has_body {
-                        state.show_toggle_button(ui, paint_agent_disclosure);
+                    if has_body
+                        && state
+                            .show_toggle_button(ui, paint_agent_disclosure)
+                            .clicked()
+                    {
+                        ui.ctx().request_discard("tool card disclosure changed");
                     }
                     let status_width = if completed {
                         24.0
@@ -1708,17 +1812,49 @@ fn agent_collapsing_header(
                     } else {
                         52.0
                     };
-                    let status_spacing = if label.is_empty() {
-                        0.0
-                    } else {
-                        ui.spacing().item_spacing.x
-                    };
-                    let title_width =
-                        (ui.available_width() - status_width - status_spacing).max(0.0);
+                    let counts = change.map(|change| {
+                        let added = ui.painter().layout_no_wrap(
+                            format!("+{}", change.added),
+                            theme::typography::code_small(),
+                            theme::ink(theme::semantic().success),
+                        );
+                        let removed = ui.painter().layout_no_wrap(
+                            format!("−{}", change.removed),
+                            theme::typography::code_small(),
+                            theme::ink(theme::semantic().danger),
+                        );
+                        (added, removed)
+                    });
+                    let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
+                        added.size().x + theme::space::SMALL + removed.size().x
+                    });
+                    let trailing_items =
+                        usize::from(counts.is_some()) + usize::from(status_width > 0.0);
+                    let title_width = (ui.available_width()
+                        - status_width
+                        - counts_width
+                        - trailing_items as f32 * ui.spacing().item_spacing.x)
+                        .max(0.0);
                     let response = agent_tool_title(ui, id, title_line, title_width, search)
                         .on_hover_text(title);
                     if has_body && response.clicked() {
                         state.toggle(ui);
+                        ui.ctx().request_discard("tool card disclosure changed");
+                    }
+                    if let Some((added, removed)) = counts {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(counts_width, 24.0), Sense::hover());
+                        let y = rect.center().y - added.size().y * 0.5;
+                        ui.painter().galley(
+                            egui::pos2(rect.left(), y),
+                            added.clone(),
+                            theme::ink(theme::semantic().success),
+                        );
+                        ui.painter().galley(
+                            egui::pos2(rect.left() + added.size().x + theme::space::SMALL, y),
+                            removed,
+                            theme::ink(theme::semantic().danger),
+                        );
                     }
                     if completed {
                         let (rect, response) =
@@ -1917,7 +2053,9 @@ fn draw_agent_changed_files(
     clicked
 }
 
-/// Returns true when the header path label was clicked.
+/// Returns `(path_clicked, scrolled_to_active_match)`: whether the header
+/// path label was clicked, and whether the card scrolled the active search
+/// match's row into view because `scroll_to_active` asked it to.
 // The shared card renderer keeps its syntax and optional search overlay explicit at the call site.
 #[expect(clippy::too_many_arguments)]
 fn draw_agent_diff(
@@ -1929,8 +2067,10 @@ fn draw_agent_diff(
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
     search: Option<(&str, Option<usize>)>,
-) -> bool {
+    scroll_to_active: bool,
+) -> (bool, bool) {
     let mut path_clicked = false;
+    let mut scrolled = false;
     let diff = cached_agent_diff(ui, id, old_text, new_text);
     let expanded_id = id.with("expanded");
     let expanded =
@@ -1998,7 +2138,7 @@ fn draw_agent_diff(
                     active.and_then(|active| active.checked_sub(path_matches)),
                 )
             });
-            draw_agent_diff_rows(
+            scrolled = draw_agent_diff_rows(
                 ui,
                 id,
                 path,
@@ -2009,6 +2149,7 @@ fn draw_agent_diff(
                 highlighter,
                 syntaxes,
                 row_search,
+                scroll_to_active,
             );
             if can_toggle {
                 let label = if expanded {
@@ -2027,11 +2168,11 @@ fn draw_agent_diff(
                 );
                 if toggle.clicked() {
                     ui.data_mut(|data| data.insert_temp(expanded_id, !expanded));
-                    ui.ctx().request_repaint();
+                    ui.ctx().request_discard("diff card disclosure changed");
                 }
             }
         });
-    path_clicked
+    (path_clicked, scrolled)
 }
 
 /// The diff line rows shared by the transcript card and the full-height diff
@@ -2048,29 +2189,36 @@ fn draw_agent_diff_rows(
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
     search: Option<(&str, Option<usize>)>,
-) {
-    let mut needed_old = Vec::new();
-    let mut needed_new = Vec::new();
-    for line in lines {
-        match line.kind {
-            AgentDiffKind::Removed => needed_old.extend(line.old_number),
-            AgentDiffKind::Added | AgentDiffKind::Context => needed_new.extend(line.new_number),
-            AgentDiffKind::Omitted => {}
-        }
-    }
-    for needed in [&mut needed_old, &mut needed_new] {
-        needed.sort_unstable();
-        needed.dedup();
-    }
+    scroll_to_active: bool,
+) -> bool {
+    let full = lines.len() == diff.lines.len();
+    let preview_needed = (!full).then(|| agent_diff_needed_lines(lines));
+    let (needed_old, needed_new) = preview_needed
+        .as_ref()
+        .map_or((&diff.needed_old, &diff.needed_new), |(old, new)| {
+            (old, new)
+        });
+    // Syntax highlighting a whole rewritten file froze the frame for seconds;
+    // past this size the rows fall back to plain diff-inked text, like every
+    // editor that stops tokenizing huge files. The collapsed preview stays
+    // colored either way because it only needs a handful of lines.
+    let highlight = needed_old.len().max(needed_new.len()) <= AGENT_DIFF_HIGHLIGHT_MAX_LINES;
+    let empty: &[usize] = &[];
+    let (needed_old, needed_new) = if highlight {
+        (needed_old.as_slice(), needed_new.as_slice())
+    } else {
+        (empty, empty)
+    };
     let old_syntax = old_text.map(|text| {
         agent_syntax_lines(
             ui,
             id.with("old_syntax"),
             path,
             text,
-            &needed_old,
+            needed_old,
             highlighter,
             syntaxes,
+            (diff.version, needed_old.len()),
         )
     });
     let new_syntax = agent_syntax_lines(
@@ -2078,20 +2226,36 @@ fn draw_agent_diff_rows(
         id.with("new_syntax"),
         path,
         new_text,
-        &needed_new,
+        needed_new,
         highlighter,
         syntaxes,
+        (diff.version, needed_new.len()),
     );
     let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
     let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
-    let longest = lines
-        .iter()
-        .map(|line| line.text.chars().count())
-        .max()
-        .unwrap_or(0);
+    let longest = if lines.len() == diff.lines.len() {
+        diff.longest_chars
+    } else {
+        lines
+            .iter()
+            .map(|line| line.text.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
     let content_width = ui.available_width();
     let desired_width =
         content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
+    // Rows have two fixed heights (code rows and "lines hidden" markers),
+    // measured from whatever was rendered last frame. Once known, off-screen
+    // rows become plain spacers so a huge diff costs only its visible band.
+    // Search keeps full layout because active-match bookkeeping must walk
+    // every row in order.
+    let heights_id = id.with("row_heights");
+    let mut row_heights = ui
+        .data(|data| data.get_temp::<(f32, f32)>(heights_id))
+        .unwrap_or((f32::NAN, f32::NAN));
+    let mut rendered_rows = 0_usize;
+    let mut active_row_rect: Option<egui::Rect> = None;
     ScrollArea::horizontal()
         .id_salt(id)
         .max_width(content_width)
@@ -2100,15 +2264,49 @@ fn draw_agent_diff_rows(
         .show(ui, |ui| {
             ui.set_width(desired_width);
             ui.spacing_mut().item_spacing.y = 0.0;
+            let clip = ui.clip_rect();
             let mut search_offset = 0;
+            // Runs of culled rows collapse into one spacer; thousands of
+            // individual add_space calls were themselves measurable.
+            let mut pending_space = 0.0_f32;
             for line in lines {
+                let omitted_row = line.kind == AgentDiffKind::Omitted;
+                let known_height = if omitted_row {
+                    row_heights.1
+                } else {
+                    row_heights.0
+                };
+                let row_top = ui.cursor().top() + pending_space;
+                // Navigation frames render everything so the active match's
+                // rect exists to scroll to; otherwise off-screen rows only
+                // contribute their match count, keeping the running offset
+                // aligned with what visible rows highlight.
+                if !scroll_to_active
+                    && known_height.is_finite()
+                    && (row_top + known_height < clip.top() - AGENT_CULL_MARGIN
+                        || row_top > clip.bottom() + AGENT_CULL_MARGIN)
+                {
+                    if let Some((query, _)) = search
+                        && !omitted_row
+                    {
+                        search_offset += match_spans(&line.text, query).len();
+                    }
+                    pending_space += known_height;
+                    continue;
+                }
+                if pending_space > 0.0 {
+                    ui.add_space(pending_space);
+                    pending_space = 0.0;
+                }
+                rendered_rows += 1;
+                let mut row_is_active = false;
                 let fill = match line.kind {
                     AgentDiffKind::Added => theme::diff::added(),
                     AgentDiffKind::Removed => theme::diff::removed(),
                     AgentDiffKind::Omitted => theme::surface().raised,
                     AgentDiffKind::Context => Color32::TRANSPARENT,
                 };
-                egui::Frame::new()
+                let row = egui::Frame::new()
                     .fill(fill)
                     .inner_margin(egui::Margin::symmetric(9, 3))
                     .show(ui, |ui| {
@@ -2190,6 +2388,7 @@ fn draw_agent_diff_rows(
                                 .and_then(|active| active.checked_sub(search_offset))
                                 .filter(|&active| active < matches.len());
                             search_offset += matches.len();
+                            row_is_active = local_active.is_some();
                             find_highlighted_job(&job, &matches, local_active.unwrap_or(usize::MAX))
                         } else {
                             job
@@ -2200,8 +2399,32 @@ fn draw_agent_diff_rows(
                                 .selectable(true),
                         );
                     });
+                if row_is_active {
+                    active_row_rect = Some(row.response.rect);
+                }
+                let measured = ui.cursor().top() - row_top;
+                if omitted_row {
+                    row_heights.1 = measured;
+                } else {
+                    row_heights.0 = measured;
+                }
+            }
+            if pending_space > 0.0 {
+                ui.add_space(pending_space);
             }
         });
+    ui.data_mut(|data| {
+        data.insert_temp(heights_id, row_heights);
+        data.insert_temp(id.with("rendered_rows"), rendered_rows);
+    });
+    // Scrolling happens after the horizontal scroll area has closed, so only
+    // the enclosing vertical scroll consumes the target and the user's
+    // horizontal position is left alone.
+    if scroll_to_active && let Some(rect) = active_row_rect {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+        return true;
+    }
+    false
 }
 
 /// The identity row every full diff surface carries: file name, directory,
@@ -2297,6 +2520,7 @@ fn draw_agent_diff_body(
                 highlighter,
                 syntaxes,
                 None,
+                false,
             );
         });
 }
@@ -3252,8 +3476,8 @@ fn terminal_toggle_rect(file_tree_button: egui::Rect) -> egui::Rect {
     file_tree_button.translate(egui::vec2(file_tree_button.width(), 0.0))
 }
 
-fn settings_toggle_rect(terminal_button: egui::Rect) -> egui::Rect {
-    terminal_button.translate(egui::vec2(terminal_button.width(), 0.0))
+fn sidebar_settings_rect(sidebar: egui::Rect) -> egui::Rect {
+    sidebar.with_min_y((sidebar.bottom() - SIDEBAR_SETTINGS_ROW_HEIGHT).max(sidebar.top()))
 }
 
 fn agentic_toggle_rect(file_tree_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
@@ -3280,10 +3504,8 @@ fn draw_sidebar_toggle_icon(
     button: egui::Rect,
     response: &egui::Response,
     open: bool,
-    panel_on_right: bool,
-) -> egui::Pos2 {
-    let icon_center = button.center();
-    let icon = egui::Rect::from_center_size(icon_center, egui::vec2(16.0, 13.0));
+) {
+    let icon = egui::Rect::from_center_size(button.center(), egui::vec2(16.0, 13.0));
     let icon_color = if response.hovered() || open {
         theme::text().primary
     } else {
@@ -3295,26 +3517,18 @@ fn draw_sidebar_toggle_icon(
         egui::Stroke::new(1.2, icon_color),
         egui::StrokeKind::Inside,
     );
-    let divider_x = if panel_on_right {
-        icon.right() - 4.5
-    } else {
-        icon.left() + 4.5
-    };
+    let divider_x = icon.left() + 4.5;
     ui.painter().vline(
         divider_x,
         icon.y_range(),
         egui::Stroke::new(1.2, icon_color),
     );
     if open {
-        let selected = if panel_on_right {
-            egui::Rect::from_min_max(egui::pos2(divider_x, icon.top()), icon.right_bottom())
-        } else {
-            egui::Rect::from_min_max(icon.left_top(), egui::pos2(divider_x, icon.bottom()))
-        };
+        let selected =
+            egui::Rect::from_min_max(icon.left_top(), egui::pos2(divider_x, icon.bottom()));
         ui.painter()
             .rect_filled(selected, 1.0, theme::state::selected());
     }
-    icon_center
 }
 
 fn agent_new_session_rect(header: egui::Rect) -> egui::Rect {
@@ -3331,14 +3545,6 @@ fn agent_sessions_rect(header: egui::Rect) -> egui::Rect {
         egui::pos2(new_session.center().x - 33.0, header.center().y),
         egui::vec2(32.0, 32.0),
     )
-}
-
-fn agent_search_rect(header: egui::Rect, agentic_mode: bool) -> egui::Rect {
-    if agentic_mode {
-        agent_toggle_rect(header)
-    } else {
-        agent_sessions_rect(header).translate(egui::vec2(-33.0, 0.0))
-    }
 }
 
 /// Inset the composer so the prompt and footer share one rhythm: equal sides,
@@ -3698,7 +3904,6 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                 }
             }
         },
-        TranscriptItem::Truncated => text.push_str("Earlier output was truncated."),
     }
     Some(text)
 }
@@ -4757,6 +4962,15 @@ pub struct EditorApp {
     agent_mention_matches: Vec<AgentMentionEntry>,
     agent_mention_selected: usize,
     agent_find: AgentFind,
+    /// Last measured height of each transcript item, so off-screen items can
+    /// be culled into spacers instead of being laid out every frame. `NAN`
+    /// means "not measured yet"; visible items re-measure every frame.
+    agent_transcript_heights: Vec<f32>,
+    /// The (width, appearance) the cached heights were measured under.
+    agent_transcript_heights_key: (u32, u64),
+    /// How many transcript items the last frame actually laid out (the rest
+    /// were culled spacers); the culling tests key off this.
+    agent_transcript_rendered: usize,
     agent_drop_hovered: bool,
     agent_file_picker: Option<AgentFilePicker>,
     project_folder_picker: Option<AgentFilePicker>,
@@ -4788,6 +5002,9 @@ pub struct EditorApp {
     settings: Settings,
     settings_error: Option<String>,
     settings_drafts: HashMap<PresetId, (String, String)>,
+    update_check_started: bool,
+    update_available: Arc<std::sync::atomic::AtomicBool>,
+    update_error: Arc<std::sync::Mutex<Option<String>>>,
     keybinding_resolver: Resolver,
     keybinding_filter: KeybindingFilter,
     keybinding_category: Option<String>,
@@ -4940,7 +5157,7 @@ fn settings_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn settings_card_fill() -> Color32 {
-    theme::mix(theme::surface().raised, theme::text().primary, 0.04)
+    theme::settings().card
 }
 
 /// One row inside a settings card: name and explanation on the left, the
@@ -5073,9 +5290,9 @@ fn settings_secondary_button(
     });
     let hovered = response.hovered();
     let fill = if hovered {
-        theme::composite(theme::state::selected(), settings_card_fill())
+        theme::composite(theme::state::hover(), theme::settings().control)
     } else {
-        theme::composite(theme::state::hover(), settings_card_fill())
+        theme::settings().control
     };
     ui.painter().rect(
         rect,
@@ -5125,7 +5342,7 @@ fn settings_danger_button(ui: &mut egui::Ui, id: impl egui::AsId, label: &str) -
         if hovered {
             theme::callout(theme::semantic().danger).fill
         } else {
-            theme::composite(theme::state::hover(), settings_card_fill())
+            theme::settings().control
         },
         egui::Stroke::new(
             1.0,
@@ -5181,14 +5398,15 @@ fn settings_combo_box(
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(11.0, 7.0);
         ui.spacing_mut().interact_size.y = 34.0;
+        let control = theme::settings().control;
         let visuals = &mut ui.style_mut().visuals.widgets;
-        visuals.inactive.weak_bg_fill = theme::surface().input;
+        visuals.inactive.weak_bg_fill = control;
         visuals.inactive.bg_stroke = egui::Stroke::new(1.0, theme::border::hairline_color());
-        visuals.hovered.weak_bg_fill = theme::state::hover();
+        visuals.hovered.weak_bg_fill = theme::composite(theme::state::hover(), control);
         visuals.hovered.bg_stroke = egui::Stroke::new(1.0, theme::border::strong_color());
-        visuals.active.weak_bg_fill = theme::state::selected();
+        visuals.active.weak_bg_fill = theme::composite(theme::state::selected(), control);
         visuals.active.bg_stroke = egui::Stroke::new(1.0, theme::border::strong_color());
-        visuals.open.weak_bg_fill = theme::state::selected();
+        visuals.open.weak_bg_fill = theme::composite(theme::state::selected(), control);
         visuals.open.bg_stroke = egui::Stroke::new(1.0, theme::accent());
         visuals.inactive.corner_radius = 6.into();
         visuals.hovered.corner_radius = 6.into();
@@ -5346,6 +5564,9 @@ impl EditorApp {
             agent_mention_matches: Vec::new(),
             agent_mention_selected: 0,
             agent_find: AgentFind::default(),
+            agent_transcript_heights: Vec::new(),
+            agent_transcript_heights_key: (0, 0),
+            agent_transcript_rendered: 0,
             agent_drop_hovered: false,
             agent_file_picker: None,
             project_folder_picker: None,
@@ -5372,6 +5593,9 @@ impl EditorApp {
             should_close: false,
             window_action: None,
             settings_open: false,
+            update_check_started: false,
+            update_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_error: Arc::new(std::sync::Mutex::new(None)),
             settings_section: SettingsSection::LanguageServers,
             settings_search: String::new(),
             settings,
@@ -5721,6 +5945,61 @@ impl EditorApp {
         self.toasts.push(Severity::Danger, error);
     }
 
+    /// Asks the release channel once per launch whether a newer build exists.
+    /// The check runs off-thread and lights the sidebar's update button when
+    /// it lands; tests never start it, so they stay off the network.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if self.update_check_started {
+            return;
+        }
+        self.update_check_started = true;
+        if cfg!(test) {
+            return;
+        }
+        let available = Arc::clone(&self.update_available);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if crate::update::check_available().unwrap_or(false) {
+                available.store(true, std::sync::atomic::Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Hands the update to a fresh `editur update` process, which asks this
+    /// editor to quit once the download verifies, then installs the new
+    /// build. If the updater fails instead, its message comes back as a toast.
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let child = match crate::update::start_in_background() {
+            Ok(child) => child,
+            Err(error) => return self.show_error(error),
+        };
+        let slot = Arc::clone(&self.update_error);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let Ok(output) = child.wait_with_output() else {
+                return;
+            };
+            if output.status.success() {
+                return;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map_or_else(
+                    || "the update did not finish".to_owned(),
+                    |line| line.trim_start_matches("editur: ").to_owned(),
+                );
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(message);
+            }
+            ctx.request_repaint();
+        });
+    }
+
     pub fn ui(&mut self, root: &mut egui::Ui) {
         self.draw_ui(root);
         crate::renderer::end_retained(root.painter(), root.max_rect());
@@ -5731,6 +6010,15 @@ impl EditorApp {
         theme::apply_to(root.style_mut());
         self.scrollbar_activity.style_egui(root);
         let ctx = root.ctx().clone();
+        self.start_update_check(&ctx);
+        if let Some(error) = self
+            .update_error
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            self.show_error(error);
+        }
         if self.agent_boot_pending {
             self.agent_boot_pending = false;
             self.open_agent(&ctx);
@@ -6263,9 +6551,10 @@ impl EditorApp {
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        let settings = sidebar_settings_rect(rect);
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
-            egui::pos2(rect.right() - 14.0, rect.bottom() - 14.0),
+            egui::pos2(rect.right() - 14.0, settings.top() - 14.0),
         );
         let mut session_load = None;
         let mut session_remove = None;
@@ -6361,6 +6650,13 @@ impl EditorApp {
                     });
             },
         );
+        let (open_settings, update) = self.draw_settings_row(ui, settings);
+        if open_settings {
+            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
+        }
+        if update {
+            self.start_update(ui.ctx());
+        }
         if let Some(session_id) = session_load
             && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
@@ -6402,9 +6698,8 @@ impl EditorApp {
         );
         let file_tree_button = file_tree_toggle_rect(rect, agent_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
-        let settings_button = settings_toggle_rect(terminal_button);
         let agentic_button =
-            agentic_toggle_rect(settings_button, sessions.map(|sessions| sessions.right()));
+            agentic_toggle_rect(terminal_button, sessions.map(|sessions| sessions.right()));
         #[cfg(target_os = "macos")]
         let controls_right = rect.right();
         #[cfg(not(target_os = "macos"))]
@@ -6412,7 +6707,7 @@ impl EditorApp {
         let sidebar_drag_rect = egui::Rect::from_min_max(
             egui::pos2(
                 if cfg!(target_os = "macos") {
-                    settings_button.right()
+                    terminal_button.right()
                 } else {
                     rect.left()
                 },
@@ -6425,7 +6720,7 @@ impl EditorApp {
         let drag_right = diff_left.map_or(controls_right, |left| controls_right.min(left));
         let drag_rect = egui::Rect::from_min_max(
             egui::pos2(
-                agentic_button.right().max(settings_button.right()) + 4.0,
+                agentic_button.right().max(terminal_button.right()) + 4.0,
                 rect.top(),
             ),
             egui::pos2(drag_right, rect.bottom()),
@@ -6444,9 +6739,6 @@ impl EditorApp {
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
-        }
-        if self.draw_settings_toggle(ui, settings_button) {
-            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
@@ -6736,9 +7028,8 @@ impl EditorApp {
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
-        let settings_button = settings_toggle_rect(terminal_button);
         let agentic_button = agentic_toggle_rect(
-            settings_button,
+            terminal_button,
             self.sidebar.then_some(editor_header.left()),
         );
         #[cfg(target_os = "macos")]
@@ -6757,7 +7048,7 @@ impl EditorApp {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let first_tabs_left = settings_button.right().max(agentic_button.right()) + 4.0;
+        let first_tabs_left = terminal_button.right().max(agentic_button.right()) + 4.0;
         for (pane, pane_rect) in panes
             .iter()
             .copied()
@@ -6791,7 +7082,7 @@ impl EditorApp {
             }
         }
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = settings_button.right();
+        let sidebar_drag_left = terminal_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
         let sidebar_drag_right = (agentic_button.left() - 3.0).max(sidebar_drag_left);
@@ -6833,9 +7124,6 @@ impl EditorApp {
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
-        }
-        if self.draw_settings_toggle(ui, settings_button) {
-            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
@@ -7228,10 +7516,20 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        let icon_center = draw_sidebar_toggle_icon(ui, button, &response, self.agent_sidebar, true);
+        let color = if response.hovered() || self.agent_sidebar {
+            theme::text().primary
+        } else {
+            theme::text().muted
+        };
+        icons::paint(
+            ui.painter(),
+            Icon::Sparkle,
+            egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
+            color,
+        );
         if self.agent.waiting_permission() {
             ui.painter().circle_filled(
-                icon_center + egui::vec2(8.0, -7.0),
+                button.center() + egui::vec2(8.0, -7.0),
                 3.0,
                 theme::ink(theme::semantic().warning),
             );
@@ -7251,7 +7549,7 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        draw_sidebar_toggle_icon(ui, button, &response, self.sidebar, false);
+        draw_sidebar_toggle_icon(ui, button, &response, self.sidebar);
         response.clicked()
     }
 
@@ -7379,6 +7677,10 @@ impl EditorApp {
         self.agent_menu = None;
         self.agent_menu_popup = None;
         self.agent_file_picker = None;
+        if !enabled {
+            self.agent_find.open = false;
+            self.agent_find.focus = false;
+        }
         if enabled {
             if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
                 let _ = controller.send(AgentCommand::RefreshSessions);
@@ -7438,22 +7740,77 @@ impl EditorApp {
         }
     }
 
-    fn draw_settings_toggle(&self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
-        let response = ui.interact(rect, Id::new("settings_toggle"), Sense::click());
+    /// The Settings entry pinned to the bottom of the left rail — a gear and
+    /// its label above a hairline — shared by the file tree and the agentic
+    /// sessions list. Returns which of the row's actions was clicked: opening
+    /// settings, or installing a detected update.
+    fn draw_settings_row(&self, ui: &mut egui::Ui, row: egui::Rect) -> (bool, bool) {
+        let response = ui
+            .interact(row, Id::new("settings_toggle"), Sense::click())
+            .on_hover_text("Open Settings");
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open Settings")
         });
-        let center = rect.center();
+        ui.painter().hline(
+            row.x_range(),
+            row.top() + 0.5,
+            egui::Stroke::new(theme::stroke::DIVIDER, theme::border::hairline_color()),
+        );
         let color = if response.hovered() {
             theme::text().primary
         } else {
             theme::text().secondary
         };
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(
+                row.left() + theme::space::MEDIUM + icons::GRID * 0.5,
+                row.center().y,
+            ),
+            egui::Vec2::splat(icons::GRID),
+        );
+        icons::paint(ui.painter(), Icon::Gear, icon, color);
+        ui.painter().text(
+            egui::pos2(icon.right() + theme::space::SNUG, row.center().y),
+            Align2::LEFT_CENTER,
+            "Settings",
+            theme::typography::small(),
+            color,
+        );
+        let update = self
+            .update_available
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.draw_update_button(ui, row);
+        (response.clicked(), update)
+    }
+
+    /// The circular accent button that appears on the settings row once a
+    /// newer release is detected, opposite the gear.
+    fn draw_update_button(&self, ui: &mut egui::Ui, row: egui::Rect) -> bool {
+        let button = egui::Rect::from_center_size(
+            egui::pos2(
+                row.right() - theme::space::MEDIUM - UPDATE_BUTTON_SIZE * 0.5,
+                row.center().y,
+            ),
+            egui::Vec2::splat(UPDATE_BUTTON_SIZE),
+        );
+        let response = ui
+            .interact(button, Id::new("settings_update"), Sense::click())
+            .on_hover_text("Update Editur");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Update Editur")
+        });
+        let fill = if response.hovered() {
+            theme::composite(theme::state::hover(), theme::accent())
+        } else {
+            theme::accent()
+        };
+        ui.painter()
+            .circle_filled(button.center(), UPDATE_BUTTON_SIZE * 0.5, fill);
         icons::paint(
             ui.painter(),
-            Icon::Gear,
-            egui::Rect::from_center_size(center, egui::Vec2::splat(icons::GRID)),
-            color,
+            Icon::Download,
+            egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID * 0.75)),
+            theme::text().on_accent,
         );
         response.clicked()
     }
@@ -7473,7 +7830,7 @@ impl EditorApp {
         root.painter()
             .rect_filled(rail, 0.0, theme::surface().chrome);
         root.painter()
-            .rect_filled(content, 0.0, theme::surface().editor);
+            .rect_filled(content, 0.0, theme::settings().content);
         root.painter().vline(
             rail.right(),
             rail.y_range(),
@@ -10197,12 +10554,9 @@ impl EditorApp {
     }
 
     fn open_find(&mut self, ctx: &egui::Context) {
-        if self.agentic_mode
-            || ctx.memory(|memory| {
-                memory.has_focus(Id::new("agent_prompt"))
-                    || memory.has_focus(Id::new("agent_find_query"))
-            })
-        {
+        // Transcript search exists only in the agentic view; in editor mode
+        // the agent sidebar leaves Cmd/Ctrl+F to the document.
+        if self.agentic_mode {
             self.open_agent_find(ctx);
             return;
         }
@@ -10876,11 +11230,23 @@ impl EditorApp {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.painter()
-            .rect_filled(ui.max_rect(), 0.0, theme::surface().chrome);
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        let settings = sidebar_settings_rect(rect);
+        let tree = rect.with_max_y(settings.top());
         #[cfg(target_os = "macos")]
-        ui.add_space(TITLEBAR_HEIGHT);
-        self.draw_tree(ui);
+        let tree = tree.with_min_y((tree.top() + TITLEBAR_HEIGHT).min(tree.bottom()));
+        ui.scope_builder(
+            UiBuilder::new().id_salt("sidebar_tree").max_rect(tree),
+            |ui| self.draw_tree(ui),
+        );
+        let (open_settings, update) = self.draw_settings_row(ui, settings);
+        if open_settings {
+            self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
+        }
+        if update {
+            self.start_update(ui.ctx());
+        }
     }
 
     fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -11617,32 +11983,6 @@ impl EditorApp {
                 session_menu_anchor = Some(button);
             }
         }
-        if self.agent.session_ready {
-            let button = agent_search_rect(header, self.agentic_mode);
-            let response = ui
-                .interact(button, Id::new("agent_search"), Sense::click())
-                .on_hover_text("Find in conversation (Cmd/Ctrl+F)");
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    ui.is_enabled(),
-                    "Find in conversation",
-                )
-            });
-            icons::paint(
-                &painter,
-                Icon::Search,
-                egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID * 0.9)),
-                if response.hovered() || self.agent_find.open {
-                    theme::text().primary
-                } else {
-                    theme::text().secondary
-                },
-            );
-            if response.clicked() {
-                self.open_agent_find(ui.ctx());
-            }
-        }
         if self.agent_find.open {
             let find_bar = transcript
                 .with_max_y((transcript.top() + AGENT_FIND_HEIGHT).min(transcript.bottom()));
@@ -11941,6 +12281,23 @@ impl EditorApp {
                     let find_query = self.agent_find.query.clone();
                     let should_scroll_to_find = self.agent_find.scroll_to_match;
                     let mut scrolled_to_find = false;
+                    // Cached heights are only valid for the width and theme
+                    // they were measured under, and only while indexes still
+                    // line up: a reloaded transcript can shrink the list.
+                    let heights_key = (transcript_width.round().to_bits(), theme::appearance());
+                    if self.agent_transcript_heights_key != heights_key
+                        || self.agent_transcript_heights.len() > self.agent.transcript.len()
+                    {
+                        self.agent_transcript_heights.clear();
+                        self.agent_transcript_heights_key = heights_key;
+                    }
+                    let mut item_heights = std::mem::take(&mut self.agent_transcript_heights);
+                    let transcript_len = self.agent.transcript.len();
+                    let transcript_has_footer =
+                        !self.agent.changed_paths.is_empty() || self.agent.active;
+                    item_heights.resize(transcript_len, f32::NAN);
+                    let mut rendered_items = 0_usize;
+                    let tool_changes = &self.agent.tool_changes;
                     let output = ScrollArea::vertical()
                         .id_salt("agent_transcript")
                         .auto_shrink([false, false])
@@ -11948,10 +12305,12 @@ impl EditorApp {
                             mouse_wheel: !menu_owns_wheel,
                             ..Default::default()
                         })
-                        .content_margin(egui::Margin::symmetric(
-                            0,
-                            AGENT_TRANSCRIPT_EDGE_PADDING,
-                        ))
+                        .content_margin(egui::Margin {
+                            left: 0,
+                            right: 0,
+                            top: AGENT_TRANSCRIPT_TOP_PADDING,
+                            bottom: 0,
+                        })
                         .stick_to_bottom(self.agent_follow_transcript)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -11959,12 +12318,34 @@ impl EditorApp {
                                 ui.vertical(|ui| {
                                     ui.set_width(transcript_width);
                                     ui.set_max_width(transcript_width);
+                                    let clip = ui.clip_rect();
                                     for (item_index, item) in
                                         self.agent.transcript.iter_mut().enumerate()
                                     {
                                 let item_top = ui.cursor().top();
-                                let item_matches = find_matches.binary_search(&item_index).is_ok();
                                 let item_is_selected = selected_find_item == Some(item_index);
+                                // An off-screen item with a known height only
+                                // needs its space, not its widgets: laying out
+                                // every item every frame is what made long
+                                // transcripts crawl. The selected item stays
+                                // rendered while a find-scroll is pending so
+                                // its diff can steer the scroll to the exact
+                                // matching row.
+                                let cached_height = item_heights[item_index];
+                                if cached_height.is_finite()
+                                    && !(item_is_selected && should_scroll_to_find)
+                                    && (item_top + cached_height < clip.top() - AGENT_CULL_MARGIN
+                                        || item_top > clip.bottom() + AGENT_CULL_MARGIN)
+                                {
+                                    ui.add_space(cached_height);
+                                    if item_index + 1 < transcript_len || transcript_has_footer {
+                                        ui.add_space(16.0);
+                                    }
+                                    continue;
+                                }
+                                rendered_items += 1;
+                                let mut item_scrolled = false;
+                                let item_matches = find_matches.binary_search(&item_index).is_ok();
                                 let item_search = item_matches.then_some((
                                     find_query.as_str(),
                                     item_is_selected
@@ -12083,6 +12464,9 @@ impl EditorApp {
                                             ("tool", &tool.id, contains_diff),
                                             title,
                                             tool.status.as_deref(),
+                                            is_file_edit
+                                                .then(|| tool_changes.get(&tool.id).copied())
+                                                .flatten(),
                                             transcript_width,
                                             item_search,
                                             has_body,
@@ -12174,20 +12558,25 @@ impl EditorApp {
                                                                 old_text,
                                                                 new_text,
                                                             } => {
-                                                                if draw_agent_diff(
-                                                                    ui,
-                                                                    Id::new((
-                                                                        "agent_diff",
-                                                                        &tool.id,
-                                                                        content_index,
-                                                                    )),
-                                                                    path,
-                                                                    old_text.as_deref(),
-                                                                    new_text,
-                                                                    &self.highlighter,
-                                                                    &self.syntaxes,
-                                                                    item_search,
-                                                                ) {
+                                                                let (clicked, scrolled) =
+                                                                    draw_agent_diff(
+                                                                        ui,
+                                                                        Id::new((
+                                                                            "agent_diff",
+                                                                            &tool.id,
+                                                                            content_index,
+                                                                        )),
+                                                                        path,
+                                                                        old_text.as_deref(),
+                                                                        new_text,
+                                                                        &self.highlighter,
+                                                                        &self.syntaxes,
+                                                                        item_search,
+                                                                        item_is_selected
+                                                                            && should_scroll_to_find,
+                                                                    );
+                                                                item_scrolled |= scrolled;
+                                                                if clicked {
                                                                     open_path_request = Some((
                                                                         path.clone(),
                                                                         None,
@@ -12405,6 +12794,8 @@ impl EditorApp {
                                                     );
                                                     ui.add(Label::new(&card.action).wrap());
                                                 });
+                                            item_heights[item_index] =
+                                                ui.cursor().top() - item_top;
                                             scrolled_to_find |= paint_agent_search_item(
                                                 ui,
                                                 item_top,
@@ -12693,21 +13084,21 @@ impl EditorApp {
                                                 ui.add(Label::new(job).wrap());
                                             });
                                     }
-                                    TranscriptItem::Truncated => {
-                                        ui.label(
-                                            RichText::new("Earlier output was truncated.")
-                                                .small()
-                                                .weak(),
-                                        );
-                                    }
                                 }
-                                scrolled_to_find |= paint_agent_search_item(
-                                    ui,
-                                    item_top,
-                                    item_is_selected,
-                                    should_scroll_to_find,
-                                );
-                                ui.add_space(16.0);
+                                item_heights[item_index] = ui.cursor().top() - item_top;
+                                // A diff that already scrolled to its exact
+                                // matching row wins over the coarser
+                                // whole-item scroll, which would override it.
+                                scrolled_to_find |= item_scrolled
+                                    || paint_agent_search_item(
+                                        ui,
+                                        item_top,
+                                        item_is_selected,
+                                        should_scroll_to_find && !item_scrolled,
+                                    );
+                                if item_index + 1 < transcript_len || transcript_has_footer {
+                                    ui.add_space(16.0);
+                                }
                             }
                             if !self.agent.changed_paths.is_empty() {
                                 let item_top = ui.cursor().top();
@@ -12744,6 +13135,8 @@ impl EditorApp {
                                 });
                             });
                         });
+                    self.agent_transcript_heights = item_heights;
+                    self.agent_transcript_rendered = rendered_items;
                     if scrolled_to_find {
                         self.agent_find.scroll_to_match = false;
                         self.agent_follow_transcript = false;
@@ -12764,14 +13157,6 @@ impl EditorApp {
                         state.store(ui.ctx(), output.id);
                         ui.ctx().request_repaint();
                     }
-                    ui.painter().add(egui::Shape::mesh(agent_transcript_fade_mesh(
-                        output.inner_rect,
-                        if self.agentic_mode {
-                            editor_background()
-                        } else {
-                            theme::surface().chrome
-                        },
-                    )));
                     if !self.agent_follow_transcript {
                         let button = egui::Rect::from_min_size(
                             egui::pos2(
@@ -12868,8 +13253,6 @@ impl EditorApp {
                 ),
             );
             ui.painter().rect_filled(composer, 0.0, editor_background());
-            ui.painter()
-                .add(theme::shadow::popover().as_shape(panel, AGENTIC_COMPOSER_RADIUS));
             ui.painter()
                 .rect_filled(panel, AGENTIC_COMPOSER_RADIUS, agentic_composer_fill());
             ui.painter().rect_stroke(
@@ -14252,7 +14635,7 @@ impl EditorApp {
 
     /// The project switcher that opens under the tree's root header: recent
     /// roots plus a folder chooser for anything not in the list.
-    fn draw_project_menu(&mut self, tree_ui: &mut egui::Ui) {
+    fn draw_project_menu(&mut self, tree_ui: &mut egui::Ui, opened_this_frame: bool) {
         let sidebar = tree_ui.max_rect();
         let position = egui::pos2(
             sidebar.left() + theme::space::SMALL,
@@ -14328,7 +14711,7 @@ impl EditorApp {
             })
             .response;
         if tree_ui.input(|input| input.key_pressed(egui::Key::Escape))
-            || response.clicked_elsewhere()
+            || (!opened_this_frame && response.clicked_elsewhere())
         {
             self.project_menu = false;
         }
@@ -14358,7 +14741,7 @@ impl EditorApp {
             self.project_menu = !self.project_menu;
         }
         if self.project_menu {
-            self.draw_project_menu(ui);
+            self.draw_project_menu(ui, output.root_clicked);
         }
         if let Some(index) = output.context_requested {
             let path = self.tree.visible[index].entry.path.clone();
@@ -18436,11 +18819,12 @@ fn find_highlighted_job(
             }
             if start < end {
                 let mut format = section.format.clone();
-                format.background = if current_match == active {
-                    theme::state::selected_focus()
+                if current_match == active {
+                    format.background = theme::state::find::active_fill();
+                    format.color = theme::state::find::active_ink();
                 } else {
-                    theme::state::selected()
-                };
+                    format.background = theme::state::find::match_fill();
+                }
                 highlighted.append(&base.text[start..end], leading_space, format);
                 leading_space = 0.0;
                 cursor = end;
@@ -18624,21 +19008,24 @@ fn presentation_job<'a>(
     bracket_overlay.unwrap_or(base)
 }
 
+/// Non-overlapping, ASCII-case-insensitive matches. Compares byte windows in
+/// place: this runs for every diff row during a search, so the two lowercase
+/// String copies the obvious version makes are too expensive.
 fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut text_lower = text.to_owned();
-    text_lower.make_ascii_lowercase();
-    let mut query_lower = query.to_owned();
-    query_lower.make_ascii_lowercase();
     let mut spans = Vec::new();
+    if query.is_empty() || query.len() > text.len() {
+        return spans;
+    }
+    let text = text.as_bytes();
+    let query = query.as_bytes();
     let mut cursor = 0;
-    while let Some(offset) = text_lower[cursor..].find(&query_lower) {
-        let start = cursor + offset;
-        let end = start + query_lower.len();
-        spans.push(start..end);
-        cursor = end;
+    while cursor + query.len() <= text.len() {
+        if text[cursor..cursor + query.len()].eq_ignore_ascii_case(query) {
+            spans.push(cursor..cursor + query.len());
+            cursor += query.len();
+        } else {
+            cursor += 1;
+        }
     }
     spans
 }
@@ -18661,14 +19048,14 @@ mod tests {
     use super::{
         AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, AgenticDiff,
         CompletionPopup, DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT,
-        PaneId, PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SettingsSection, TAB_CLOSE,
-        TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
-        TITLEBAR_PAINT_KEY, TabDrop, TreeState, WINDOW_CORNER_RADIUS, agent_collapsing_header,
-        agent_composer_content, agent_composer_height, agent_diff_preview, agent_markdown_galley,
-        agent_mention_matches, agent_mention_query, agent_menu_rect, agent_near_bottom,
-        agent_new_session_rect, agent_search_matches, agent_selector_button,
-        agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
-        agent_transcript_fade_mesh, agentic_empty_state_top_padding, allowed_tab_drop_zone,
+        PaneId, PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT,
+        SettingsSection, TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH,
+        TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState, UPDATE_BUTTON_SIZE,
+        WINDOW_CORNER_RADIUS, agent_collapsing_header, agent_composer_content,
+        agent_composer_height, agent_diff_preview, agent_markdown_galley, agent_mention_matches,
+        agent_mention_query, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
+        agent_search_matches, agent_selector_button, agent_send_button_colors, agent_sessions_rect,
+        agent_toggle_rect, agentic_empty_state_top_padding, allowed_tab_drop_zone,
         build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions,
         completion_word_range, copy_tree_entry, defer_resize, diagnostic_highlighted_job,
         disable_transient_egui_debug_overlays, draw_agent_diff, draw_editor_empty_state,
@@ -20358,7 +20745,7 @@ mod tests {
     }
     use egui::{
         Color32, CursorIcon, DroppedFile, Event, HoveredFile, Id, Key, Modifiers, MouseWheelUnit,
-        PointerButton, RawInput, Rect, TouchPhase, Vec2, epaint::Shape, pos2,
+        PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2, epaint::Shape, pos2,
     };
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
@@ -20400,7 +20787,7 @@ mod tests {
     #[test]
     fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
         let button = Rect::from_center_size(pos2(50.0, 17.0), Vec2::new(34.0, 34.0));
-        let draw = |open, panel_on_right| {
+        let draw = |open| {
             let context = theme::test_context();
             let output = context.run_ui(
                 RawInput {
@@ -20410,10 +20797,10 @@ mod tests {
                 |ui| {
                     let response = ui.interact(
                         button,
-                        Id::new(("sidebar_toggle_icon", open, panel_on_right)),
+                        Id::new(("sidebar_toggle_icon", open)),
                         egui::Sense::click(),
                     );
-                    draw_sidebar_toggle_icon(ui, button, &response, open, panel_on_right);
+                    draw_sidebar_toggle_icon(ui, button, &response, open);
                 },
             );
             output
@@ -20427,18 +20814,15 @@ mod tests {
                 })
                 .expect("sidebar toggle icon")
         };
-        let inactive = [draw(false, false), draw(false, true)];
-        let active = [draw(true, false), draw(true, true)];
+        let inactive = draw(false);
+        let active = draw(true);
 
-        assert_eq!(
-            active.map(|icon| icon.0 - button.center()),
-            inactive.map(|icon| icon.0 - button.center())
-        );
-        assert_eq!(active.map(|icon| icon.1), [theme::text().primary; 2]);
+        assert_eq!(active.0 - button.center(), inactive.0 - button.center());
+        assert_eq!(active.1, theme::text().primary);
     }
 
     #[test]
-    fn settings_toggle_sits_next_to_terminal_toggle() {
+    fn agent_toggle_is_a_sparkle_rather_than_a_panel_glyph() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut app = EditorApp::new(OpenTarget {
@@ -20449,7 +20833,7 @@ mod tests {
         .unwrap();
         let context = theme::test_context();
 
-        let _ = context.run_ui(
+        let output = context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     Default::default(),
@@ -20460,16 +20844,178 @@ mod tests {
             |root| app.ui(root),
         );
 
-        let terminal = context
-            .read_response(Id::new("terminal_toggle"))
-            .expect("terminal toggle")
+        let button = context
+            .read_response(Id::new("agent_sidebar_toggle"))
+            .expect("agent toggle")
             .rect;
+        let sparkle = crate::icons::probe::bounds(&output.shapes, button, theme::text().muted)
+            .expect("sparkle glyph inside the agent toggle");
+        assert!(sparkle.width() <= crate::icons::GRID + 1.0);
+        assert!(!output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Rect(rect) => {
+                button.contains_rect(rect.rect) && rect.rect.size() == Vec2::new(16.0, 13.0)
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn settings_row_sits_at_the_bottom_of_the_file_tree_sidebar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let sidebar = split_workspace(screen, true, app.sidebar_width, false, 0.0)
+            .0
+            .expect("file tree sidebar");
         let settings = context
             .read_response(Id::new("settings_toggle"))
-            .expect("settings toggle")
+            .expect("settings row")
             .rect;
-        assert_eq!(settings.left(), terminal.right());
-        assert_eq!(settings.size(), terminal.size());
+        assert_eq!(settings.bottom(), sidebar.bottom());
+        assert_eq!(settings.x_range(), sidebar.x_range());
+        assert_eq!(settings.height(), SIDEBAR_SETTINGS_ROW_HEIGHT);
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Settings"))
+        );
+        assert!(
+            output.shapes.iter().any(|shape| match shape.shape {
+                Shape::LineSegment { points, .. } =>
+                    (points[0].y - settings.top()).abs() <= 1.0
+                        && (points[1].y - settings.top()).abs() <= 1.0
+                        && points[0].x <= settings.left() + 1.0
+                        && points[1].x >= settings.right() - 1.0,
+                _ => false,
+            }),
+            "a hairline separates the settings row from the tree"
+        );
+    }
+
+    #[test]
+    fn settings_row_sits_at_the_bottom_of_the_agentic_sessions_rail() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        let sessions = split_agentic_workspace(screen, true, app.sidebar_width)
+            .0
+            .expect("agentic sessions rail");
+        let settings = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings row")
+            .rect;
+        assert_eq!(settings.bottom(), sessions.bottom());
+        assert_eq!(settings.x_range(), sessions.x_range());
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "Settings"))
+        );
+    }
+
+    #[test]
+    fn update_button_appears_on_the_settings_row_only_when_an_update_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
+        let input = || RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        };
+
+        let _ = context.run_ui(input(), |root| app.ui(root));
+        assert!(
+            context.read_response(Id::new("settings_update")).is_none(),
+            "the button may only appear once an update is detected"
+        );
+
+        app.update_available
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let output = context.run_ui(input(), |root| app.ui(root));
+
+        let row = context
+            .read_response(Id::new("settings_toggle"))
+            .expect("settings row")
+            .rect;
+        let button = context
+            .read_response(Id::new("settings_update"))
+            .expect("update button")
+            .rect;
+        assert_eq!(button.size(), Vec2::splat(UPDATE_BUTTON_SIZE));
+        assert_eq!(button.right(), row.right() - theme::space::MEDIUM);
+        assert_eq!(button.center().y, row.center().y);
+        fn is_accent_circle(shape: &Shape, center: egui::Pos2) -> bool {
+            match shape {
+                Shape::Circle(circle) => {
+                    circle.center == center
+                        && circle.radius == UPDATE_BUTTON_SIZE * 0.5
+                        && circle.fill == theme::accent()
+                }
+                Shape::Vec(shapes) => shapes.iter().any(|shape| is_accent_circle(shape, center)),
+                _ => false,
+            }
+        }
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| is_accent_circle(&shape.shape, button.center())),
+            "the update button is a solid accent circle"
+        );
     }
 
     #[test]
@@ -20850,6 +21396,39 @@ mod tests {
     }
 
     #[test]
+    fn transcript_search_is_command_only_in_the_agentic_view() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        for agentic_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agentic_mode = agentic_mode;
+            app.agent_sidebar = !agentic_mode;
+            app.agent.connection = ConnectionState::Ready;
+            app.agent.session_ready = true;
+            let context = theme::test_context();
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+
+            assert!(context.read_response(Id::new("agent_search")).is_none());
+            app.open_find(&context);
+            assert_eq!(
+                app.agent_find.open, agentic_mode,
+                "Cmd/Ctrl+F routed to the transcript with agentic_mode={agentic_mode}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_header_button_hover_brightens_the_icon_without_adding_a_surface() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
@@ -21208,20 +21787,52 @@ mod tests {
     }
 
     #[test]
-    fn agent_transcript_fades_cover_both_scroll_edges() {
-        let rect = Rect::from_min_size(pos2(10.0, 20.0), Vec2::new(300.0, 400.0));
-        let mesh = agent_transcript_fade_mesh(rect, theme::surface().chrome);
+    fn tool_card_toggle_settles_layout_before_the_frame_is_presented() {
+        let context = theme::test_context();
+        let draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 160.0))),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    agent_collapsing_header(
+                        ui,
+                        "settled-tool-card",
+                        "Edit src/lib.rs",
+                        Some("Completed"),
+                        None,
+                        360.0,
+                        None,
+                        true,
+                        false,
+                        |ui| {
+                            ui.label("expanded body");
+                        },
+                    );
+                },
+            )
+        };
+        let pointer = pos2(17.0, 20.0);
+        let _ = draw(Vec::new());
+        let _ = draw(vec![
+            Event::PointerMoved(pointer),
+            Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let output = draw(vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
 
-        assert_eq!(mesh.vertices.len(), 8);
-        assert_eq!(mesh.indices.len(), 12);
-        assert_eq!(mesh.vertices[0].pos, rect.left_top());
-        assert_eq!(mesh.vertices[0].color.a(), 255);
-        assert_eq!(mesh.vertices[2].pos.y, rect.top() + 28.0);
-        assert_eq!(mesh.vertices[2].color.a(), 0);
-        assert_eq!(mesh.vertices[4].pos.y, rect.bottom() - 28.0);
-        assert_eq!(mesh.vertices[4].color.a(), 0);
-        assert_eq!(mesh.vertices[6].pos, rect.left_bottom());
-        assert_eq!(mesh.vertices[6].color.a(), 255);
+        assert_eq!(output.platform_output.num_completed_passes, 2);
     }
 
     #[test]
@@ -21870,9 +22481,79 @@ mod tests {
     }
 
     #[test]
+    fn individual_edit_cards_render_their_line_stats() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .apply(crate::agent::controller::Event::ToolCallUpdated(
+                ToolActivity {
+                    id: "edit-lib".into(),
+                    title: Some("Edit src/lib.rs".into()),
+                    status: Some("Completed".into()),
+                    kind: Some("Edit".into()),
+                    paths: vec!["src/lib.rs".into()],
+                    detail: Some(ToolDetail {
+                        input: None,
+                        content: vec![crate::agent::controller::ToolOutput::Diff {
+                            path: "src/lib.rs".into(),
+                            old_text: Some("keep\nremove\n".into()),
+                            new_text: "keep\nadd one\nadd two\n".into(),
+                        }],
+                        output: None,
+                    }),
+                },
+            ));
+        // The closing summary has the same counts; remove it so this check can
+        // only be satisfied by the individual tool card header.
+        app.agent.changed_paths.clear();
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn collect_text(shape: &Shape, texts: &mut String) {
+            match shape {
+                Shape::Text(text) => {
+                    texts.push_str(text.galley.text());
+                    texts.push('\n');
+                }
+                Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect_text(shape, texts)),
+                _ => {}
+            }
+        }
+        let mut texts = String::new();
+        for shape in &output.shapes {
+            collect_text(&shape.shape, &mut texts);
+        }
+
+        assert!(texts.contains("+2"), "{texts}");
+        assert!(texts.contains("−1"), "{texts}");
+    }
+
+    #[test]
     #[ignore = "timing spike, run manually"]
     fn timing_spike_for_agent_sidebar_costs() {
-        let source = fs::read_to_string("docs/index.html").unwrap();
+        let source = (0..12_000)
+            .map(|index| {
+                format!(
+                    "<div class=\"row-{index}\"><span>cell {index}</span>\
+                     <script>var value_{index} = {index} * 2;</script></div>\n"
+                )
+            })
+            .collect::<String>();
         let syntaxes = SyntaxManager::built_in().unwrap();
         let highlighter = Highlighter::new().unwrap();
         let syntax = syntaxes.detect(std::path::Path::new("docs/index.html"), false);
@@ -21896,16 +22577,18 @@ mod tests {
             bundle.is_ok()
         );
 
-        let mut new_text = source.clone();
-        new_text.push_str("<div>tail</div>\n");
+        // Every line changes, like a full-file rewrite: no context compaction,
+        // so the expanded card carries added+removed rows for the whole file.
+        let new_text = source.replace("cell", "unit");
         let start = std::time::Instant::now();
         let diff = build_agent_diff(Some(&source), &new_text);
         eprintln!(
-            "diff {} lines: {:?} (+{} -{})",
+            "diff {} lines: {:?} (+{} -{}, {} rows)",
             source.lines().count(),
             start.elapsed(),
             diff.added,
-            diff.removed
+            diff.removed,
+            diff.lines.len()
         );
 
         let start = std::time::Instant::now();
@@ -21922,12 +22605,12 @@ mod tests {
 
         let context = theme::test_context();
         let input = || RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(700.0, 4000.0),
-            )),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(700.0, 700.0))),
             ..RawInput::default()
         };
+        // Force the card open: the complaint is scrolling with a large diff
+        // expanded, so steady-state frames must pay the expanded cost.
+        context.data_mut(|data| data.insert_temp(Id::new("spike_diff").with("expanded"), true));
         let render = |label: &str| {
             let start = std::time::Instant::now();
             let _ = context.run_ui(input(), |ui| {
@@ -21940,12 +22623,100 @@ mod tests {
                     &highlighter,
                     &syntaxes,
                     None,
+                    false,
                 );
             });
             eprintln!("{label}: {:?}", start.elapsed());
         };
-        render("diff card first frame");
-        render("diff card cached frame");
+        render("expanded diff first frame");
+        for frame in 0..5 {
+            render(&format!("expanded diff steady frame {frame}"));
+        }
+        let render_search = |label: &str| {
+            let start = std::time::Instant::now();
+            let _ = context.run_ui(input(), |ui| {
+                draw_agent_diff(
+                    ui,
+                    Id::new("spike_diff"),
+                    std::path::Path::new("docs/index.html"),
+                    Some(&source),
+                    &new_text,
+                    &highlighter,
+                    &syntaxes,
+                    Some(("unit", Some(3))),
+                    false,
+                );
+            });
+            eprintln!("{label}: {:?}", start.elapsed());
+        };
+        for frame in 0..3 {
+            render_search(&format!("expanded diff search frame {frame}"));
+        }
+    }
+
+    #[test]
+    fn huge_diff_rows_skip_syntax_highlighting_but_previews_stay_colored() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        let highlighter = Highlighter::new().unwrap();
+        let source = (0..1_500)
+            .map(|index| format!("<span class=\"cell\">item {index}</span>\n"))
+            .collect::<String>();
+        let new_text = source.replace("item", "unit");
+        fn code_row_sections(output: &egui::FullOutput, needle: &str) -> Option<usize> {
+            fn visit(shape: &Shape, needle: &str) -> Option<usize> {
+                match shape {
+                    Shape::Text(text) if text.galley.text().contains(needle) => {
+                        Some(text.galley.job.sections.len())
+                    }
+                    Shape::Vec(shapes) => shapes.iter().find_map(|shape| visit(shape, needle)),
+                    _ => None,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| visit(&shape.shape, needle))
+        }
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(700.0, 700.0))),
+            ..RawInput::default()
+        };
+        let render = |context: &egui::Context, id: &str| {
+            context.run_ui(input(), |ui| {
+                draw_agent_diff(
+                    ui,
+                    Id::new(id),
+                    std::path::Path::new("page.html"),
+                    Some(&source),
+                    &new_text,
+                    &highlighter,
+                    &syntaxes,
+                    None,
+                    false,
+                );
+            })
+        };
+        // Expanded: 1500 changed lines per side is past the highlight cap, so
+        // a code row is gutter + sign + one plain code section.
+        let context = theme::test_context();
+        context.data_mut(|data| data.insert_temp(Id::new("huge").with("expanded"), true));
+        let expanded = render(&context, "huge");
+        let sections =
+            code_row_sections(&expanded, "item 0").expect("expanded diff renders its first rows");
+        assert!(
+            sections <= 3,
+            "a capped diff row must not carry syntax sections, found {sections}"
+        );
+        // Collapsed: the preview only needs a handful of lines, so it keeps
+        // real syntax colors (many sections per row).
+        let context = theme::test_context();
+        let preview = render(&context, "preview");
+        let sections =
+            code_row_sections(&preview, "item 0").expect("preview renders its first rows");
+        assert!(
+            sections > 3,
+            "the collapsed preview should stay syntax highlighted, found {sections}"
+        );
     }
 
     #[test]
@@ -21967,6 +22738,7 @@ mod tests {
                     &highlighter,
                     &syntaxes,
                     None,
+                    false,
                 );
             },
         );
@@ -22166,6 +22938,293 @@ mod tests {
     }
 
     #[test]
+    fn agent_transcript_culls_offscreen_items_and_restores_them_when_scrolled_into_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        for index in 0..120 {
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant(format!(
+                    "Reply number {index} ends here"
+                )));
+        }
+        fn contains_text(shape: &Shape, needle: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(needle),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, needle)),
+                _ => false,
+            }
+        }
+        fn text_pos(shape: &Shape, needle: &str) -> Option<Pos2> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains(needle) => Some(text.pos),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_pos(shape, needle)),
+                _ => None,
+            }
+        }
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
+            ..RawInput::default()
+        };
+        let context = theme::test_context();
+        // First frame measures every item; the second starts from cached
+        // heights with the view pinned to the newest reply.
+        let _ = context.run_ui(input(), |root| app.ui(root));
+        assert_eq!(
+            app.agent_transcript_rendered, 120,
+            "the measuring frame lays out every item"
+        );
+        let output = context.run_ui(input(), |root| app.ui(root));
+        let last = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_pos(&shape.shape, "Reply number 119 ends here"))
+            .expect("newest reply visible at the bottom");
+        assert!(
+            app.agent_transcript_rendered < 60,
+            "items far above the viewport must be culled into spacers, \
+             but {} of 120 were laid out",
+            app.agent_transcript_rendered
+        );
+        // Wheel-scroll back to the top over the transcript; culled items must
+        // rematerialize once they enter the viewport.
+        let mut oldest_visible = false;
+        for _ in 0..12 {
+            let mut scroll = input();
+            scroll.events = vec![
+                Event::PointerMoved(last),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, 1_000_000.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ];
+            let output = context.run_ui(scroll, |root| app.ui(root));
+            if output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Reply number 0 ends here"))
+            {
+                oldest_visible = true;
+                assert!(
+                    app.agent_transcript_rendered < 60,
+                    "culling must keep working at the top of the transcript"
+                );
+                break;
+            }
+        }
+        assert!(
+            oldest_visible,
+            "scrolling up must bring culled items back into the transcript"
+        );
+    }
+
+    #[test]
+    fn agent_diff_body_culls_rows_far_outside_the_viewport() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let new_text = (0..2000)
+            .map(|index| format!("diff row {index} payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = super::build_agent_diff(None, &new_text);
+        fn contains_text(shape: &Shape, needle: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(needle),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, needle)),
+                _ => false,
+            }
+        }
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(500.0, 400.0))),
+            ..RawInput::default()
+        };
+        let context = theme::test_context();
+        let run = |events: Vec<Event>| {
+            let mut frame = input();
+            frame.events = events;
+            context.run_ui(frame, |ui| {
+                super::draw_agent_diff_body(
+                    ui,
+                    Id::new("diff_cull"),
+                    std::path::Path::new("notes.txt"),
+                    &diff,
+                    None,
+                    &new_text,
+                    &app.highlighter,
+                    &app.syntaxes,
+                );
+            })
+        };
+        let rendered_rows = || {
+            context
+                .data(|data| data.get_temp::<usize>(Id::new("diff_cull").with("rendered_rows")))
+                .expect("diff body records its rendered row count")
+        };
+        // Row height is learned from the first rendered row, so even the
+        // first frame only lays out the visible band.
+        let first = run(Vec::new());
+        assert!(
+            first
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "diff row 0 payload")),
+            "the first rows start visible"
+        );
+        let output = run(Vec::new());
+        assert!(
+            rendered_rows() < 100,
+            "rows far below the viewport must be culled into spacers, \
+             but {} of 2000 were laid out",
+            rendered_rows()
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "diff row 0 payload")),
+            "rows inside the viewport keep rendering"
+        );
+        // Wheel to the bottom: culled rows must rematerialize exactly where
+        // their spacers put them.
+        let mut bottom_visible = false;
+        for _ in 0..12 {
+            let output = run(vec![
+                Event::PointerMoved(pos2(250.0, 200.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -1_000_000.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            if output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "diff row 1999 payload"))
+            {
+                bottom_visible = true;
+                assert!(
+                    rendered_rows() < 100,
+                    "culling must keep working at the bottom of the diff"
+                );
+                break;
+            }
+        }
+        assert!(
+            bottom_visible,
+            "scrolling down must bring culled rows back into view"
+        );
+    }
+
+    #[test]
+    fn find_navigation_scrolls_the_matching_diff_row_into_view() {
+        use crate::agent::controller::ToolOutput;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        // One tool card whose (search-expanded) diff hides the only match at
+        // row 250, followed by enough replies that the view rests far below.
+        let new_text = (0..300)
+            .map(|index| {
+                if index == 250 {
+                    "the needle line".to_owned()
+                } else {
+                    format!("filler line {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "edit".into(),
+                title: Some("Edit big.txt".into()),
+                status: Some("Completed".into()),
+                kind: Some("Edit".into()),
+                paths: Vec::new(),
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![ToolOutput::Diff {
+                        path: "big.txt".into(),
+                        old_text: None,
+                        new_text: new_text.clone(),
+                    }],
+                    output: None,
+                }),
+            }));
+        for index in 0..40 {
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant(format!("reply {index}")));
+        }
+        fn text_pos(shape: &Shape, needle: &str) -> Option<Pos2> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains(needle) => Some(text.pos),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_pos(shape, needle)),
+                _ => None,
+            }
+        }
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
+            ..RawInput::default()
+        };
+        let context = theme::test_context();
+        let _ = context.run_ui(input(), |root| app.ui(root));
+        // Navigate to the match the way the find bar would.
+        app.agent_find.query = "needle".to_owned();
+        app.agent_find.matches =
+            super::agent_search_matches(&app.agent.transcript, &app.agent.changed_paths, "needle");
+        assert_eq!(app.agent_find.matches, vec![0], "the diff holds the match");
+        app.agent_find.selected = 0;
+        app.agent_find.scroll_to_match = true;
+        app.agent_follow_transcript = false;
+        let mut match_visible = false;
+        for _ in 0..12 {
+            let output = context.run_ui(input(), |root| app.ui(root));
+            if let Some(pos) = output
+                .shapes
+                .iter()
+                .find_map(|shape| text_pos(&shape.shape, "the needle line"))
+                && (0.0..700.0).contains(&pos.y)
+            {
+                match_visible = true;
+                break;
+            }
+        }
+        assert!(
+            match_visible,
+            "navigating to a match inside a diff must scroll its row into view"
+        );
+        assert!(
+            !app.agent_find.scroll_to_match,
+            "the pending scroll must be consumed once the row is in view"
+        );
+    }
+
+    #[test]
     fn detail_less_tool_cards_are_not_expandable() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
@@ -22242,6 +23301,7 @@ mod tests {
                     "tool-card",
                     "python3 -c",
                     Some("Completed"),
+                    None,
                     340.0,
                     None,
                     true,
@@ -22331,6 +23391,7 @@ mod tests {
                         "marquee-tool",
                         &format!("Edit {path}"),
                         Some("Completed"),
+                        None,
                         260.0,
                         None,
                         false,
@@ -25050,9 +26111,9 @@ mod tests {
         );
         draw(&mut app, Vec::new());
 
-        let settings = context
-            .read_response(Id::new("settings_toggle"))
-            .expect("settings toggle")
+        let terminal = context
+            .read_response(Id::new("terminal_toggle"))
+            .expect("terminal toggle")
             .rect;
         let agentic = context
             .read_response(Id::new("agentic_mode_toggle"))
@@ -25060,14 +26121,14 @@ mod tests {
             .rect;
 
         assert!(
-            settings.right() <= app.sidebar_width,
-            "settings={settings:?}, agentic={agentic:?}, width={}",
+            terminal.right() <= app.sidebar_width,
+            "terminal={terminal:?}, agentic={agentic:?}, width={}",
             app.sidebar_width
         );
-        assert!(agentic.left() >= settings.right());
+        assert!(agentic.left() >= terminal.right());
         assert!(
             agentic.right() <= app.sidebar_width,
-            "settings={settings:?}, agentic={agentic:?}, width={}",
+            "terminal={terminal:?}, agentic={agentic:?}, width={}",
             app.sidebar_width
         );
     }
@@ -25885,17 +26946,17 @@ mod tests {
         let sessions = split_agentic_workspace(screen, true, app.sidebar_width)
             .0
             .expect("agentic session sidebar");
-        let settings = context
-            .read_response(Id::new("settings_toggle"))
-            .expect("settings toggle")
+        let terminal = context
+            .read_response(Id::new("terminal_toggle"))
+            .expect("terminal toggle")
             .rect;
         let mode = context
             .read_response(Id::new("agentic_mode_toggle"))
             .expect("agentic mode toggle")
             .rect;
 
-        assert!(settings.right() <= sessions.right());
-        assert!(mode.left() >= settings.right());
+        assert!(terminal.right() <= sessions.right());
+        assert!(mode.left() >= terminal.right());
         assert!(mode.right() <= sessions.right());
     }
 
@@ -26086,6 +27147,52 @@ mod tests {
         }
         assert!(texts.iter().any(|text| text == "neighbor"), "{texts:?}");
         assert!(texts.iter().any(|text| text == "Open Folder…"), "{texts:?}");
+        assert!(app.project_menu);
+    }
+
+    #[test]
+    fn opening_the_project_menu_survives_the_root_click() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        let context = theme::test_context();
+        let screen = Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 700.0),
+        ));
+        let root_header = pos2(100.0, TITLEBAR_HEIGHT + 10.0);
+        let mut draw = |events| {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+        };
+
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(root_header),
+            Event::PointerButton {
+                pos: root_header,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        draw(vec![Event::PointerButton {
+            pos: root_header,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
         assert!(app.project_menu);
     }
 
