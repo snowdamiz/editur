@@ -168,6 +168,7 @@ impl TerminalPanel {
             self.activate_tab(index);
         }
         if panes.len() > 1
+            && self.focused(ui.ctx())
             && let Some((_, pane)) = panes.iter().find(|(pane, _)| *pane == self.active_pane)
         {
             ui.painter().rect_stroke(
@@ -259,17 +260,10 @@ impl TerminalPanel {
                             if dragging {
                                 theme::state::selected()
                             } else if selected {
-                                theme::surface().input
+                                theme::surface().editor
                             } else {
                                 theme::state::hover()
                             },
-                        );
-                    }
-                    if selected {
-                        ui.painter().hline(
-                            tab.x_range(),
-                            tab.bottom() - 1.0,
-                            egui::Stroke::new(2.0, theme::accent()),
                         );
                     }
                     let close_rect = egui::Rect::from_center_size(
@@ -280,7 +274,11 @@ impl TerminalPanel {
                         egui::pos2(tab.left() + 12.0, tab.center().y),
                         Align2::LEFT_CENTER,
                         title,
-                        theme::typography::small(),
+                        if selected {
+                            theme::typography::strong()
+                        } else {
+                            theme::typography::small()
+                        },
                         if selected {
                             theme::text().primary
                         } else {
@@ -1101,6 +1099,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn selected_terminal_tab_uses_the_editor_tab_face_without_an_accent_border() {
+        let ctx = theme::test_context();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                panel.show(ui, ui.max_rect(), Path::new("."));
+            },
+        );
+        let tab = ctx
+            .read_response(egui::Id::new(("terminal_tab", 1_u64)))
+            .expect("terminal tab")
+            .rect;
+
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::Shape::Rect(rect)
+                    if rect.rect == tab && rect.fill == theme::surface().editor
+            )
+        }));
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::Shape::LineSegment { points, stroke }
+                    if tab.contains(points[0])
+                        && tab.contains(points[1])
+                        && stroke.color == theme::accent()
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn selected_terminal_pane_draws_the_editor_focus_outline() {
         let ctx = theme::test_context();
         let mut panel = TerminalPanel::default();
@@ -1122,6 +1162,38 @@ mod tests {
         );
 
         assert!(output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::Shape::Rect(rect) if rect.stroke.color == theme::border::focus_color()
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unfocused_terminal_panes_do_not_draw_a_focus_outline() {
+        let ctx = theme::test_context();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+        panel.focus_active = false;
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("editor")));
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                panel.show(ui, ui.max_rect(), Path::new("."));
+            },
+        );
+
+        assert!(!output.shapes.iter().any(|shape| {
             matches!(
                 &shape.shape,
                 egui::Shape::Rect(rect) if rect.stroke.color == theme::border::focus_color()

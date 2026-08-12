@@ -51,6 +51,8 @@ pub struct TreeOutput {
     pub clicked: Option<usize>,
     pub drag_started: Option<usize>,
     pub context_requested: Option<usize>,
+    /// The project name at the top was clicked; the app opens the switcher.
+    pub root_clicked: bool,
 }
 
 impl TreeSurface {
@@ -65,7 +67,7 @@ impl TreeSurface {
         let (id, full) = ui.allocate_space(ui.available_size());
         ui.painter().rect_filled(full, 0.0, theme::surface().chrome);
         let header = full.with_max_y((full.top() + theme::control::ROW).min(full.bottom()));
-        self.draw_root_header(ui, id, header, root);
+        let root_clicked = self.draw_root_header(ui, id, header, root);
         let rect = full.with_min_y(header.bottom());
         let content = rect;
         let response = ui.interact(content, id.with("tree"), Sense::click_and_drag());
@@ -256,17 +258,28 @@ impl TreeSurface {
             clicked,
             drag_started,
             context_requested,
+            root_clicked,
         }
     }
 
-    /// The first thing in the window that says which project is open.
-    fn draw_root_header(&self, ui: &mut Ui, id: egui::Id, header: Rect, root: &Path) {
-        let response = ui.interact(header, id.with("tree_root"), Sense::hover());
+    /// The first thing in the window that says which project is open. Clicking
+    /// it is how the editor switches projects, so it reads as a button on
+    /// hover.
+    fn draw_root_header(&self, ui: &mut Ui, id: egui::Id, header: Rect, root: &Path) -> bool {
+        let response = ui
+            .interact(header, id.with("tree_root"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Switch project")
+        });
         let name = root
             .file_name()
             .unwrap_or(root.as_os_str())
             .to_string_lossy();
         let painter = ui.painter_at(header);
+        if response.hovered() {
+            painter.rect_filled(header, 0.0, theme::state::hover());
+        }
         let left = header.left() + theme::space::MEDIUM;
         icons::paint(
             &painter,
@@ -277,15 +290,38 @@ impl TreeSurface {
             ),
             theme::text().muted,
         );
+        let label_left = left + icons::GRID + theme::space::SNUG;
         painter.text(
-            egui::pos2(left + icons::GRID + theme::space::SNUG, header.center().y),
+            egui::pos2(label_left, header.center().y),
             egui::Align2::LEFT_CENTER,
-            name,
+            name.as_ref(),
             theme::typography::strong(),
             theme::text().primary,
         );
+        if response.hovered() {
+            let name_width = painter
+                .layout_no_wrap(
+                    name.into_owned(),
+                    theme::typography::strong(),
+                    theme::text().primary,
+                )
+                .size()
+                .x;
+            icons::paint(
+                &painter,
+                Icon::ChevronDown,
+                Rect::from_center_size(
+                    egui::pos2(
+                        label_left + name_width + theme::space::SNUG + icons::GRID * 0.5,
+                        header.center().y,
+                    ),
+                    egui::Vec2::splat(icons::GRID * 0.75),
+                ),
+                theme::text().muted,
+            );
+        }
         painter.hline(header.x_range(), header.bottom(), theme::border::hairline());
-        response.on_hover_text(root.display().to_string());
+        response.on_hover_text(root.display().to_string()).clicked()
     }
 
     pub fn visible_rows(&self, total: usize, viewport_height: f32) -> Range<usize> {
@@ -322,9 +358,10 @@ impl TreeSurface {
 }
 
 /// The x of the indent guide for `depth`, which is also where that depth's
-/// content starts.
+/// content starts. The base offset leaves the depth-0 disclosure chevron a
+/// full gutter instead of pressing it against the sidebar border.
 fn column(rect: Rect, depth: usize) -> f32 {
-    rect.left() + 14.0 + depth as f32 * INDENT
+    rect.left() + theme::space::XWIDE + depth as f32 * INDENT
 }
 
 #[cfg(test)]
@@ -542,6 +579,49 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_root_header_reports_a_project_switch_request() {
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows: [TreeRow; 0] = [];
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0)));
+        let header = pos2(100.0, 10.0);
+        let mut draw = |events| {
+            let mut root_clicked = false;
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    root_clicked = surface
+                        .show(ui, Path::new("/tmp/project"), &rows, None, false)
+                        .root_clicked
+                },
+            );
+            root_clicked
+        };
+
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(header),
+            Event::PointerButton {
+                pos: header,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+
+        assert!(draw(vec![Event::PointerButton {
+            pos: header,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]));
+    }
+
+    #[test]
     fn open_context_menu_blocks_tree_hover_underneath() {
         let context = theme::test_context();
         let mut surface = TreeSurface::default();
@@ -667,6 +747,20 @@ mod tests {
                 "depth {depth} draws its chevron on top of its own guide"
             );
         }
+    }
+
+    #[test]
+    fn the_top_level_chevron_keeps_a_breathing_gutter_from_the_left_border() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0));
+        let chevron_center = super::column(rect, 0) - super::CHEVRON_INSET;
+        let chevron_left = chevron_center - crate::icons::GRID * 0.75 * 0.5;
+
+        assert!(
+            chevron_left - rect.left() >= theme::space::MEDIUM,
+            "the depth-0 chevron glyph starts {}px from the border, wants at least {}px",
+            chevron_left - rect.left(),
+            theme::space::MEDIUM
+        );
     }
 
     #[test]

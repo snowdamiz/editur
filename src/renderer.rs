@@ -52,6 +52,16 @@ pub(crate) fn retained_paint(primitive: &Primitive) -> Result<Option<RetainedPai
     }
 }
 
+fn retained_for_mesh(
+    retained: &mut Option<(RetainedPaint, Rect)>,
+    mesh_clip_rect: Rect,
+) -> Option<RetainedPaint> {
+    retained
+        .take()
+        .filter(|(_, marker_clip_rect)| *marker_clip_rect == mesh_clip_rect)
+        .map(|(paint, _)| paint)
+}
+
 pub(crate) fn upload_required(current: Option<&RetainedUpload>, next: RetainedUpload) -> bool {
     current != Some(&next)
 }
@@ -116,9 +126,13 @@ compile_error!("editur supports macOS, Windows, and Linux");
 mod tests {
     use super::{
         RetainedUpload, buffer_capacity, choose_adapter,
-        invalidate_retained_uploads_on_texture_replace, retain_active_uploads, upload_required,
+        invalidate_retained_uploads_on_texture_replace, retain_active_uploads, retained_for_mesh,
+        upload_required,
     };
-    use egui::{Color32, ColorImage, TextureId, TextureOptions, TexturesDelta, epaint::ImageDelta};
+    use egui::{
+        Color32, ColorImage, Rect, TextureId, TextureOptions, TexturesDelta, epaint::ImageDelta,
+        pos2,
+    };
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -159,6 +173,21 @@ mod tests {
                 ..upload
             }
         ));
+    }
+
+    #[test]
+    fn retained_marker_does_not_cross_into_an_adjacent_panel() {
+        let marker_clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(240.0, 700.0));
+        let mesh_clip = Rect::from_min_max(pos2(240.0, 0.0), pos2(1_000.0, 700.0));
+        let mut retained = Some((
+            super::RetainedPaint {
+                key: 1,
+                revision: 1,
+            },
+            marker_clip,
+        ));
+
+        assert_eq!(retained_for_mesh(&mut retained, mesh_clip), None);
     }
 
     #[test]

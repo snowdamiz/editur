@@ -67,11 +67,11 @@ pub(crate) const DARK: Palette = Palette {
     dark: true,
     accent: CYAN,
     surface: Surfaces {
-        sunken: Color32::from_rgb(16, 16, 18),
-        chrome: Color32::from_rgb(22, 22, 25),
-        editor: Color32::from_rgb(30, 30, 34),
-        raised: Color32::from_rgb(38, 38, 43),
-        input: Color32::from_rgb(26, 26, 30),
+        sunken: Color32::from_rgb(12, 12, 14),
+        chrome: Color32::from_rgb(18, 18, 21),
+        editor: Color32::from_rgb(27, 27, 31),
+        raised: Color32::from_rgb(33, 33, 38),
+        input: Color32::from_rgb(21, 21, 25),
     },
     text: TextRoles {
         primary: Color32::from_rgb(233, 234, 238),

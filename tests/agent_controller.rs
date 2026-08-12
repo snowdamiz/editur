@@ -668,6 +668,122 @@ fn rejected_prompt_reports_an_error_and_finishes_the_turn() {
 }
 
 #[test]
+fn cursor_transport_drop_resumes_the_turn_automatically() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("transport-drop".into()))
+        .unwrap();
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::AssistantDelta(text) if text.contains("reply")),
+    );
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::Error(error)
+                if error.contains("RetriableError") && error.contains("resuming")
+        )),
+        "transport drop should be reported and resumed: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::UserMessage(text)
+            if text == editur::agent::controller::TURN_RESUME_PROMPT
+    )));
+    controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn transport_drops_do_not_resume_other_providers() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("transport-drop".into()))
+        .unwrap();
+    let mut events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    events.extend(controller.events().try_iter());
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::UserMessage(_)))
+            .count(),
+        1,
+        "non-Cursor providers must not auto-resume: {events:?}"
+    );
+    controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
+fn transport_drop_resumes_are_bounded() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("transport-drop-loop".into()))
+        .unwrap();
+    let mut finished = 0;
+    let mut events = receive_until(&controller, Duration::from_secs(10), |event| {
+        if matches!(event, Event::TurnFinished { .. }) {
+            finished += 1;
+        }
+        finished == 3
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    events.extend(controller.events().try_iter());
+
+    let resumes = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Event::UserMessage(text)
+                    if text == editur::agent::controller::TURN_RESUME_PROMPT
+            )
+        })
+        .count();
+    assert_eq!(resumes, 2, "resumes must stay bounded: {events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::TurnFinished { .. }))
+            .count(),
+        3
+    );
+    controller.send(Command::Shutdown).unwrap();
+}
+
+#[test]
 fn split_tool_updates_render_supplied_details_and_unknown_notifications_are_ignored() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(
@@ -914,6 +1030,124 @@ fn cursor_extension_notifications_reach_structured_tool_cards() {
                     if content == "Ship it"
             ))
     )));
+}
+
+#[test]
+fn cursor_task_notifications_with_custom_subagent_types_stay_structured() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("cursor-task".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "cursor/task degraded into an error card: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ToolCallUpdated(tool)
+            if tool.id == "task-1" && tool.detail.as_ref().is_some_and(|detail| matches!(
+                detail.content.as_slice(),
+                [editur::agent::controller::ToolOutput::Task {
+                    subagent_type,
+                    model: Some(model),
+                    duration_ms: Some(1200),
+                    ..
+                }] if subagent_type == "reviewer" && model == "gpt-5"
+            ))
+    )));
+}
+
+#[test]
+fn cursor_generated_images_without_a_path_stay_structured() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("cursor-image".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Error(_))),
+        "cursor/generate_image degraded into an error card: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ToolCallUpdated(tool)
+            if tool.id == "image-1" && tool.detail.as_ref().is_some_and(|detail| matches!(
+                detail.content.as_slice(),
+                [editur::agent::controller::ToolOutput::GeneratedImage {
+                    description,
+                    file_path: None,
+                    ..
+                }] if description == "Minimal flat app icon"
+            ))
+    )));
+}
+
+#[test]
+fn cursor_plan_extension_round_trips_acceptance() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("cursor-plan".into()))
+        .unwrap();
+    let request = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::InteractionRequested(_))
+    })
+    .into_iter()
+    .find_map(|event| match event {
+        Event::InteractionRequested(request) => Some(request),
+        _ => None,
+    })
+    .unwrap();
+    assert!(matches!(
+        &request.kind,
+        editur::agent::controller::InteractionKind::Plan(plan)
+            if plan.name.as_deref() == Some("Fix sidebar")
+    ));
+    controller
+        .send(Command::RespondInteraction {
+            request_id: request.request_id,
+            response: InteractionResponse::PlanAccepted,
+        })
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "accepted"))
+    );
 }
 
 #[test]

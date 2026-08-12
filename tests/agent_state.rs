@@ -3,7 +3,7 @@ use editur::agent::{
         ConnectionState, Event, PermissionChoice, PermissionRequest, PlanItem, ToolActivity,
         ToolDetail, ToolOutput,
     },
-    state::{AgentState, TranscriptItem},
+    state::{AgentState, FileChange, TranscriptItem},
 };
 
 #[test]
@@ -156,6 +156,63 @@ fn state_enforces_one_turn_orders_streams_and_answers_permission_once() {
 }
 
 #[test]
+fn finished_turns_finalize_tools_that_never_completed() {
+    let running_tool = |id: &str| {
+        Event::ToolCallUpdated(ToolActivity {
+            id: id.into(),
+            title: Some("Edit File".into()),
+            status: Some("InProgress".into()),
+            kind: None,
+            paths: Vec::new(),
+            detail: None,
+        })
+    };
+    let tool_status = |state: &AgentState, id: &str| {
+        state
+            .transcript
+            .iter()
+            .find_map(|item| match item {
+                TranscriptItem::Tool(tool) if tool.id == id => tool.status.clone(),
+                _ => None,
+            })
+            .expect("tool should keep a status")
+    };
+
+    let mut state = AgentState::default();
+    state.apply(Event::UserMessage("edit".into()));
+    state.apply(running_tool("failed-edit"));
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "done-edit".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: None,
+        paths: Vec::new(),
+        detail: None,
+    }));
+    state.apply(Event::Error(
+        "agent turn failed: RetriableError: [canceled] http/2 stream closed".into(),
+    ));
+    state.apply(Event::TurnFinished { cancelled: false });
+    assert_eq!(tool_status(&state, "failed-edit"), "Failed");
+    assert_eq!(tool_status(&state, "done-edit"), "Completed");
+
+    let mut state = AgentState::default();
+    state.apply(Event::UserMessage("edit".into()));
+    state.apply(running_tool("cancelled-edit"));
+    state.apply(Event::TurnFinished { cancelled: true });
+    assert_eq!(tool_status(&state, "cancelled-edit"), "Cancelled");
+
+    let mut state = AgentState::default();
+    state.apply(Event::UserMessage("edit".into()));
+    state.apply(running_tool("orphaned-edit"));
+    state.apply(Event::ProcessExited {
+        error: "gone".into(),
+        diagnostics: String::new(),
+    });
+    assert_eq!(tool_status(&state, "orphaned-edit"), "Failed");
+}
+
+#[test]
 fn streamed_unicode_is_trimmed_only_at_character_boundaries() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("a".repeat(64 * 1024 - 1)));
@@ -176,6 +233,7 @@ fn raw_tool_details_are_evicted_before_visible_messages() {
             id: id.to_string(),
             title: Some("tool".into()),
             status: Some("Completed".into()),
+            kind: None,
             paths: Vec::new(),
             detail: Some(ToolDetail {
                 input: None,
@@ -200,12 +258,41 @@ fn raw_tool_details_are_evicted_before_visible_messages() {
 }
 
 #[test]
+fn tool_kind_survives_updates_that_omit_it() {
+    let mut state = AgentState::default();
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: Some("Subagent: explore".into()),
+        status: Some("InProgress".into()),
+        kind: Some("Task".into()),
+        paths: Vec::new(),
+        detail: None,
+    }));
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: None,
+        paths: Vec::new(),
+        detail: None,
+    }));
+
+    assert!(matches!(
+        state.transcript.back(),
+        Some(TranscriptItem::Tool(tool))
+            if tool.kind.as_deref() == Some("Task")
+                && tool.status.as_deref() == Some("Completed")
+    ));
+}
+
+#[test]
 fn split_tool_updates_preserve_input_and_structured_output() {
     let mut state = AgentState::default();
     state.apply(Event::ToolCallUpdated(ToolActivity {
         id: "tool".into(),
         title: Some("Edit".into()),
         status: Some("InProgress".into()),
+        kind: None,
         paths: Vec::new(),
         detail: Some(ToolDetail {
             input: Some("command".into()),
@@ -217,6 +304,7 @@ fn split_tool_updates_preserve_input_and_structured_output() {
         id: "tool".into(),
         title: None,
         status: Some("Completed".into()),
+        kind: None,
         paths: Vec::new(),
         detail: Some(ToolDetail {
             input: None,
@@ -243,6 +331,7 @@ fn zero_detail_tools_and_changed_paths_are_bounded() {
             id: id.to_string(),
             title: None,
             status: None,
+            kind: Some("Edit".into()),
             paths: vec![format!("/tmp/{id}").into()],
             detail: None,
         }));
@@ -254,4 +343,269 @@ fn zero_detail_tools_and_changed_paths_are_bounded() {
         state.transcript.front(),
         Some(TranscriptItem::Truncated)
     ));
+}
+
+#[test]
+fn only_modifying_tools_mark_files_as_changed() {
+    let mut state = AgentState::default();
+    let tool = |id: &str, kind: &str, path: &str| ToolActivity {
+        id: id.into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: Some(kind.into()),
+        paths: vec![path.into()],
+        detail: None,
+    };
+    state.apply(Event::ToolCallUpdated(tool("read", "Read", "/w/read.rs")));
+    state.apply(Event::ToolCallUpdated(tool(
+        "search",
+        "Search",
+        "/w/found.rs",
+    )));
+    state.apply(Event::ToolCallUpdated(tool("edit", "Edit", "/w/edited.rs")));
+    state.apply(Event::ToolCallUpdated(tool(
+        "delete",
+        "Delete",
+        "/w/deleted.rs",
+    )));
+
+    assert_eq!(
+        {
+            let mut paths = state
+                .changed_paths
+                .keys()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        },
+        ["/w/deleted.rs", "/w/edited.rs"]
+    );
+    assert_eq!(state.refresh_queue.len(), 4, "refresh stays conservative");
+}
+
+#[test]
+fn a_diff_marks_its_file_changed_even_when_the_kind_arrives_earlier() {
+    let mut state = AgentState::default();
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "edit".into(),
+        title: None,
+        status: Some("InProgress".into()),
+        kind: Some("Other".into()),
+        paths: vec!["/w/read-location.rs".into()],
+        detail: None,
+    }));
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "edit".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: None,
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Diff {
+                path: "/w/patched.rs".into(),
+                old_text: Some("old".into()),
+                new_text: "new".into(),
+            }],
+            output: None,
+        }),
+    }));
+
+    assert_eq!(
+        state
+            .changed_paths
+            .keys()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        ["/w/patched.rs"]
+    );
+}
+
+#[test]
+fn diff_line_stats_accumulate_without_double_counting_streamed_updates() {
+    let mut state = AgentState::default();
+    let diff_update = |id: &str, old_text: &str, new_text: &str| {
+        Event::ToolCallUpdated(ToolActivity {
+            id: id.into(),
+            title: None,
+            status: Some("InProgress".into()),
+            kind: Some("Edit".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: None,
+                content: vec![ToolOutput::Diff {
+                    path: "/w/streamed.rs".into(),
+                    old_text: Some(old_text.into()),
+                    new_text: new_text.into(),
+                }],
+                output: None,
+            }),
+        })
+    };
+    // The same tool streams a growing diff: its contribution is replaced.
+    state.apply(diff_update(
+        "edit-1",
+        "kept\nremoved\n",
+        "kept\nadded one\n",
+    ));
+    state.apply(diff_update(
+        "edit-1",
+        "kept\nremoved\n",
+        "kept\nadded one\nadded two\n",
+    ));
+    // A second tool touching the same file adds to the total.
+    state.apply(diff_update("edit-2", "kept\n", "kept\nlater\n"));
+
+    assert_eq!(
+        state
+            .changed_paths
+            .get(std::path::Path::new("/w/streamed.rs")),
+        Some(&FileChange {
+            added: 3,
+            removed: 1
+        })
+    );
+}
+
+#[test]
+fn diff_line_stats_survive_tool_detail_eviction() {
+    let mut state = AgentState::default();
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "early-edit".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: Some("Edit".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Diff {
+                path: "/w/early.rs".into(),
+                old_text: Some("a\n".into()),
+                new_text: "a\nb\nc\n".into(),
+            }],
+            output: None,
+        }),
+    }));
+    // Blow the transcript byte budget so the early tool's detail is evicted.
+    for id in 0..40 {
+        state.apply(Event::ToolCallUpdated(ToolActivity {
+            id: format!("big-{id}"),
+            title: None,
+            status: Some("Completed".into()),
+            kind: None,
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: None,
+                content: vec![ToolOutput::Text("x".repeat(60_000))],
+                output: None,
+            }),
+        }));
+    }
+
+    let early_detail = state.transcript.iter().find_map(|item| match item {
+        TranscriptItem::Tool(tool) if tool.id == "early-edit" => Some(tool.detail.is_some()),
+        _ => None,
+    });
+    assert_eq!(early_detail, Some(false), "the diff text was evicted");
+    assert_eq!(
+        state.changed_paths.get(std::path::Path::new("/w/early.rs")),
+        Some(&FileChange {
+            added: 2,
+            removed: 0
+        })
+    );
+}
+
+fn diff_event(id: &str, path: &str, old_text: Option<&str>, new_text: &str) -> Event {
+    Event::ToolCallUpdated(ToolActivity {
+        id: id.into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: Some("Edit".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Diff {
+                path: path.into(),
+                old_text: old_text.map(str::to_owned),
+                new_text: new_text.into(),
+            }],
+            output: None,
+        }),
+    })
+}
+
+#[test]
+fn the_first_diff_per_file_records_the_session_baseline() {
+    let mut state = AgentState::default();
+
+    state.apply(diff_event(
+        "edit-1",
+        "/w/lib.rs",
+        Some("original\n"),
+        "first pass\n",
+    ));
+    state.apply(diff_event(
+        "edit-2",
+        "/w/lib.rs",
+        Some("first pass\n"),
+        "second pass\n",
+    ));
+    state.apply(diff_event("create", "/w/new.rs", None, "created\n"));
+
+    assert_eq!(
+        state.baselines.get(std::path::Path::new("/w/lib.rs")),
+        Some(&Some("original\n".to_owned())),
+        "the earliest pre-edit content wins"
+    );
+    assert_eq!(
+        state.baselines.get(std::path::Path::new("/w/new.rs")),
+        Some(&None),
+        "a created file records that there was no file before"
+    );
+}
+
+#[test]
+fn oversized_baselines_are_skipped_so_memory_stays_bounded() {
+    let mut state = AgentState::default();
+    let huge = "x".repeat(1024 * 1024 + 1);
+
+    state.apply(diff_event("edit", "/w/huge.rs", Some(&huge), "tiny\n"));
+
+    assert!(state.baselines.is_empty());
+    assert!(
+        state
+            .changed_paths
+            .contains_key(std::path::Path::new("/w/huge.rs")),
+        "line stats are still tracked"
+    );
+}
+
+#[test]
+fn a_new_session_clears_recorded_baselines() {
+    let mut state = AgentState::default();
+    state.apply(diff_event("edit", "/w/lib.rs", Some("original\n"), "new\n"));
+
+    state.apply(Event::SessionReady {
+        current_mode: None,
+        modes: Vec::new(),
+        config_options: Vec::new(),
+    });
+
+    assert!(state.baselines.is_empty());
+}
+
+#[test]
+fn a_failed_session_load_restores_the_previous_baselines() {
+    let mut state = AgentState::default();
+    state.apply(diff_event("edit", "/w/lib.rs", Some("original\n"), "new\n"));
+
+    state.apply(Event::SessionLoading { title: None });
+    state.apply(Event::SessionLoadFailed);
+
+    assert_eq!(
+        state.baselines.get(std::path::Path::new("/w/lib.rs")),
+        Some(&Some("original\n".to_owned()))
+    );
 }

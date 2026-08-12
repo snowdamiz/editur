@@ -98,9 +98,11 @@ pub struct SidecarManifest {
     #[serde(default)]
     pub entrypoint: Option<String>,
     pub args: Vec<String>,
-    #[serde(default)]
+    // Deployed updaters reject unknown fields, so empty probe lists must not
+    // appear in published manifests (see the legacy-updaters test).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub version_probes: Vec<VersionProbe>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub package_probes: Vec<PackageProbe>,
     pub entries: Vec<ManagedEntry>,
     pub license_url: String,
@@ -208,12 +210,14 @@ impl SidecarManifest {
             ArchiveFormat::TarGz => inspect_tar_gz(bytes)?,
             ArchiveFormat::Zip => inspect_zip(bytes)?,
         };
-        if entries.len() > MAX_ARCHIVE_ENTRIES
-            || entries
-                .iter()
-                .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
-                .is_none_or(|total| total > MAX_EXTRACTED_BYTES)
-        {
+        let extracted_bytes = entries
+            .iter()
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
+            .filter(|total| *total <= MAX_EXTRACTED_BYTES);
+        let Some(extracted_bytes) = extracted_bytes else {
+            return Err("ACP provider archive exceeds the release extraction limits".into());
+        };
+        if entries.len() > MAX_ARCHIVE_ENTRIES {
             return Err("ACP provider archive exceeds the release extraction limits".into());
         }
         if !entries
@@ -241,9 +245,12 @@ impl SidecarManifest {
             archive_sha256: crate::agent::provision::sha256_hex(bytes),
             archive_format: distribution.archive_format,
             archive_size_bytes: bytes.len() as u64,
-            max_compressed_bytes: MAX_COMPRESSED_BYTES,
-            max_extracted_bytes: MAX_EXTRACTED_BYTES,
-            max_entries: MAX_ARCHIVE_ENTRIES,
+            // Limits pin the archive exactly (all enforcement compares with
+            // strict `>`): the tightest safe caps, and the only values that
+            // deployed builds with older global ceilings still accept.
+            max_compressed_bytes: bytes.len() as u64,
+            max_extracted_bytes: extracted_bytes,
+            max_entries: entries.len(),
             command: distribution.command.clone(),
             entrypoint: distribution.entrypoint.clone(),
             args: distribution.args.clone(),
@@ -1892,6 +1899,76 @@ mod tests {
         manifest
     }
 
+    /// Deployed builds parse the published `<asset>.agent.json` with exactly
+    /// this schema (`deny_unknown_fields`), so a serialized Cursor manifest
+    /// must never grow fields they cannot read: that bricks `editur update`
+    /// for the whole fleet, which cannot be fixed client-side after the fact.
+    #[test]
+    fn serialized_cursor_manifests_stay_readable_by_deployed_updaters() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyEntry {
+            #[allow(dead_code)]
+            path: String,
+            #[allow(dead_code)]
+            kind: serde_json::Value,
+            #[allow(dead_code)]
+            size: u64,
+            #[serde(default)]
+            #[allow(dead_code)]
+            sha256: Option<String>,
+            #[allow(dead_code)]
+            executable: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyUpdaterManifest {
+            #[allow(dead_code)]
+            format_version: u32,
+            #[allow(dead_code)]
+            agent: String,
+            #[allow(dead_code)]
+            version: String,
+            #[allow(dead_code)]
+            os: String,
+            #[allow(dead_code)]
+            architecture: String,
+            #[allow(dead_code)]
+            archive_url: String,
+            #[allow(dead_code)]
+            archive_sha256: String,
+            #[allow(dead_code)]
+            archive_format: serde_json::Value,
+            #[allow(dead_code)]
+            archive_size_bytes: u64,
+            #[allow(dead_code)]
+            max_compressed_bytes: u64,
+            #[allow(dead_code)]
+            max_extracted_bytes: u64,
+            #[allow(dead_code)]
+            max_entries: usize,
+            #[allow(dead_code)]
+            command: String,
+            #[serde(default)]
+            #[allow(dead_code)]
+            entrypoint: Option<String>,
+            #[allow(dead_code)]
+            args: Vec<String>,
+            #[allow(dead_code)]
+            entries: Vec<LegacyEntry>,
+            #[allow(dead_code)]
+            license_url: String,
+            #[allow(dead_code)]
+            terms_url: String,
+        }
+
+        let bytes = serde_json::to_vec(&zip_manifest(b"agent archive")).unwrap();
+
+        let error = serde_json::from_slice::<LegacyUpdaterManifest>(&bytes).err();
+
+        assert!(error.is_none(), "{error:?}");
+    }
+
     #[test]
     fn release_spec_selects_the_pinned_current_platform() {
         let spec = ReleaseSpec::parse(
@@ -3015,6 +3092,50 @@ mod tests {
                 "dist-package/cursor-agent",
                 Some(expected_file_checksum.as_str()),
             )
+        );
+    }
+
+    /// Extraction limits must describe the pinned archive itself, not our
+    /// global ceilings: deployed builds validate published manifests against
+    /// their own (older, smaller) ceilings, so writing today's constants into
+    /// the manifest locks old installs out of `editur update`.
+    #[test]
+    fn generated_manifests_pin_extraction_limits_to_the_archive() {
+        let spec = ReleaseSpec::parse(
+            br#"{
+                "version": "2026.07.23-e383d2b",
+                "distributions": [{
+                    "os": "macos",
+                    "architecture": "aarch64",
+                    "archive_url": "https://downloads.cursor.com/lab/pinned/agent.zip",
+                    "command": "dist-package/cursor-agent",
+                    "args": ["--disable-auto-update", "acp"],
+                    "archive_format": "zip"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "dist-package/cursor-agent",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"agent").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+
+        let generated =
+            SidecarManifest::generate(&spec, spec.select("macos", "aarch64").unwrap(), &bytes)
+                .unwrap();
+
+        assert_eq!(
+            (
+                generated.max_compressed_bytes,
+                generated.max_extracted_bytes,
+                generated.max_entries,
+            ),
+            (bytes.len() as u64, b"agent".len() as u64, 1)
         );
     }
 

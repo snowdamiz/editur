@@ -137,6 +137,11 @@ mod tests {
     use super::{
         accent, apply, color, editor, radius, set_light, space, surface, text, typography,
     };
+    use std::sync::Mutex;
+
+    /// The active palette is process-global, so the test that flips it and the
+    /// test that reads it through `apply` must not interleave.
+    static PALETTE_FLAG: Mutex<()> = Mutex::new(());
 
     /// The one test that keeps this plan from unwinding: a color built outside
     /// the theme module is a color that will drift away from every other color.
@@ -175,6 +180,9 @@ mod tests {
 
     #[test]
     fn theme_switching_does_not_require_a_restart() {
+        let _flag = PALETTE_FLAG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = super::test_context();
         assert!(color::palette().dark);
         set_light(true);
@@ -191,6 +199,9 @@ mod tests {
 
     #[test]
     fn apply_wires_the_token_layer_into_every_egui_style() {
+        let _flag = PALETTE_FLAG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = egui::Context::default();
 
         apply(&context);

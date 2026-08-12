@@ -134,24 +134,36 @@ pub(crate) fn callout(color: Color32) -> Callout {
     }
 }
 
-/// The diff colors, which are the callout recipe applied to success and danger.
+/// The diff colors. A diff row is the content under review rather than an
+/// annotation beside it, so it uses a dark semantic tint rather than the pale
+/// callout wash.
 pub(crate) mod diff {
     use egui::Color32;
 
     use super::super::color;
 
-    pub(crate) fn added() -> Color32 {
-        color::composite(
-            color::subtle(color::semantic().success),
-            color::surface().editor,
+    fn wash(color: Color32) -> Color32 {
+        let surface = color::surface();
+        color::mix(
+            color::mix(surface.editor, surface.sunken, 0.35),
+            color,
+            0.25,
         )
     }
 
+    /// A syntax color on a tinted row: pushed toward the page the same way
+    /// ink is, because hues tuned for the editor surface lose their contrast
+    /// once a green or red wash sits underneath them.
+    pub(crate) fn code(color: Color32) -> Color32 {
+        color::ink(color)
+    }
+
+    pub(crate) fn added() -> Color32 {
+        wash(color::semantic().success)
+    }
+
     pub(crate) fn removed() -> Color32 {
-        color::composite(
-            color::subtle(color::semantic().danger),
-            color::surface().editor,
-        )
+        wash(color::semantic().danger)
     }
 
     pub(crate) fn added_ink() -> Color32 {
@@ -160,6 +172,17 @@ pub(crate) mod diff {
 
     pub(crate) fn removed_ink() -> Color32 {
         color::ink(color::semantic().danger)
+    }
+
+    /// Gutter numbers on tinted rows: the row's ink pulled partway toward the
+    /// wash, so numbers stay legible on green/red without competing with the
+    /// code beside them.
+    pub(crate) fn added_number() -> Color32 {
+        color::mix(added(), added_ink(), 0.65)
+    }
+
+    pub(crate) fn removed_number() -> Color32 {
+        color::mix(removed(), removed_ink(), 0.65)
     }
 }
 
@@ -196,7 +219,76 @@ pub(crate) mod editor {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill, hover, selected_focus};
+    use super::super::color;
+    use super::{diff, fill, hover, selected_focus};
+
+    #[test]
+    fn diff_rows_stay_dark_without_losing_their_green_and_red_hues() {
+        let editor = color::surface().editor;
+        let added = diff::added();
+        let removed = diff::removed();
+
+        assert!(
+            added.g() >= editor.g() + 28 && added.g() <= editor.g() + 45,
+            "the added row is too washed out or too bright: {added:?} over {editor:?}"
+        );
+        assert!(
+            removed.r() >= editor.r() + 35 && removed.r() <= editor.r() + 55,
+            "the removed row is too washed out or too bright: {removed:?} over {editor:?}"
+        );
+        assert!(
+            added.g() >= added.r() + 15 && removed.r() >= removed.g() + 25,
+            "diff rows lost their semantic hues: {added:?}, {removed:?}"
+        );
+    }
+
+    #[test]
+    fn lifted_code_keeps_every_syntax_role_legible_on_the_diff_washes() {
+        let syntax = color::syntax();
+        // A comment recedes to 3:1 like it does on the document; every other
+        // role holds the same 4:1 bar it clears on the editor surface.
+        let roles = [
+            (syntax.comment, 3.0),
+            (syntax.foreground, 4.0),
+            (syntax.string, 4.0),
+            (syntax.keyword, 4.0),
+            (syntax.declared_type, 4.0),
+            (syntax.macro_name, 4.0),
+            (syntax.escape, 4.0),
+            (syntax.link, 4.0),
+        ];
+        for wash in [diff::added(), diff::removed()] {
+            for (role, minimum) in roles {
+                let ratio = color::contrast_ratio(diff::code(role), wash);
+                assert!(
+                    ratio >= minimum,
+                    "{role:?} code is only {ratio:.2}:1 on the {wash:?} wash"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_numbers_stay_legible_on_the_diff_washes() {
+        let contrast = |text: egui::Color32, fill: egui::Color32| {
+            (i32::from(text.r()) - i32::from(fill.r())).abs()
+                + (i32::from(text.g()) - i32::from(fill.g())).abs()
+                + (i32::from(text.b()) - i32::from(fill.b())).abs()
+        };
+
+        assert!(
+            contrast(diff::added_number(), diff::added()) >= 120,
+            "added-row numbers vanish into the wash: {:?} on {:?}",
+            diff::added_number(),
+            diff::added()
+        );
+        assert!(
+            contrast(diff::removed_number(), diff::removed()) >= 120,
+            "removed-row numbers vanish into the wash: {:?} on {:?}",
+            diff::removed_number(),
+            diff::removed()
+        );
+    }
 
     #[test]
     fn a_focused_list_marks_its_selection_with_accent_and_an_unfocused_one_does_not() {

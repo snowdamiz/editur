@@ -27,6 +27,8 @@ pub(crate) enum Icon {
     Stop,
     Folder,
     File,
+    Home,
+    Search,
     Terminal,
     Gear,
     ArrowUp,
@@ -112,6 +114,23 @@ const FILE: &[Segment] = &[
         (3.8, 13.6),
     ]),
     Segment::Line(&[(9.4, 2.4), (9.4, 5.2), (12.2, 5.2)]),
+];
+const HOME: &[Segment] = &[
+    Segment::Outline(&[
+        (3.2, 7.0),
+        (8.0, 3.0),
+        (12.8, 7.0),
+        (12.8, 13.0),
+        (3.2, 13.0),
+    ]),
+    Segment::Line(&[(6.6, 13.0), (6.6, 9.6), (9.4, 9.6), (9.4, 13.0)]),
+];
+const SEARCH: &[Segment] = &[
+    Segment::Circle {
+        center: (7.0, 7.0),
+        radius: 3.6,
+    },
+    Segment::Line(&[(9.7, 9.7), (12.6, 12.6)]),
 ];
 const TERMINAL: &[Segment] = &[
     Segment::Outline(&[(2.2, 3.4), (13.8, 3.4), (13.8, 12.6), (2.2, 12.6)]),
@@ -216,6 +235,8 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Stop => STOP,
         Icon::Folder => FOLDER,
         Icon::File => FILE,
+        Icon::Home => HOME,
+        Icon::Search => SEARCH,
         Icon::Terminal => TERMINAL,
         Icon::Gear => GEAR,
         Icon::ArrowUp => ARROW_UP,
@@ -230,7 +251,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 22] = [
+pub(crate) const ALL: [Icon; 24] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -244,6 +265,8 @@ pub(crate) const ALL: [Icon; 22] = [
     Icon::Stop,
     Icon::Folder,
     Icon::File,
+    Icon::Home,
+    Icon::Search,
     Icon::Terminal,
     Icon::Gear,
     Icon::ArrowUp,

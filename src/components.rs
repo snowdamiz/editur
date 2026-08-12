@@ -5,17 +5,6 @@ use crate::{
     theme,
 };
 
-/// The shared popover frame: menus, the palette, and the agent file picker are
-/// all this, so the product has exactly two overlay species.
-pub(crate) fn popover_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(theme::surface().raised)
-        .stroke(theme::border::strong())
-        .inner_margin(theme::space::SMALL as i8)
-        .corner_radius(theme::corner(theme::radius::CARD))
-        .shadow(theme::shadow::popover())
-}
-
 pub(crate) struct SelectableRow {
     pub(crate) rect: Rect,
     pub(crate) response: Response,

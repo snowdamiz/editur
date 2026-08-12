@@ -12,6 +12,7 @@ pub mod keybindings;
 pub mod lsp;
 mod markdown;
 mod network;
+pub mod projects;
 pub mod renderer;
 mod scrollbar;
 pub mod search;

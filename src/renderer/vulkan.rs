@@ -1332,13 +1332,15 @@ fn copy_meshes(
         let mesh = match &primitive.primitive {
             Primitive::Mesh(mesh) => mesh,
             Primitive::Callback(_) => {
-                retained = super::retained_paint(&primitive.primitive)?;
+                retained = super::retained_paint(&primitive.primitive)?
+                    .map(|paint| (paint, primitive.clip_rect));
                 continue;
             }
         };
         let vertex_bytes: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
         let index_bytes: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-        let upload = retained.take().map(|paint| {
+        let paint = super::retained_for_mesh(&mut retained, primitive.clip_rect);
+        let upload = paint.map(|paint| {
             active_retained.insert(paint.key);
             (
                 paint.key,

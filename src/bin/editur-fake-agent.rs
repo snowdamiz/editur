@@ -227,6 +227,7 @@ async fn run(
     let compatibility_fixture = compatibility_fixture.map(Arc::new);
     let sessions_supported = sessions_supported || compatibility_fixture.is_some();
     let prompts = Arc::new(AtomicUsize::new(0));
+    let always_drop_transport = Arc::new(AtomicBool::new(false));
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
     let claude_auth_file = claude_auth_file.map(PathBuf::from).map(Arc::new);
     let boolean_config_options = Arc::new(AtomicBool::new(false));
@@ -520,13 +521,35 @@ async fn run(
         .on_receive_request(
             {
                 let prompts = Arc::clone(&prompts);
+                let always_drop_transport = Arc::clone(&always_drop_transport);
                 async move |request: PromptRequest,
                             responder,
                             connection: ConnectionTo<agent_client_protocol::Client>| {
                     let cancel_rx = cancel_rx.clone();
+                    let always_drop_transport = Arc::clone(&always_drop_transport);
                     let turn = prompts.fetch_add(1, Ordering::Relaxed) + 1;
                     let task_connection = connection.clone();
                     connection.spawn(async move {
+                        if prompt_text(&request) == "transport-drop-loop" {
+                            always_drop_transport.store(true, Ordering::Release);
+                        }
+                        if prompt_text(&request) == "transport-drop"
+                            || always_drop_transport.load(Ordering::Acquire)
+                        {
+                            task_connection.send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new("drop-edit", "Edit File")
+                                        .status(ToolCallStatus::InProgress),
+                                ),
+                            ))?;
+                            return responder.respond_with_result(Err(
+                                agent_client_protocol::Error::internal_error().data(
+                                    "Error: RetriableError: [canceled] http/2 stream closed \
+                                     with error code CANCEL (0x8)",
+                                ),
+                            ));
+                        }
                         if prompt_text(&request) == "wait" {
                             let _ = cancel_rx.recv().await;
                             return responder.respond(PromptResponse::new(StopReason::Cancelled));
@@ -684,6 +707,63 @@ async fn run(
                                         }]
                                     }),
                                 )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-task" {
+                            task_connection.send_notification(
+                                agent_client_protocol::UntypedMessage::new(
+                                    "cursor/task",
+                                    serde_json::json!({
+                                        "toolCallId": "task-1",
+                                        "description": "Review changes",
+                                        "prompt": "Look at the diff and report issues.",
+                                        "subagentType": {"custom": "reviewer"},
+                                        "model": "gpt-5",
+                                        "agentId": "agent-9",
+                                        "durationMs": 1200
+                                    }),
+                                )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-image" {
+                            task_connection.send_notification(
+                                agent_client_protocol::UntypedMessage::new(
+                                    "cursor/generate_image",
+                                    serde_json::json!({
+                                        "toolCallId": "image-1",
+                                        "description": "Minimal flat app icon"
+                                    }),
+                                )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-plan" {
+                            let response = task_connection
+                                .send_request(CursorRequest {
+                                    method: "cursor/create_plan".into(),
+                                    params: serde_json::json!({
+                                        "toolCallId": "plan-1",
+                                        "name": "Fix sidebar",
+                                        "overview": "Keep every update visible",
+                                        "plan": "1. Normalize\n2. Render",
+                                        "todos": [{
+                                            "id": "one",
+                                            "content": "Normalize",
+                                            "status": "pending"
+                                        }],
+                                        "isProject": false
+                                    }),
+                                })
+                                .block_task()
+                                .await?;
+                            stream_text(
+                                &task_connection,
+                                &request,
+                                response["outcome"]["outcome"]
+                                    .as_str()
+                                    .unwrap_or("invalid"),
                             )?;
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }

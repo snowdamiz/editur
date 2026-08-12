@@ -32,6 +32,10 @@ const MAX_CHOICES: usize = 128;
 const MAX_PLAN_ITEMS: usize = 1_024;
 const MAX_TOOL_PATHS: usize = 256;
 const MAX_HIDDEN_SESSIONS: usize = 4_096;
+/// Consecutive automatic resumes after retriable transport drops, per user turn.
+const MAX_TURN_RESUMES: u64 = 2;
+/// Prompt sent to resume a turn after the provider's upstream connection dropped.
+pub const TURN_RESUME_PROMPT: &str = "Continue from where you left off.";
 pub const MAX_PROMPT_ATTACHMENTS: usize = 8;
 pub const MAX_PROMPT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_PROMPT_ATTACHMENT_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
@@ -316,8 +320,51 @@ pub struct ToolActivity {
     pub id: String,
     pub title: Option<String>,
     pub status: Option<String>,
-    pub paths: Vec<PathBuf>,
+    /// The ACP `ToolCall.kind` (`Read`, `Edit`, `Execute`, …) or `Task` for
+    /// `cursor/task` subagent notifications.
+    pub kind: Option<String>,
+    pub paths: Vec<ToolPath>,
     pub detail: Option<ToolDetail>,
+}
+
+impl ToolActivity {
+    /// Title shown on the activity card. Codex/Claude sometimes ship bare tool
+    /// names (`wait`, `spawn_agent`, `Bash`); turn those into readable labels
+    /// using kind, paths, and raw input when the agent did not.
+    pub fn display_title(&self) -> std::borrow::Cow<'_, str> {
+        tool_display_title(
+            self.title.as_deref(),
+            self.kind.as_deref(),
+            &self.paths,
+            self.detail.as_ref().and_then(|detail| detail.input.as_deref()),
+        )
+    }
+}
+
+/// A file the tool touched, with the optional line number the agent reported
+/// for that location.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolPath {
+    pub path: PathBuf,
+    pub line: Option<u32>,
+}
+
+impl From<PathBuf> for ToolPath {
+    fn from(path: PathBuf) -> Self {
+        Self { path, line: None }
+    }
+}
+
+impl From<String> for ToolPath {
+    fn from(path: String) -> Self {
+        PathBuf::from(path).into()
+    }
+}
+
+impl From<&str> for ToolPath {
+    fn from(path: &str) -> Self {
+        PathBuf::from(path).into()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,7 +399,7 @@ pub enum ToolOutput {
     },
     GeneratedImage {
         description: String,
-        file_path: PathBuf,
+        file_path: Option<PathBuf>,
         reference_image_paths: Vec<PathBuf>,
     },
 }
@@ -465,6 +512,8 @@ pub enum Command {
     TransportFailed(String),
     #[doc(hidden)]
     TerminalAuthFinished(Result<(), String>),
+    #[doc(hidden)]
+    ResumeTurn,
 }
 
 pub struct AgentController {
@@ -961,6 +1010,11 @@ async fn run_connection(
 ) -> agent_client_protocol::Result<()> {
     let extensions = descriptor(provider).extensions;
     let active = Arc::new(AtomicBool::new(false));
+    let turn_resume = TurnResume {
+        enabled: extensions == ProviderExtensions::Cursor,
+        commands: internal_commands.clone(),
+        attempts: Arc::new(AtomicU64::new(0)),
+    };
     let auto_approve_permissions = Arc::new(AtomicBool::new(false));
     let permissions = Arc::new(Mutex::new(HashMap::new()));
     let interactions = Arc::new(Mutex::new(HashMap::new()));
@@ -1499,6 +1553,7 @@ async fn run_connection(
                             }
                         }
                         Command::Prompt(text) => {
+                            turn_resume.attempts.store(0, Ordering::Release);
                             send_prompt(
                                 &connection,
                                 &events,
@@ -1507,9 +1562,11 @@ async fn run_connection(
                                 text,
                                 Vec::new(),
                                 attachment_support,
+                                turn_resume.clone(),
                             )?;
                         }
                         Command::PromptWithAttachments { text, attachments } => {
+                            turn_resume.attempts.store(0, Ordering::Release);
                             send_prompt(
                                 &connection,
                                 &events,
@@ -1518,6 +1575,19 @@ async fn run_connection(
                                 text,
                                 attachments,
                                 attachment_support,
+                                turn_resume.clone(),
+                            )?;
+                        }
+                        Command::ResumeTurn => {
+                            send_prompt(
+                                &connection,
+                                &events,
+                                &active,
+                                session_id.clone(),
+                                TURN_RESUME_PROMPT.into(),
+                                Vec::new(),
+                                attachment_support,
+                                turn_resume.clone(),
                             )?;
                         }
                         Command::DecidePermission {
@@ -1632,6 +1702,25 @@ async fn run_connection(
         .await
 }
 
+#[derive(Clone)]
+struct TurnResume {
+    enabled: bool,
+    commands: async_channel::Sender<Command>,
+    attempts: Arc<AtomicU64>,
+}
+
+/// Cursor classifies upstream connection drops (for example
+/// "RetriableError: [canceled] http/2 stream closed with error code CANCEL")
+/// as retriable; progress up to the drop stays checkpointed in the session,
+/// so the turn can be resumed with a follow-up prompt.
+fn is_retriable_transport_error(error: &agent_client_protocol::Error) -> bool {
+    let text = error.to_string();
+    text.contains("RetriableError")
+        || text.contains("http/2 stream closed")
+        || text.contains("stream closed with error code CANCEL")
+}
+
+#[expect(clippy::too_many_arguments)]
 fn send_prompt(
     connection: &ConnectionTo<Agent>,
     events: &EventSender,
@@ -1640,6 +1729,7 @@ fn send_prompt(
     text: String,
     attachments: Vec<PromptAttachment>,
     attachment_support: AttachmentSupport,
+    resume: TurnResume,
 ) -> agent_client_protocol::Result<()> {
     let Some(session) = session else {
         send_event(
@@ -1681,15 +1771,27 @@ fn send_prompt(
         .on_receiving_result(async move |result| {
             active_for_result.store(false, Ordering::Release);
             let cancelled = match result {
-                Ok(response) => response.stop_reason == StopReason::Cancelled,
+                Ok(response) => {
+                    resume.attempts.store(0, Ordering::Release);
+                    response.stop_reason == StopReason::Cancelled
+                }
                 Err(error) => {
+                    let message =
+                        acp_error(events_for_result.provider, "agent turn failed", &error);
+                    let resuming = resume.enabled
+                        && is_retriable_transport_error(&error)
+                        && resume.attempts.fetch_add(1, Ordering::AcqRel) < MAX_TURN_RESUMES
+                        && resume.commands.try_send(Command::ResumeTurn).is_ok();
                     send_event(
                         &events_for_result,
-                        Event::Error(acp_error(
-                            events_for_result.provider,
-                            "agent turn failed",
-                            &error,
-                        )),
+                        Event::Error(if resuming {
+                            format!(
+                                "{message}\n\nThe connection dropped mid-turn; progress is \
+                                 preserved in this session — resuming automatically."
+                            )
+                        } else {
+                            message
+                        }),
                     );
                     false
                 }
@@ -2482,6 +2584,7 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                 id: tool.tool_call_id.0.to_string(),
                 title: Some(tool.title),
                 status: Some(format!("{:?}", tool.status)),
+                kind: Some(format!("{:?}", tool.kind)),
                 paths: tool_paths(&tool.locations, &tool.content),
                 detail: tool_detail(
                     tool.raw_input.as_ref(),
@@ -2500,6 +2603,7 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                     id: update.tool_call_id.0.to_string(),
                     title: fields.title,
                     status: fields.status.map(|status| format!("{status:?}")),
+                    kind: fields.kind.map(|kind| format!("{kind:?}")),
                     paths: tool_paths(locations, content),
                     detail: tool_detail(
                         fields.raw_input.as_ref(),
@@ -2576,7 +2680,7 @@ struct CursorTaskUpdate {
     tool_call_id: String,
     description: String,
     prompt: String,
-    subagent_type: String,
+    subagent_type: CursorSubagentType,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -2585,12 +2689,40 @@ struct CursorTaskUpdate {
     duration_ms: Option<u64>,
 }
 
+/// Cursor documents `subagentType` as a set of known strings plus a
+/// `{ custom: string }` object for user-defined subagent types. Live
+/// `agent acp` (verified 2026-08-11) additionally sends `custom` as an
+/// object, e.g. `{"custom": {"unspecified": {}}}`, so the payload is kept
+/// permissive and normalized to a display string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CursorSubagentType {
+    Named(String),
+    Custom { custom: serde_json::Value },
+}
+
+impl From<CursorSubagentType> for String {
+    fn from(subagent_type: CursorSubagentType) -> Self {
+        match subagent_type {
+            CursorSubagentType::Named(name) => name,
+            CursorSubagentType::Custom { custom } => match custom {
+                serde_json::Value::String(name) => name,
+                serde_json::Value::Object(map) if map.len() == 1 => {
+                    map.into_iter().next().expect("one entry").0
+                }
+                _ => "custom".into(),
+            },
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CursorImageUpdate {
     tool_call_id: String,
     description: String,
-    file_path: PathBuf,
+    #[serde(default)]
+    file_path: Option<PathBuf>,
     #[serde(default)]
     reference_image_paths: Vec<PathBuf>,
 }
@@ -2606,6 +2738,7 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                     "Todos".into()
                 }),
                 status: None,
+                kind: None,
                 paths: Vec::new(),
                 detail: Some(ToolDetail {
                     input: None,
@@ -2628,13 +2761,14 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                 id: update.tool_call_id,
                 title: Some(format!("Subagent: {}", update.description)),
                 status: None,
+                kind: Some("Task".into()),
                 paths: Vec::new(),
                 detail: Some(ToolDetail {
                     input: None,
                     content: vec![ToolOutput::Task {
                         description: update.description,
                         prompt: update.prompt,
-                        subagent_type: update.subagent_type,
+                        subagent_type: update.subagent_type.into(),
                         model: update.model,
                         agent_id: update.agent_id,
                         duration_ms: update.duration_ms,
@@ -2648,7 +2782,13 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                 id: update.tool_call_id,
                 title: Some("Generated image".into()),
                 status: Some("Completed".into()),
-                paths: vec![update.file_path.clone()],
+                kind: None,
+                paths: update
+                    .file_path
+                    .clone()
+                    .into_iter()
+                    .map(ToolPath::from)
+                    .collect(),
                 detail: Some(ToolDetail {
                     input: None,
                     content: vec![ToolOutput::GeneratedImage {
@@ -2783,20 +2923,23 @@ fn normalize_config_options(options: &[SessionConfigOption]) -> Vec<ConfigChoice
         .collect()
 }
 
-fn tool_paths(locations: &[ToolCallLocation], content: &[ToolCallContent]) -> Vec<PathBuf> {
+fn tool_paths(locations: &[ToolCallLocation], content: &[ToolCallContent]) -> Vec<ToolPath> {
     let mut paths = locations
         .iter()
         .take(MAX_TOOL_PATHS)
-        .map(|location| location.path.clone())
+        .map(|location| ToolPath {
+            path: location.path.clone(),
+            line: location.line,
+        })
         .collect::<Vec<_>>();
     for item in content {
         if paths.len() == MAX_TOOL_PATHS {
             break;
         }
         if let ToolCallContent::Diff(diff) = item
-            && !paths.contains(&diff.path)
+            && !paths.iter().any(|existing| existing.path == diff.path)
         {
-            paths.push(diff.path.clone());
+            paths.push(diff.path.clone().into());
         }
     }
     paths
@@ -2906,6 +3049,210 @@ fn send_event(events: &EventSender, event: Event) {
     }
     let _ = events.event_tx.send(event);
     (events.wake)();
+}
+
+fn tool_display_title<'a>(
+    title: Option<&'a str>,
+    kind: Option<&str>,
+    paths: &[ToolPath],
+    raw_input: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    let trimmed = title.map(str::trim).filter(|title| !title.is_empty());
+    let input = raw_input.and_then(parse_tool_input);
+    if let Some(title) = trimmed
+        && !tool_title_needs_humanizing(title)
+    {
+        return std::borrow::Cow::Borrowed(title);
+    }
+    if let Some(humanized) = humanize_machine_tool_title(trimmed, kind, paths, input.as_ref()) {
+        return std::borrow::Cow::Owned(humanized);
+    }
+    trimmed
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("Tool activity"))
+}
+
+fn tool_title_needs_humanizing(title: &str) -> bool {
+    let stripped = title.trim_start_matches(':').trim();
+    if stripped.is_empty() {
+        return true;
+    }
+    if stripped.contains(char::is_whitespace) {
+        return false;
+    }
+    // Single-token titles that look like API / function names.
+    stripped.contains('_')
+        || stripped.contains('-')
+        || stripped.bytes().all(|byte| byte.is_ascii_lowercase())
+        || matches!(
+            stripped,
+            "Bash"
+                | "Read"
+                | "Edit"
+                | "Write"
+                | "Glob"
+                | "Grep"
+                | "Task"
+                | "Wait"
+                | "Shell"
+                | "Exec"
+                | "ApplyPatch"
+                | "apply_patch"
+        )
+}
+
+fn parse_tool_input(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed)
+        .ok()
+        .or_else(|| Some(serde_json::Value::String(trimmed.to_owned())))
+}
+
+fn humanize_machine_tool_title(
+    title: Option<&str>,
+    kind: Option<&str>,
+    paths: &[ToolPath],
+    input: Option<&serde_json::Value>,
+) -> Option<String> {
+    let name = title
+        .map(|title| title.trim_start_matches(':').trim())
+        .filter(|title| !title.is_empty())
+        .unwrap_or("");
+    let path_label = paths.first().map(|path| {
+        path.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.path.display().to_string())
+    });
+    let input_string = |keys: &[&str]| -> Option<String> {
+        match input? {
+            serde_json::Value::String(value) => {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            }
+            serde_json::Value::Object(object) => keys.iter().find_map(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            }),
+            _ => None,
+        }
+    };
+    let first_line = |value: &str| {
+        value
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or(value)
+            .to_owned()
+    };
+    let input_path_label = || {
+        input_string(&["path", "file", "file_path", "target_file"]).map(|path| {
+            Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(path)
+        })
+    };
+
+    let mapped = match name.to_ascii_lowercase().as_str() {
+        "wait" | "wait_agent" => {
+            if let Some(prompt) = input_string(&["prompt", "description", "reason"]) {
+                Some(format!("Waiting · {}", first_line(&prompt)))
+            } else if input
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|object| object.contains_key("agentsStates"))
+            {
+                Some("Waiting for agents".into())
+            } else if let Some(command) = input_string(&["command", "cmd"]) {
+                Some(format!("Waiting · {}", first_line(&command)))
+            } else {
+                Some("Waiting".into())
+            }
+        }
+        "spawn_agent" | "spawn_agents" => input_string(&["prompt", "description", "task"])
+            .map(|prompt| format!("Spawn agent · {}", first_line(&prompt)))
+            .or_else(|| Some("Spawn agent".into())),
+        "send_input" => input_string(&["prompt", "input", "message", "text"])
+            .map(|prompt| format!("Send input · {}", first_line(&prompt)))
+            .or_else(|| Some("Send input".into())),
+        "close_agent" | "close_agents" => Some("Close agent".into()),
+        "resume_agent" => Some("Resume agent".into()),
+        "apply_patch" | "applypatch" => path_label
+            .clone()
+            .map(|path| format!("Edit {path}"))
+            .or_else(|| Some("Editing files".into())),
+        "bash" | "shell" | "exec" | "execute" | "run_terminal_cmd" | "run_command" => {
+            input_string(&["command", "cmd", "description"])
+                .map(|command| first_line(&command))
+                .or_else(|| Some("Run command".into()))
+        }
+        "read" | "read_file" | "readfile" => path_label
+            .clone()
+            .or_else(input_path_label)
+            .map(|path| format!("Read {path}"))
+            .or_else(|| Some("Read file".into())),
+        "edit" | "write" | "write_file" | "edit_file" | "search_replace" => path_label
+            .clone()
+            .or_else(input_path_label)
+            .map(|path| format!("Edit {path}"))
+            .or_else(|| Some("Edit file".into())),
+        "grep" | "rg" | "search" => input_string(&["query", "pattern", "regex"])
+            .map(|query| format!("Search · {query}"))
+            .or_else(|| Some("Search".into())),
+        "glob" | "find" => input_string(&["glob", "pattern", "path", "query"])
+            .map(|query| format!("Find · {query}"))
+            .or_else(|| Some("Find files".into())),
+        "web_search" | "websearch" => input_string(&["query", "search_term"])
+            .map(|query| format!("Web search · {query}"))
+            .or_else(|| Some("Web search".into())),
+        "" => None,
+        other if other.contains('_') || other.contains('-') => {
+            let words = other
+                .split(['_', '-'])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!words.is_empty()).then_some(words)
+        }
+        other if other.bytes().all(|byte| byte.is_ascii_lowercase()) => {
+            let mut chars = other.chars();
+            chars.next().map(|first| {
+                format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+            })
+        }
+        _ => None,
+    };
+    mapped.or_else(|| {
+        // No usable title: fall back to kind + path.
+        let path = path_label.as_deref();
+        match (kind, path) {
+            (Some("Read"), Some(path)) => Some(format!("Read {path}")),
+            (Some("Edit"), Some(path)) => Some(format!("Edit {path}")),
+            (Some("Delete"), Some(path)) => Some(format!("Delete {path}")),
+            (Some("Move"), Some(path)) => Some(format!("Move {path}")),
+            (Some("Search"), _) => Some("Search".into()),
+            (Some("Execute"), _) => input_string(&["command", "cmd", "description"])
+                .map(|command| first_line(&command))
+                .or_else(|| Some("Run command".into())),
+            (Some("Fetch"), _) => Some("Fetch".into()),
+            (Some("Think"), _) => Some("Thinking".into()),
+            _ => None,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -3141,6 +3488,128 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_kind_reaches_the_sidebar_and_updates_leave_it_unset() {
+        assert!(matches!(
+            one_event(SessionUpdate::ToolCall(
+                ToolCall::new("run-1", "Run command").kind(ToolKind::Execute),
+            )),
+            Event::ToolCallUpdated(tool) if tool.kind.as_deref() == Some("Execute")
+        ));
+        assert!(matches!(
+            one_event(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "run-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            ))),
+            Event::ToolCallUpdated(tool) if tool.kind.is_none()
+        ));
+    }
+
+    fn cursor_notification_tool(method: &str, params: serde_json::Value) -> ToolActivity {
+        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let events = EventSender {
+            provider: ProviderId::Cursor,
+            event_tx,
+            wake: Arc::new(|| {}),
+            active_session: None,
+        };
+        normalize_cursor_notification(method, params, &events);
+        match event_rx.recv().unwrap() {
+            Event::ToolCallUpdated(tool) => tool,
+            event => panic!("expected a tool card, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_task_accepts_documented_and_custom_subagent_types() {
+        for name in [
+            "unspecified",
+            "computer_use",
+            "explore",
+            "video_review",
+            "browser_use",
+            "shell",
+            "vm_setup_helper",
+        ] {
+            let tool = cursor_notification_tool(
+                "cursor/task",
+                serde_json::json!({
+                    "toolCallId": "task-1",
+                    "description": "Explore codebase",
+                    "prompt": "Find where authentication is handled.",
+                    "subagentType": name,
+                }),
+            );
+            assert!(matches!(
+                tool.detail.as_ref().unwrap().content.as_slice(),
+                [ToolOutput::Task { subagent_type, .. }] if subagent_type == name
+            ));
+        }
+
+        let tool = cursor_notification_tool(
+            "cursor/task",
+            serde_json::json!({
+                "toolCallId": "task-2",
+                "description": "Review changes",
+                "prompt": "Look at the diff and report issues.",
+                "subagentType": {"custom": "reviewer"},
+                "model": "gpt-5",
+                "agentId": "agent-9",
+                "durationMs": 1200,
+            }),
+        );
+        assert_eq!(tool.kind.as_deref(), Some("Task"));
+        assert!(matches!(
+            tool.detail.as_ref().unwrap().content.as_slice(),
+            [ToolOutput::Task {
+                subagent_type,
+                model: Some(model),
+                agent_id: Some(agent_id),
+                duration_ms: Some(1200),
+                ..
+            }] if subagent_type == "reviewer" && model == "gpt-5" && agent_id == "agent-9"
+        ));
+
+        // Live `agent acp` sends `custom` as an object (verified 2026-08-11).
+        let tool = cursor_notification_tool(
+            "cursor/task",
+            serde_json::json!({
+                "toolCallId": "task-3",
+                "description": "Reply READY and stop",
+                "prompt": "Reply with the single word READY and stop.",
+                "subagentType": {"custom": {"unspecified": {}}},
+                "model": "claude-opus-5-thinking-high",
+                "agentId": "83634e95-e3bc-4a12-8838-e8ae4b7d9906",
+                "durationMs": 5195,
+            }),
+        );
+        assert!(matches!(
+            tool.detail.as_ref().unwrap().content.as_slice(),
+            [ToolOutput::Task { subagent_type, .. }] if subagent_type == "unspecified"
+        ));
+    }
+
+    #[test]
+    fn cursor_generate_image_without_a_file_path_stays_a_card() {
+        let tool = cursor_notification_tool(
+            "cursor/generate_image",
+            serde_json::json!({
+                "toolCallId": "image-1",
+                "description": "Minimal flat app icon",
+            }),
+        );
+
+        assert!(tool.paths.is_empty());
+        assert!(matches!(
+            tool.detail.as_ref().unwrap().content.as_slice(),
+            [ToolOutput::GeneratedImage {
+                description,
+                file_path: None,
+                reference_image_paths,
+            }] if description == "Minimal flat app icon" && reference_image_paths.is_empty()
+        ));
+    }
+
+    #[test]
     fn cursor_question_extensions_validate_and_return_multi_select_answers() {
         let (request, kind) = parse_cursor_interaction(
             9,
@@ -3308,6 +3777,74 @@ mod tests {
         );
         assert_eq!(login.environment()["BASE"], "one");
         assert_eq!(login.environment()["AUTH"], "two");
+    }
+
+    #[test]
+    fn tool_display_title_humanizes_codex_wait_and_keeps_real_titles() {
+        let wait = ToolActivity {
+            id: "wait-1".into(),
+            title: Some("wait".into()),
+            status: Some("Completed".into()),
+            kind: Some("Other".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: Some(
+                    serde_json::json!({
+                        "agentsStates": [{"id": "a"}],
+                        "status": "completed"
+                    })
+                    .to_string(),
+                ),
+                content: Vec::new(),
+                output: None,
+            }),
+        };
+        assert_eq!(wait.display_title(), "Waiting for agents");
+
+        let bare = ToolActivity {
+            id: "wait-2".into(),
+            title: Some("wait".into()),
+            status: Some("Completed".into()),
+            kind: Some("Other".into()),
+            paths: Vec::new(),
+            detail: None,
+        };
+        assert_eq!(bare.display_title(), "Waiting");
+
+        let command = ToolActivity {
+            id: "bash-1".into(),
+            title: Some("Bash".into()),
+            status: Some("Completed".into()),
+            kind: Some("Execute".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                // Single-field raw input is collapsed to the string by bounded_json.
+                input: Some("cargo test".into()),
+                content: Vec::new(),
+                output: None,
+            }),
+        };
+        assert_eq!(command.display_title(), "cargo test");
+
+        let snake = ToolActivity {
+            id: "git-1".into(),
+            title: Some("::git-stage".into()),
+            status: Some("Completed".into()),
+            kind: Some("Other".into()),
+            paths: Vec::new(),
+            detail: None,
+        };
+        assert_eq!(snake.display_title(), "Git Stage");
+
+        let human = ToolActivity {
+            id: "read-1".into(),
+            title: Some("Read src/app.rs".into()),
+            status: Some("Completed".into()),
+            kind: Some("Read".into()),
+            paths: vec![ToolPath::from("src/app.rs")],
+            detail: None,
+        };
+        assert_eq!(human.display_title(), "Read src/app.rs");
     }
 
     #[cfg(target_os = "macos")]

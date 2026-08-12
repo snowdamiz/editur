@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use super::controller::{
@@ -14,6 +14,8 @@ const MAX_ITEM_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_ITEMS: usize = 2_048;
 const MAX_CHANGED_PATHS: usize = 4_096;
 const MAX_CHOICES: usize = 128;
+const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
+const MAX_BASELINE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TranscriptItem {
@@ -55,9 +57,22 @@ pub struct UsageState {
     pub cost: Option<String>,
 }
 
+/// Added/removed line counts for one file, accumulated across every diff the
+/// agent produced for it this session. Kept beside the transcript rather than
+/// derived from it, because `trim()` evicts tool details (and their diff
+/// text) long before the session ends.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileChange {
+    pub added: u64,
+    pub removed: u64,
+}
+
 struct SessionLoadBackup {
     transcript: VecDeque<TranscriptItem>,
-    changed_paths: HashSet<PathBuf>,
+    changed_paths: HashMap<PathBuf, FileChange>,
+    baselines: HashMap<PathBuf, Option<String>>,
+    baseline_bytes: usize,
+    tool_credits: HashMap<(String, PathBuf), FileChange>,
     title: Option<String>,
     usage: Option<UsageState>,
 }
@@ -70,7 +85,24 @@ pub struct AgentState {
     pub allow_run_everything: bool,
     pub prompt: String,
     pub transcript: VecDeque<TranscriptItem>,
-    pub changed_paths: HashSet<PathBuf>,
+    /// Every file the agent modified this session with its accumulated line
+    /// stats; feeds the "files changed" card.
+    pub changed_paths: HashMap<PathBuf, FileChange>,
+    /// The content each changed file had before the agent's first recorded
+    /// edit this session (`None` inside an entry = the agent created the
+    /// file). Captured from the first diff per path and kept beside
+    /// `changed_paths` so the diff view survives `trim()` evicting the tool
+    /// details. Oversized files are skipped, never truncated.
+    pub baselines: HashMap<PathBuf, Option<String>>,
+    /// Bytes currently held in `baselines`, enforcing the retention cap.
+    baseline_bytes: usize,
+    /// What each tool has currently contributed to `changed_paths`, so a tool
+    /// that streams the same diff repeatedly replaces its contribution
+    /// instead of double-counting it.
+    tool_credits: HashMap<(String, PathBuf), FileChange>,
+    /// Paths not yet reflected in the tree/search; drained by the refresh
+    /// pass after each turn so `changed_paths` can persist for the UI.
+    pub refresh_queue: HashSet<PathBuf>,
     pub current_mode: Option<String>,
     pub modes: Vec<ModeChoice>,
     pub config_options: Vec<ConfigChoice>,
@@ -93,7 +125,11 @@ impl Default for AgentState {
             allow_run_everything: false,
             prompt: String::new(),
             transcript: VecDeque::new(),
-            changed_paths: HashSet::new(),
+            changed_paths: HashMap::new(),
+            baselines: HashMap::new(),
+            baseline_bytes: 0,
+            tool_credits: HashMap::new(),
+            refresh_queue: HashSet::new(),
             current_mode: None,
             modes: Vec::new(),
             config_options: Vec::new(),
@@ -177,6 +213,10 @@ impl AgentState {
                 self.active = false;
                 self.transcript.clear();
                 self.changed_paths.clear();
+                self.baselines.clear();
+                self.baseline_bytes = 0;
+                self.tool_credits.clear();
+                self.refresh_queue.clear();
                 self.session_id = None;
                 self.title = None;
                 self.current_mode = current_mode.map(bounded);
@@ -196,9 +236,13 @@ impl AgentState {
                 self.session_load_backup = Some(SessionLoadBackup {
                     transcript: std::mem::take(&mut self.transcript),
                     changed_paths: std::mem::take(&mut self.changed_paths),
+                    baselines: std::mem::take(&mut self.baselines),
+                    baseline_bytes: std::mem::take(&mut self.baseline_bytes),
+                    tool_credits: std::mem::take(&mut self.tool_credits),
                     title: self.title.take(),
                     usage: self.usage.take(),
                 });
+                self.refresh_queue.clear();
                 self.session_ready = false;
                 self.active = false;
                 self.connection = ConnectionState::Starting;
@@ -208,6 +252,9 @@ impl AgentState {
                 if let Some(backup) = self.session_load_backup.take() {
                     self.transcript = backup.transcript;
                     self.changed_paths = backup.changed_paths;
+                    self.baselines = backup.baselines;
+                    self.baseline_bytes = backup.baseline_bytes;
+                    self.tool_credits = backup.tool_credits;
                     self.title = backup.title;
                     self.usage = backup.usage;
                 }
@@ -325,10 +372,38 @@ impl AgentState {
                 }
             }
             Event::ToolCallUpdated(tool) => {
+                // Baselines capture the pre-edit file content before
+                // `bounded_tool` truncates strings: a truncated baseline
+                // would diff as garbage, so oversized files are skipped
+                // inside `record_baseline` instead.
+                for content in tool.detail.iter().flat_map(|detail| detail.content.iter()) {
+                    if let ToolOutput::Diff { path, old_text, .. } = content {
+                        self.record_baseline(path, old_text.as_deref());
+                    }
+                }
                 let tool = bounded_tool(tool);
-                let remaining = MAX_CHANGED_PATHS.saturating_sub(self.changed_paths.len());
-                self.changed_paths
-                    .extend(tool.paths.iter().take(remaining).cloned());
+                let remaining = MAX_CHANGED_PATHS.saturating_sub(self.refresh_queue.len());
+                self.refresh_queue.extend(
+                    tool.paths
+                        .iter()
+                        .take(remaining)
+                        .map(|tool_path| tool_path.path.clone()),
+                );
+                let tool_id = tool.id.clone();
+                let diff_credits = tool
+                    .detail
+                    .iter()
+                    .flat_map(|detail| {
+                        detail.content.iter().filter_map(|content| match content {
+                            ToolOutput::Diff {
+                                path,
+                                old_text,
+                                new_text,
+                            } => Some((path.clone(), diff_stats(old_text.as_deref(), new_text))),
+                            _ => None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 if let Some(TranscriptItem::Tool(current)) = self.transcript.iter_mut().rev().find(
                     |item| matches!(item, TranscriptItem::Tool(current) if current.id == tool.id),
                 ) {
@@ -337,6 +412,9 @@ impl AgentState {
                     }
                     if tool.status.is_some() {
                         current.status = tool.status;
+                    }
+                    if tool.kind.is_some() {
+                        current.kind = tool.kind;
                     }
                     if !tool.paths.is_empty() {
                         current.paths = tool.paths;
@@ -359,6 +437,30 @@ impl AgentState {
                     }
                 } else {
                     self.push(TranscriptItem::Tool(tool));
+                }
+                // "Changed files" means files the agent modified, judged on the
+                // merged record: an Edit/Delete/Move kind marks its location
+                // paths as changed, and a diff always marks its own path, even
+                // when the kind arrived on an earlier update.
+                let merged = self.transcript.iter().rev().find_map(|item| match item {
+                    TranscriptItem::Tool(current) if current.id == tool_id => Some(current),
+                    _ => None,
+                });
+                if let Some(merged) = merged {
+                    let modifies =
+                        matches!(merged.kind.as_deref(), Some("Edit" | "Delete" | "Move"));
+                    let location_paths = merged
+                        .paths
+                        .iter()
+                        .filter(|_| modifies)
+                        .map(|tool_path| tool_path.path.clone())
+                        .collect::<Vec<_>>();
+                    for path in location_paths {
+                        self.register_changed_path(path);
+                    }
+                }
+                for (path, stats) in diff_credits {
+                    self.credit_diff(&tool_id, path, stats);
                 }
             }
             Event::PermissionRequested(request) => {
@@ -393,7 +495,10 @@ impl AgentState {
                     cost: cost.map(bounded),
                 });
             }
-            Event::TurnFinished { .. } => self.active = false,
+            Event::TurnFinished { cancelled } => {
+                self.active = false;
+                self.finalize_running_tools(if cancelled { "Cancelled" } else { "Failed" });
+            }
             Event::Error(error) => self.push(TranscriptItem::Error(bounded(error))),
             Event::ProcessExited { error, diagnostics } => {
                 self.active = false;
@@ -401,6 +506,7 @@ impl AgentState {
                 self.connection = ConnectionState::Failed(error.clone());
                 self.diagnostics = (!diagnostics.is_empty()).then(|| bounded(diagnostics));
                 self.push(TranscriptItem::Error(bounded(error)));
+                self.finalize_running_tools("Failed");
             }
         }
         self.trim();
@@ -408,6 +514,79 @@ impl AgentState {
 
     fn push(&mut self, item: TranscriptItem) {
         self.transcript.push_back(item);
+    }
+
+    /// Tool updates only arrive while a turn runs, so once the turn ends any
+    /// tool still pending or in progress can never complete and would show
+    /// "Running" forever.
+    fn finalize_running_tools(&mut self, status: &str) {
+        for item in &mut self.transcript {
+            if let TranscriptItem::Tool(tool) = item
+                && matches!(tool.status.as_deref(), Some("Pending" | "InProgress"))
+            {
+                tool.status = Some(status.to_owned());
+            }
+        }
+    }
+
+    /// Remembers the first pre-edit content the session saw for `path`
+    /// (`None` = the agent created the file), giving the changed-files card
+    /// a stable old side for its diff view. First write wins: a later tool
+    /// editing the same file diffs against an intermediate state, not the
+    /// session start. Files over the per-file or total byte caps record
+    /// nothing, and the UI falls back to a plain open.
+    fn record_baseline(&mut self, path: &Path, old_text: Option<&str>) {
+        if self.baselines.contains_key(path) || self.baselines.len() >= MAX_CHANGED_PATHS {
+            return;
+        }
+        let Some(text) = old_text else {
+            self.baselines.insert(path.to_owned(), None);
+            return;
+        };
+        if text.len() > MAX_BASELINE_FILE_BYTES
+            || self.baseline_bytes.saturating_add(text.len()) > MAX_BASELINE_TOTAL_BYTES
+        {
+            return;
+        }
+        self.baseline_bytes += text.len();
+        self.baselines
+            .insert(path.to_owned(), Some(text.to_owned()));
+    }
+
+    /// Lists a modified file without line stats (kind-based detection, e.g. an
+    /// Edit tool that reported a location but no diff).
+    fn register_changed_path(&mut self, path: PathBuf) {
+        if self.changed_paths.len() < MAX_CHANGED_PATHS || self.changed_paths.contains_key(&path) {
+            self.changed_paths.entry(path).or_default();
+        }
+    }
+
+    /// Applies one tool's diff stats for one file, replacing whatever that
+    /// tool previously contributed for it: a streaming edit re-sends the
+    /// growing diff on every update and must not be counted repeatedly.
+    fn credit_diff(&mut self, tool_id: &str, path: PathBuf, stats: FileChange) {
+        let key = (tool_id.to_owned(), path.clone());
+        let previous = if let Some(credit) = self.tool_credits.get_mut(&key) {
+            std::mem::replace(credit, stats)
+        } else if self.tool_credits.len() < MAX_CHANGED_PATHS {
+            self.tool_credits.insert(key, stats);
+            FileChange::default()
+        } else {
+            return;
+        };
+        if self.changed_paths.len() >= MAX_CHANGED_PATHS && !self.changed_paths.contains_key(&path)
+        {
+            return;
+        }
+        let entry = self.changed_paths.entry(path).or_default();
+        entry.added = entry
+            .added
+            .saturating_sub(previous.added)
+            .saturating_add(stats.added);
+        entry.removed = entry
+            .removed
+            .saturating_sub(previous.removed)
+            .saturating_add(stats.removed);
     }
 
     fn trim(&mut self) {
@@ -437,13 +616,65 @@ impl AgentState {
     }
 }
 
+/// Added/removed line counts for one diff, matching the numbers the diff card
+/// renders: an LCS comparison while the input is small enough, and a
+/// prefix/suffix trim beyond that (the same bound and fallback as the UI's
+/// diff builder in `app.rs`).
+fn diff_stats(old_text: Option<&str>, new_text: &str) -> FileChange {
+    let Some(old_text) = old_text else {
+        return FileChange {
+            added: new_text.lines().count() as u64,
+            removed: 0,
+        };
+    };
+    let old = old_text.lines().collect::<Vec<_>>();
+    let new = new_text.lines().collect::<Vec<_>>();
+    if (old.len() + 1).saturating_mul(new.len() + 1) <= 250_000 {
+        let width = new.len() + 1;
+        let mut previous = vec![0_u32; width];
+        let mut current = vec![0_u32; width];
+        for old_line in old.iter().rev() {
+            for new_index in (0..new.len()).rev() {
+                current[new_index] = if *old_line == new[new_index] {
+                    previous[new_index + 1] + 1
+                } else {
+                    previous[new_index].max(current[new_index + 1])
+                };
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let common = previous[0] as u64;
+        FileChange {
+            added: new.len() as u64 - common,
+            removed: old.len() as u64 - common,
+        }
+    } else {
+        let prefix = old
+            .iter()
+            .zip(&new)
+            .take_while(|(before, after)| before == after)
+            .count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(before, after)| before == after)
+            .count();
+        FileChange {
+            added: (new.len() - prefix - suffix) as u64,
+            removed: (old.len() - prefix - suffix) as u64,
+        }
+    }
+}
+
 fn bounded_tool(mut tool: ToolActivity) -> ToolActivity {
     tool.id = bounded(tool.id);
     tool.title = tool.title.map(bounded);
     tool.status = tool.status.map(bounded);
+    tool.kind = tool.kind.map(bounded);
     tool.detail = tool.detail.map(bounded_tool_detail);
     tool.paths
-        .retain(|path| path.as_os_str().as_encoded_bytes().len() <= MAX_ITEM_BYTES);
+        .retain(|tool_path| tool_path.path.as_os_str().as_encoded_bytes().len() <= MAX_ITEM_BYTES);
     tool.paths.truncate(MAX_CHOICES);
     tool
 }
@@ -702,12 +933,13 @@ fn item_size(item: &TranscriptItem) -> usize {
 fn tool_size(tool: &ToolActivity) -> usize {
     tool.id.len()
         + tool.status.as_ref().map_or(0, String::len)
+        + tool.kind.as_ref().map_or(0, String::len)
         + tool.detail.as_ref().map_or(0, tool_detail_size)
         + tool.title.as_ref().map_or(0, String::len)
         + tool
             .paths
             .iter()
-            .map(|path| path.as_os_str().as_encoded_bytes().len())
+            .map(|tool_path| tool_path.path.as_os_str().as_encoded_bytes().len())
             .sum::<usize>()
 }
 
@@ -797,7 +1029,9 @@ fn tool_detail_size(detail: &ToolDetail) -> usize {
                     reference_image_paths,
                 } => {
                     description.len()
-                        + file_path.as_os_str().as_encoded_bytes().len()
+                        + file_path
+                            .as_ref()
+                            .map_or(0, |path| path.as_os_str().as_encoded_bytes().len())
                         + reference_image_paths
                             .iter()
                             .map(|path| path.as_os_str().as_encoded_bytes().len())

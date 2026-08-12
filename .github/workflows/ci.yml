@@ -254,19 +254,32 @@ jobs:
       - name: Assemble provider bundle
         run: >-
           cargo run --locked --example build_provider_bundle --
-          dist/${{ matrix.update_asset }}.agent.json
+          dist/${{ matrix.update_asset }}.providers.json
           dist/${{ matrix.update_asset }}.cursor.json
           dist/${{ matrix.update_asset }}.codex.json
           dist/${{ matrix.update_asset }}.claude.json
+      # Deployed builds fetch <asset>.agent.json during `editur update` and
+      # parse it with a strict single-provider schema, so this published file
+      # must stay in the legacy format-1 shape forever; the multi-provider
+      # bundle above is only embedded into new binaries at build time.
+      - name: Publish the updater manifest in the legacy single-provider format
+        shell: bash
+        run: |
+          cp "dist/${{ matrix.update_asset }}.cursor.json" "dist/${{ matrix.update_asset }}.agent.json"
+          grep -q '"format_version": 1' "dist/${{ matrix.update_asset }}.agent.json"
+          if grep -qE '"(providers|version_probes|package_probes)"' "dist/${{ matrix.update_asset }}.agent.json"; then
+            echo "updater manifest contains fields deployed builds cannot parse" >&2
+            exit 1
+          fi
       - name: Assemble bundle-without-Claude rollback candidate
         run: >-
           cargo run --locked --example build_provider_bundle --
-          dist/${{ matrix.update_asset }}.without-claude.agent.json
+          dist/${{ matrix.update_asset }}.without-claude.providers.json
           dist/${{ matrix.update_asset }}.cursor.json
           dist/${{ matrix.update_asset }}.codex.json
       - name: Build bundle-without-Claude rollback candidate
         env:
-          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.without-claude.agent.json
+          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.without-claude.providers.json
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
           EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
@@ -282,7 +295,7 @@ jobs:
           dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
       - name: Build release binary
         env:
-          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.agent.json
+          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.providers.json
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
           EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
@@ -360,6 +373,7 @@ jobs:
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
             dist/${{ matrix.update_asset }}.agent.json
+            dist/${{ matrix.update_asset }}.providers.json
             dist/editur-provider-codex-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
             dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
           if-no-files-found: error
@@ -373,6 +387,7 @@ jobs:
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
             dist/${{ matrix.update_asset }}.agent.json
+            dist/${{ matrix.update_asset }}.providers.json
             dist/editur-provider-codex-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
             dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
   release-gate:

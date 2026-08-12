@@ -1,45 +1,124 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
+
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Editur — a small native editor for focused file changes</title>
-  <meta name="description" content="Editur opens one file beside a keyboard-navigable tree, searches from a floating palette, and saves through conflict-checked atomic replacement. Native Metal, Direct3D 12, and Vulkan." />
+  <meta name="description"
+    content="Editur opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating palette, and saves through conflict-checked atomic replacement. Metal, Direct3D 12, and Vulkan, with no runtime graphics fallback." />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#101012" />
+
+  <meta property="og:type" content="website" />
   <meta property="og:title" content="Editur" />
   <meta property="og:description" content="A small native editor for quick, focused file changes." />
   <meta property="og:image" content="editur.png" />
+  <meta name="twitter:card" content="summary_large_image" />
   <link rel="icon" href="editur-icon.png" type="image/png" />
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,650;12..96,800&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400..700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+    rel="stylesheet" />
+
+  <script>
+    /* Set before first paint so the reveal styles never apply to a page that
+       cannot run them. */
+    document.documentElement.classList.add("js");
+  </script>
+
   <style>
+    /* ═══════════════════════════════════════════════════════════════════
+       Tokens. The palettes below are the product's own, transcribed from
+       src/theme/color.rs so the site and the editor cannot drift apart.
+       ═══════════════════════════════════════════════════════════════ */
+
     :root {
-      --bg: #09090b;
-      --bg-elevated: #141416;
-      --bg-panel: #18181a;
-      --bg-soft: #1c1c20;
+      /* Surfaces: sunken → chrome → editor → raised, plus input wells. */
+      --sunken: #101012;
+      --chrome: #161619;
+      --editor: #1e1e22;
+      --raised: #26262b;
+      --input: #1a1a1e;
+
+      /* Text roles. Hierarchy comes from weight and size, not gray alone. */
+      --ink: #e9eaee;
+      --ink-2: #a6a8b0;
+      --ink-3: #8e9098;
+      --on-accent: #081a1e;
+
+      --accent: #5ed2e0;
+      --danger: #e86a66;
+      --warning: #e0b054;
+      --success: #76c796;
+      --info: #6c9ed6;
+
+      /* Syntax roles, used verbatim by the code samples. */
+      --syn-comment: #707480;
+      --syn-string: #96c88a;
+      --syn-keyword: #c785e0;
+      --syn-type: #70ace8;
+      --syn-macro: #e4be80;
+      --syn-link: #7ec6d2;
+
       --line: rgba(255, 255, 255, 0.07);
-      --line-strong: rgba(255, 255, 255, 0.12);
-      --ink: #eceef3;
-      --ink-muted: #9aa3b2;
-      --ink-dim: #6a7280;
-      --cyan: #56cfe1;
-      --cyan-bright: #7adced;
-      --cyan-ink: #041016;
-      --cyan-soft: rgba(86, 207, 225, 0.12);
-      --amber: #f5b84d;
-      --green: #5bd69c;
-      --red: #ff5f57;
-      --yellow: #febc2e;
-      --traffic-green: #28c840;
-      --font-display: "Bricolage Grotesque", sans-serif;
-      --font-body: "Source Sans 3", sans-serif;
-      --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+      --line-2: rgba(255, 255, 255, 0.12);
+      --hover: rgba(255, 255, 255, 0.05);
+      --accent-soft: rgba(94, 210, 224, 0.12);
+      --shadow-lift: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+
+      --traffic-close: #ff5f57;
+      --traffic-min: #febc2e;
+      --traffic-zoom: #28c840;
+
+      --sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      /* The editor's real metrics: a 14px code face in a 20px line box. */
+      --code-line: 20px;
+      --titlebar: 42px;
+      --statusbar: 30px;
+      --explorer: 232px;
+      --gutter: 58px;
+
+      --r-sm: 5px;
+      --r-md: 8px;
+      --r-lg: 12px;
       --ease: cubic-bezier(0.2, 0, 0, 1);
-      --slash: 22deg;
-      --r-sm: 0.35rem;
-      --r-md: 0.55rem;
-      --r-lg: 0.85rem;
+    }
+
+    [data-theme="light"] {
+      --sunken: #d2d2d7;
+      --chrome: #e2e2e7;
+      --editor: #f3f3f6;
+      --raised: #ffffff;
+      --input: #ececf0;
+
+      --ink: #121317;
+      --ink-2: #42454d;
+      --ink-3: #565962;
+      --on-accent: #f7fdfe;
+
+      --accent: #117888;
+      --danger: #b22626;
+      --warning: #805806;
+      --success: #146c42;
+      --info: #1c589e;
+
+      --syn-comment: #70747e;
+      --syn-string: #186a34;
+      --syn-keyword: #8c26a2;
+      --syn-type: #1658a4;
+      --syn-macro: #80540a;
+      --syn-link: #146678;
+
+      --line: rgba(0, 0, 0, 0.09);
+      --line-2: rgba(0, 0, 0, 0.16);
+      --hover: rgba(0, 0, 0, 0.045);
+      --accent-soft: rgba(17, 120, 136, 0.1);
+      --shadow-lift: 0 1px 0 rgba(255, 255, 255, 0.7) inset, 0 18px 40px -28px rgba(0, 0, 0, 0.4);
     }
 
     *,
@@ -48,1336 +127,2112 @@
       box-sizing: border-box;
     }
 
-    html {
-      scroll-behavior: smooth;
-    }
-
     body {
       margin: 0;
-      min-height: 100vh;
+      background: var(--sunken);
       color: var(--ink);
-      background: var(--bg);
-      font-family: var(--font-body);
-      font-size: 1.0625rem;
-      line-height: 1.55;
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.6;
       -webkit-font-smoothing: antialiased;
-      text-rendering: optimizeLegibility;
-      overflow-x: hidden;
+      -moz-osx-font-smoothing: grayscale;
+      font-synthesis-weight: none;
     }
 
     ::selection {
-      background: var(--cyan);
-      color: var(--cyan-ink);
+      background: var(--accent);
+      color: var(--on-accent);
     }
 
     a {
-      color: var(--cyan);
-      text-decoration-thickness: 1px;
-      text-underline-offset: 0.18em;
+      color: var(--accent);
+      text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+      text-underline-offset: 0.2em;
     }
 
-    a:hover {
-      color: var(--cyan-bright);
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: 3px;
     }
 
-    .grain {
-      pointer-events: none;
-      position: fixed;
-      inset: 0;
-      z-index: 80;
-      opacity: 0.055;
-      mix-blend-mode: overlay;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-    }
-
-    .wrap {
-      width: min(1140px, calc(100% - 2.75rem));
-      margin-inline: auto;
-    }
-
-    /* —— Nav —— */
-    .nav {
-      position: relative;
-      z-index: 10;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 1.15rem 0 0;
-    }
-
-    .nav-brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.65rem;
-      color: var(--ink);
-      text-decoration: none;
-      font-family: var(--font-display);
-      font-weight: 650;
-      font-size: 1.05rem;
-      letter-spacing: -0.03em;
-    }
-
-    .nav-brand img {
-      width: 1.7rem;
-      height: 1.7rem;
-      border-radius: 0.4rem;
-      outline: 1px solid rgba(255, 255, 255, 0.1);
-    }
-
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 0.15rem;
-    }
-
-    .nav-links a {
-      position: relative;
-      color: var(--ink-muted);
-      text-decoration: none;
-      padding: 0.55rem 0.75rem;
-      border-radius: var(--r-sm);
-      font-size: 0.95rem;
-      transition-property: color, background-color;
-      transition-duration: 160ms;
-      transition-timing-function: var(--ease);
-    }
-
-    .nav-links a:hover {
-      color: var(--ink);
-      background: rgba(255, 255, 255, 0.04);
-    }
-
-    .nav-links a.nav-cta {
-      margin-left: 0.35rem;
-      color: var(--cyan-ink);
-      background: var(--cyan);
+    h1,
+    h2,
+    h3 {
+      margin: 0;
       font-weight: 600;
+      letter-spacing: -0.022em;
+      line-height: 1.15;
     }
 
-    .nav-links a.nav-cta:hover {
-      color: var(--cyan-ink);
-      background: var(--cyan-bright);
+    p {
+      margin: 0;
     }
 
-    .nav-links a.nav-cta:active {
-      transform: scale(0.96);
-    }
-
-    /* —— Hero —— */
-    .hero {
-      position: relative;
-      min-height: 100svh;
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-end;
-      padding-bottom: clamp(1.5rem, 4vh, 2.75rem);
-      isolation: isolate;
-    }
-
-    .hero-atmosphere {
-      pointer-events: none;
+    .skip {
       position: absolute;
-      inset: 0;
-      z-index: 0;
-      overflow: hidden;
-      background:
-        radial-gradient(ellipse 55% 45% at 78% 28%, rgba(86, 207, 225, 0.11), transparent 58%),
-        radial-gradient(ellipse 40% 35% at 12% 72%, rgba(86, 207, 225, 0.04), transparent 55%),
-        linear-gradient(180deg, #0c0c0f 0%, var(--bg) 100%);
+      left: -9999px;
+      top: 0;
+      z-index: 100;
+      padding: 0.6rem 1rem;
+      background: var(--raised);
+      color: var(--ink);
+      border-radius: var(--r-sm);
     }
 
-    .hero-atmosphere::before {
-      content: "";
-      position: absolute;
-      inset: -15%;
-      background:
-        repeating-linear-gradient(
-          var(--slash),
-          transparent 0 72px,
-          rgba(86, 207, 225, 0.028) 72px 73px
-        );
-      mask-image: radial-gradient(ellipse 70% 60% at 65% 35%, #000 20%, transparent 75%);
-      animation: slash-drift 28s linear infinite;
+    .skip:focus {
+      left: 0.75rem;
+      top: 0.75rem;
     }
 
-    @keyframes slash-drift {
-      from { transform: translate3d(0, 0, 0); }
-      to { transform: translate3d(-72px, 40px, 0); }
-    }
+    /* ═══════════════════════════════════════════════════════════════════
+       The shell. On a desktop viewport the whole page is framed as the
+       application window: fixed titlebar, explorer, and status bar, with
+       only the document scrolling.
+       ═══════════════════════════════════════════════════════════════ */
 
-    .stage {
-      position: absolute;
-      inset: 0;
-      z-index: 1;
+    .app {
+      height: 100dvh;
+      display: grid;
+      grid-template-rows: var(--titlebar) minmax(0, 1fr) var(--statusbar);
+      background: var(--chrome);
       overflow: hidden;
     }
 
-    .stage-veil {
-      position: absolute;
-      inset: 0;
-      z-index: 2;
-      background:
-        linear-gradient(90deg, var(--bg) 0%, rgba(9, 9, 11, 0.92) 28%, rgba(9, 9, 11, 0.35) 48%, transparent 62%),
-        linear-gradient(180deg, rgba(9, 9, 11, 0.55) 0%, transparent 18%, transparent 72%, rgba(9, 9, 11, 0.85) 100%);
-    }
-
-    .stage-frame {
-      position: absolute;
-      right: max(-6%, calc(48% - 28rem));
-      top: max(5.5rem, 11%);
-      width: min(62rem, 96vw);
-      height: min(74vh, 42rem);
-      transform: perspective(1600px) rotateY(-9deg) rotateX(3.5deg);
-      transform-origin: 60% 40%;
-      border-radius: var(--r-lg) 0 0 var(--r-lg);
-      background: var(--bg-elevated);
-      box-shadow:
-        -40px 50px 120px rgba(0, 0, 0, 0.65),
-        -8px 12px 40px rgba(0, 0, 0, 0.4),
-        inset 0 1px 0 rgba(255, 255, 255, 0.06);
-      outline: 1px solid rgba(255, 255, 255, 0.06);
-      overflow: hidden;
-      opacity: 0;
-      animation: stage-in 1.1s var(--ease) 180ms forwards;
-    }
-
-    @keyframes stage-in {
-      from {
-        opacity: 0;
-        transform: perspective(1600px) rotateY(-14deg) rotateX(6deg) translate3d(2.5rem, 1rem, 0);
-      }
-      to {
-        opacity: 1;
-        transform: perspective(1600px) rotateY(-9deg) rotateX(3.5deg);
-      }
-    }
+    /* —— Titlebar —— */
 
     .titlebar {
       display: flex;
       align-items: center;
-      gap: 0.6rem;
-      height: 2.4rem;
-      padding: 0 0.9rem;
-      background: var(--bg-panel);
-      box-shadow: inset 0 -1px 0 var(--line);
+      gap: 0.75rem;
+      padding-inline: 0.85rem;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--line);
+      user-select: none;
     }
 
     .traffic {
       display: flex;
-      gap: 0.42rem;
-      flex-shrink: 0;
+      gap: 8px;
+      flex: none;
     }
 
-    .traffic i {
-      width: 0.68rem;
-      height: 0.68rem;
+    .traffic span {
+      width: 12px;
+      height: 12px;
       border-radius: 50%;
-      display: block;
-      box-shadow: inset 0 -0.5px 0 rgba(0, 0, 0, 0.25);
+      background: var(--dot);
     }
 
-    .traffic .r { background: var(--red); }
-    .traffic .y { background: var(--yellow); }
-    .traffic .g { background: var(--traffic-green); }
+    .traffic span:nth-child(1) {
+      --dot: var(--traffic-close);
+    }
 
-    .titlebar-label {
-      color: var(--ink-dim);
-      font-family: var(--font-mono);
-      font-size: 0.7rem;
-      letter-spacing: 0.01em;
+    .traffic span:nth-child(2) {
+      --dot: var(--traffic-min);
+    }
+
+    .traffic span:nth-child(3) {
+      --dot: var(--traffic-zoom);
+    }
+
+    /* The tab strip mirrors the section under the reading position. */
+    .tabstrip {
+      display: flex;
+      align-items: stretch;
+      align-self: stretch;
+      margin-left: 0.5rem;
+      min-width: 0;
+    }
+
+    .tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0 0.9rem;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--ink);
+      background: var(--editor);
+      border-inline: 1px solid var(--line);
+      border-top: 1px solid transparent;
       white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
 
-    .titlebar-actions {
+    .tab::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex: none;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
       margin-left: auto;
+      text-decoration: none;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12.5px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      flex: none;
+    }
+
+    .brand img {
+      width: 20px;
+      height: 20px;
+      border-radius: 5px;
+      display: block;
+    }
+
+    .tb-actions {
       display: flex;
       align-items: center;
-      gap: 0.35rem;
-      color: var(--ink-dim);
-      font-family: var(--font-mono);
-      font-size: 0.62rem;
+      gap: 2px;
+      flex: none;
     }
 
-    .titlebar-actions span {
-      padding: 0.2rem 0.4rem;
-      border-radius: 0.25rem;
-      background: rgba(255, 255, 255, 0.04);
+    .icon-btn {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border: 0;
+      border-radius: var(--r-sm);
+      background: transparent;
+      color: var(--ink-2);
+      cursor: pointer;
+      transition: background 120ms var(--ease), color 120ms var(--ease);
     }
+
+    .icon-btn:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+
+    .icon-btn svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+    }
+
+    /* The toggle swaps which glyph is visible, never both. */
+    [data-theme="dark"] .icon-sun {
+      display: none;
+    }
+
+    [data-theme="light"] .icon-moon {
+      display: none;
+    }
+
+    /* —— Workspace —— */
 
     .workspace {
       display: grid;
-      grid-template-columns: 11.75rem minmax(0, 1fr) 13rem;
-      height: calc(100% - 2.4rem);
+      grid-template-columns: var(--explorer) minmax(0, 1fr);
+      min-height: 0;
+      background: var(--sunken);
     }
 
-    .tree,
-    .agent {
-      min-width: 0;
-      background: #101012;
-      padding: 0.8rem 0.7rem;
-      font-family: var(--font-mono);
-      font-size: 0.7rem;
-      color: #8f96a3;
+    .explorer {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      padding: 0.9rem 0 1rem;
+      background: var(--chrome);
+      border-right: 1px solid var(--line);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .explorer-label {
+      padding: 0 1rem 0.7rem;
+      font-family: var(--mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--ink-3);
     }
 
     .tree {
-      box-shadow: inset -1px 0 0 var(--line);
+      list-style: none;
+      margin: 0;
+      padding: 0 0.5rem;
     }
 
-    .agent {
-      box-shadow: inset 1px 0 0 var(--line);
+    .tree-root {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.3rem 0.5rem 0.45rem;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--ink-2);
     }
 
-    .pane-label {
-      margin: 0 0 0.7rem;
-      color: #5c6472;
-      font-size: 0.6rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
+    .tree-root svg {
+      width: 13px;
+      height: 13px;
+      color: var(--ink-3);
+    }
+
+    /* Rows sit under a guide line, the way a real indent guide reads. */
+    .tree-files {
+      list-style: none;
+      margin: 0;
+      padding: 0 0 0 0.85rem;
+      border-left: 1px solid var(--line);
+      margin-left: 0.85rem;
+    }
+
+    .tree-link {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.3rem 0.5rem;
+      border-radius: var(--r-sm);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--ink-2);
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background 120ms var(--ease), color 120ms var(--ease);
+    }
+
+    .tree-link svg {
+      width: 13px;
+      height: 13px;
+      flex: none;
+      color: var(--tint, var(--ink-3));
+    }
+
+    .tree-link:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+
+    .tree-link[aria-current="location"] {
+      background: var(--accent-soft);
+      color: var(--ink);
       font-weight: 500;
     }
 
-    .tree ul,
-    .agent ul {
-      list-style: none;
-      margin: 0;
-      padding: 0;
+    .tree-sep {
+      height: 1px;
+      margin: 0.7rem 0.9rem;
+      background: var(--line);
     }
 
-    .tree li {
-      padding: 0.2rem 0.4rem;
-      border-radius: 0.22rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+    .explorer-foot {
+      margin-top: auto;
+      padding: 1rem 1rem 0;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.7;
+      color: var(--ink-3);
     }
 
-    .tree li.active {
-      background: var(--cyan-soft);
-      color: var(--cyan);
-    }
-
-    .tree .folder {
-      color: #c8ced8;
-      margin-top: 0.15rem;
-    }
-
-    .buffer {
-      position: relative;
-      min-width: 0;
-      background: var(--bg-elevated);
-      padding: 0.9rem 1.05rem 1.1rem;
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      line-height: 1.58;
-      color: #dfe3eb;
-      overflow: hidden;
-    }
-
-    .buffer .ln {
-      display: grid;
-      grid-template-columns: 1.85rem 1fr;
-      gap: 0.9rem;
-    }
-
-    .buffer .n {
-      color: #4a5060;
-      text-align: right;
-      user-select: none;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .kw { color: #56cfe1; }
-    .fn { color: #9ae4ef; }
-    .str { color: #f5b84d; }
-    .cm { color: #6b7280; font-style: italic; }
-    .ty { color: #8fd4bc; }
-    .op { color: #aeb6c4; }
-    .hl {
-      background: rgba(86, 207, 225, 0.16);
-      border-radius: 0.12rem;
-      box-shadow: 0 0 0 1px rgba(86, 207, 225, 0.12);
-    }
-
-    .cursor-blink {
-      display: inline-block;
-      width: 0.42em;
-      height: 1.05em;
-      margin-left: 0.04em;
-      vertical-align: text-bottom;
-      background: var(--cyan);
-      animation: blink 1.05s steps(1) infinite;
-    }
-
-    @keyframes blink {
-      50% { opacity: 0; }
-    }
-
-    .palette {
-      position: absolute;
-      left: 50%;
-      top: 18%;
-      width: min(22rem, 86%);
-      transform: translateX(-50%);
-      border-radius: calc(var(--r-md) + 2px);
-      padding: 2px;
-      background: rgba(20, 20, 22, 0.92);
-      box-shadow:
-        0 24px 60px rgba(0, 0, 0, 0.55),
-        0 0 0 1px rgba(255, 255, 255, 0.08),
-        inset 0 1px 0 rgba(255, 255, 255, 0.05);
-      backdrop-filter: blur(10px);
-      opacity: 0;
-      animation: palette-in 700ms var(--ease) 900ms forwards;
-    }
-
-    .palette-inner {
-      border-radius: var(--r-md);
-      overflow: hidden;
-      background: #1a1a1e;
-    }
-
-    .palette-query {
-      display: flex;
-      align-items: center;
-      gap: 0.55rem;
-      padding: 0.7rem 0.8rem;
-      box-shadow: inset 0 -1px 0 var(--line);
-      color: var(--ink);
-      font-family: var(--font-mono);
-      font-size: 0.74rem;
-    }
-
-    .palette-query .caret {
-      width: 0.08rem;
-      height: 0.95em;
-      background: var(--cyan);
-      animation: blink 1.05s steps(1) infinite;
-    }
-
-    .palette-query .muted {
-      color: var(--ink-dim);
-    }
-
-    .palette-hit {
-      display: flex;
-      justify-content: space-between;
-      gap: 0.75rem;
-      padding: 0.45rem 0.8rem;
-      font-family: var(--font-mono);
-      font-size: 0.68rem;
-      color: var(--ink-muted);
-    }
-
-    .palette-hit.active {
-      background: var(--cyan-soft);
-      color: var(--cyan);
-    }
-
-    .palette-hit .tag {
-      color: var(--ink-dim);
-      flex-shrink: 0;
-    }
-
-    @keyframes palette-in {
-      from {
-        opacity: 0;
-        transform: translateX(-50%) translateY(0.6rem) scale(0.98);
-      }
-      to {
-        opacity: 1;
-        transform: translateX(-50%);
-      }
-    }
-
-    .agent .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      margin-bottom: 0.8rem;
-      color: var(--green);
-      font-size: 0.68rem;
-    }
-
-    .agent .status::before {
-      content: "";
-      width: 0.38rem;
-      height: 0.38rem;
-      border-radius: 50%;
-      background: currentColor;
-    }
-
-    .agent .bubble {
-      margin-top: 0.5rem;
-      padding: 0.55rem 0.6rem;
-      background: #17171b;
-      border-radius: 0.35rem;
-      box-shadow: inset 0 0 0 1px var(--line);
-      color: #c4cad4;
-      line-height: 1.45;
-      font-size: 0.68rem;
-    }
-
-    .agent .bubble.diff {
-      color: #9ad4c0;
-      white-space: pre-wrap;
-    }
-
-    /* —— Hero copy —— */
-    .hero-copy {
-      position: relative;
-      z-index: 3;
-      max-width: 34rem;
-      padding: clamp(5rem, 16vh, 9rem) 0 1.5rem;
-    }
-
-    .brand-lockup {
-      display: flex;
-      align-items: center;
-      gap: 0.9rem;
-      margin: 0 0 1.5rem;
-    }
-
-    .brand-lockup img {
-      width: clamp(3.4rem, 7vw, 4.5rem);
-      height: clamp(3.4rem, 7vw, 4.5rem);
-      border-radius: 1rem;
-      outline: 1px solid rgba(255, 255, 255, 0.1);
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
-    }
-
-    .brand-name {
-      margin: 0;
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(3.6rem, 11vw, 6rem);
-      line-height: 0.9;
-      letter-spacing: -0.06em;
-      text-wrap: balance;
-    }
-
-    .headline {
-      margin: 0 0 0.9rem;
-      max-width: 14ch;
-      font-family: var(--font-display);
-      font-weight: 650;
-      font-size: clamp(1.65rem, 3.6vw, 2.35rem);
-      line-height: 1.12;
-      letter-spacing: -0.04em;
-      text-wrap: balance;
-    }
-
-    .lede {
-      margin: 0 0 1.85rem;
-      max-width: 33ch;
-      color: var(--ink-muted);
-      font-size: 1.125rem;
-      text-wrap: pretty;
-    }
-
-    .cta-row {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 0.7rem 0.85rem;
-    }
-
-    .btn {
-      appearance: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.45rem;
-      min-height: 2.9rem;
-      padding: 0.7rem 1.25rem;
-      border: 0;
-      border-radius: var(--r-sm);
-      font-family: var(--font-body);
-      font-size: 1rem;
-      font-weight: 600;
-      letter-spacing: -0.01em;
+    .explorer-foot a {
+      color: var(--ink-2);
       text-decoration: none;
-      cursor: pointer;
-      transition-property: transform, background-color, color, box-shadow;
-      transition-duration: 150ms;
-      transition-timing-function: var(--ease);
     }
 
-    .btn:active {
-      transform: scale(0.96);
+    .explorer-foot a:hover {
+      color: var(--accent);
     }
 
-    .btn-primary {
-      background: var(--cyan);
-      color: var(--cyan-ink);
-      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.2) inset;
+    /* —— Document —— */
+
+    .doc {
+      min-width: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      background: var(--editor);
+      scroll-behavior: smooth;
     }
 
-    .btn-primary:hover {
-      background: var(--cyan-bright);
-      color: var(--cyan-ink);
+    .doc-inner {
+      position: relative;
+      display: grid;
+      grid-template-columns: var(--gutter) minmax(0, 1fr);
+      max-width: 1080px;
+      margin-inline: auto;
+      padding-right: 2.5rem;
     }
 
-    .btn-ghost {
-      background: rgba(255, 255, 255, 0.03);
-      color: var(--ink);
-      box-shadow: inset 0 0 0 1px var(--line-strong);
+    /* One text node of newline-separated numbers, so the decorative gutter
+       costs a single element instead of hundreds. It is taken out of flow so
+       that a rounded-up line count can never push the row taller and feed
+       back into the measurement that produced it. */
+    .gutter {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: var(--gutter);
+      height: 100%;
+      margin: 0;
+      padding: 0 14px 0 0;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: var(--code-line);
+      text-align: right;
+      color: var(--ink-3);
+      opacity: 0.32;
+      user-select: none;
+      overflow: hidden;
+      border-right: 1px solid var(--line);
     }
 
-    .btn-ghost:hover {
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--ink);
+    .doc-body {
+      grid-column: 2;
+      min-width: 0;
+      padding: 0 0 6rem 1.5rem;
     }
 
-    .btn .arrow {
-      display: inline-block;
-      transition-property: transform;
-      transition-duration: 160ms;
-      transition-timing-function: var(--ease);
+    section {
+      scroll-margin-top: 1.5rem;
+      padding: 4.5rem 0;
+      border-bottom: 1px solid var(--line);
     }
 
-    .btn-primary:hover .arrow {
-      transform: translateX(2px);
+    section:last-of-type {
+      border-bottom: 0;
     }
 
-    /* —— Reveals —— */
-    .reveal {
+    /* —— Reveal ——
+       Only a page that has already proved it can run the observer is allowed
+       to hide anything. Without scripting, `.rise` is simply visible text. */
+
+    .js .rise {
       opacity: 0;
-      transform: translateY(0.9rem);
-      animation: rise 720ms var(--ease) forwards;
+      transform: translateY(14px);
+      transition: opacity 620ms var(--ease), transform 620ms var(--ease);
+      transition-delay: calc(var(--i, 0) * 70ms);
     }
 
-    .d1 { animation-delay: 60ms; }
-    .d2 { animation-delay: 150ms; }
-    .d3 { animation-delay: 240ms; }
-    .d4 { animation-delay: 330ms; }
-    .d5 { animation-delay: 420ms; }
-
-    @keyframes rise {
-      to {
-        opacity: 1;
-        transform: none;
-      }
-    }
-
-    .inview {
-      opacity: 0;
-      transform: translateY(1rem);
-      transition-property: opacity, transform;
-      transition-duration: 700ms;
-      transition-timing-function: var(--ease);
-    }
-
-    .inview.is-visible {
+    .js .rise.in {
       opacity: 1;
       transform: none;
     }
 
-    .inview.delay-1 { transition-delay: 80ms; }
-    .inview.delay-2 { transition-delay: 160ms; }
-    .inview.delay-3 { transition-delay: 240ms; }
+    /* ═══════════════════════════════════════════════════════════════════
+       Typography and shared pieces
+       ═══════════════════════════════════════════════════════════════ */
 
-    @media (prefers-reduced-motion: reduce) {
-      .reveal,
-      .stage-frame,
-      .palette,
-      .cursor-blink,
-      .palette-query .caret,
-      .hero-atmosphere::before {
-        animation: none !important;
-      }
-
-      .reveal,
-      .stage-frame,
-      .palette,
-      .inview {
-        opacity: 1 !important;
-        transform: none !important;
-        transition: none !important;
-      }
-    }
-
-    /* —— Sections —— */
-    section {
-      position: relative;
-      padding: clamp(4.25rem, 11vw, 7rem) 0;
-    }
-
-    .section-edge {
-      box-shadow: inset 0 1px 0 var(--line);
-    }
-
-    .section-kicker {
+    .eyebrow {
       display: inline-flex;
       align-items: center;
       gap: 0.55rem;
-      margin: 0 0 0.85rem;
-      color: var(--cyan);
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      margin-bottom: 1.5rem;
+      padding: 0.3rem 0.7rem 0.3rem 0.55rem;
+      border: 1px solid var(--line-2);
+      border-radius: 999px;
+      background: var(--raised);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--ink-2);
     }
 
-    .section-kicker::before {
-      content: "";
-      width: 1.1rem;
-      height: 0.12rem;
-      background: var(--cyan);
-      transform: skewX(-22deg);
-    }
-
-    .section-title {
-      margin: 0 0 0.8rem;
-      max-width: 14ch;
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(1.9rem, 4vw, 2.7rem);
-      line-height: 1.05;
-      letter-spacing: -0.045em;
-      text-wrap: balance;
-    }
-
-    .section-copy {
-      margin: 0 0 2.25rem;
-      max-width: 36rem;
-      color: var(--ink-muted);
-      text-wrap: pretty;
-    }
-
-    /* —— Install —— */
-    .install-shell {
-      border-radius: calc(var(--r-lg) + 0.15rem);
-      padding: 0.35rem;
-      background: rgba(255, 255, 255, 0.025);
-      box-shadow:
-        inset 0 0 0 1px var(--line),
-        0 20px 50px rgba(0, 0, 0, 0.25);
-    }
-
-    .install-tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.25rem;
-      padding: 0.15rem 0.15rem 0.45rem;
-    }
-
-    .install-tab {
-      appearance: none;
-      border: 0;
-      border-radius: var(--r-sm);
-      min-height: 2.4rem;
-      padding: 0.45rem 0.9rem;
-      background: transparent;
-      color: var(--ink-muted);
-      font-family: var(--font-body);
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition-property: color, background-color, transform;
-      transition-duration: 150ms;
-      transition-timing-function: var(--ease);
-    }
-
-    .install-tab:hover {
-      color: var(--ink);
-      background: rgba(255, 255, 255, 0.04);
-    }
-
-    .install-tab[aria-selected="true"] {
-      color: var(--cyan-ink);
-      background: var(--cyan);
-    }
-
-    .install-tab:active {
-      transform: scale(0.96);
-    }
-
-    .terminal {
-      border-radius: var(--r-lg);
-      background: var(--bg-panel);
-      overflow: hidden;
-      box-shadow: inset 0 0 0 1px var(--line);
-    }
-
-    .terminal-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      padding: 0.7rem 0.95rem;
-      box-shadow: inset 0 -1px 0 var(--line);
-      color: var(--ink-dim);
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-    }
-
-    .copy-btn {
-      appearance: none;
-      position: relative;
-      border: 0;
-      border-radius: 0.28rem;
-      min-height: 2rem;
-      min-width: 4.25rem;
-      padding: 0.35rem 0.65rem;
-      background: rgba(255, 255, 255, 0.04);
-      color: var(--ink-muted);
-      font-family: var(--font-mono);
-      font-size: 0.72rem;
-      cursor: pointer;
-      transition-property: color, background-color, transform;
-      transition-duration: 140ms;
-      transition-timing-function: var(--ease);
-    }
-
-    .copy-btn:hover {
-      color: var(--ink);
-      background: rgba(255, 255, 255, 0.07);
-    }
-
-    .copy-btn:active {
-      transform: scale(0.96);
-    }
-
-    .copy-btn.copied {
-      color: var(--green);
-    }
-
-    .terminal pre {
-      margin: 0;
-      padding: 1.15rem 1.05rem 1.3rem;
-      overflow-x: auto;
-      font-family: var(--font-mono);
-      font-size: 0.82rem;
-      line-height: 1.7;
-      color: #d5dae3;
-      white-space: pre;
-    }
-
-    .terminal .prompt {
-      color: var(--cyan);
-      user-select: none;
-    }
-
-    .terminal-panel[hidden] {
-      display: none;
-    }
-
-    .after-install {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 0.35rem 1.5rem;
-      margin-top: 1.35rem;
-      color: var(--ink-muted);
-      font-size: 0.98rem;
-    }
-
-    .after-install code {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      color: var(--cyan);
-      background: var(--cyan-soft);
-      padding: 0.14em 0.42em;
-      border-radius: 0.28rem;
-    }
-
-    .platforms {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.55rem 1.6rem;
-      margin-top: 1.75rem;
-      padding-top: 1.35rem;
-      box-shadow: inset 0 1px 0 var(--line);
-      color: var(--ink-dim);
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-    }
-
-    .platforms strong {
-      color: var(--ink-muted);
+    .eyebrow b {
+      color: var(--accent);
       font-weight: 500;
     }
 
-    /* —— Features —— */
-    .feature-list {
-      display: grid;
-      gap: 0;
+    .pulse {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 60%, transparent);
+      animation: pulse 2.6s var(--ease) infinite;
     }
 
-    .feature {
-      display: grid;
-      gap: 0.45rem 2.5rem;
-      padding: 1.45rem 0;
-      box-shadow: inset 0 1px 0 var(--line);
-      transition-property: background-color;
-      transition-duration: 180ms;
-      transition-timing-function: var(--ease);
-    }
+    @keyframes pulse {
 
-    .feature:last-child {
-      box-shadow:
-        inset 0 1px 0 var(--line),
-        inset 0 -1px 0 var(--line);
-    }
-
-    @media (min-width: 760px) {
-      .feature {
-        grid-template-columns: 2.5rem 13.5rem 1fr;
-        align-items: baseline;
-        padding-inline: 0.35rem;
+      0%,
+      70%,
+      100% {
+        box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent);
       }
 
-      .feature:hover {
-        background: rgba(255, 255, 255, 0.015);
+      35% {
+        box-shadow: 0 0 0 5px transparent;
       }
     }
 
-    .feature-num {
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      color: var(--cyan);
-      font-variant-numeric: tabular-nums;
+    .section-index {
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      margin-bottom: 1.15rem;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--ink-3);
     }
 
-    .feature h3 {
-      margin: 0;
-      font-family: var(--font-display);
-      font-size: 1.2rem;
-      font-weight: 650;
-      letter-spacing: -0.03em;
+    /* The logo shears its right edge; the section rule repeats that angle. */
+    .section-index::before {
+      content: "";
+      width: 26px;
+      height: 9px;
+      background: var(--accent);
+      clip-path: polygon(0 0, 100% 0, calc(100% - 4px) 100%, 0 100%);
+      flex: none;
     }
 
-    .feature p {
-      margin: 0;
-      color: var(--ink-muted);
-      max-width: 40rem;
-      text-wrap: pretty;
+    h2 {
+      font-size: clamp(1.75rem, 1.35rem + 1.5vw, 2.5rem);
+      max-width: 22ch;
     }
 
-    .feature .keys {
-      font-family: var(--font-mono);
-      font-size: 0.84em;
-      color: var(--ink-dim);
+    .lede {
+      margin-top: 1.05rem;
+      max-width: 62ch;
+      font-size: 1.0625rem;
+      color: var(--ink-2);
     }
 
-    /* —— Closing band —— */
-    .close-band {
-      margin-top: 0.5rem;
-      padding: clamp(2.5rem, 6vw, 3.5rem);
-      border-radius: calc(var(--r-lg) + 0.2rem);
-      background:
-        linear-gradient(135deg, rgba(86, 207, 225, 0.08), transparent 45%),
-        var(--bg-panel);
-      box-shadow: inset 0 0 0 1px var(--line);
+    .note {
+      margin-top: 1.4rem;
+      max-width: 64ch;
+      font-size: 0.9375rem;
+      color: var(--ink-3);
     }
 
-    .close-band h2 {
-      margin: 0 0 0.65rem;
-      font-family: var(--font-display);
-      font-weight: 800;
-      font-size: clamp(1.6rem, 3vw, 2.1rem);
-      letter-spacing: -0.04em;
-      text-wrap: balance;
-    }
+    /* —— Buttons —— */
 
-    .close-band p {
-      margin: 0 0 1.35rem;
-      max-width: 34rem;
-      color: var(--ink-muted);
-      text-wrap: pretty;
-    }
-
-    /* —— Footer —— */
-    footer {
-      position: relative;
-      padding: 2rem 0 2.75rem;
-      box-shadow: inset 0 1px 0 var(--line);
-      color: var(--ink-dim);
-      font-size: 0.92rem;
-    }
-
-    .footer-row {
+    .row {
       display: flex;
       flex-wrap: wrap;
+      gap: 0.7rem;
       align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
     }
 
-    .footer-row a {
-      color: var(--ink-muted);
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.62rem 1.05rem;
+      border: 1px solid transparent;
+      border-radius: var(--r-md);
+      font-family: var(--sans);
+      font-size: 0.9375rem;
+      font-weight: 600;
       text-decoration: none;
-      transition-property: color;
-      transition-duration: 150ms;
-      transition-timing-function: var(--ease);
+      cursor: pointer;
+      transition: transform 140ms var(--ease), background 140ms var(--ease), border-color 140ms var(--ease);
     }
 
-    .footer-row a:hover {
+    .btn:active {
+      transform: translateY(1px);
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: var(--on-accent);
+    }
+
+    .btn-primary:hover {
+      background: color-mix(in srgb, var(--accent) 82%, white);
+    }
+
+    .btn-ghost {
+      background: var(--raised);
+      border-color: var(--line-2);
       color: var(--ink);
     }
 
-    .footer-links {
+    .btn-ghost:hover {
+      border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    }
+
+    .btn svg {
+      width: 15px;
+      height: 15px;
+    }
+
+    /* —— Terminal / code surfaces —— */
+
+    .surface {
+      border: 1px solid var(--line);
+      border-radius: var(--r-lg);
+      background: var(--raised);
+      box-shadow: var(--shadow-lift);
+      overflow: hidden;
+    }
+
+    .surface-head {
       display: flex;
-      gap: 1.2rem;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.5rem 0.85rem;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--ink-3);
     }
 
-    /* —— Responsive —— */
-    @media (max-width: 900px) {
-      .hero {
-        min-height: auto;
-        justify-content: flex-start;
+    .surface-head .grow {
+      margin-left: auto;
+    }
+
+    pre.code {
+      margin: 0;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      background: var(--input);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: var(--code-line);
+      color: var(--ink);
+      tab-size: 2;
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.875em;
+    }
+
+    p code,
+    li code {
+      padding: 0.1em 0.35em;
+      border-radius: 4px;
+      background: var(--raised);
+      color: var(--ink);
+    }
+
+    .k {
+      color: var(--syn-keyword);
+    }
+
+    .s {
+      color: var(--syn-string);
+    }
+
+    .c {
+      color: var(--syn-comment);
+    }
+
+    .t {
+      color: var(--syn-type);
+    }
+
+    .m {
+      color: var(--syn-macro);
+    }
+
+    .a {
+      color: var(--accent);
+    }
+
+    .dim {
+      color: var(--ink-3);
+    }
+
+    /* —— Copyable command —— */
+
+    .cmd {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--r-md);
+      background: var(--input);
+      overflow: hidden;
+    }
+
+    /* A long install command scrolls rather than wraps, so the fade is what
+       tells you there is more of it than the box can show. */
+    .cmd-text {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.7rem 0.9rem;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      white-space: nowrap;
+      scrollbar-width: none;
+      mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+    }
+
+    .cmd-text::-webkit-scrollbar {
+      display: none;
+    }
+
+    .cmd-text::before {
+      content: "$";
+      color: var(--accent);
+      flex: none;
+    }
+
+    .copy {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex: none;
+      padding: 0 0.9rem;
+      border: 0;
+      border-left: 1px solid var(--line);
+      background: var(--raised);
+      color: var(--ink-2);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition: color 120ms var(--ease), background 120ms var(--ease);
+    }
+
+    .copy:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+
+    .copy[data-copied="true"] {
+      color: var(--success);
+    }
+
+    .copy svg {
+      width: 13px;
+      height: 13px;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+       Hero
+       ═══════════════════════════════════════════════════════════════ */
+
+    #overview {
+      padding-top: 3.5rem;
+    }
+
+    .hero-mark {
+      width: 60px;
+      height: 60px;
+      border-radius: 14px;
+      display: block;
+      margin-bottom: 1.6rem;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 1.5rem + 3.4vw, 4rem);
+      letter-spacing: -0.035em;
+      line-height: 1.03;
+      max-width: 17ch;
+    }
+
+    h1 em {
+      font-style: normal;
+      color: var(--accent);
+    }
+
+    .hero-lede {
+      margin-top: 1.5rem;
+      max-width: 56ch;
+      font-size: 1.125rem;
+      color: var(--ink-2);
+    }
+
+    .hero-install {
+      margin-top: 2.2rem;
+      max-width: 680px;
+    }
+
+    .hero-actions {
+      margin-top: 1.1rem;
+    }
+
+    .renderers {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 2.6rem;
+      padding-top: 1.6rem;
+      border-top: 1px solid var(--line);
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--raised);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--ink-2);
+    }
+
+    .chip[data-host="true"] {
+      border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+      color: var(--ink);
+    }
+
+    .chip::before {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--ink-3);
+    }
+
+    .chip[data-host="true"]::before {
+      background: var(--accent);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+       Install
+       ═══════════════════════════════════════════════════════════════ */
+
+    .tabs {
+      display: flex;
+      gap: 0.3rem;
+      margin: 1rem 0 0.75rem;
+    }
+
+    .tab-btn {
+      padding: 0.4rem 0.85rem;
+      border: 1px solid transparent;
+      border-radius: var(--r-sm);
+      background: transparent;
+      color: var(--ink-3);
+      font-family: var(--mono);
+      font-size: 12px;
+      cursor: pointer;
+      transition: color 120ms var(--ease), background 120ms var(--ease);
+    }
+
+    .tab-btn:hover {
+      color: var(--ink);
+    }
+
+    .tab-btn[aria-selected="true"] {
+      background: var(--raised);
+      border-color: var(--line-2);
+      color: var(--ink);
+    }
+
+    .panel[hidden] {
+      display: none;
+    }
+
+    .steps {
+      display: grid;
+      gap: 1rem;
+      margin-top: 1.6rem;
+      max-width: 620px;
+    }
+
+    .step,
+    .step-lead {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 0.9rem;
+      align-items: center;
+    }
+
+    .step-lead {
+      margin-top: 2rem;
+    }
+
+    .step-lead p {
+      font-size: 0.9375rem;
+      color: var(--ink-2);
+    }
+
+    .step-n {
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 1px solid var(--line-2);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--ink-3);
+    }
+
+    .step p {
+      font-size: 0.9375rem;
+      color: var(--ink-2);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+       Feature lists and cards
+       ═══════════════════════════════════════════════════════════════ */
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1px;
+      margin-top: 2.4rem;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: var(--r-lg);
+      overflow: hidden;
+    }
+
+    .cell {
+      padding: 1.4rem 1.35rem;
+      background: var(--editor);
+    }
+
+    .cell h3 {
+      font-size: 1rem;
+      margin-bottom: 0.45rem;
+    }
+
+    .cell p {
+      font-size: 0.9rem;
+      color: var(--ink-2);
+    }
+
+    .cell-key {
+      display: inline-block;
+      margin-bottom: 0.75rem;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 2.5rem;
+      align-items: start;
+      margin-top: 2.4rem;
+    }
+
+    .facts {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 0.95rem;
+    }
+
+    .facts li {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 0.7rem;
+      font-size: 0.9375rem;
+      color: var(--ink-2);
+    }
+
+    .facts li svg {
+      width: 15px;
+      height: 15px;
+      margin-top: 0.28rem;
+      color: var(--accent);
+      flex: none;
+    }
+
+    .facts strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    kbd {
+      display: inline-block;
+      min-width: 1.5em;
+      padding: 0.12em 0.42em;
+      border: 1px solid var(--line-2);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      background: var(--raised);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 0.78em;
+      text-align: center;
+    }
+
+    /* —— Search palette mock —— */
+
+    .palette {
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-lg);
+      background: var(--raised);
+      box-shadow: var(--shadow-lift);
+      overflow: hidden;
+    }
+
+    .palette-input {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.8rem 0.95rem;
+      border-bottom: 1px solid var(--line);
+      background: var(--input);
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--ink);
+    }
+
+    .palette-input svg {
+      width: 14px;
+      height: 14px;
+      color: var(--ink-3);
+      flex: none;
+    }
+
+    .caret {
+      width: 1.5px;
+      height: 15px;
+      background: var(--accent);
+      animation: blink 1.1s steps(1) infinite;
+    }
+
+    @keyframes blink {
+
+      0%,
+      50% {
+        opacity: 1;
       }
 
-      .hero-copy {
-        padding-top: 3rem;
-        padding-bottom: 1.25rem;
-        max-width: 100%;
+      50.01%,
+      100% {
+        opacity: 0;
+      }
+    }
+
+    .palette-group {
+      padding: 0.5rem 0.95rem 0.25rem;
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--ink-3);
+    }
+
+    .palette-row {
+      display: flex;
+      align-items: baseline;
+      gap: 0.6rem;
+      padding: 0.35rem 0.95rem;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--ink-2);
+    }
+
+    .palette-row[data-active="true"] {
+      background: var(--accent-soft);
+      color: var(--ink);
+    }
+
+    .palette-row .path {
+      margin-left: auto;
+      color: var(--ink-3);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .palette-row mark {
+      background: color-mix(in srgb, var(--accent) 28%, transparent);
+      color: inherit;
+      border-radius: 2px;
+    }
+
+    .palette-foot {
+      padding: 0.55rem 0.95rem;
+      border-top: 1px solid var(--line);
+      background: var(--chrome);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--ink-3);
+    }
+
+    /* —— Measured table —— */
+
+    .table-wrap {
+      margin-top: 2.4rem;
+      border: 1px solid var(--line);
+      border-radius: var(--r-lg);
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    caption {
+      padding: 0.85rem 1.1rem;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--ink-3);
+    }
+
+    th,
+    td {
+      padding: 0.7rem 1.1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+
+    thead th {
+      font-family: var(--mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--ink-3);
+    }
+
+    tbody th {
+      font-weight: 400;
+      color: var(--ink-2);
+      white-space: normal;
+    }
+
+    tbody td:nth-child(2) {
+      font-family: var(--mono);
+      font-size: 0.8125rem;
+      color: var(--ink);
+    }
+
+    tbody tr:last-child th,
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .pass {
+      color: var(--success);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    /* —— Closing —— */
+
+    .closing {
+      margin-top: 1rem;
+      padding: 3rem 0 1rem;
+    }
+
+    .closing h2 {
+      max-width: 18ch;
+      font-size: clamp(1.9rem, 1.3rem + 2.2vw, 2.9rem);
+    }
+
+    .colophon {
+      margin-top: 3.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--line);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem 1.5rem;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--ink-3);
+    }
+
+    .colophon a {
+      color: var(--ink-2);
+      text-decoration: none;
+    }
+
+    .colophon a:hover {
+      color: var(--accent);
+    }
+
+    /* —— Status bar —— */
+
+    .statusbar {
+      display: flex;
+      align-items: center;
+      gap: 1.1rem;
+      padding-inline: 0.95rem;
+      background: var(--chrome);
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--ink-3);
+      user-select: none;
+    }
+
+    .statusbar .grow {
+      margin-left: auto;
+    }
+
+    .statusbar b {
+      font-weight: 400;
+      color: var(--ink-2);
+    }
+
+    .status-accent {
+      color: var(--accent);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+       Responsive. Below 960px the window chrome dissolves into an ordinary
+       document: the shell stops being a claim the small screen can't keep.
+       ═══════════════════════════════════════════════════════════════ */
+
+    @media (max-width: 960px) {
+      .app {
+        height: auto;
+        overflow: visible;
+        display: block;
       }
 
-      .stage {
-        position: relative;
-        height: min(48vh, 24rem);
-        margin: 0 calc(50% - 50vw) 0.5rem;
-        width: 100vw;
+      .titlebar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        height: var(--titlebar);
       }
 
-      .stage-veil {
-        background:
-          linear-gradient(180deg, rgba(9, 9, 11, 0.2) 0%, transparent 20%, transparent 70%, rgba(9, 9, 11, 0.95) 100%),
-          linear-gradient(90deg, rgba(9, 9, 11, 0.55) 0%, transparent 30%);
+      .traffic,
+      .tabstrip {
+        display: none;
       }
 
-      .stage-frame {
-        position: absolute;
-        left: 6%;
-        right: -20%;
-        top: 0.5rem;
-        width: auto;
-        height: calc(100% - 0.5rem);
+      .brand {
+        margin-left: 0;
+        margin-right: auto;
+      }
+
+      .workspace {
+        display: block;
+      }
+
+      .explorer {
+        display: none;
+      }
+
+      .doc {
+        overflow: visible;
+        height: auto;
+      }
+
+      .doc-inner {
+        display: block;
+        padding-inline: 1.35rem;
+      }
+
+      .gutter {
+        display: none;
+      }
+
+      .doc-body {
+        padding: 0 0 4rem;
+      }
+
+      .statusbar {
+        height: var(--statusbar);
+      }
+
+      section {
+        padding: 3.25rem 0;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .statusbar .optional {
+        display: none;
+      }
+
+      .split {
+        gap: 1.75rem;
+      }
+
+      .btn {
+        width: 100%;
+        justify-content: center;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+
+      .doc {
+        scroll-behavior: auto;
+      }
+
+      .rise {
+        opacity: 1;
         transform: none;
-        border-radius: var(--r-md) 0 0 var(--r-md);
-        animation-name: stage-in-flat;
-      }
-
-      @keyframes stage-in-flat {
-        from {
-          opacity: 0;
-          transform: translateY(1rem);
-        }
-        to {
-          opacity: 1;
-          transform: none;
-        }
-      }
-
-      .workspace {
-        grid-template-columns: 8.75rem 1fr;
-      }
-
-      .agent,
-      .palette {
-        display: none;
-      }
-
-      .nav-links a:not(.nav-cta) {
-        display: none;
-      }
-    }
-
-    @media (max-width: 540px) {
-      .wrap {
-        width: min(1140px, calc(100% - 1.5rem));
-      }
-
-      .workspace {
-        grid-template-columns: 1fr;
-      }
-
-      .tree {
-        display: none;
-      }
-
-      .brand-lockup {
-        gap: 0.7rem;
-      }
-
-      .close-band {
-        padding: 1.75rem 1.25rem;
       }
     }
   </style>
 </head>
-<body>
-  <div class="grain" aria-hidden="true"></div>
 
-  <div class="wrap">
-    <nav class="nav reveal d1" aria-label="Primary">
-      <a class="nav-brand" href="#top">
-        <img src="editur-icon.png" width="28" height="28" alt="" />
+<body>
+  <a class="skip" href="#overview">Skip to content</a>
+
+  <!-- Shared glyphs -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-file" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 1.5H4.5A1.5 1.5 0 0 0 3 3v10a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 13V5.5L9 1.5Z" />
+      <path d="M9 1.5V5.5H13" />
+    </symbol>
+    <symbol id="i-folder" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M1.75 12.5v-9h4l1.5 2h7v7a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1Z" />
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M2.5 8.5 6 12l7.5-8" />
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+      stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5.5" y="5.5" width="9" height="9" rx="1.5" />
+      <path d="M10.5 5.5v-3a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h3" />
+    </symbol>
+    <symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"
+      stroke-linecap="round">
+      <circle cx="7" cy="7" r="4.75" />
+      <path d="m10.5 10.5 3.5 3.5" />
+    </symbol>
+    <symbol id="i-arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 8h10M9 4l4 4-4 4" />
+    </symbol>
+    <symbol id="i-github" viewBox="0 0 16 16">
+      <path fill="currentColor"
+        d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M13.5 9.6A5.9 5.9 0 0 1 6.4 2.5a5.9 5.9 0 1 0 7.1 7.1Z" />
+    </symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"
+      stroke-linecap="round">
+      <circle cx="8" cy="8" r="3.1" />
+      <path d="M8 1v1.6M8 13.4V15M15 8h-1.6M2.6 8H1M12.9 3.1l-1.1 1.1M4.2 11.8l-1.1 1.1M12.9 12.9l-1.1-1.1M4.2 4.2 3.1 3.1" />
+    </symbol>
+  </svg>
+
+  <div class="app">
+
+    <!-- ══ Titlebar ══ -->
+    <header class="titlebar">
+      <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
+
+      <div class="tabstrip" aria-hidden="true">
+        <span class="tab" id="tab-label">overview.md</span>
+      </div>
+
+      <a class="brand" href="#overview">
+        <img src="editur-icon.png" width="20" height="20" alt="" />
         Editur
       </a>
-      <div class="nav-links">
-        <a href="#install">Install</a>
-        <a href="#features">Features</a>
-        <a class="nav-cta" href="https://github.com/snowdamiz/editur">GitHub</a>
+
+      <div class="tb-actions">
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Switch to light theme">
+          <svg class="icon-moon" aria-hidden="true">
+            <use href="#i-moon" />
+          </svg>
+          <svg class="icon-sun" aria-hidden="true">
+            <use href="#i-sun" />
+          </svg>
+        </button>
+        <a class="icon-btn" href="https://github.com/snowdamiz/editur" aria-label="Editur on GitHub">
+          <svg aria-hidden="true">
+            <use href="#i-github" />
+          </svg>
+        </a>
       </div>
-    </nav>
-  </div>
+    </header>
 
-  <header class="hero" id="top">
-    <div class="hero-atmosphere" aria-hidden="true"></div>
+    <div class="workspace">
 
-    <div class="stage" aria-hidden="true">
-      <div class="stage-frame">
-        <div class="titlebar">
-          <div class="traffic"><i class="r"></i><i class="y"></i><i class="g"></i></div>
-          <div class="titlebar-label">editur · src/main.rs</div>
-          <div class="titlebar-actions"><span>Rust</span><span>LF</span></div>
-        </div>
-        <div class="workspace">
-          <aside class="tree">
-            <p class="pane-label">Files</p>
-            <ul>
-              <li class="folder">src/</li>
-              <li>&nbsp;&nbsp;app.rs</li>
-              <li class="active">&nbsp;&nbsp;main.rs</li>
-              <li>&nbsp;&nbsp;cli.rs</li>
-              <li>&nbsp;&nbsp;instance.rs</li>
-              <li class="folder">assets/</li>
-              <li>&nbsp;&nbsp;icons/</li>
-              <li>Cargo.toml</li>
-              <li>README.md</li>
+      <!-- ══ Explorer, doubling as the table of contents ══ -->
+      <nav class="explorer" aria-label="Sections">
+        <div class="explorer-label">Explorer</div>
+        <ul class="tree">
+          <li>
+            <div class="tree-root">
+              <svg aria-hidden="true">
+                <use href="#i-folder" />
+              </svg>
+              editur
+            </div>
+            <ul class="tree-files" id="tree">
+              <li><a class="tree-link" href="#overview" style="--tint:var(--info)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>overview.md</a></li>
+              <li><a class="tree-link" href="#install" style="--tint:var(--success)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>install.sh</a></li>
+              <li><a class="tree-link" href="#editor" style="--tint:var(--syn-macro)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>editor.rs</a></li>
+              <li><a class="tree-link" href="#search" style="--tint:var(--syn-macro)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>search.rs</a></li>
+              <li><a class="tree-link" href="#keys" style="--tint:var(--warning)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>keybindings.json</a></li>
+              <li><a class="tree-link" href="#agent" style="--tint:var(--accent)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>agent.acp</a></li>
+              <li><a class="tree-link" href="#lsp" style="--tint:var(--ink-3)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>lsp.toml</a></li>
+              <li><a class="tree-link" href="#measured" style="--tint:var(--info)"><svg aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>benchmarks.md</a></li>
             </ul>
-          </aside>
-          <div class="buffer">
-            <div class="ln"><span class="n">1</span><span><span class="kw">use</span> std::path::PathBuf;</span></div>
-            <div class="ln"><span class="n">2</span><span></span></div>
-            <div class="ln"><span class="n">3</span><span><span class="kw">fn</span> <span class="fn">main</span>() {</span></div>
-            <div class="ln"><span class="n">4</span><span>    <span class="cm">// open a file. change it. leave.</span></span></div>
-            <div class="ln"><span class="n">5</span><span>    <span class="kw">let</span> path = args().nth(<span class="str">1</span>);</span></div>
-            <div class="ln"><span class="n">6</span><span>    <span class="hl">editur::run(path)</span><span class="cursor-blink"></span></span></div>
-            <div class="ln"><span class="n">7</span><span>}</span></div>
-            <div class="ln"><span class="n">8</span><span></span></div>
-            <div class="ln"><span class="n">9</span><span><span class="kw">struct</span> <span class="ty">Editor</span> {</span></div>
-            <div class="ln"><span class="n">10</span><span>    root: <span class="ty">PathBuf</span>,</span></div>
-            <div class="ln"><span class="n">11</span><span>    buffer: <span class="ty">String</span>,</span></div>
-            <div class="ln"><span class="n">12</span><span>    dirty: <span class="ty">bool</span>,</span></div>
-            <div class="ln"><span class="n">13</span><span>}</span></div>
+          </li>
+        </ul>
 
-            <div class="palette">
-              <div class="palette-inner">
-                <div class="palette-query">
-                  <span class="muted">⌕</span>
-                  <span>atomic save<span class="caret"></span></span>
-                </div>
-                <div class="palette-hit active">
-                  <span>src/editor_surface.rs</span>
-                  <span class="tag">content</span>
-                </div>
-                <div class="palette-hit">
-                  <span>src/app.rs</span>
-                  <span class="tag">content</span>
-                </div>
-                <div class="palette-hit">
-                  <span>tests/save_conflict.rs</span>
-                  <span class="tag">file</span>
+        <div class="tree-sep"></div>
+
+        <div class="explorer-foot">
+          <a href="https://github.com/snowdamiz/editur">Source</a><br />
+          <a href="https://github.com/snowdamiz/editur/releases/tag/release">Releases</a><br />
+          <a href="https://github.com/snowdamiz/editur/blob/release/PERFORMANCE.md">Performance</a>
+        </div>
+      </nav>
+
+      <!-- ══ Document ══ -->
+      <main class="doc" id="doc">
+        <div class="doc-inner">
+          <pre class="gutter" id="gutter" aria-hidden="true"></pre>
+
+          <div class="doc-body">
+
+            <!-- ── Overview ── -->
+            <section id="overview">
+              <img class="hero-mark rise in" src="editur-icon.png" width="60" height="60" alt="Editur" />
+
+              <div class="eyebrow rise in" style="--i:1">
+                <span class="pulse" aria-hidden="true"></span>
+                Continuous release · <b>macOS, Windows, Linux</b>
+              </div>
+
+              <h1 class="rise in" style="--i:2">A small native editor for <em>quick, focused</em> file changes.</h1>
+
+              <p class="hero-lede rise in" style="--i:3">
+                Editur opens one file beside a lazy, keyboard-navigable tree, searches the project from a floating
+                palette, and saves through conflict-checked atomic replacement. Nothing else is competing for the
+                window.
+              </p>
+
+              <div class="hero-install rise in" style="--i:4">
+                <div class="cmd">
+                  <div class="cmd-text"><span id="hero-cmd">curl --proto '=https' --tlsv1.2 -LsSf
+                      https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh</span></div>
+                  <button class="copy" type="button" data-copy="#hero-cmd">
+                    <svg aria-hidden="true">
+                      <use href="#i-copy" />
+                    </svg><span>Copy</span>
+                  </button>
                 </div>
               </div>
-            </div>
+
+              <div class="row hero-actions rise in" style="--i:5">
+                <a class="btn btn-primary" href="#install">Install Editur
+                  <svg aria-hidden="true">
+                    <use href="#i-arrow" />
+                  </svg>
+                </a>
+                <a class="btn btn-ghost" href="https://github.com/snowdamiz/editur">
+                  <svg aria-hidden="true">
+                    <use href="#i-github" />
+                  </svg>View source
+                </a>
+              </div>
+
+              <div class="renderers rise in" style="--i:6">
+                <span class="chip" data-renderer="metal">Metal · macOS</span>
+                <span class="chip" data-renderer="d3d12">Direct3D 12 · Windows 10+</span>
+                <span class="chip" data-renderer="vulkan">Vulkan 1.1 · Linux</span>
+                <span class="chip" style="border-style:dashed">No wgpu, no runtime fallback</span>
+              </div>
+            </section>
+
+            <!-- ── Install ── -->
+            <section id="install">
+              <div class="section-index rise">install.sh</div>
+              <h2 class="rise" style="--i:1">One line from the shell.</h2>
+              <p class="lede rise" style="--i:2">
+                Both installers download from the continuous release and verify its SHA-256 checksum before
+                installing anything.
+              </p>
+
+              <div class="step-lead rise" style="--i:3">
+                <span class="step-n">1</span>
+                <p>Run the installer for your platform.</p>
+              </div>
+
+              <div class="tabs rise" style="--i:3" role="tablist" aria-label="Platform">
+                <button class="tab-btn" type="button" role="tab" id="tab-unix" aria-controls="panel-unix"
+                  aria-selected="true">macOS · Linux</button>
+                <button class="tab-btn" type="button" role="tab" id="tab-win" aria-controls="panel-win"
+                  aria-selected="false">Windows</button>
+              </div>
+
+              <div class="rise" style="--i:4">
+                <div class="panel" id="panel-unix" role="tabpanel" aria-labelledby="tab-unix">
+                  <div class="cmd">
+                    <div class="cmd-text"><span id="cmd-unix">curl --proto '=https' --tlsv1.2 -LsSf
+                        https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh</span></div>
+                    <button class="copy" type="button" data-copy="#cmd-unix">
+                      <svg aria-hidden="true">
+                        <use href="#i-copy" />
+                      </svg><span>Copy</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="panel" id="panel-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+                  <div class="cmd">
+                    <div class="cmd-text"><span id="cmd-win">irm
+                        https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex</span></div>
+                    <button class="copy" type="button" data-copy="#cmd-win">
+                      <svg aria-hidden="true">
+                        <use href="#i-copy" />
+                      </svg><span>Copy</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="steps rise" style="--i:5">
+                <div class="step">
+                  <span class="step-n">2</span>
+                  <p>Open a new terminal if the installer asks you to, then open a project with
+                    <code>editur .</code>
+                  </p>
+                </div>
+                <div class="step">
+                  <span class="step-n">3</span>
+                  <p>Update the installed binary at any time with <code>editur update</code>. It refuses to discard
+                    unsaved work.</p>
+                </div>
+              </div>
+
+              <p class="note rise" style="--i:6">
+                macOS installs the native <code>Editur.app</code> bundle to <code>~/Applications</code> with a CLI
+                symlink. Windows installs the icon-bearing executable and a Start menu entry. Linux installs the
+                native executable. Release assets carry GitHub artifact attestations.
+              </p>
+            </section>
+
+            <!-- ── Editor ── -->
+            <section id="editor">
+              <div class="section-index rise">editor.rs</div>
+              <h2 class="rise" style="--i:1">Saving is the part that has to be right.</h2>
+              <p class="lede rise" style="--i:2">
+                Every write goes through conflict-checked atomic replacement. If the file changed underneath you,
+                the save stops and asks first.
+              </p>
+
+              <div class="split">
+                <ul class="facts rise" style="--i:3">
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>External edits never disappear.</strong> A changed file offers Reload, Save As, or
+                      Cancel instead of overwriting.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>Line endings and permissions survive.</strong> LF and CRLF are preserved exactly as
+                      found, and the file mode is left alone.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>Binary input is refused.</strong> Invalid UTF-8 never gets opened, so it can never be
+                      written back mangled.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>One resident process.</strong> A later <code>editur PATH</code> forwards the target to
+                      the running window and returns immediately.</span>
+                  </li>
+                </ul>
+
+                <div class="surface rise" style="--i:4">
+                  <div class="surface-head">
+                    <svg style="width:13px;height:13px" aria-hidden="true">
+                      <use href="#i-file" />
+                    </svg>
+                    save.rs
+                    <span class="grow"></span>
+                    <span>UTF-8</span>
+                  </div>
+                  <pre class="code"><code><span class="c">// The write is a rename, so a crash mid-save cannot</span>
+<span class="c">// leave a half-written file on disk.</span>
+<span class="k">let</span> stamp = <span class="t">Metadata</span>::read(path)?;
+<span class="k">if</span> stamp != opened_at {
+    <span class="k">return</span> <span class="t">Err</span>(<span class="t">Conflict</span>::<span class="m">Changed</span>);
+}
+
+temp.write_all(buffer.as_bytes())?;
+temp.<span class="m">persist</span>(path)?;  <span class="c">// atomic</span></code></pre>
+                </div>
+              </div>
+
+              <p class="note rise" style="--i:5">
+                The editor wraps long lines and scrolls vertically, so there is no horizontal scrollbar to chase.
+                Closing the window exits completely, after the usual unsaved-change check.
+              </p>
+            </section>
+
+            <!-- ── Search ── -->
+            <section id="search">
+              <div class="section-index rise">search.rs</div>
+              <h2 class="rise" style="--i:1">Search that stays out of the way.</h2>
+              <p class="lede rise" style="--i:2">
+                Recursive indexing does not start until your first non-empty project query. Opening a large
+                repository costs nothing until you actually ask it something.
+              </p>
+
+              <div class="split">
+                <div class="palette rise" style="--i:3">
+                  <div class="palette-input">
+                    <svg aria-hidden="true">
+                      <use href="#i-search" />
+                    </svg>
+                    <span>atomic</span><span class="caret" aria-hidden="true"></span>
+                  </div>
+                  <div class="palette-group">Filenames</div>
+                  <div class="palette-row" data-active="true"><span><mark>atomic</mark>_save.rs</span><span
+                      class="path">src/</span></div>
+                  <div class="palette-group">Contents</div>
+                  <div class="palette-row"><span>fn <mark>atomic</mark>_replace(&amp;self)</span><span
+                      class="path">src/save.rs:118</span></div>
+                  <div class="palette-row"><span>// <mark>atomic</mark> rename, never truncate</span><span
+                      class="path">src/save.rs:104</span></div>
+                  <div class="palette-foot">Enter to open · Shift+Enter for previous</div>
+                </div>
+
+                <ul class="facts rise" style="--i:4">
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong><kbd class="mod">⌘</kbd><kbd>F</kbd> in the file.</strong> Matches highlight live,
+                      with Enter and Shift+Enter to walk them.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong><kbd class="mod">⌘</kbd><kbd>⇧</kbd><kbd>F</kbd> across the project.</strong>
+                      Results arrive grouped into filename and content matches.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>A lazy tree.</strong> The explorer reads directories as you expand them, not on
+                      launch.</span>
+                  </li>
+                </ul>
+              </div>
+            </section>
+
+            <!-- ── Keybindings ── -->
+            <section id="keys">
+              <div class="section-index rise">keybindings.json</div>
+              <h2 class="rise" style="--i:1">VS Code muscle memory, or real modal editing.</h2>
+              <p class="lede rise" style="--i:2">
+                Two immutable profiles ship with the editor. Customize derives an editable profile from either one
+                without copying the preset, and every change is saved atomically without touching your buffers or
+                undo history.
+              </p>
+
+              <div class="grid rise" style="--i:3">
+                <div class="cell">
+                  <span class="cell-key">VS Code profile</span>
+                  <h3>Only the commands that exist</h3>
+                  <p>Platform conventions for save, search, panes, and sidebar. Nothing is bound to a feature Editur
+                    doesn't implement.</p>
+                </div>
+                <div class="cell">
+                  <span class="cell-key">Vim profile</span>
+                  <h3>Practical modal editing</h3>
+                  <p>Normal, Insert, Replace, Visual character and line, and Operator-pending, with counts, text
+                    objects, registers, and a safe Ex subset.</p>
+                </div>
+                <div class="cell">
+                  <span class="cell-key">Recorder</span>
+                  <h3>Up to four strokes</h3>
+                  <p>Record logical chords and opt a single stroke into physical-key-position matching when layout
+                    matters.</p>
+                </div>
+              </div>
+
+              <div class="surface rise" style="--i:4; margin-top:2rem">
+                <div class="surface-head">
+                  <svg style="width:13px;height:13px" aria-hidden="true">
+                    <use href="#i-file" />
+                  </svg>
+                  keybindings.json
+                  <span class="grow"></span>
+                  <span>Custom profile</span>
+                </div>
+                <pre class="code"><code>{
+  <span class="t">"profile"</span>: <span class="s">"vscode+"</span>,
+  <span class="t">"bindings"</span>: [
+    { <span class="t">"key"</span>: <span class="s">"cmd+k cmd+s"</span>, <span class="t">"command"</span>: <span class="s">"application.openKeyboardShortcuts"</span> },
+    { <span class="t">"key"</span>: <span class="s">"cmd+shift+f"</span>, <span class="t">"command"</span>: <span class="s">"search.searchProject"</span> },
+    { <span class="t">"key"</span>: <span class="s">"f12"</span>,          <span class="t">"command"</span>: <span class="s">"editor.goToDefinition"</span> }
+  ]
+}</code></pre>
+              </div>
+
+              <p class="note rise" style="--i:5">
+                Command palettes, multi-cursor editing, folding, refactoring, and arbitrary <code>when</code>
+                expressions are intentionally absent. Terminal control keys fall through to the PTY unless you
+                explicitly override one.
+              </p>
+            </section>
+
+            <!-- ── Agent ── -->
+            <section id="agent">
+              <div class="section-index rise">agent.acp</div>
+              <h2 class="rise" style="--i:1">An agent sidebar that costs nothing until you open it.</h2>
+              <p class="lede rise" style="--i:2">
+                Nothing provider-related is inspected, provisioned, or launched until Agent is opened for the first
+                time. Normal startup builds one titlebar toggle and stops there.
+              </p>
+
+              <div class="split">
+                <ul class="facts rise" style="--i:3">
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>Cursor and Codex, pinned.</strong> Release builds ship one attested provider bundle
+                      at an exact version, never a mutable package tag or a global install.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>Exact permission choices.</strong> Tool activity, supplied diffs, and cancellation
+                      are rendered as the agent reports them.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>No telemetry, no stored transcript.</strong> Editur adds neither, and it never asks
+                      for or stores provider credentials.</span>
+                  </li>
+                  <li>
+                    <svg aria-hidden="true">
+                      <use href="#i-check" />
+                    </svg>
+                    <span><strong>Your buffer stays yours.</strong> A dirty file must be saved before a prompt, and an
+                      external edit never overwrites unsaved work.</span>
+                  </li>
+                </ul>
+
+                <div class="surface rise" style="--i:4">
+                  <div class="surface-head">
+                    <span style="width:7px;height:7px;border-radius:50%;background:var(--success)"
+                      aria-hidden="true"></span>
+                    Agent
+                    <span class="grow"></span>
+                    <span>ACP v1</span>
+                  </div>
+                  <pre class="code"><code><span class="dim">→</span> <span class="a">initialize</span>
+<span class="dim">←</span> protocol <span class="s">"v1"</span>, capabilities [
+     load-session, mcp/http, image,
+     session-list, <span class="m">cursor_login</span>
+   ]
+<span class="dim">→</span> session/new  <span class="c">// project scoped</span>
+<span class="dim">←</span> ready <span class="dim">in</span> <span class="a">291 ms</span></code></pre>
+                </div>
+              </div>
+
+              <p class="note rise" style="--i:5">
+                Permission cards reduce accidental execution, but they are not an operating-system sandbox. Prompts
+                and relevant project code are sent to the provider you select, under that provider's own terms and
+                billing.
+              </p>
+            </section>
+
+            <!-- ── LSP ── -->
+            <section id="lsp">
+              <div class="section-index rise">lsp.toml</div>
+              <h2 class="rise" style="--i:1">Language servers you already installed.</h2>
+              <p class="lede rise" style="--i:2">
+                Editur never downloads a language server and never makes an LSP network request. It runs the
+                binaries already on your <code>PATH</code>, lazily, per project.
+              </p>
+
+              <div class="grid rise" style="--i:3">
+                <div class="cell">
+                  <span class="cell-key">Ctrl+Space</span>
+                  <h3>Completion</h3>
+                  <p>Plain-text completion from the server, with hover documentation after the pointer rests.</p>
+                </div>
+                <div class="cell">
+                  <span class="cell-key">F8 · Shift+F8</span>
+                  <h3>Diagnostics</h3>
+                  <p>Walk to the next or previous diagnostic without leaving the keyboard.</p>
+                </div>
+                <div class="cell">
+                  <span class="cell-key">F12 · <span class="mod-text">⌘</span>-click</span>
+                  <h3>Go to definition</h3>
+                  <p>Jump straight to the definition, or open it in a split pane.</p>
+                </div>
+              </div>
+
+              <p class="note rise" style="--i:4">
+                Presets cover rust-analyzer, TypeScript Language Server, Pyright, gopls, and clangd; each one can be
+                left on Auto, pointed at a custom executable, or turned off. Servers stop when their last document
+                closes, and files above 5 MiB never start one.
+              </p>
+            </section>
+
+            <!-- ── Measured ── -->
+            <section id="measured">
+              <div class="section-index rise">benchmarks.md</div>
+              <h2 class="rise" style="--i:1">Measured, not asserted.</h2>
+              <p class="lede rise" style="--i:2">
+                Every number below comes from the stripped release build, recorded in the repository so you can
+                reproduce it.
+              </p>
+
+              <div class="table-wrap rise" style="--i:3">
+                <table>
+                  <caption>Reference machine: Apple M4, 16 GB, macOS 26.5.2</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Metric</th>
+                      <th scope="col">Result</th>
+                      <th scope="col">Target</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th scope="row">Command to editable window, warm</th>
+                      <td>181 ms</td>
+                      <td>150 ms</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Open-request handoff to a running window, median</th>
+                      <td>10.2 ms</td>
+                      <td><span class="pass">25 ms · pass</span></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Incremental highlighting on 1 MiB, p95</th>
+                      <td>4.30 ms</td>
+                      <td><span class="pass">16 ms · pass</span></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Resize frame, p95</th>
+                      <td>0.287 ms</td>
+                      <td><span class="pass">10.6× faster</span></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Idle CPU</th>
+                      <td>0.1%</td>
+                      <td><span class="pass">&lt;1% · pass</span></td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Stripped arm64 binary</th>
+                      <td>12.3 MiB</td>
+                      <td><span class="pass">30 MiB · pass</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <p class="note rise" style="--i:4">
+                Windows and Linux runtime baselines still require their native release runners. The full table, its
+                method, and the reproduction commands live in
+                <a href="https://github.com/snowdamiz/editur/blob/release/PERFORMANCE.md">PERFORMANCE.md</a>.
+              </p>
+            </section>
+
+            <!-- ── Closing ── -->
+            <section class="closing">
+              <h2 class="rise">Small enough to stay out of the way.</h2>
+              <p class="lede rise" style="--i:1">
+                One file, one window, one keystroke to save it.
+              </p>
+              <div class="row rise" style="--i:2; margin-top:1.8rem">
+                <a class="btn btn-primary" href="#install">Install Editur
+                  <svg aria-hidden="true">
+                    <use href="#i-arrow" />
+                  </svg>
+                </a>
+                <a class="btn btn-ghost" href="https://github.com/snowdamiz/editur/releases/tag/release">Releases</a>
+              </div>
+
+              <div class="colophon">
+                <span>Built in Rust</span>
+                <a href="https://github.com/snowdamiz/editur">github.com/snowdamiz/editur</a>
+                <a href="https://github.com/snowdamiz/editur/blob/release/README.md">Documentation</a>
+              </div>
+            </section>
+
           </div>
-          <aside class="agent">
-            <p class="pane-label">Agent</p>
-            <div class="status">Ready</div>
-            <div class="bubble">Refuse overwrite when the file changed on disk.</div>
-            <div class="bubble diff">+ if external_mtime != known {
-+   return Conflict
-+ }</div>
-          </aside>
         </div>
-      </div>
-      <div class="stage-veil"></div>
+      </main>
     </div>
 
-    <div class="wrap">
-      <div class="hero-copy">
-        <div class="brand-lockup reveal d1">
-          <img src="editur-icon.png" width="72" height="72" alt="Editur logo" />
-          <h1 class="brand-name">Editur</h1>
-        </div>
-        <p class="headline reveal d2">Open a file. Change it. Leave.</p>
-        <p class="lede reveal d3">A small native editor for quick, focused file changes—launched from your terminal, drawn on Metal, Direct3D&nbsp;12, or Vulkan.</p>
-        <div class="cta-row reveal d4">
-          <a class="btn btn-primary" href="#install">Install Editur <span class="arrow" aria-hidden="true">→</span></a>
-          <a class="btn btn-ghost" href="https://github.com/snowdamiz/editur">View source</a>
-        </div>
-      </div>
-    </div>
-  </header>
-
-  <section class="section-edge" id="install">
-    <div class="wrap">
-      <p class="section-kicker inview">Install</p>
-      <h2 class="section-title inview delay-1">One line from the shell</h2>
-      <p class="section-copy inview delay-2">Checksum-verified continuous releases for macOS, Linux, and Windows. No account wall. No project config.</p>
-
-      <div class="install-shell inview delay-3">
-        <div class="install-tabs" role="tablist" aria-label="Install platform">
-          <button type="button" class="install-tab" role="tab" id="tab-unix" aria-controls="panel-unix" aria-selected="true">macOS / Linux</button>
-          <button type="button" class="install-tab" role="tab" id="tab-win" aria-controls="panel-win" aria-selected="false">Windows</button>
-        </div>
-
-        <div class="terminal-panel" role="tabpanel" id="panel-unix" aria-labelledby="tab-unix">
-          <div class="terminal">
-            <div class="terminal-bar">
-              <span>install.sh</span>
-              <button type="button" class="copy-btn" data-copy="curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh">Copy</button>
-            </div>
-            <pre><span class="prompt">$</span> curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh</pre>
-          </div>
-        </div>
-
-        <div class="terminal-panel" role="tabpanel" id="panel-win" aria-labelledby="tab-win" hidden>
-          <div class="terminal">
-            <div class="terminal-bar">
-              <span>PowerShell</span>
-              <button type="button" class="copy-btn" data-copy="irm https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex">Copy</button>
-            </div>
-            <pre><span class="prompt">></span> irm https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex</pre>
-          </div>
-        </div>
-      </div>
-
-      <div class="after-install inview">
-        <span>Then run <code>editur .</code></span>
-        <span>Update with <code>editur update</code></span>
-      </div>
-
-      <div class="platforms" aria-label="Supported platforms">
-        <span><strong>macOS</strong> · Metal</span>
-        <span><strong>Windows 10+</strong> · Direct3D 12</span>
-        <span><strong>Linux</strong> · Vulkan 1.1</span>
-      </div>
-    </div>
-  </section>
-
-  <section class="section-edge" id="features">
-    <div class="wrap">
-      <p class="section-kicker inview">Workflow</p>
-      <h2 class="section-title inview delay-1">Built for the quick change</h2>
-      <p class="section-copy inview delay-2">One buffer. A lazy tree. Safe saves. Optional Cursor Agent when you need it—never until you open the sidebar.</p>
-
-      <div class="feature-list">
-        <article class="feature inview">
-          <span class="feature-num" aria-hidden="true">01</span>
-          <h3>Terminal-native</h3>
-          <p>Launch with a path, reuse one resident window, exit when you close. Later <span class="keys">editur PATH</span> calls forward into the open process.</p>
-        </article>
-        <article class="feature inview delay-1">
-          <span class="feature-num" aria-hidden="true">02</span>
-          <h3>Search that stays out of the way</h3>
-          <p>In-file find as you type. Project filenames and contents from a floating palette. <span class="keys">Cmd/Ctrl+F</span> · <span class="keys">Cmd/Ctrl+Shift+F</span></p>
-        </article>
-        <article class="feature inview delay-2">
-          <span class="feature-num" aria-hidden="true">03</span>
-          <h3>Conflict-checked saves</h3>
-          <p>Atomic replacement that refuses to silently overwrite an externally changed file. Reload, Save As, or Cancel—your call.</p>
-        </article>
-        <article class="feature inview">
-          <span class="feature-num" aria-hidden="true">04</span>
-          <h3>Syntax on demand</h3>
-          <p>Syntax highlighting for common programming, markup, configuration, and shell formats ships built in.</p>
-        </article>
-        <article class="feature inview delay-1">
-          <span class="feature-num" aria-hidden="true">05</span>
-          <h3>Cursor Agent sidebar</h3>
-          <p>Streamed replies, plans, diffs, and permission cards for the current project. Private to Editur—nothing agent-related starts until you open it.</p>
-        </article>
-      </div>
-
-      <div class="close-band inview">
-        <h2>Small enough to stay out of the way.</h2>
-        <p>Editur is for the change you already know how to make—not another workspace to configure.</p>
-        <div class="cta-row">
-          <a class="btn btn-primary" href="#install">Install Editur <span class="arrow" aria-hidden="true">→</span></a>
-          <a class="btn btn-ghost" href="https://github.com/snowdamiz/editur/releases/tag/release">Releases</a>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <footer>
-    <div class="wrap footer-row">
-      <div>Editur · MIT OR Apache-2.0</div>
-      <div class="footer-links">
-        <a href="https://github.com/snowdamiz/editur">GitHub</a>
-        <a href="https://github.com/snowdamiz/editur/releases/tag/release">Releases</a>
-        <a href="https://github.com/snowdamiz/editur/blob/main/README.md">Docs</a>
-      </div>
-    </div>
-  </footer>
+    <!-- ══ Status bar ══ -->
+    <footer class="statusbar">
+      <span class="status-accent" id="status-renderer">Metal</span>
+      <span class="optional">UTF-8</span>
+      <span class="optional">LF</span>
+      <span class="grow"></span>
+      <span><b id="status-file">overview.md</b></span>
+    </footer>
+  </div>
 
   <script>
-    (() => {
-      const unix = {
-        tab: document.getElementById("tab-unix"),
-        panel: document.getElementById("panel-unix"),
-      };
-      const win = {
-        tab: document.getElementById("tab-win"),
-        panel: document.getElementById("panel-win"),
-      };
+    (function () {
+      "use strict";
 
-      const select = (next) => {
-        const isUnix = next === "unix";
-        unix.tab.setAttribute("aria-selected", String(isUnix));
-        win.tab.setAttribute("aria-selected", String(!isUnix));
-        unix.panel.hidden = !isUnix;
-        win.panel.hidden = isUnix;
-      };
+      var root = document.documentElement;
+      var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-      unix.tab.addEventListener("click", () => select("unix"));
-      win.tab.addEventListener("click", () => select("win"));
+      /* ── Theme. Both palettes ship in the editor, so the site offers both. ── */
+      var toggle = document.getElementById("theme-toggle");
+      var stored = null;
+      try { stored = localStorage.getItem("editur-theme"); } catch (e) { }
+      if (!stored && window.matchMedia("(prefers-color-scheme: light)").matches) stored = "light";
+      applyTheme(stored === "light" ? "light" : "dark");
 
-      document.querySelectorAll(".copy-btn").forEach((button) => {
-        button.addEventListener("click", async () => {
-          const value = button.getAttribute("data-copy") || "";
-          try {
-            await navigator.clipboard.writeText(value);
-            const previous = button.textContent;
-            button.textContent = "Copied";
-            button.classList.add("copied");
-            window.setTimeout(() => {
-              button.textContent = previous;
-              button.classList.remove("copied");
-            }, 1400);
-          } catch {
-            button.textContent = "Select & copy";
+      function applyTheme(mode) {
+        root.setAttribute("data-theme", mode);
+        toggle.setAttribute("aria-label", mode === "dark" ? "Switch to light theme" : "Switch to dark theme");
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", mode === "dark" ? "#101012" : "#e2e2e7");
+      }
+
+      toggle.addEventListener("click", function () {
+        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        applyTheme(next);
+        try { localStorage.setItem("editur-theme", next); } catch (e) { }
+      });
+
+      /* ── Platform. Preselect the install tab and name the real renderer. ── */
+      var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+      var ua = navigator.userAgent || "";
+      var isWindows = /win/i.test(platform) || /Windows/i.test(ua);
+      var isLinux = !isWindows && (/linux/i.test(platform) || /Linux|X11/i.test(ua)) && !/Android/i.test(ua);
+
+      var renderer = isWindows ? "Direct3D 12" : isLinux ? "Vulkan" : "Metal";
+      document.getElementById("status-renderer").textContent = renderer;
+      var hostChip = document.querySelector(
+        '[data-renderer="' + (isWindows ? "d3d12" : isLinux ? "vulkan" : "metal") + '"]'
+      );
+      if (hostChip) hostChip.setAttribute("data-host", "true");
+
+      if (isWindows) {
+        document.getElementById("hero-cmd").textContent =
+          "irm https://raw.githubusercontent.com/snowdamiz/editur/release/install.ps1 | iex";
+      }
+
+      /* ── Install tabs ── */
+      var tabs = [document.getElementById("tab-unix"), document.getElementById("tab-win")];
+      function selectTab(active) {
+        tabs.forEach(function (tab) {
+          var on = tab === active;
+          tab.setAttribute("aria-selected", String(on));
+          document.getElementById(tab.getAttribute("aria-controls")).hidden = !on;
+        });
+      }
+      tabs.forEach(function (tab, index) {
+        tab.addEventListener("click", function () { selectTab(tab); });
+        tab.addEventListener("keydown", function (event) {
+          var step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+          if (!step) return;
+          event.preventDefault();
+          var next = tabs[(index + step + tabs.length) % tabs.length];
+          selectTab(next);
+          next.focus();
+        });
+      });
+      if (isWindows) selectTab(tabs[1]);
+
+      /* ── Copy buttons ── */
+      document.querySelectorAll(".copy").forEach(function (button) {
+        var label = button.querySelector("span");
+        var original = label.textContent;
+        var timer;
+
+        button.addEventListener("click", function () {
+          var text = document.querySelector(button.getAttribute("data-copy")).textContent.trim();
+          var done = function () {
+            label.textContent = "Copied";
+            button.setAttribute("data-copied", "true");
+            clearTimeout(timer);
+            timer = setTimeout(function () {
+              label.textContent = original;
+              button.removeAttribute("data-copied");
+            }, 1600);
+          };
+
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, fallback);
+          } else {
+            fallback();
+          }
+
+          function fallback() {
+            var field = document.createElement("textarea");
+            field.value = text;
+            field.setAttribute("readonly", "");
+            field.style.position = "fixed";
+            field.style.opacity = "0";
+            document.body.appendChild(field);
+            field.select();
+            try { document.execCommand("copy"); done(); } catch (e) { }
+            document.body.removeChild(field);
           }
         });
       });
 
-      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      if (!reduce && "IntersectionObserver" in window) {
-        const observer = new IntersectionObserver(
-          (entries) => {
-            entries.forEach((entry) => {
-              if (entry.isIntersecting) {
-                entry.target.classList.add("is-visible");
-                observer.unobserve(entry.target);
-              }
-            });
-          },
-          { rootMargin: "0px 0px -8% 0px", threshold: 0.12 }
-        );
-        document.querySelectorAll(".inview").forEach((el) => observer.observe(el));
-      } else {
-        document.querySelectorAll(".inview").forEach((el) => el.classList.add("is-visible"));
+      /* ── Reveal on scroll ── */
+      var scroller = document.getElementById("doc");
+      var desktop = window.matchMedia("(min-width: 961px)");
+      var pending = document.querySelectorAll(".rise:not(.in)");
+
+      function revealAll() {
+        document.querySelectorAll(".rise:not(.in)").forEach(function (node) {
+          node.classList.add("in");
+        });
       }
+
+      if (!reduced && "IntersectionObserver" in window) {
+        var fired = false;
+        var reveal = new IntersectionObserver(function (entries) {
+          fired = true;
+          entries.forEach(function (entry) {
+            if (!entry.isIntersecting) return;
+            entry.target.classList.add("in");
+            reveal.unobserve(entry.target);
+          });
+        }, { root: desktop.matches ? scroller : null, rootMargin: "0px 0px -10% 0px", threshold: 0 });
+        pending.forEach(function (node) { reveal.observe(node); });
+
+        /* If the observer never reports at all, the animation is not worth a
+           blank page: drop it and show everything. */
+        setTimeout(function () {
+          if (fired) return;
+          reveal.disconnect();
+          revealAll();
+        }, 1200);
+      } else {
+        revealAll();
+      }
+
+      /* ── Scroll spy: the tree, the tab, and the status bar all follow. ── */
+      var links = Array.prototype.slice.call(document.querySelectorAll(".tree-link"));
+      var sections = links
+        .map(function (link) { return document.querySelector(link.getAttribute("href")); })
+        .filter(Boolean);
+      var tabLabel = document.getElementById("tab-label");
+      var statusFile = document.getElementById("status-file");
+
+      function setActive(id) {
+        var name = "overview.md";
+        links.forEach(function (link) {
+          var on = link.getAttribute("href") === "#" + id;
+          if (on) { link.setAttribute("aria-current", "location"); name = link.textContent.trim(); }
+          else { link.removeAttribute("aria-current"); }
+        });
+        tabLabel.textContent = name;
+        statusFile.textContent = name;
+      }
+
+      /* A reading line a third of the way down the viewport decides which
+         section is current. Measuring directly beats an observer here: the
+         answer stays correct after a resize, a fragment jump, or a reload
+         partway down the page. */
+      function currentSection() {
+        var probe = (desktop.matches ? scroller.getBoundingClientRect().top : 0)
+          + (desktop.matches ? scroller.clientHeight : window.innerHeight) * 0.35;
+        var current = sections[0];
+        sections.forEach(function (section) {
+          if (section.getBoundingClientRect().top <= probe) current = section;
+        });
+        return current.id;
+      }
+
+      var spyFrame = 0;
+      function syncSpy() {
+        if (spyFrame) return;
+        spyFrame = requestAnimationFrame(function () {
+          spyFrame = 0;
+          setActive(currentSection());
+        });
+      }
+
+      if (sections.length) {
+        scroller.addEventListener("scroll", syncSpy, { passive: true });
+        window.addEventListener("scroll", syncSpy, { passive: true });
+        window.addEventListener("resize", syncSpy);
+        window.addEventListener("load", syncSpy);
+        syncSpy();
+      }
+
+      /* ── Decorative line-number gutter, one text node deep. ── */
+      var gutter = document.getElementById("gutter");
+      var body = document.querySelector(".doc-body");
+      var pitch = 20;
+
+      function paintGutter() {
+        if (!desktop.matches) return;
+        var count = Math.ceil(body.offsetHeight / pitch);
+        if (count === paintGutter.count) return;
+        paintGutter.count = count;
+        var numbers = new Array(count);
+        for (var i = 0; i < count; i++) numbers[i] = i + 1;
+        gutter.textContent = numbers.join("\n");
+      }
+
+      paintGutter();
+      if ("ResizeObserver" in window) {
+        var frame;
+        new ResizeObserver(function () {
+          cancelAnimationFrame(frame);
+          frame = requestAnimationFrame(paintGutter);
+        }).observe(body);
+      } else {
+        window.addEventListener("resize", paintGutter);
+      }
+      window.addEventListener("load", paintGutter);
     })();
   </script>
 </body>
+
 </html>

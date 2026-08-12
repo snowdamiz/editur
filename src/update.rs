@@ -48,7 +48,7 @@ pub fn run() -> Result<(), String> {
     if !crate::instance::quit_running()? {
         return Err("save or discard changes in the running editor before updating".into());
     }
-    provision_sidecar(&sidecar_manifest_url(&binary_url))?;
+    provision_sidecar_best_effort(&binary_url);
 
     #[cfg(unix)]
     {
@@ -92,6 +92,17 @@ fn update_urls(base: &str, asset: &str) -> Result<(String, String), String> {
 
 fn sidecar_manifest_url(binary_url: &str) -> String {
     format!("{binary_url}.agent.json")
+}
+
+/// Pre-installs the Cursor agent so the updated build starts fast, but never
+/// blocks a verified binary update on it: the new build provisions its own
+/// agents at launch, and aborting here once stranded old installs on a
+/// manifest format they could not read.
+fn provision_sidecar_best_effort(binary_url: &str) {
+    if let Err(error) = provision_sidecar(&sidecar_manifest_url(binary_url)) {
+        eprintln!("editur: skipping the Cursor agent pre-install: {error}");
+        eprintln!("editur: the updated build will install its agents on launch.");
+    }
 }
 
 fn provision_sidecar(url: &str) -> Result<(), String> {
@@ -300,11 +311,7 @@ fn migrate_macos_install(base: &str, executable: &std::path::Path) -> Result<(),
         return Err("save or discard changes in the running editor before updating".into());
     }
     let update_asset = format!("editur-macos-{}", env::consts::ARCH);
-    provision_sidecar(&sidecar_manifest_url(&format!(
-        "{}/{}",
-        base.trim_end_matches('/'),
-        update_asset
-    )))?;
+    provision_sidecar_best_effort(&format!("{}/{}", base.trim_end_matches('/'), update_asset));
 
     let parent = executable
         .parent()
