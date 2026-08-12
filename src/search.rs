@@ -183,7 +183,7 @@ fn walk_root(root: &Path, mut visit: impl FnMut(IndexedFile) -> bool) -> bool {
     true
 }
 
-fn ignored_directory(name: &str) -> bool {
+pub(crate) fn ignored_directory(name: &str) -> bool {
     matches!(
         name,
         ".git" | ".hg" | ".svn" | "node_modules" | "target" | ".next"

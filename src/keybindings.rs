@@ -272,7 +272,7 @@ const DOCUMENT: &[Scope] = &[
     Scope::VimVisual,
     Scope::VimOperator,
 ];
-const DOCUMENT_AND_FIND: &[Scope] = &[Scope::DocumentEditor, Scope::Find];
+const DOCUMENT_AND_FIND: &[Scope] = &[Scope::DocumentEditor, Scope::Find, Scope::Agent];
 const TREE: &[Scope] = &[Scope::FilesTree];
 const VIM_COMMAND: &[Scope] = &[Scope::VimNormal, Scope::VimVisual, Scope::VimOperator];
 const VIM_NORMAL: &[Scope] = &[Scope::VimNormal];
@@ -440,7 +440,7 @@ pub static CATALOG: &[CommandInfo] = &[
         "search.close",
         "Close Search",
         "Search",
-        &[Scope::Find, Scope::ProjectSearch],
+        &[Scope::Find, Scope::ProjectSearch, Scope::Agent],
         false,
         false
     ),

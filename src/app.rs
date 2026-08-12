@@ -336,6 +336,7 @@ pub(crate) fn resize_divider_stroke(ctx: &egui::Context, active: bool) -> egui::
 
 const WINDOW_CORNER_RADIUS: u8 = theme::radius::WINDOW;
 const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
+const AGENT_FIND_HEIGHT: f32 = FIND_BAR_HEIGHT;
 const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
 const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
 const AGENT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
@@ -344,6 +345,7 @@ const AGENT_PROVIDER_MENU_WIDTH: f32 = 240.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
 const AGENT_PROVIDER_ROW_HEIGHT: f32 = 44.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
+const AGENT_MENTION_ROW_HEIGHT: f32 = 32.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
 const AGENT_FOLLOW_THRESHOLD: f32 = 48.0;
 const AGENT_TRANSCRIPT_EDGE_PADDING: i8 = 14;
@@ -412,27 +414,45 @@ fn agent_transcript_fade_mesh(rect: egui::Rect, opaque: Color32) -> egui::Mesh {
     mesh
 }
 
-fn draw_agent_content(ui: &mut egui::Ui, content: &DisplayContent) {
+fn draw_agent_content(
+    ui: &mut egui::Ui,
+    content: &DisplayContent,
+    search: Option<(&str, Option<usize>)>,
+) {
     match content {
         DisplayContent::Image {
             mime_type,
             uri,
             encoded_bytes,
         } => {
-            ui.label(format!(
-                "Image · {mime_type} · {encoded_bytes} encoded bytes"
-            ));
+            agent_search_label(
+                ui,
+                &format!("Image · {mime_type} · {encoded_bytes} encoded bytes"),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
             if let Some(uri) = uri {
-                ui.add(Label::new(RichText::new(uri).monospace().small()).wrap());
+                agent_search_label(
+                    ui,
+                    uri,
+                    theme::typography::code_small(),
+                    theme::text().primary,
+                    search,
+                );
             }
         }
         DisplayContent::Audio {
             mime_type,
             encoded_bytes,
         } => {
-            ui.label(format!(
-                "Audio · {mime_type} · {encoded_bytes} encoded bytes"
-            ));
+            agent_search_label(
+                ui,
+                &format!("Audio · {mime_type} · {encoded_bytes} encoded bytes"),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
         }
         DisplayContent::ResourceLink {
             name,
@@ -442,10 +462,28 @@ fn draw_agent_content(ui: &mut egui::Ui, content: &DisplayContent) {
             mime_type,
             size,
         } => {
-            ui.label(title.as_deref().unwrap_or(name));
-            ui.add(Label::new(RichText::new(uri).monospace().small()).wrap());
+            agent_search_label(
+                ui,
+                title.as_deref().unwrap_or(name),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
+            agent_search_label(
+                ui,
+                uri,
+                theme::typography::code_small(),
+                theme::text().primary,
+                search,
+            );
             if let Some(description) = description {
-                ui.add(Label::new(description).wrap());
+                agent_search_label(
+                    ui,
+                    description,
+                    theme::typography::body(),
+                    theme::text().primary,
+                    search,
+                );
             }
             let metadata = [mime_type.clone(), size.map(|size| format!("{size} bytes"))]
                 .into_iter()
@@ -453,7 +491,13 @@ fn draw_agent_content(ui: &mut egui::Ui, content: &DisplayContent) {
                 .collect::<Vec<_>>()
                 .join(" · ");
             if !metadata.is_empty() {
-                ui.label(RichText::new(metadata).small().weak());
+                agent_search_label(
+                    ui,
+                    &metadata,
+                    theme::typography::small(),
+                    theme::text().muted,
+                    search,
+                );
             }
         }
         DisplayContent::TextResource {
@@ -461,20 +505,50 @@ fn draw_agent_content(ui: &mut egui::Ui, content: &DisplayContent) {
             mime_type,
             text,
         } => {
-            ui.label(mime_type.as_deref().unwrap_or("Text resource"));
-            ui.add(Label::new(RichText::new(uri).monospace().small()).wrap());
-            ui.add(Label::new(RichText::new(text).monospace().small()).wrap());
+            agent_search_label(
+                ui,
+                mime_type.as_deref().unwrap_or("Text resource"),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
+            agent_search_label(
+                ui,
+                uri,
+                theme::typography::code_small(),
+                theme::text().primary,
+                search,
+            );
+            agent_search_label(
+                ui,
+                text,
+                theme::typography::code_small(),
+                theme::text().primary,
+                search,
+            );
         }
         DisplayContent::BlobResource {
             uri,
             mime_type,
             encoded_bytes,
         } => {
-            ui.label(format!(
-                "Binary resource · {} · {encoded_bytes} encoded bytes",
-                mime_type.as_deref().unwrap_or("unknown type")
-            ));
-            ui.add(Label::new(RichText::new(uri).monospace().small()).wrap());
+            agent_search_label(
+                ui,
+                &format!(
+                    "Binary resource · {} · {encoded_bytes} encoded bytes",
+                    mime_type.as_deref().unwrap_or("unknown type")
+                ),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
+            agent_search_label(
+                ui,
+                uri,
+                theme::typography::code_small(),
+                theme::text().primary,
+                search,
+            );
         }
     }
 }
@@ -776,13 +850,19 @@ fn agent_task_duration(duration_ms: u64) -> String {
 
 /// A clickable path label; every path the agent surfaces routes through this
 /// so one click opens the file in the editor.
-fn agent_path_link(ui: &mut egui::Ui, label: &str) -> egui::Response {
+fn agent_path_link(
+    ui: &mut egui::Ui,
+    label: &str,
+    search: Option<(&str, Option<usize>)>,
+) -> egui::Response {
     ui.add(
-        Label::new(
-            RichText::new(label)
-                .monospace()
-                .size(theme::typography::SMALL_SIZE),
-        )
+        Label::new(agent_text_job(
+            label,
+            ui.available_width(),
+            theme::typography::code_small(),
+            theme::text().primary,
+            search,
+        ))
         .truncate()
         .sense(Sense::click()),
     )
@@ -1289,6 +1369,8 @@ fn append_agent_syntax_line(
     }
 }
 
+// The renderer needs syntax, width, cache identity, and an optional search overlay together.
+#[expect(clippy::too_many_arguments)]
 fn agent_code_galley(
     ui: &mut egui::Ui,
     id: Id,
@@ -1297,8 +1379,22 @@ fn agent_code_galley(
     width: f32,
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    search: Option<(&str, Option<usize>)>,
 ) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
+    if let Some((query, active)) = search {
+        let syntax = syntaxes.detect(path, false);
+        let mut job = highlighter
+            .highlight_job(source, syntax, syntaxes.set(), width)
+            .unwrap_or_else(|_| plain_text_job(source, width));
+        job.wrap.break_anywhere = true;
+        for section in &mut job.sections {
+            section.format.font_id.size = 12.5;
+        }
+        let matches = match_spans(&job.text, query);
+        let job = find_highlighted_job(&job, &matches, active.unwrap_or(usize::MAX));
+        return ui.fonts_mut(|fonts| fonts.layout_job(job));
+    }
     let cached = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
         if cache.path != path || cache.source != source {
@@ -1348,8 +1444,22 @@ fn agent_markdown_galley(
     width: f32,
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    search: Option<(&str, Option<usize>)>,
 ) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
+    if let Some((query, active)) = search {
+        let job = markdown::compact_layout(source, width, |language, code| {
+            let syntax = language
+                .map(|language| syntaxes.detect_token(language))
+                .unwrap_or_else(|| syntaxes.plain_text());
+            highlighter
+                .highlight_job(code, syntax, syntaxes.set(), width)
+                .ok()
+        });
+        let matches = match_spans(&job.text, query);
+        let job = find_highlighted_job(&job, &matches, active.unwrap_or(usize::MAX));
+        return ui.fonts_mut(|fonts| fonts.layout_job(job));
+    }
     let cached = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
         if cache.source != source {
@@ -1391,7 +1501,65 @@ fn agent_markdown_galley(
     galley
 }
 
-fn agent_tool_title(ui: &mut egui::Ui, id: Id, title: &str, width: f32) -> egui::Response {
+fn agent_text_job(
+    text: &str,
+    width: f32,
+    font_id: egui::FontId,
+    color: Color32,
+    search: Option<(&str, Option<usize>)>,
+) -> LayoutJob {
+    let mut job = LayoutJob::simple(text.to_owned(), font_id, color, width);
+    job.wrap.break_anywhere = true;
+    if let Some((query, active)) = search {
+        job = find_highlighted_job(
+            &job,
+            &match_spans(text, query),
+            active.unwrap_or(usize::MAX),
+        );
+    }
+    job
+}
+
+fn agent_search_label(
+    ui: &mut egui::Ui,
+    text: &str,
+    font_id: egui::FontId,
+    color: Color32,
+    search: Option<(&str, Option<usize>)>,
+) -> egui::Response {
+    let job = agent_text_job(text, ui.available_width(), font_id, color, search);
+    ui.add(Label::new(job).wrap())
+}
+
+fn agent_tool_title(
+    ui: &mut egui::Ui,
+    id: Id,
+    title: &str,
+    width: f32,
+    search: Option<(&str, Option<usize>)>,
+) -> egui::Response {
+    if search.is_some() {
+        return ui
+            .allocate_ui_with_layout(
+                egui::vec2(width, 24.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_width(width);
+                    ui.add(
+                        Label::new(agent_text_job(
+                            title,
+                            width,
+                            theme::typography::body(),
+                            theme::text().primary,
+                            search,
+                        ))
+                        .truncate()
+                        .sense(Sense::click()),
+                    )
+                },
+            )
+            .inner;
+    }
     let Some((action, path)) = title.split_once(' ').filter(|(action, path)| {
         !path.is_empty()
             && (action.eq_ignore_ascii_case("Read") || action.eq_ignore_ascii_case("Edit"))
@@ -1490,6 +1658,7 @@ fn agent_collapsing_header(
     title: &str,
     status: Option<&str>,
     width: f32,
+    search: Option<(&str, Option<usize>)>,
     default_open: bool,
     add_body: impl FnOnce(&mut egui::Ui),
 ) {
@@ -1499,6 +1668,9 @@ fn agent_collapsing_header(
         id,
         default_open,
     );
+    if search.is_some() {
+        state.set_open(true);
+    }
     let title_line = title
         .lines()
         .next()
@@ -1541,8 +1713,8 @@ fn agent_collapsing_header(
                     };
                     let title_width =
                         (ui.available_width() - status_width - status_spacing).max(0.0);
-                    let response =
-                        agent_tool_title(ui, id, title_line, title_width).on_hover_text(title);
+                    let response = agent_tool_title(ui, id, title_line, title_width, search)
+                        .on_hover_text(title);
                     if response.clicked() {
                         state.toggle(ui);
                     }
@@ -1607,6 +1779,7 @@ fn draw_agent_changed_files(
     ui: &mut egui::Ui,
     root: &Path,
     changed_paths: &HashMap<PathBuf, FileChange>,
+    search: Option<(&str, Option<usize>)>,
 ) -> Option<PathBuf> {
     let mut rows = changed_paths.iter().collect::<Vec<_>>();
     rows.sort_by_key(|(path, _)| *path);
@@ -1630,6 +1803,7 @@ fn draw_agent_changed_files(
             );
             ui.add_space(theme::space::SNUG);
             ui.spacing_mut().item_spacing.y = 0.0;
+            let mut search_offset = 0;
             for (path, stats) in rows {
                 let (added, removed) = (stats.added, stats.removed);
                 let (row, response) = ui.allocate_exact_size(
@@ -1713,6 +1887,18 @@ fn draw_agent_changed_files(
                     (counts_left - theme::space::SMALL) - (row.left() + theme::space::XWIDE);
                 job.wrap.max_rows = 1;
                 job.wrap.break_anywhere = true;
+                if let Some((query, active)) = search {
+                    let matches = match_spans(&path.display().to_string(), query);
+                    let local_active = active
+                        .and_then(|active| active.checked_sub(search_offset))
+                        .filter(|&active| active < matches.len());
+                    search_offset += matches.len();
+                    job = find_highlighted_job(
+                        &job,
+                        &match_spans(&job.text, query),
+                        local_active.unwrap_or(usize::MAX),
+                    );
+                }
                 let galley = ui.painter().layout_job(job);
                 ui.painter().galley(
                     egui::pos2(
@@ -1728,6 +1914,8 @@ fn draw_agent_changed_files(
 }
 
 /// Returns true when the header path label was clicked.
+// The shared card renderer keeps its syntax and optional search overlay explicit at the call site.
+#[expect(clippy::too_many_arguments)]
 fn draw_agent_diff(
     ui: &mut egui::Ui,
     id: Id,
@@ -1736,11 +1924,13 @@ fn draw_agent_diff(
     new_text: &str,
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    search: Option<(&str, Option<usize>)>,
 ) -> bool {
     let mut path_clicked = false;
     let diff = cached_agent_diff(ui, id, old_text, new_text);
     let expanded_id = id.with("expanded");
-    let expanded = ui.data(|data| data.get_temp::<bool>(expanded_id).unwrap_or(false));
+    let expanded =
+        search.is_some() || ui.data(|data| data.get_temp::<bool>(expanded_id).unwrap_or(false));
     let lines = (!expanded)
         .then_some(diff.preview.as_deref())
         .flatten()
@@ -1760,12 +1950,13 @@ fn draw_agent_diff(
                     ui.horizontal(|ui| {
                         let header = ui
                             .add(
-                                Label::new(
-                                    RichText::new(file_name.as_ref())
-                                        .size(theme::typography::BODY_SIZE)
-                                        .strong()
-                                        .color(theme::text().primary),
-                                )
+                                Label::new(agent_text_job(
+                                    file_name.as_ref(),
+                                    ui.available_width(),
+                                    theme::typography::strong(),
+                                    theme::text().primary,
+                                    search,
+                                ))
                                 .sense(Sense::click()),
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1796,6 +1987,13 @@ fn draw_agent_diff(
                 ui.cursor().top(),
                 egui::Stroke::new(1.0, theme::border::strong_color()),
             );
+            let row_search = search.map(|(query, active)| {
+                let path_matches = match_spans(&path.display().to_string(), query).len();
+                (
+                    query,
+                    active.and_then(|active| active.checked_sub(path_matches)),
+                )
+            });
             draw_agent_diff_rows(
                 ui,
                 id,
@@ -1806,6 +2004,7 @@ fn draw_agent_diff(
                 new_text,
                 highlighter,
                 syntaxes,
+                row_search,
             );
             if can_toggle {
                 let label = if expanded {
@@ -1844,6 +2043,7 @@ fn draw_agent_diff_rows(
     new_text: &str,
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    search: Option<(&str, Option<usize>)>,
 ) {
     let mut needed_old = Vec::new();
     let mut needed_new = Vec::new();
@@ -1896,6 +2096,7 @@ fn draw_agent_diff_rows(
         .show(ui, |ui| {
             ui.set_width(desired_width);
             ui.spacing_mut().item_spacing.y = 0.0;
+            let mut search_offset = 0;
             for line in lines {
                 let fill = match line.kind {
                     AgentDiffKind::Added => theme::diff::added(),
@@ -1966,6 +2167,7 @@ fn draw_agent_diff_rows(
                             AgentDiffKind::Added | AgentDiffKind::Context => line.new_number,
                             AgentDiffKind::Omitted => None,
                         };
+                        let code_start = job.text.len();
                         if let (Some(highlighted), Some(line_number)) = (highlighted, line_number) {
                             append_agent_syntax_line(
                                 &mut job,
@@ -1975,6 +2177,19 @@ fn draw_agent_diff_rows(
                                 matches!(line.kind, AgentDiffKind::Added | AgentDiffKind::Removed),
                             );
                         }
+                        let job = if let Some((query, active)) = search {
+                            let matches = match_spans(&line.text, query)
+                                .into_iter()
+                                .map(|span| code_start + span.start..code_start + span.end)
+                                .collect::<Vec<_>>();
+                            let local_active = active
+                                .and_then(|active| active.checked_sub(search_offset))
+                                .filter(|&active| active < matches.len());
+                            search_offset += matches.len();
+                            find_highlighted_job(&job, &matches, local_active.unwrap_or(usize::MAX))
+                        } else {
+                            job
+                        };
                         ui.add(
                             Label::new(job)
                                 .wrap_mode(egui::TextWrapMode::Extend)
@@ -2077,6 +2292,7 @@ fn draw_agent_diff_body(
                 new_text,
                 highlighter,
                 syntaxes,
+                None,
             );
         });
 }
@@ -3113,6 +3329,14 @@ fn agent_sessions_rect(header: egui::Rect) -> egui::Rect {
     )
 }
 
+fn agent_search_rect(header: egui::Rect, agentic_mode: bool) -> egui::Rect {
+    if agentic_mode {
+        agent_toggle_rect(header)
+    } else {
+        agent_sessions_rect(header).translate(egui::vec2(-33.0, 0.0))
+    }
+}
+
 /// Inset the composer so the prompt and footer share one rhythm: equal sides,
 /// a little extra air under the toolbar so the selects don't sit on the edge.
 fn agent_composer_content(composer: egui::Rect) -> egui::Rect {
@@ -3133,9 +3357,10 @@ fn agent_menu_rect(
     anchor: egui::Rect,
     item_count: usize,
     row_height: f32,
+    vertical_padding: f32,
 ) -> egui::Rect {
     let width = AGENT_MENU_WIDTH.min((transcript.width() - 12.0).max(1.0));
-    let desired_height = 16.0 + (item_count as f32 * row_height).min(280.0);
+    let desired_height = 2.0 * vertical_padding + (item_count as f32 * row_height).min(280.0);
     let bottom = anchor.top() - 4.0;
     let height = desired_height.min((bottom - transcript.top() - 8.0).max(1.0));
     let left = anchor.left().clamp(
@@ -3188,6 +3413,330 @@ fn slash_command_query(prompt: &str) -> Option<&str> {
         .filter(|query| !query.chars().any(char::is_whitespace))
 }
 
+fn agent_mention_query(prompt: &str) -> Option<&str> {
+    if prompt.chars().next_back().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let token = prompt.split_whitespace().next_back()?;
+    let query = token.strip_prefix('@')?;
+    (token.len() == query.len() + 1).then_some(query)
+}
+
+fn remove_agent_mention(prompt: &mut String) {
+    if agent_mention_query(prompt).is_some() {
+        let start = prompt.rfind('@').unwrap_or(prompt.len());
+        prompt.truncate(start);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentMentionEntry {
+    path: PathBuf,
+    relative: String,
+    is_dir: bool,
+}
+
+fn collect_agent_mentions(root: &Path) -> Vec<AgentMentionEntry> {
+    let mut found = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let is_dir = file_type.is_dir();
+            if is_dir && crate::search::ignored_directory(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            if !is_dir && !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            found.push(AgentMentionEntry {
+                path: path.clone(),
+                relative: relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                is_dir,
+            });
+            if is_dir {
+                directories.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn agent_mention_matches(entries: &[AgentMentionEntry], query: &str) -> Vec<AgentMentionEntry> {
+    let query = query.to_ascii_lowercase();
+    let mut matches = entries
+        .iter()
+        .filter_map(|entry| {
+            let relative = entry.relative.to_ascii_lowercase();
+            let name = entry
+                .path
+                .file_name()
+                .unwrap_or(entry.path.as_os_str())
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let score = if query.is_empty() || name == query {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else if name.contains(&query) {
+                2
+            } else if relative.contains(&query) {
+                3
+            } else {
+                return None;
+            };
+            Some((score, entry.relative.len(), entry))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        (left.0, left.1, left.2.relative.as_str()).cmp(&(
+            right.0,
+            right.1,
+            right.2.relative.as_str(),
+        ))
+    });
+    matches
+        .into_iter()
+        .take(10)
+        .map(|(_, _, entry)| entry.clone())
+        .collect()
+}
+
+fn append_display_search_text(text: &mut String, content: &DisplayContent) {
+    use std::fmt::Write as _;
+    match content {
+        DisplayContent::Image { mime_type, uri, .. } => {
+            let _ = writeln!(text, "{mime_type}");
+            if let Some(uri) = uri {
+                let _ = writeln!(text, "{uri}");
+            }
+        }
+        DisplayContent::Audio { mime_type, .. } => {
+            let _ = writeln!(text, "{mime_type}");
+        }
+        DisplayContent::ResourceLink {
+            name,
+            title,
+            uri,
+            description,
+            mime_type,
+            ..
+        } => {
+            let _ = writeln!(text, "{name}\n{uri}");
+            for value in [title, description, mime_type].into_iter().flatten() {
+                let _ = writeln!(text, "{value}");
+            }
+        }
+        DisplayContent::TextResource {
+            uri,
+            mime_type,
+            text: content,
+        } => {
+            let _ = writeln!(text, "{uri}\n{content}");
+            if let Some(mime_type) = mime_type {
+                let _ = writeln!(text, "{mime_type}");
+            }
+        }
+        DisplayContent::BlobResource { uri, mime_type, .. } => {
+            let _ = writeln!(text, "{uri}");
+            if let Some(mime_type) = mime_type {
+                let _ = writeln!(text, "{mime_type}");
+            }
+        }
+    }
+}
+
+fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    match item {
+        TranscriptItem::Thought(_)
+        | TranscriptItem::Content {
+            role: ContentRole::Thought,
+            ..
+        } => return None,
+        TranscriptItem::User(content)
+        | TranscriptItem::Assistant(content)
+        | TranscriptItem::Error(content) => text.push_str(content),
+        TranscriptItem::Content { content, .. } => append_display_search_text(&mut text, content),
+        TranscriptItem::Plan(items) => {
+            for item in items {
+                let _ = writeln!(text, "{} {}", item.status, item.content);
+            }
+        }
+        TranscriptItem::Tool(tool) => {
+            let title = tool.display_title();
+            let _ = writeln!(text, "{title}");
+            let action = title.split_whitespace().next();
+            let title_includes_paths = action.is_some_and(|action| {
+                action.eq_ignore_ascii_case("Read") || action.eq_ignore_ascii_case("Edit")
+            });
+            if !title_includes_paths {
+                for path in &tool.paths {
+                    let _ = writeln!(text, "{}", path.path.display());
+                }
+            }
+            if let Some(detail) = &tool.detail {
+                if detail.content.is_empty()
+                    && let Some(value) = detail.output.as_ref().or(detail.input.as_ref())
+                {
+                    let _ = writeln!(text, "{value}");
+                }
+                for content in &detail.content {
+                    match content {
+                        ToolOutput::Text(content) => {
+                            let _ = writeln!(text, "{content}");
+                        }
+                        ToolOutput::Content(content) => {
+                            append_display_search_text(&mut text, content)
+                        }
+                        ToolOutput::Diff {
+                            path,
+                            old_text,
+                            new_text,
+                        } => {
+                            let _ = writeln!(text, "{}", path.display());
+                            for line in &build_agent_diff(old_text.as_deref(), new_text).lines {
+                                let _ = writeln!(text, "{}", line.text);
+                            }
+                        }
+                        ToolOutput::Terminal(id) => {
+                            let _ = writeln!(text, "Terminal {id}");
+                        }
+                        ToolOutput::Todo {
+                            id,
+                            content,
+                            status,
+                        } => {
+                            let _ = writeln!(text, "{status} {content} {id}");
+                        }
+                        ToolOutput::Task {
+                            description,
+                            prompt,
+                            subagent_type,
+                            model,
+                            duration_ms,
+                            ..
+                        } => {
+                            let _ = writeln!(text, "{description}\n{prompt}\n{subagent_type}");
+                            if let Some(model) = model {
+                                let _ = writeln!(text, "{model}");
+                            }
+                            if let Some(duration_ms) = duration_ms {
+                                let _ = writeln!(text, "{}", agent_task_duration(*duration_ms));
+                            }
+                        }
+                        ToolOutput::GeneratedImage {
+                            description,
+                            file_path,
+                            reference_image_paths,
+                        } => {
+                            let _ = writeln!(text, "{description}");
+                            if let Some(path) = file_path {
+                                let _ = writeln!(text, "{}", path.display());
+                            }
+                            for path in reference_image_paths {
+                                let _ = writeln!(text, "{}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        TranscriptItem::Permission(card) => {
+            let _ = writeln!(text, "{}", card.action);
+            for option in &card.options {
+                let _ = writeln!(text, "{} {}", option.name, option.kind);
+            }
+        }
+        TranscriptItem::Interaction(card) => match &card.request.kind {
+            InteractionKind::Questions { title, questions } => {
+                let _ = writeln!(text, "{title}");
+                for question in questions {
+                    let _ = writeln!(text, "{}", question.prompt);
+                    for option in &question.options {
+                        let _ = writeln!(text, "{}", option.label);
+                    }
+                }
+            }
+            InteractionKind::Plan(plan) => {
+                for value in [&plan.name, &plan.overview].into_iter().flatten() {
+                    let _ = writeln!(text, "{value}");
+                }
+                let _ = writeln!(text, "{}", plan.plan);
+                for item in plan
+                    .todos
+                    .iter()
+                    .chain(plan.phases.iter().flat_map(|phase| phase.todos.iter()))
+                {
+                    let _ = writeln!(text, "{} {}", item.status, item.content);
+                }
+                for phase in &plan.phases {
+                    let _ = writeln!(text, "{}", phase.name);
+                }
+            }
+        },
+        TranscriptItem::Truncated => text.push_str("Earlier output was truncated."),
+    }
+    Some(text)
+}
+
+fn agent_search_matches(
+    transcript: &std::collections::VecDeque<TranscriptItem>,
+    changed_paths: &HashMap<PathBuf, FileChange>,
+    query: &str,
+) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for (index, item) in transcript.iter().enumerate() {
+        let count = agent_searchable_text(item)
+            .map(|text| match_spans(&text, query).len())
+            .unwrap_or(0);
+        matches.extend(std::iter::repeat_n(index, count));
+    }
+    let changed_index = transcript.len();
+    let mut paths = changed_paths.keys().collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let count = match_spans(&path.display().to_string(), query).len();
+        matches.extend(std::iter::repeat_n(changed_index, count));
+    }
+    matches
+}
+
+fn paint_agent_search_item(ui: &mut egui::Ui, top: f32, selected: bool, scroll: bool) -> bool {
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(ui.min_rect().left(), top),
+        egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+    );
+    if selected && scroll {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+        true
+    } else {
+        false
+    }
+}
+
 fn command_matches(name: &str, query: &str) -> bool {
     name.to_ascii_lowercase()
         .starts_with(&query.to_ascii_lowercase())
@@ -3211,6 +3760,7 @@ enum AgentMenu {
     Providers,
     Sessions,
     Commands(String),
+    Mentions(String),
     Permissions,
     Mode,
     Config(String),
@@ -3413,6 +3963,30 @@ struct PaneFind {
     match_query: String,
     selected: usize,
     scroll_to_match: bool,
+}
+
+struct AgentFind {
+    open: bool,
+    query: String,
+    focus: bool,
+    matches: Vec<usize>,
+    selected: usize,
+    scroll_to_match: bool,
+    dirty: bool,
+}
+
+impl Default for AgentFind {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            focus: false,
+            matches: Vec::new(),
+            selected: 0,
+            scroll_to_match: false,
+            dirty: true,
+        }
+    }
 }
 
 impl Default for PaneFind {
@@ -3782,20 +4356,29 @@ fn agent_attachment_tile(
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         ui.painter()
             .rect_filled(rect, 7.0, theme::state::selected());
-        let extension = attachment
-            .file
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .filter(|extension| !extension.is_empty())
-            .map_or_else(|| "FILE".into(), |extension| extension.to_uppercase());
-        ui.painter().text(
-            rect.center() + egui::vec2(0.0, 1.0),
-            Align2::CENTER_CENTER,
-            extension.chars().take(5).collect::<String>(),
-            theme::typography::micro(),
-            theme::text().secondary,
-        );
+        if attachment.file.is_directory() {
+            icons::paint(
+                ui.painter(),
+                Icon::Folder,
+                egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(icons::GRID * 1.25)),
+                theme::text().secondary,
+            );
+        } else {
+            let extension = attachment
+                .file
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .filter(|extension| !extension.is_empty())
+                .map_or_else(|| "FILE".into(), |extension| extension.to_uppercase());
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 1.0),
+                Align2::CENTER_CENTER,
+                extension.chars().take(5).collect::<String>(),
+                theme::typography::micro(),
+                theme::text().secondary,
+            );
+        }
         response
     };
     ui.painter().rect_stroke(
@@ -4164,6 +4747,10 @@ pub struct EditorApp {
     agent_prompt_history_index: Option<usize>,
     agent_prompt_history_draft: String,
     agent_attachments: Vec<AgentComposerAttachment>,
+    agent_mentions: Option<Vec<AgentMentionEntry>>,
+    agent_mention_matches: Vec<AgentMentionEntry>,
+    agent_mention_selected: usize,
+    agent_find: AgentFind,
     agent_drop_hovered: bool,
     agent_file_picker: Option<AgentFilePicker>,
     project_folder_picker: Option<AgentFilePicker>,
@@ -4749,6 +5336,10 @@ impl EditorApp {
             agent_prompt_history_index: None,
             agent_prompt_history_draft: String::new(),
             agent_attachments: Vec::new(),
+            agent_mentions: None,
+            agent_mention_matches: Vec::new(),
+            agent_mention_selected: 0,
+            agent_find: AgentFind::default(),
             agent_drop_hovered: false,
             agent_file_picker: None,
             project_folder_picker: None,
@@ -9375,6 +9966,11 @@ impl EditorApp {
         if ctx.memory(|memory| memory.has_focus(Id::new("agent_prompt"))) {
             return vec![Scope::Agent];
         }
+        if self.agent_find.open
+            && ctx.memory(|memory| memory.has_focus(Id::new("agent_find_query")))
+        {
+            return vec![Scope::Agent];
+        }
         if self.search_open {
             return vec![Scope::ProjectSearch];
         }
@@ -9502,6 +10098,7 @@ impl EditorApp {
             KeybindingCommand::SearchProject => self.open_project_search(ctx),
             KeybindingCommand::SearchClose => {
                 self.search_open = false;
+                self.agent_find.open = false;
                 if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
                     find.open = false;
                 }
@@ -9597,6 +10194,15 @@ impl EditorApp {
     }
 
     fn open_find(&mut self, ctx: &egui::Context) {
+        if self.agentic_mode
+            || ctx.memory(|memory| {
+                memory.has_focus(Id::new("agent_prompt"))
+                    || memory.has_focus(Id::new("agent_find_query"))
+            })
+        {
+            self.open_agent_find(ctx);
+            return;
+        }
         self.lsp_completion = None;
         self.lsp_hover = None;
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
@@ -9628,6 +10234,18 @@ impl EditorApp {
     }
 
     fn step_find(&mut self, previous: bool) {
+        if self.agent_find.open {
+            if self.agent_find.matches.is_empty() {
+                return;
+            }
+            self.agent_find.selected = next_find_match(
+                self.agent_find.selected,
+                self.agent_find.matches.len(),
+                previous,
+            );
+            self.agent_find.scroll_to_match = true;
+            return;
+        }
         self.refresh_find_matches(self.active_pane);
         let Some(find) = self.pane_find.get_mut(&self.active_pane) else {
             return;
@@ -9637,6 +10255,14 @@ impl EditorApp {
         }
         find.selected = next_find_match(find.selected, find.matches.len(), previous);
         find.scroll_to_match = true;
+    }
+
+    fn open_agent_find(&mut self, ctx: &egui::Context) {
+        self.agent_find.open = true;
+        self.agent_find.focus = true;
+        self.agent_find.dirty = true;
+        self.agent_find.scroll_to_match = !self.agent_find.matches.is_empty();
+        ctx.memory_mut(|memory| memory.surrender_focus(Id::new("agent_prompt")));
     }
 
     fn execute_tree_command(&mut self, command: KeybindingCommand) {
@@ -10264,6 +10890,112 @@ impl EditorApp {
         self.warm_providers(ctx);
     }
 
+    fn draw_agent_find(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        if self.agent_find.dirty {
+            self.agent_find.matches =
+                agent_search_matches(
+                    &self.agent.transcript,
+                    &self.agent.changed_paths,
+                    &self.agent_find.query,
+                );
+            self.agent_find.selected = self
+                .agent_find
+                .selected
+                .min(self.agent_find.matches.len().saturating_sub(1));
+            self.agent_find.dirty = false;
+        }
+        let count = if self.agent_find.matches.is_empty() {
+            "0 / 0".to_owned()
+        } else {
+            format!(
+                "{} / {}",
+                self.agent_find.selected + 1,
+                self.agent_find.matches.len()
+            )
+        };
+        let query_id = Id::new("agent_find_query");
+        let focused = ui.memory(|memory| memory.has_focus(query_id));
+        let (enter, backwards, escape) = ui.input(|input| {
+            (
+                focused && input.key_pressed(Key::Enter),
+                input.modifiers.shift,
+                input.key_pressed(Key::Escape),
+            )
+        });
+        let mut previous = false;
+        let mut next = false;
+        let mut close = escape;
+        let mut changed = false;
+        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
+        );
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt("agent_find")
+                .max_rect(rect.shrink2(egui::vec2(8.0, 5.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let controls = 3.0 * theme::control::STANDARD + 54.0;
+                let response = ui.add_sized(
+                    [
+                        (ui.available_width() - controls).max(64.0),
+                        theme::control::COMPACT + 2.0,
+                    ],
+                    TextEdit::singleline(&mut self.agent_find.query)
+                        .id(query_id)
+                        .hint_text("Find in conversation…")
+                        .frame(egui::Frame::NONE),
+                );
+                changed = response.changed();
+                ui.label(
+                    RichText::new(count)
+                        .size(theme::typography::MICRO_SIZE)
+                        .color(theme::text().muted),
+                );
+                previous = chevron_icon_button(ui, true, "Previous match (Shift+Enter)").clicked();
+                next = chevron_icon_button(ui, false, "Next match (Enter)").clicked();
+                close |= close_icon_button(ui).clicked();
+            },
+        );
+        if self.agent_find.focus {
+            ui.memory_mut(|memory| memory.request_focus(query_id));
+            self.agent_find.focus = false;
+        }
+        if changed {
+            self.agent_find.matches =
+                agent_search_matches(
+                    &self.agent.transcript,
+                    &self.agent.changed_paths,
+                    &self.agent_find.query,
+                );
+            self.agent_find.selected = 0;
+            self.agent_find.scroll_to_match = !self.agent_find.matches.is_empty();
+            self.agent_find.dirty = false;
+        }
+        if enter {
+            if backwards {
+                previous = true;
+            } else {
+                next = true;
+            }
+        }
+        if !self.agent_find.matches.is_empty() && (previous || next) {
+            self.agent_find.selected = next_find_match(
+                self.agent_find.selected,
+                self.agent_find.matches.len(),
+                previous,
+            );
+            self.agent_find.scroll_to_match = true;
+        }
+        if close {
+            self.agent_find.open = false;
+            self.agent_find.focus = false;
+        }
+    }
+
     fn ensure_provider_catalog(&mut self) {
         if !self.available_providers.is_empty() {
             return;
@@ -10331,6 +11063,7 @@ impl EditorApp {
         self.agent_prompt_history_index = None;
         self.agent_prompt_history_draft.clear();
         self.agent_follow_transcript = true;
+        self.agent_find.dirty = true;
         self.agent_file_picker = None;
         self.agent_run_everything = None;
         self.start_provider(target, ctx);
@@ -10364,6 +11097,9 @@ impl EditorApp {
         }
         for (provider, event) in events {
             let selected = provider == self.selected_provider;
+            if selected {
+                self.agent_find.dirty = true;
+            }
             if selected
                 && matches!(
                     event,
@@ -10519,6 +11255,7 @@ impl EditorApp {
         }
         self.tree.refresh_visible();
         if !changed.is_empty() {
+            self.agent_mentions = None;
             match SearchController::new(self.tree.root.clone()) {
                 Ok(search) => {
                     self.search = search;
@@ -10577,7 +11314,7 @@ impl EditorApp {
     ) {
         for path in paths {
             if self.agent_attachments.len() >= MAX_PROMPT_ATTACHMENTS {
-                self.show_error(format!("attach at most {MAX_PROMPT_ATTACHMENTS} files"));
+                self.show_error(format!("attach at most {MAX_PROMPT_ATTACHMENTS} items"));
                 break;
             }
             let attachment = match PromptAttachment::from_path(path) {
@@ -10719,7 +11456,7 @@ impl EditorApp {
         } else {
             composer_height
         };
-        let (header, transcript, composer) = split_agent_sidebar(rect, composer_height);
+        let (header, mut transcript, composer) = split_agent_sidebar(rect, composer_height);
         let menu_owns_wheel = self.agent_menu.is_some()
             && self.agent_menu_popup.is_some_and(|popup| {
                 ui.input(|input| {
@@ -10879,6 +11616,38 @@ impl EditorApp {
                 session_menu_anchor = Some(button);
             }
         }
+        if self.agent.session_ready {
+            let button = agent_search_rect(header, self.agentic_mode);
+            let response = ui
+                .interact(button, Id::new("agent_search"), Sense::click())
+                .on_hover_text("Find in conversation (Cmd/Ctrl+F)");
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Find in conversation",
+                )
+            });
+            icons::paint(
+                &painter,
+                Icon::Search,
+                egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID * 0.9)),
+                if response.hovered() || self.agent_find.open {
+                    theme::text().primary
+                } else {
+                    theme::text().secondary
+                },
+            );
+            if response.clicked() {
+                self.open_agent_find(ui.ctx());
+            }
+        }
+        if self.agent_find.open {
+            let find_bar = transcript
+                .with_max_y((transcript.top() + AGENT_FIND_HEIGHT).min(transcript.bottom()));
+            transcript = transcript.with_min_y(find_bar.bottom());
+            self.draw_agent_find(ui, find_bar);
+        }
 
         let mut reconnect = false;
         let mut authenticate = None;
@@ -10893,14 +11662,13 @@ impl EditorApp {
         };
         let transcript_content = transcript.shrink2(egui::vec2(transcript_padding, 0.0));
         let transcript_width = transcript_content.width();
-        let transcript_region =
-            if matches!(&status, ConnectionState::Ready)
-                && (!self.agent.transcript.is_empty() || self.agent.active)
-            {
-                transcript
-            } else {
-                transcript_content
-            };
+        let transcript_region = if matches!(&status, ConnectionState::Ready)
+            && (!self.agent.transcript.is_empty() || self.agent.active)
+        {
+            transcript
+        } else {
+            transcript_content
+        };
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agent_transcript_region")
@@ -11159,6 +11927,19 @@ impl EditorApp {
                     if scrolling_up {
                         self.agent_follow_transcript = false;
                     }
+                    let find_matches = self.agent_find.matches.clone();
+                    let selected_find_item = find_matches
+                        .get(self.agent_find.selected)
+                        .copied();
+                    let selected_find_occurrence = selected_find_item.map(|item| {
+                        find_matches[..self.agent_find.selected]
+                            .iter()
+                            .filter(|&&candidate| candidate == item)
+                            .count()
+                    });
+                    let find_query = self.agent_find.query.clone();
+                    let should_scroll_to_find = self.agent_find.scroll_to_match;
+                    let mut scrolled_to_find = false;
                     let output = ScrollArea::vertical()
                         .id_salt("agent_transcript")
                         .auto_shrink([false, false])
@@ -11180,6 +11961,15 @@ impl EditorApp {
                                     for (item_index, item) in
                                         self.agent.transcript.iter_mut().enumerate()
                                     {
+                                let item_top = ui.cursor().top();
+                                let item_matches = find_matches.binary_search(&item_index).is_ok();
+                                let item_is_selected = selected_find_item == Some(item_index);
+                                let item_search = item_matches.then_some((
+                                    find_query.as_str(),
+                                    item_is_selected
+                                        .then_some(selected_find_occurrence)
+                                        .flatten(),
+                                ));
                                 match item {
                                     TranscriptItem::User(text) => {
                                         ui.label(
@@ -11198,7 +11988,14 @@ impl EditorApp {
                                             .corner_radius(8)
                                             .show(ui, |ui| {
                                                 ui.set_width(ui.available_width());
-                                                ui.add(Label::new(text.as_str()).wrap());
+                                                let job = agent_text_job(
+                                                    text,
+                                                    ui.available_width(),
+                                                    theme::typography::body(),
+                                                    theme::text().primary,
+                                                    item_search,
+                                                );
+                                                ui.add(Label::new(job).wrap());
                                             });
                                     }
                                     TranscriptItem::Assistant(text) => {
@@ -11211,6 +12008,7 @@ impl EditorApp {
                                             width,
                                             &self.highlighter,
                                             &self.syntaxes,
+                                            item_search,
                                         );
                                         ui.add(Label::new(galley).wrap());
                                     }
@@ -11239,7 +12037,7 @@ impl EditorApp {
                                                 ui.label(RichText::new("Thinking").small().strong());
                                             }
                                         }
-                                        draw_agent_content(ui, content);
+                                        draw_agent_content(ui, content, item_search);
                                     }
                                     TranscriptItem::Plan(plan) => {
                                         egui::CollapsingHeader::new("Plan")
@@ -11248,12 +12046,15 @@ impl EditorApp {
                                             .icon(paint_agent_disclosure)
                                             .show(ui, |ui| {
                                                 for item in plan {
-                                                    ui.add(
-                                                        Label::new(format!(
+                                                    agent_search_label(
+                                                        ui,
+                                                        &format!(
                                                             "{}  {}",
                                                             item.status, item.content
-                                                        ))
-                                                        .wrap(),
+                                                        ),
+                                                        theme::typography::body(),
+                                                        theme::text().primary,
+                                                        item_search,
                                                     );
                                                 }
                                             });
@@ -11280,6 +12081,7 @@ impl EditorApp {
                                             title,
                                             tool.status.as_deref(),
                                             transcript_width,
+                                            item_search,
                                             is_subagent || (contains_diff && !is_file_edit),
                                             |ui| {
                                                 if is_subagent {
@@ -11302,7 +12104,8 @@ impl EditorApp {
                                                                 .display()
                                                                 .to_string(),
                                                         };
-                                                        if agent_path_link(ui, &label).clicked()
+                                                        if agent_path_link(ui, &label, item_search)
+                                                            .clicked()
                                                         {
                                                             open_path_request = Some((
                                                                 tool_path.path.clone(),
@@ -11338,6 +12141,7 @@ impl EditorApp {
                                                                         width,
                                                                         &self.highlighter,
                                                                         &self.syntaxes,
+                                                                        item_search,
                                                                     );
                                                                     ui.add(
                                                                         Label::new(galley)
@@ -11345,13 +12149,21 @@ impl EditorApp {
                                                                             .selectable(true),
                                                                     );
                                                                 } else {
-                                                                    ui.add(
-                                                                        Label::new(text).wrap(),
+                                                                    agent_search_label(
+                                                                        ui,
+                                                                        text,
+                                                                        theme::typography::body(),
+                                                                        theme::text().primary,
+                                                                        item_search,
                                                                     );
                                                                 }
                                                             }
                                                             ToolOutput::Content(content) => {
-                                                                draw_agent_content(ui, content);
+                                                                draw_agent_content(
+                                                                    ui,
+                                                                    content,
+                                                                    item_search,
+                                                                );
                                                             }
                                                             ToolOutput::Diff {
                                                                 path,
@@ -11370,6 +12182,7 @@ impl EditorApp {
                                                                     new_text,
                                                                     &self.highlighter,
                                                                     &self.syntaxes,
+                                                                    item_search,
                                                                 ) {
                                                                     open_path_request = Some((
                                                                         path.clone(),
@@ -11378,18 +12191,27 @@ impl EditorApp {
                                                                 }
                                                             }
                                                             ToolOutput::Terminal(id) => {
-                                                                ui.label(format!("Terminal {id}"));
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    &format!("Terminal {id}"),
+                                                                    theme::typography::body(),
+                                                                    theme::text().primary,
+                                                                    item_search,
+                                                                );
                                                             }
                                                             ToolOutput::Todo {
                                                                 id,
                                                                 content,
                                                                 status,
                                                             } => {
-                                                                ui.add(
-                                                                    Label::new(format!(
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    &format!(
                                                                         "{status}  {content} ({id})"
-                                                                    ))
-                                                                    .wrap(),
+                                                                    ),
+                                                                    theme::typography::body(),
+                                                                    theme::text().primary,
+                                                                    item_search,
                                                                 );
                                                             }
                                                             ToolOutput::Task {
@@ -11400,9 +12222,12 @@ impl EditorApp {
                                                                 agent_id: _,
                                                                 duration_ms,
                                                             } => {
-                                                                ui.label(
-                                                                    RichText::new(description)
-                                                                        .strong(),
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    description,
+                                                                    theme::typography::strong(),
+                                                                    theme::text().primary,
+                                                                    item_search,
                                                                 );
                                                                 let metadata = [
                                                                     Some(subagent_type.clone()),
@@ -11415,10 +12240,12 @@ impl EditorApp {
                                                                 .flatten()
                                                                 .collect::<Vec<_>>()
                                                                 .join(" · ");
-                                                                ui.label(
-                                                                    RichText::new(metadata)
-                                                                        .small()
-                                                                        .weak(),
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    &metadata,
+                                                                    theme::typography::small(),
+                                                                    theme::text().muted,
+                                                                    item_search,
                                                                 );
                                                                 egui::CollapsingHeader::new(
                                                                     "Prompt",
@@ -11430,11 +12257,12 @@ impl EditorApp {
                                                                 ))
                                                                 .icon(paint_agent_disclosure)
                                                                 .show(ui, |ui| {
-                                                                    ui.add(
-                                                                        Label::new(
-                                                                            prompt.as_str(),
-                                                                        )
-                                                                        .wrap(),
+                                                                    agent_search_label(
+                                                                        ui,
+                                                                        prompt,
+                                                                        theme::typography::body(),
+                                                                        theme::text().primary,
+                                                                        item_search,
                                                                     );
                                                                 });
                                                             }
@@ -11443,8 +12271,12 @@ impl EditorApp {
                                                                 file_path,
                                                                 reference_image_paths,
                                                             } => {
-                                                                ui.add(
-                                                                    Label::new(description).wrap(),
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    description,
+                                                                    theme::typography::body(),
+                                                                    theme::text().primary,
+                                                                    item_search,
                                                                 );
                                                                 if let Some(file_path) = file_path {
                                                                     if let Some(preview) =
@@ -11463,6 +12295,7 @@ impl EditorApp {
                                                                         &file_path
                                                                             .display()
                                                                             .to_string(),
+                                                                        item_search,
                                                                     )
                                                                     .clicked()
                                                                     {
@@ -11483,14 +12316,15 @@ impl EditorApp {
                                                                 for reference in
                                                                     reference_image_paths
                                                                 {
-                                                                    ui.label(
-                                                                        RichText::new(format!(
+                                                                    agent_search_label(
+                                                                        ui,
+                                                                        &format!(
                                                                             "Reference: {}",
                                                                             reference.display()
-                                                                        ))
-                                                                        .monospace()
-                                                                        .small()
-                                                                        .weak(),
+                                                                        ),
+                                                                        theme::typography::code_small(),
+                                                                        theme::text().muted,
+                                                                        item_search,
                                                                     );
                                                                 }
                                                             }
@@ -11502,15 +12336,17 @@ impl EditorApp {
                                                             .as_deref()
                                                             .or(detail.input.as_deref())
                                                     {
+                                                        let job = agent_text_job(
+                                                            text,
+                                                            ui.available_width(),
+                                                            theme::typography::code_small(),
+                                                            theme::text().secondary,
+                                                            item_search,
+                                                        );
                                                         ui.add(
-                                                            Label::new(
-                                                                RichText::new(text)
-                                                                    .monospace()
-                                                                    .size(theme::typography::SMALL_SIZE)
-                                                                    .color(theme::text().secondary),
-                                                            )
-                                                            .wrap()
-                                                            .selectable(true),
+                                                            Label::new(job)
+                                                                .wrap()
+                                                                .selectable(true),
                                                         );
                                                     }
                                                 }
@@ -11565,6 +12401,13 @@ impl EditorApp {
                                                     );
                                                     ui.add(Label::new(&card.action).wrap());
                                                 });
+                                            scrolled_to_find |= paint_agent_search_item(
+                                                ui,
+                                                item_top,
+                                                item_is_selected,
+                                                should_scroll_to_find,
+                                            );
+                                            ui.add_space(16.0);
                                             continue;
                                         }
                                         egui::Frame::new()
@@ -11836,14 +12679,14 @@ impl EditorApp {
                                             .corner_radius(6)
                                             .show(ui, |ui| {
                                                 ui.set_width(ui.available_width());
-                                                ui.add(
-                                                    Label::new(
-                                                        RichText::new(error.as_str()).color(
-                                                            theme::ink(theme::semantic().danger),
-                                                        ),
-                                                    )
-                                                    .wrap(),
+                                                let job = agent_text_job(
+                                                    error,
+                                                    ui.available_width(),
+                                                    theme::typography::body(),
+                                                    theme::ink(theme::semantic().danger),
+                                                    item_search,
                                                 );
+                                                ui.add(Label::new(job).wrap());
                                             });
                                     }
                                     TranscriptItem::Truncated => {
@@ -11854,16 +12697,41 @@ impl EditorApp {
                                         );
                                     }
                                 }
+                                scrolled_to_find |= paint_agent_search_item(
+                                    ui,
+                                    item_top,
+                                    item_is_selected,
+                                    should_scroll_to_find,
+                                );
                                 ui.add_space(16.0);
                             }
-                            if !self.agent.changed_paths.is_empty()
-                                && let Some(path) = draw_agent_changed_files(
+                            if !self.agent.changed_paths.is_empty() {
+                                let item_top = ui.cursor().top();
+                                if let Some(path) = draw_agent_changed_files(
                                     ui,
                                     &self.tree.root,
                                     &self.agent.changed_paths,
-                                )
-                            {
-                                open_diff_request = Some(path);
+                                    (selected_find_item == Some(self.agent.transcript.len()))
+                                        .then_some((
+                                            find_query.as_str(),
+                                            selected_find_occurrence,
+                                        ))
+                                        .or_else(|| {
+                                            find_matches
+                                                .binary_search(&self.agent.transcript.len())
+                                                .is_ok()
+                                                .then_some((find_query.as_str(), None))
+                                        }),
+                                ) {
+                                    open_diff_request = Some(path);
+                                }
+                                let item_index = self.agent.transcript.len();
+                                scrolled_to_find |= paint_agent_search_item(
+                                    ui,
+                                    item_top,
+                                    selected_find_item == Some(item_index),
+                                    should_scroll_to_find,
+                                );
                             }
                             if self.agent.active {
                                 ui.add_space(theme::space::SMALL);
@@ -11872,6 +12740,10 @@ impl EditorApp {
                                 });
                             });
                         });
+                    if scrolled_to_find {
+                        self.agent_find.scroll_to_match = false;
+                        self.agent_follow_transcript = false;
+                    }
                     let max_offset =
                         (output.content_size.y - output.inner_rect.height()).max(0.0);
                     let near_bottom = agent_near_bottom(output.state.offset.y, max_offset);
@@ -11953,6 +12825,7 @@ impl EditorApp {
         let mut submit_shortcut = false;
         let mut prompt_changed = false;
         let mut history_navigated = false;
+        let mut mention_attach = None;
         let composer_enabled = self.agent.session_ready && !self.agent.active;
         let composer_hint = if self.agent.session_ready {
             format!(
@@ -12047,10 +12920,7 @@ impl EditorApp {
         };
         if attachment_height > 0.0 {
             let attachments = egui::Rect::from_min_max(
-                egui::pos2(
-                    composer_content.left(),
-                    composer_content.top(),
-                ),
+                egui::pos2(composer_content.left(), composer_content.top()),
                 egui::pos2(
                     composer_content.right(),
                     composer_content.top() + attachment_height,
@@ -12120,13 +12990,53 @@ impl EditorApp {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         let prompt_id = Id::new("agent_prompt");
+                        let mention_open = matches!(open_menu, Some(AgentMenu::Mentions(_)))
+                            && !self.agent_mention_matches.is_empty();
+                        if mention_open && ui.memory(|memory| memory.has_focus(prompt_id)) {
+                            let (up, down, tab) = ui.input(|input| {
+                                (
+                                    input.modifiers == egui::Modifiers::NONE
+                                        && input.key_pressed(Key::ArrowUp),
+                                    input.modifiers == egui::Modifiers::NONE
+                                        && input.key_pressed(Key::ArrowDown),
+                                    input.modifiers == egui::Modifiers::NONE
+                                        && input.key_pressed(Key::Tab),
+                                )
+                            });
+                            if up {
+                                self.agent_mention_selected =
+                                    self.agent_mention_selected.saturating_sub(1);
+                                ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                                });
+                            } else if down {
+                                self.agent_mention_selected = (self.agent_mention_selected + 1)
+                                    .min(self.agent_mention_matches.len() - 1);
+                                ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                                });
+                            }
+                            if tab {
+                                mention_attach = self
+                                    .agent_mention_matches
+                                    .get(self.agent_mention_selected)
+                                    .map(|entry| entry.path.clone());
+                                remove_agent_mention(&mut self.agent.prompt);
+                                open_menu = None;
+                                prompt_changed = true;
+                                ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::NONE, Key::Tab);
+                                });
+                            }
+                        }
                         let cursor_at_start = egui::TextEdit::load_state(ui.ctx(), prompt_id)
                             .and_then(|state| state.cursor.char_range())
                             .is_some_and(|range| {
                                 range.primary.index == egui::text::CharIndex(0)
                                     && range.secondary.index == egui::text::CharIndex(0)
                             });
-                        let history_key = (ui.memory(|memory| memory.has_focus(prompt_id))
+                        let history_key = (!mention_open
+                            && ui.memory(|memory| memory.has_focus(prompt_id))
                             && cursor_at_start)
                             .then(|| {
                                 ui.input(|input| {
@@ -12187,7 +13097,7 @@ impl EditorApp {
                             self.agent_prompt_history_index = None;
                             self.agent_prompt_history_draft.clear();
                         }
-                        prompt_changed = history_navigated || input_changed;
+                        prompt_changed |= history_navigated || input_changed;
                         submit_shortcut = input.has_focus()
                             && ui.input(|input| {
                                 !input.modifiers.shift && input.key_pressed(Key::Enter)
@@ -12198,7 +13108,39 @@ impl EditorApp {
         if history_navigated {
             ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
         }
-        if composer_enabled
+        let mention_query = composer_enabled
+            .then(|| agent_mention_query(&self.agent.prompt))
+            .flatten();
+        if let Some(query) = mention_query
+            && (prompt_changed || matches!(open_menu, Some(AgentMenu::Mentions(_))))
+        {
+            if self.agent_mentions.is_none() {
+                // ponytail: one path-only scan on the first @; move it to the existing search
+                // worker only if very large workspaces make this measurable.
+                self.agent_mentions = Some(collect_agent_mentions(&self.tree.root));
+            }
+            let query_changed = !matches!(
+                &open_menu,
+                Some(AgentMenu::Mentions(current)) if current == query
+            );
+            self.agent_mention_matches =
+                agent_mention_matches(self.agent_mentions.as_deref().unwrap_or_default(), query);
+            if query_changed {
+                self.agent_mention_selected = 0;
+                self.agent_menu_scroll_y = 0.0;
+            } else {
+                self.agent_mention_selected = self
+                    .agent_mention_selected
+                    .min(self.agent_mention_matches.len().saturating_sub(1));
+            }
+            open_menu = Some(AgentMenu::Mentions(query.to_owned()));
+            menu_anchor = Some(input_rect);
+        } else if prompt_changed && matches!(open_menu, Some(AgentMenu::Mentions(_))) {
+            self.agent_mention_matches.clear();
+            open_menu = None;
+        }
+        if mention_query.is_none()
+            && composer_enabled
             && let Some(query) = slash_command_query(&self.agent.prompt)
             && (prompt_changed || matches!(open_menu, Some(AgentMenu::Commands(_))))
         {
@@ -12220,7 +13162,7 @@ impl EditorApp {
                             ui,
                             Some(Id::new("agent_attach")),
                             Icon::Plus,
-                            "Attach files",
+                            "Attach files (or type @ for files and folders)",
                             theme::text().secondary,
                             egui::Vec2::splat(theme::control::STANDARD),
                         )
@@ -12401,7 +13343,7 @@ impl EditorApp {
             ui.painter().text(
                 composer_panel.center(),
                 Align2::CENTER_CENTER,
-                "Drop files to attach",
+                "Drop files or folders to attach",
                 theme::typography::body(),
                 theme::text().primary,
             );
@@ -12424,6 +13366,7 @@ impl EditorApp {
                         .count()
                         .max(1),
                 ),
+                AgentMenu::Mentions(_) => Some(self.agent_mention_matches.len().max(1)),
                 AgentMenu::Permissions => Some(2),
                 AgentMenu::Mode => Some(self.agent.modes.len()),
                 AgentMenu::Config(id) => self
@@ -12446,8 +13389,14 @@ impl EditorApp {
                 let row_height = match menu {
                     AgentMenu::Providers => AGENT_PROVIDER_ROW_HEIGHT,
                     AgentMenu::Commands(_) => AGENT_COMMAND_ROW_HEIGHT,
+                    AgentMenu::Mentions(_) => AGENT_MENTION_ROW_HEIGHT,
                     AgentMenu::Sessions => AGENT_SESSION_ROW_HEIGHT,
                     _ => AGENT_MENU_ROW_HEIGHT,
+                };
+                let menu_padding_y = if matches!(menu, AgentMenu::Mentions(_)) {
+                    4.0
+                } else {
+                    8.0
                 };
                 let popup = match menu {
                     AgentMenu::Providers => agent_provider_menu_rect(
@@ -12463,11 +13412,14 @@ impl EditorApp {
                         row_height,
                         AGENT_MENU_WIDTH,
                     ),
-                    _ => agent_menu_rect(transcript, anchor, item_count, row_height),
+                    _ => {
+                        agent_menu_rect(transcript, anchor, item_count, row_height, menu_padding_y)
+                    }
                 };
                 menu_popup = Some(popup);
-                let max_scroll =
-                    (item_count as f32 * row_height - (popup.height() - 16.0)).max(0.0);
+                let max_scroll = (item_count as f32 * row_height
+                    - (popup.height() - 2.0 * menu_padding_y))
+                    .max(0.0);
                 let wheel_delta = ui.input(|input| {
                     input
                         .pointer
@@ -12509,7 +13461,7 @@ impl EditorApp {
                         ui.scope_builder(
                             UiBuilder::new()
                                 .id_salt("agent_menu_content")
-                                .max_rect(popup.shrink2(egui::vec2(6.0, 8.0)))
+                                .max_rect(popup.shrink2(egui::vec2(6.0, menu_padding_y)))
                                 .layout(Layout::top_down_justified(Align::LEFT)),
                             |ui| {
                                 let list_height = ui.available_height();
@@ -12623,6 +13575,49 @@ impl EditorApp {
                                                                 .weak(),
                                                         ),
                                                     );
+                                                }
+                                            }
+                                            AgentMenu::Mentions(_) => {
+                                                if self.agent_mention_matches.is_empty() {
+                                                    ui.add_sized(
+                                                        [
+                                                            ui.available_width(),
+                                                            AGENT_COMMAND_ROW_HEIGHT,
+                                                        ],
+                                                        Label::new(
+                                                            RichText::new(
+                                                                "No matching files or folders",
+                                                            )
+                                                            .weak(),
+                                                        ),
+                                                    );
+                                                }
+                                                for (index, entry) in self
+                                                    .agent_mention_matches
+                                                    .iter()
+                                                    .cloned()
+                                                    .enumerate()
+                                                {
+                                                    let response = agent_mention_row(
+                                                        ui,
+                                                        &entry,
+                                                        index == self.agent_mention_selected,
+                                                    );
+                                                    if index == self.agent_mention_selected {
+                                                        response.scroll_to_me(Some(Align::Center));
+                                                    }
+                                                    if response.clicked() {
+                                                        mention_attach = Some(entry.path);
+                                                        remove_agent_mention(
+                                                            &mut self.agent.prompt,
+                                                        );
+                                                        ui.memory_mut(|memory| {
+                                                            memory.request_focus(Id::new(
+                                                                "agent_prompt",
+                                                            ));
+                                                        });
+                                                        selected = true;
+                                                    }
                                                 }
                                             }
                                             AgentMenu::Permissions => {
@@ -12751,6 +13746,11 @@ impl EditorApp {
         self.agent_menu_popup = menu_popup;
         self.agent_menu = open_menu;
 
+        if let Some(path) = mention_attach {
+            self.attach_agent_files(ui.ctx(), [path]);
+            ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
+            ui.ctx().request_repaint();
+        }
         if open_file_picker {
             self.open_agent_file_picker();
             ui.ctx().request_repaint();
@@ -16817,6 +17817,49 @@ fn agent_menu_option(
     row.response
 }
 
+fn agent_mention_row(
+    ui: &mut egui::Ui,
+    entry: &AgentMentionEntry,
+    selected: bool,
+) -> egui::Response {
+    let response = selectable_content_row(ui, selected, 20.0, |ui| {
+        ui.horizontal(|ui| {
+            let (_, icon) = ui.allocate_space(egui::Vec2::splat(icons::GRID));
+            icons::paint(
+                ui.painter(),
+                if entry.is_dir {
+                    Icon::Folder
+                } else {
+                    Icon::File
+                },
+                icon,
+                if selected {
+                    theme::text().primary
+                } else {
+                    theme::text().secondary
+                },
+            );
+            ui.add(
+                Label::new(
+                    RichText::new(&entry.relative)
+                        .monospace()
+                        .size(theme::typography::SMALL_SIZE),
+                )
+                .truncate(),
+            );
+        });
+    });
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            entry.relative.clone(),
+        )
+    });
+    response
+}
+
 fn agent_toggle_row(ui: &mut egui::Ui, label: &str, enabled: bool, height: f32) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
@@ -17364,9 +18407,9 @@ fn find_highlighted_job(
             if start < end {
                 let mut format = section.format.clone();
                 format.background = if current_match == active {
-                    theme::state::selected()
+                    theme::state::selected_focus()
                 } else {
-                    theme::state::hover()
+                    theme::state::selected()
                 };
                 highlighted.append(&base.text[start..end], leading_space, format);
                 leading_space = 0.0;
@@ -17590,23 +18633,136 @@ mod tests {
         TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
         TITLEBAR_PAINT_KEY, TabDrop, TreeState, WINDOW_CORNER_RADIUS, agent_collapsing_header,
         agent_composer_content, agent_composer_height, agent_diff_preview, agent_markdown_galley,
-        agent_menu_rect, agent_near_bottom, agent_new_session_rect, agent_selector_button,
+        agent_mention_matches, agent_mention_query, agent_menu_rect, agent_near_bottom,
+        agent_new_session_rect, agent_search_matches, agent_selector_button,
         agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agent_transcript_fade_mesh, agentic_empty_state_top_padding, allowed_tab_drop_zone,
-        build_agent_diff, cached_agent_diff, child_path, completion_word_range, copy_tree_entry,
-        defer_resize, diagnostic_highlighted_job, disable_transient_egui_debug_overlays,
-        draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
-        draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
-        file_result_job, find_highlighted_job, install_repaint_wake, launch_in_current_process,
-        match_bracket_pair, match_spans, model_display_name, next_find_match,
-        pane_header_and_content, picker_breadcrumb_segments, plain_text_job, presentation_job,
-        project_chooser_ui, provider_selector_visible, repaint_deadline,
-        repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
-        search_group_header, search_needs_polling, search_selection_after_navigation,
-        should_show_project_chooser, skip_transition_render, slash_command_query,
-        split_agent_sidebar, split_agentic_diff, split_agentic_workspace, split_bottom_panel,
-        split_pane_content, split_workspace, stable_tab_drop_zone, tab_width, unique_copy_path,
+        build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions,
+        completion_word_range, copy_tree_entry, defer_resize, diagnostic_highlighted_job,
+        disable_transient_egui_debug_overlays, draw_agent_diff, draw_editor_empty_state,
+        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
+        editor_background, editor_column_content, file_result_job, find_highlighted_job,
+        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
+        model_display_name, next_find_match, pane_header_and_content, picker_breadcrumb_segments,
+        plain_text_job, presentation_job, project_chooser_ui, provider_selector_visible,
+        repaint_deadline, repaint_delay_after_texture_update, resize_divider_stroke,
+        run_everything_state, search_group_header, search_needs_polling,
+        search_selection_after_navigation, should_show_project_chooser, skip_transition_render,
+        slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
+        split_bottom_panel, split_pane_content, split_workspace, stable_tab_drop_zone, tab_width,
+        unique_copy_path,
     };
+
+    #[test]
+    fn composer_mentions_only_use_the_active_at_token() {
+        assert_eq!(
+            agent_mention_query("Review @src/agent/sta"),
+            Some("src/agent/sta")
+        );
+        assert_eq!(agent_mention_query("Attach @"), Some(""));
+        assert_eq!(agent_mention_query("mail dev@example.com"), None);
+        assert_eq!(agent_mention_query("Review @src then explain"), None);
+        assert_eq!(agent_mention_query("Review @src "), None);
+    }
+
+    #[test]
+    fn composer_mentions_find_files_and_folders_but_skip_build_outputs() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src/agent")).unwrap();
+        fs::create_dir_all(project.path().join("target/debug")).unwrap();
+        fs::write(project.path().join("src/agent/state.rs"), "state").unwrap();
+        fs::write(project.path().join("target/debug/state.rs"), "build").unwrap();
+
+        let entries = collect_agent_mentions(project.path());
+        let state = agent_mention_matches(&entries, "state.rs");
+        let agent = agent_mention_matches(&entries, "agent");
+
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].relative, "src/agent/state.rs");
+        assert!(
+            agent
+                .iter()
+                .any(|entry| entry.relative == "src/agent" && entry.is_dir)
+        );
+    }
+
+    #[test]
+    fn composer_mention_menu_uses_compact_rows_without_bottom_slack() {
+        let entry = super::AgentMentionEntry {
+            path: "src".into(),
+            relative: "src".into(),
+            is_dir: true,
+        };
+        let mut row_height = 0.0;
+        let _ = theme::test_context().run_ui(RawInput::default(), |ui| {
+            row_height = super::agent_mention_row(ui, &entry, false).rect.height();
+        });
+        let transcript = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 400.0));
+        let anchor = Rect::from_min_size(pos2(0.0, 390.0), Vec2::new(100.0, 10.0));
+        let popup = agent_menu_rect(transcript, anchor, 5, row_height, 4.0);
+
+        assert_eq!(row_height, super::AGENT_MENTION_ROW_HEIGHT);
+        assert_eq!(popup.height(), 8.0 + 5.0 * row_height);
+    }
+
+    #[test]
+    fn agent_search_covers_output_paths_and_diffs_but_not_thoughts() {
+        use crate::agent::controller::{ToolActivity, ToolDetail, ToolOutput};
+        use crate::agent::state::TranscriptItem;
+        use std::collections::VecDeque;
+
+        let transcript = VecDeque::from([
+            TranscriptItem::Thought("private renderer guess".into()),
+            TranscriptItem::Assistant("Updated the renderer.".into()),
+            TranscriptItem::Tool(ToolActivity {
+                id: "edit".into(),
+                title: Some("Edit src/agent/state.rs".into()),
+                status: Some("Completed".into()),
+                kind: Some("Edit".into()),
+                paths: vec!["src/agent/state.rs".into()],
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![ToolOutput::Diff {
+                        path: "src/agent/state.rs".into(),
+                        old_text: Some("old extension".into()),
+                        new_text: "new extension".into(),
+                    }],
+                    output: None,
+                }),
+            }),
+        ]);
+
+        let changed_paths = std::collections::HashMap::new();
+        assert_eq!(
+            agent_search_matches(&transcript, &changed_paths, "renderer"),
+            vec![1]
+        );
+        assert_eq!(
+            agent_search_matches(&transcript, &changed_paths, "state.rs"),
+            vec![2, 2]
+        );
+        assert_eq!(
+            agent_search_matches(&transcript, &changed_paths, "extension"),
+            vec![2, 2]
+        );
+        assert!(agent_search_matches(&transcript, &changed_paths, "private").is_empty());
+    }
+
+    #[test]
+    fn agent_search_returns_every_occurrence_in_transcript_order() {
+        use crate::agent::state::TranscriptItem;
+        use std::collections::VecDeque;
+
+        let transcript = VecDeque::from([
+            TranscriptItem::User("page".into()),
+            TranscriptItem::Assistant("page after page".into()),
+        ]);
+
+        assert_eq!(
+            agent_search_matches(&transcript, &std::collections::HashMap::new(), "page"),
+            vec![0, 1, 1]
+        );
+    }
 
     #[test]
     fn completion_replaces_the_word_around_the_cursor() {
@@ -20162,6 +21318,7 @@ mod tests {
                     320.0,
                     &highlighter,
                     &syntaxes,
+                    None,
                 );
                 let diff = cached_agent_diff(ui, Id::new("cached_diff"), Some("before"), new_text);
                 cached = Some((markdown, diff));
@@ -20191,6 +21348,7 @@ mod tests {
                 320.0,
                 &highlighter,
                 &syntaxes,
+                None,
             ));
         });
         let galley = galley.unwrap();
@@ -20749,6 +21907,7 @@ mod tests {
                     &new_text,
                     &highlighter,
                     &syntaxes,
+                    None,
                 );
             });
             eprintln!("{label}: {:?}", start.elapsed());
@@ -20775,6 +21934,7 @@ mod tests {
                     "fn after() {}",
                     &highlighter,
                     &syntaxes,
+                    None,
                 );
             },
         );
@@ -20987,6 +22147,7 @@ mod tests {
                     "python3 -c",
                     Some("Completed"),
                     340.0,
+                    None,
                     false,
                     |_| {},
                 );
@@ -21074,6 +22235,7 @@ mod tests {
                         &format!("Edit {path}"),
                         Some("Completed"),
                         260.0,
+                        None,
                         false,
                         |_| {},
                     );
@@ -22381,7 +23543,7 @@ mod tests {
             pos2(content.left(), content.bottom() - 30.0),
             Vec2::new(76.0, 30.0),
         );
-        let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT);
+        let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT, 8.0);
 
         assert_eq!(
             content.bottom(),

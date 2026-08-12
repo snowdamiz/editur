@@ -45,6 +45,7 @@ enum PromptAttachmentKind {
     Image(&'static str),
     Audio(&'static str),
     File,
+    Directory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,10 +63,12 @@ impl PromptAttachment {
             .map_err(|error| format!("cannot attach {}: {error}", source.display()))?;
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!("{} is not a file", path.display()));
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(format!("{} is not a file or folder", path.display()));
         }
-        if metadata.len() == 0 || metadata.len() > MAX_PROMPT_ATTACHMENT_BYTES {
+        if metadata.is_file()
+            && (metadata.len() == 0 || metadata.len() > MAX_PROMPT_ATTACHMENT_BYTES)
+        {
             return Err(format!(
                 "{} must be a non-empty file no larger than {} MiB",
                 path.display(),
@@ -73,13 +76,21 @@ impl PromptAttachment {
             ));
         }
         let mut header = Vec::with_capacity(12);
-        fs::File::open(&path)
-            .and_then(|file| file.take(12).read_to_end(&mut header))
-            .map_err(|error| format!("cannot read attached file {}: {error}", path.display()))?;
+        if metadata.is_file() {
+            fs::File::open(&path)
+                .and_then(|file| file.take(12).read_to_end(&mut header))
+                .map_err(|error| {
+                    format!("cannot read attached file {}: {error}", path.display())
+                })?;
+        }
         Ok(Self {
             path,
-            kind: attachment_kind(&header),
-            byte_len: metadata.len(),
+            kind: if metadata.is_dir() {
+                PromptAttachmentKind::Directory
+            } else {
+                attachment_kind(&header)
+            },
+            byte_len: if metadata.is_dir() { 0 } else { metadata.len() },
         })
     }
 
@@ -91,11 +102,18 @@ impl PromptAttachment {
         matches!(self.kind, PromptAttachmentKind::Image(_))
     }
 
+    pub const fn is_directory(&self) -> bool {
+        matches!(self.kind, PromptAttachmentKind::Directory)
+    }
+
     pub const fn byte_len(&self) -> u64 {
         self.byte_len
     }
 
     fn read(&self) -> Result<Vec<u8>, String> {
+        if self.is_directory() {
+            return Ok(Vec::new());
+        }
         let bytes = read_bounded_attachment(&self.path)?;
         if attachment_kind(&bytes) != self.kind {
             return Err(format!("{} changed file type", self.path.display()));
@@ -1807,7 +1825,7 @@ fn prompt_content(
     support: AttachmentSupport,
 ) -> Result<(Vec<ContentBlock>, Vec<DisplayContent>), String> {
     if attachments.len() > MAX_PROMPT_ATTACHMENTS {
-        return Err(format!("attach at most {MAX_PROMPT_ATTACHMENTS} files"));
+        return Err(format!("attach at most {MAX_PROMPT_ATTACHMENTS} items"));
     }
     let mut content = Vec::with_capacity(attachments.len() + usize::from(!text.trim().is_empty()));
     if !text.trim().is_empty() {
@@ -1816,6 +1834,34 @@ fn prompt_content(
     let mut displays = Vec::with_capacity(attachments.len());
     let mut total = 0_u64;
     for attachment in attachments {
+        if attachment.kind == PromptAttachmentKind::Directory {
+            if !attachment.path.is_dir() {
+                return Err(format!(
+                    "{} is no longer a folder",
+                    attachment.path.display()
+                ));
+            }
+            let uri = attachment_uri(&attachment.path);
+            let name = attachment
+                .path
+                .file_name()
+                .unwrap_or(attachment.path.as_os_str())
+                .to_string_lossy()
+                .into_owned();
+            content.push(ContentBlock::ResourceLink(ResourceLink::new(
+                name.clone(),
+                uri.clone(),
+            )));
+            displays.push(DisplayContent::ResourceLink {
+                name,
+                title: None,
+                uri,
+                description: Some("Folder".into()),
+                mime_type: None,
+                size: None,
+            });
+            continue;
+        }
         let bytes = attachment.read()?;
         total = total.saturating_add(bytes.len() as u64);
         if total > MAX_PROMPT_ATTACHMENT_TOTAL_BYTES {
@@ -1880,7 +1926,7 @@ fn prompt_content(
                 let mime_type = match kind {
                     PromptAttachmentKind::Image(mime_type)
                     | PromptAttachmentKind::Audio(mime_type) => Some(mime_type),
-                    PromptAttachmentKind::File => None,
+                    PromptAttachmentKind::File | PromptAttachmentKind::Directory => None,
                 };
                 let mut link = ResourceLink::new(name.clone(), uri.clone()).size(byte_len);
                 if let Some(mime_type) = mime_type {
@@ -3382,6 +3428,35 @@ mod tests {
             attachment_uri(Path::new("/tmp/Project files/notes #1.md")),
             "file:///tmp/Project%20files/notes%20%231.md"
         );
+    }
+
+    #[test]
+    fn directory_attachment_becomes_an_acp_resource_link() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join("src");
+        std::fs::create_dir(&directory).unwrap();
+        let attachment = PromptAttachment::from_path(&directory).unwrap();
+
+        let (content, displays) = prompt_content(
+            "inspect this folder",
+            &[attachment],
+            AttachmentSupport {
+                image: true,
+                audio: true,
+                embedded_context: true,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            content.as_slice(),
+            [ContentBlock::Text(_), ContentBlock::ResourceLink(_)]
+        ));
+        assert!(matches!(
+            displays.as_slice(),
+            [DisplayContent::ResourceLink { name, uri, size: None, .. }]
+                if name == "src" && uri.ends_with("/src")
+        ));
     }
 
     #[test]
