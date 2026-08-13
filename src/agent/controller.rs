@@ -1014,6 +1014,23 @@ fn protect_managed_process(
     Ok((config, ManagedTree {}))
 }
 
+fn client_capabilities(provider: ProviderId) -> ClientCapabilities {
+    let mut capabilities =
+        ClientCapabilities::new().session(ClientSessionCapabilities::new().config_options(
+            SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new()),
+        ));
+    if provider == ProviderId::Cursor {
+        capabilities = capabilities.meta(serde_json::Map::from_iter([(
+            "parameterizedModelPicker".into(),
+            serde_json::Value::Bool(true),
+        )]));
+    }
+    if provider == ProviderId::Claude {
+        capabilities = capabilities.auth(AuthCapabilities::new().terminal(true));
+    }
+    capabilities
+}
+
 async fn run_connection(
     (agent, auth_config, system_terminal, internal_commands): (
         AcpAgent,
@@ -1214,17 +1231,7 @@ async fn run_connection(
             let interactions = Arc::clone(&interactions);
             let shutdown = Arc::clone(&shutdown);
             async move {
-                let client_capabilities = ClientCapabilities::new().session(
-                    ClientSessionCapabilities::new().config_options(
-                        SessionConfigOptionsCapabilities::new()
-                            .boolean(BooleanConfigOptionCapabilities::new()),
-                    ),
-                );
-                let client_capabilities = if provider == ProviderId::Claude {
-                    client_capabilities.auth(AuthCapabilities::new().terminal(true))
-                } else {
-                    client_capabilities
-                };
+                let client_capabilities = client_capabilities(provider);
                 let initialized = connection
                     .send_request(
                         InitializeRequest::new(ProtocolVersion::V1)
@@ -3320,6 +3327,16 @@ mod tests {
             },
         );
         event_rx.recv().expect("update should be visible")
+    }
+
+    #[test]
+    fn cursor_requests_parameterized_model_controls() {
+        let capabilities = client_capabilities(ProviderId::Cursor);
+
+        assert_eq!(
+            capabilities.meta.as_ref().unwrap()["parameterizedModelPicker"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]

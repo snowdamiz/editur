@@ -39,6 +39,7 @@ pub(crate) enum Icon {
     Error,
     Info,
     Sparkle,
+    Bolt,
 }
 
 /// One piece of an icon, in grid coordinates.
@@ -225,6 +226,14 @@ const SPARKLE: &[Segment] = &[
         (11.3, 11.3),
     ]),
 ];
+const BOLT: &[Segment] = &[Segment::Solid(&[
+    (8.8, 1.6),
+    (3.8, 8.6),
+    (7.2, 8.6),
+    (6.2, 14.4),
+    (12.2, 6.6),
+    (8.8, 6.6),
+])];
 
 fn segments(icon: Icon) -> &'static [Segment] {
     match icon {
@@ -253,12 +262,13 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Error => ERROR,
         Icon::Info => INFO,
         Icon::Sparkle => SPARKLE,
+        Icon::Bolt => BOLT,
     }
 }
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 25] = [
+pub(crate) const ALL: [Icon; 26] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -284,6 +294,7 @@ pub(crate) const ALL: [Icon; 25] = [
     Icon::Error,
     Icon::Info,
     Icon::Sparkle,
+    Icon::Bolt,
 ];
 
 /// Paints `icon` centered inside `rect`, scaled from the 16 px grid so the

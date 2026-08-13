@@ -11,7 +11,7 @@ use egui::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::app::{
+use crate::pane::{
     DropZone, PaneId, PaneLayout, SplitAxis, TabDrop, paint_pane_resize_handles,
     resize_dragged_pane_handle, stable_tab_drop_zone, tab_drop_preview,
 };
@@ -53,6 +53,40 @@ struct TerminalSession {
     output: Receiver<Vec<u8>>,
     size: (u16, u16),
     exit_reported: bool,
+    selection: Option<TerminalSelection>,
+    selecting: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CellPosition {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TerminalSelection {
+    anchor: CellPosition,
+    cursor: CellPosition,
+}
+
+impl TerminalSelection {
+    fn bounds(self) -> (CellPosition, CellPosition) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    fn text(self, screen: &vt100::Screen) -> String {
+        let (start, end) = self.bounds();
+        screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1))
+    }
+
+    fn contains(self, position: CellPosition) -> bool {
+        let (start, end) = self.bounds();
+        start <= position && position <= end
+    }
 }
 
 impl Default for TerminalPanel {
@@ -668,6 +702,8 @@ impl TerminalSession {
             output,
             size,
             exit_reported: false,
+            selection: None,
+            selecting: false,
         })
     }
 
@@ -714,7 +750,11 @@ impl TerminalSession {
             self.size = size;
         }
 
-        let response = ui.interact(rect, Id::new(("terminal_surface", self.id)), Sense::click());
+        let response = ui.interact(
+            rect,
+            Id::new(("terminal_surface", self.id)),
+            Sense::click_and_drag(),
+        );
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), &self.title)
         });
@@ -723,6 +763,41 @@ impl TerminalSession {
         }
         if request_focus {
             response.request_focus();
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Text);
+        }
+        let (pointer_pressed, pointer_down, pointer) = ui.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+                input.pointer.interact_pos(),
+            )
+        });
+        if pointer_pressed && let Some(pointer) = pointer.filter(|pointer| rect.contains(*pointer))
+        {
+            response.request_focus();
+            let position = cell_at(pointer, rect, cell_width, size);
+            self.selection = Some(TerminalSelection {
+                anchor: position,
+                cursor: position,
+            });
+            self.selecting = true;
+        } else if self.selecting
+            && pointer_down
+            && let Some(pointer) = pointer
+            && let Some(selection) = &mut self.selection
+        {
+            selection.cursor = cell_at(pointer, rect, cell_width, size);
+        } else if response.clicked()
+            && self
+                .selection
+                .is_some_and(|selection| selection.anchor == selection.cursor)
+        {
+            self.selection = None;
+        }
+        if !pointer_down {
+            self.selecting = false;
         }
         if response.hovered() {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
@@ -775,6 +850,12 @@ impl TerminalSession {
                         foreground = theme::surface().editor;
                     }
                 }
+                if self
+                    .selection
+                    .is_some_and(|selection| selection.contains(CellPosition { row, col }))
+                {
+                    background = theme::editor::selection();
+                }
                 if cursor == Some((row, col)) {
                     foreground = theme::surface().editor;
                     background = theme::accent();
@@ -813,8 +894,18 @@ impl TerminalSession {
 
     fn handle_events(&mut self, ui: &egui::Ui) -> Result<(), String> {
         let application_cursor = self.parser.screen().application_cursor();
+        let modifiers = ui.input(|input| input.modifiers);
         for event in ui.input(|input| input.events.clone()) {
             let bytes = match event {
+                Event::Copy if modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift) => {
+                    if let Some(selection) = self.selection {
+                        let text = selection.text(self.parser.screen());
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                    Vec::new()
+                }
                 Event::Paste(text) => {
                     if self.parser.screen().bracketed_paste() {
                         format!("\x1b[200~{text}\x1b[201~").into_bytes()
@@ -838,6 +929,7 @@ impl TerminalSession {
                     .and_then(|()| self.writer.flush())
                     .map_err(|error| format!("cannot write to terminal: {error}"))?;
                 self.parser.screen_mut().set_scrollback(0);
+                self.selection = None;
             }
         }
         Ok(())
@@ -859,6 +951,22 @@ fn pty_size((rows, cols): (u16, u16)) -> PtySize {
     }
 }
 
+fn cell_at(
+    pointer: egui::Pos2,
+    rect: egui::Rect,
+    cell_width: f32,
+    (rows, cols): (u16, u16),
+) -> CellPosition {
+    CellPosition {
+        row: ((pointer.y - rect.top() - CONTENT_PADDING) / LINE_HEIGHT)
+            .floor()
+            .clamp(0.0, f32::from(rows.saturating_sub(1))) as u16,
+        col: ((pointer.x - rect.left() - CONTENT_PADDING) / cell_width.max(1.0))
+            .floor()
+            .clamp(0.0, f32::from(cols.saturating_sub(1))) as u16,
+    }
+}
+
 fn split_insert_preview(axis: SplitAxis, bounds: egui::Rect, center: egui::Pos2) -> egui::Rect {
     match axis {
         SplitAxis::Horizontal => {
@@ -877,6 +985,26 @@ fn split_insert_preview(axis: SplitAxis, bounds: egui::Rect, center: egui::Pos2)
 }
 
 fn key_sequence(key: Key, modifiers: Modifiers, application_cursor: bool) -> Option<Vec<u8>> {
+    if (key == Key::V
+        && (modifiers.command || modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)))
+        || (key == Key::C && (modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)))
+    {
+        return None;
+    }
+    if modifiers.mac_cmd {
+        match key {
+            Key::ArrowLeft => return Some(vec![1]),
+            Key::ArrowRight => return Some(vec![5]),
+            _ => {}
+        }
+    }
+    if modifiers.alt && !modifiers.ctrl {
+        match key {
+            Key::ArrowLeft => return Some(b"\x1bb".to_vec()),
+            Key::ArrowRight => return Some(b"\x1bf".to_vec()),
+            _ => {}
+        }
+    }
     if key == Key::Backspace {
         if modifiers.mac_cmd {
             return Some(vec![21]);
@@ -890,6 +1018,20 @@ fn key_sequence(key: Key, modifiers: Modifiers, application_cursor: bool) -> Opt
         && let Some(byte) = control_byte(key)
     {
         return Some(vec![byte]);
+    }
+    let arrow = match key {
+        Key::ArrowUp => Some('A'),
+        Key::ArrowDown => Some('B'),
+        Key::ArrowRight => Some('C'),
+        Key::ArrowLeft => Some('D'),
+        _ => None,
+    };
+    let modifier =
+        1 + u8::from(modifiers.shift) + 2 * u8::from(modifiers.alt) + 4 * u8::from(modifiers.ctrl);
+    if let Some(arrow) = arrow
+        && modifier > 1
+    {
+        return Some(format!("\x1b[1;{modifier}{arrow}").into_bytes());
     }
     let bytes: &[u8] = match key {
         Key::Enter => b"\r",
@@ -986,11 +1128,13 @@ mod tests {
     use portable_pty::CommandBuilder;
 
     #[cfg(unix)]
-    use crate::app::{DropZone, PaneId};
+    use crate::pane::{DropZone, PaneId};
     #[cfg(unix)]
     use crate::theme;
 
-    use super::key_sequence;
+    use super::{
+        CONTENT_PADDING, CellPosition, FONT_SIZE, LINE_HEIGHT, TerminalSelection, key_sequence,
+    };
     #[cfg(unix)]
     use super::{TerminalPanel, TerminalSession};
 
@@ -1228,6 +1372,57 @@ mod tests {
     }
 
     #[test]
+    fn mac_navigation_shortcuts_match_shell_line_editing() {
+        let command = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        assert_eq!(
+            key_sequence(Key::ArrowLeft, Modifiers::ALT, false),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            key_sequence(Key::ArrowRight, Modifiers::ALT, false),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(key_sequence(Key::ArrowLeft, command, false), Some(vec![1]));
+        assert_eq!(key_sequence(Key::ArrowRight, command, false), Some(vec![5]));
+    }
+
+    #[test]
+    fn modified_arrows_keep_their_xterm_modifiers() {
+        assert_eq!(
+            key_sequence(Key::ArrowLeft, Modifiers::CTRL, false),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+        assert_eq!(
+            key_sequence(Key::ArrowUp, Modifiers::SHIFT, false),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+    }
+
+    #[test]
+    fn control_shift_clipboard_shortcuts_do_not_reach_the_shell() {
+        let clipboard = Modifiers::CTRL | Modifiers::SHIFT;
+
+        assert_eq!(key_sequence(Key::C, clipboard, false), None);
+        assert_eq!(key_sequence(Key::V, clipboard, false), None);
+    }
+
+    #[test]
+    fn primary_paste_shortcut_does_not_reach_the_shell() {
+        let paste = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        assert_eq!(key_sequence(Key::V, paste, false), None);
+    }
+
+    #[test]
     fn arrows_follow_the_terminal_cursor_mode() {
         assert_eq!(
             key_sequence(Key::ArrowUp, Modifiers::NONE, false),
@@ -1242,6 +1437,114 @@ mod tests {
     #[test]
     fn printable_keys_are_handled_by_text_events() {
         assert_eq!(key_sequence(Key::A, Modifiers::NONE, false), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_copy_writes_the_dragged_terminal_selection() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/sh"),
+            &context,
+        )
+        .unwrap();
+        session.parser.process(b"zero one\r\nsecond line");
+        session.selection = Some(TerminalSelection {
+            anchor: CellPosition { row: 0, col: 5 },
+            cursor: CellPosition { row: 1, col: 5 },
+        });
+        let command = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        let output = context.run_ui(
+            egui::RawInput {
+                modifiers: command,
+                events: vec![egui::Event::Copy],
+                ..egui::RawInput::default()
+            },
+            |ui| session.handle_events(ui).unwrap(),
+        );
+
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "one\nsecond")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dragging_over_terminal_cells_selects_their_text() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        session.parser.process(b"alpha beta");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 200.0));
+        let mut cell_width = 0.0;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            cell_width = ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        "M".into(),
+                        egui::FontId::monospace(FONT_SIZE),
+                        theme::text().primary,
+                    )
+                    .size()
+                    .x
+            });
+        });
+        let point = |col: f32| {
+            egui::pos2(
+                CONTENT_PADDING + (col + 0.5) * cell_width,
+                CONTENT_PADDING + LINE_HEIGHT * 0.5,
+            )
+        };
+        let mut draw = |events| {
+            context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    session.show(ui, rect, false).unwrap();
+                },
+            )
+        };
+
+        let _ = draw(vec![
+            egui::Event::PointerMoved(point(0.0)),
+            egui::Event::PointerButton {
+                pos: point(0.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![egui::Event::PointerMoved(point(4.0))]);
+        let _ = draw(vec![egui::Event::PointerButton {
+            pos: point(4.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert_eq!(
+            session
+                .selection
+                .map(|selection| selection.text(session.parser.screen())),
+            Some("alpha".into())
+        );
     }
 
     #[cfg(unix)]
