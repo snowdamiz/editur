@@ -2875,13 +2875,15 @@ struct GalleyKey {
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
 }
 
+type MarkdownLayoutCache = Option<((u64, u32, u64), Arc<egui::Galley>)>;
+
 struct FileTab {
     buffer: Buffer,
     editor_surface: EditorSurface,
     highlight_cache: HighlightCache,
     pane: PaneId,
     markdown_preview: bool,
-    markdown_layout: Option<((u64, u32), Arc<egui::Galley>)>,
+    markdown_layout: MarkdownLayoutCache,
     /// When set, the tab renders the agent-session diff (this baseline
     /// against the live buffer) instead of the editor. `None` inside means
     /// the agent created the file, so every line shows as added.
@@ -3649,6 +3651,10 @@ pub struct EditorApp {
     tree_surface: TreeSurface,
     recent_projects: Vec<PathBuf>,
     project_menu: bool,
+    git_workspace_status: Option<crate::projects::GitWorkspaceStatus>,
+    git_workspace_status_rx:
+        Option<std::sync::mpsc::Receiver<Option<crate::projects::GitWorkspaceStatus>>>,
+    git_workspace_status_started: bool,
     /// The previous window was in agent mode when the project switched, so the
     /// replacement starts its providers on the first frame that has a context.
     agent_boot_pending: bool,
@@ -3811,6 +3817,9 @@ impl EditorApp {
                 .map(|directory| crate::projects::load(&directory))
                 .unwrap_or_default(),
             project_menu: false,
+            git_workspace_status: None,
+            git_workspace_status_rx: None,
+            git_workspace_status_started: false,
             agent_boot_pending: false,
             syntaxes,
             highlighter: Highlighter::new()?,
@@ -3936,6 +3945,40 @@ impl EditorApp {
         });
     }
 
+    fn start_git_workspace_status(&mut self, ctx: &egui::Context) {
+        if self.git_workspace_status_started {
+            return;
+        }
+        self.git_workspace_status_started = true;
+        if cfg!(test) {
+            return;
+        }
+        let root = self.tree.root.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        self.git_workspace_status_rx = Some(receive);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(crate::projects::inspect_git_workspace(&root));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_git_workspace_status(&mut self) {
+        let Some(receive) = &self.git_workspace_status_rx else {
+            return;
+        };
+        match receive.try_recv() {
+            Ok(status) => {
+                self.git_workspace_status = status;
+                self.git_workspace_status_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.git_workspace_status_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     /// Hands the update to a fresh `editur update` process, which asks this
     /// editor to quit once the download verifies, then installs the new
     /// build. If the updater fails instead, its message comes back as a toast.
@@ -3993,6 +4036,7 @@ impl EditorApp {
             self.agent_boot_pending = false;
             self.open_agent(&ctx);
         }
+        self.poll_git_workspace_status();
         self.poll_agent(&ctx);
         if self.agent.active {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -4026,6 +4070,7 @@ impl EditorApp {
 
         let window = root.max_rect();
         if self.agentic_mode {
+            self.start_git_workspace_status(&ctx);
             self.update_agentic_sidebar_resize(&ctx, window);
             self.draw_agentic_workspace(root, window);
             self.draw_dialogs(&ctx);
@@ -4584,18 +4629,23 @@ impl EditorApp {
                     .show(ui, |ui| {
                         add_project = agentic_section_header(
                             ui,
-                            "Projects",
-                            Some(("agentic_add_project", "Add project")),
+                            "Workspaces",
+                            Some(("agentic_add_project", "Add workspace")),
                         );
                         ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                        if agentic_project_row(ui, &self.tree.root, true) {
+                        if agentic_project_row(
+                            ui,
+                            &self.tree.root,
+                            true,
+                            self.git_workspace_status.as_ref(),
+                        ) {
                             switch_to = Some(self.tree.root.clone());
                         }
                         for root in &self.recent_projects {
                             if root == &self.tree.root {
                                 continue;
                             }
-                            if agentic_project_row(ui, root, false) {
+                            if agentic_project_row(ui, root, false, None) {
                                 switch_to = Some(root.clone());
                             }
                         }
@@ -6478,21 +6528,39 @@ fn agentic_section_header(
 
 /// One project in the agentic rail. The open project is marked selected;
 /// clicking any row asks the app to switch to that root.
-fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
+fn agentic_project_row(
+    ui: &mut egui::Ui,
+    root: &Path,
+    selected: bool,
+    status: Option<&crate::projects::GitWorkspaceStatus>,
+) -> bool {
     let name = root
         .file_name()
         .unwrap_or(root.as_os_str())
         .to_string_lossy();
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(
-            ui.available_width(),
-            theme::control::ROW + theme::space::TIGHT,
-        ),
-        Sense::hover(),
-    );
+    let height = if status.is_some() {
+        58.0
+    } else {
+        theme::control::ROW + theme::space::TIGHT
+    };
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    let hover = status
+        .and_then(|status| status.pull_request.as_ref())
+        .map_or_else(
+            || root.display().to_string(),
+            |pull_request| {
+                format!(
+                    "{}\n{}\n{}",
+                    root.display(),
+                    pull_request.title,
+                    pull_request.url
+                )
+            },
+        );
     let response = ui
         .interact(rect, Id::new(("agentic_project", root)), Sense::click())
-        .on_hover_text(root.display().to_string());
+        .on_hover_text(hover);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -6513,17 +6581,18 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
             theme::state::hover(),
         );
     }
+    let name_y = status.map_or(rect.center().y, |_| rect.top() + 16.0);
     icons::paint(
         ui.painter(),
         Icon::Folder,
         egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 16.0, rect.center().y),
+            egui::pos2(rect.left() + 16.0, name_y),
             egui::Vec2::splat(icons::GRID),
         ),
         theme::text().secondary,
     );
     ui.painter().text(
-        egui::pos2(rect.left() + 31.0, rect.center().y),
+        egui::pos2(rect.left() + 31.0, name_y),
         Align2::LEFT_CENTER,
         name,
         if selected {
@@ -6537,6 +6606,24 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
             theme::text().secondary
         },
     );
+    if let Some(status) = status {
+        ui.painter().text(
+            egui::pos2(rect.left() + 31.0, rect.top() + 33.0),
+            Align2::LEFT_CENTER,
+            &status.branch,
+            theme::typography::micro(),
+            theme::text().muted,
+        );
+        if let Some(pull_request) = &status.pull_request {
+            ui.painter().text(
+                egui::pos2(rect.left() + 31.0, rect.top() + 48.0),
+                Align2::LEFT_CENTER,
+                pull_request.label(),
+                theme::typography::micro(),
+                theme::accent(),
+            );
+        }
+    }
     response.clicked()
 }
 
@@ -6673,14 +6760,18 @@ fn draw_markdown_preview(
     ui: &mut egui::Ui,
     source: &str,
     revision: u64,
-    cache: &mut Option<((u64, u32), Arc<egui::Galley>)>,
+    cache: &mut MarkdownLayoutCache,
     pane: PaneId,
 ) {
     let rect = ui.available_rect_before_wrap();
     ui.painter().rect_filled(rect, 0.0, theme::surface().editor);
     let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
     let side = ((rect.width() - content_width) * 0.5).max(0.0);
-    let key = (revision, content_width.round().to_bits());
+    let key = (
+        revision,
+        content_width.round().to_bits(),
+        theme::paint_appearance(ui.pixels_per_point()),
+    );
     if cache.as_ref().is_none_or(|(current, _)| *current != key) {
         let job = markdown::layout(source, content_width);
         *cache = Some((key, ui.fonts_mut(|fonts| fonts.layout_job(job))));

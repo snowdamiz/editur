@@ -1847,6 +1847,111 @@ fn ui_scale_slider_commits_only_after_release() {
     assert_eq!((held, value), (100, 200));
 }
 
+#[test]
+fn ui_scale_change_in_agentic_mode_rebuilds_hidden_editor_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("cached-tree-entry.rs");
+    fs::write(&file, "cached editor line\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: Some(file),
+        create: false,
+    })
+    .unwrap();
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1_000.0, 700.0),
+        )),
+        ..RawInput::default()
+    };
+    let draw = |app: &mut EditorApp| context.run_ui(input(), |root| app.ui(root));
+    fn galley(output: &egui::FullOutput, expected: &str) -> std::sync::Arc<egui::Galley> {
+        fn find(shape: &Shape, expected: &str) -> Option<std::sync::Arc<egui::Galley>> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(std::sync::Arc::clone(&text.galley))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, expected)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, expected))
+            .unwrap_or_else(|| panic!("missing rendered text {expected:?}"))
+    }
+
+    let before = draw(&mut app);
+    let before_tree = galley(&before, "cached-tree-entry.rs");
+    let before_editor = galley(&before, "cached editor line");
+
+    app.agentic_mode = true;
+    app.settings.appearance.ui_scale_percent = 150;
+    let _ = draw(&mut app); // UI zoom becomes active at the start of the next pass.
+    let scaled_agent = draw(&mut app);
+    assert_eq!(scaled_agent.pixels_per_point, 1.5);
+
+    app.agentic_mode = false;
+    let returned = draw(&mut app);
+    let returned_tree = galley(&returned, "cached-tree-entry.rs");
+    let returned_editor = galley(&returned, "cached editor line");
+
+    assert!(!std::sync::Arc::ptr_eq(&before_tree, &returned_tree));
+    assert!(!std::sync::Arc::ptr_eq(&before_editor, &returned_editor));
+}
+
+#[test]
+fn ui_scale_change_rebuilds_hidden_markdown_preview() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("preview.md");
+    fs::write(&file, "cached preview paragraph\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: Some(file),
+        create: false,
+    })
+    .unwrap();
+    app.tabs[0].markdown_preview = true;
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1_000.0, 700.0),
+        )),
+        ..RawInput::default()
+    };
+    let draw = |app: &mut EditorApp| context.run_ui(input(), |root| app.ui(root));
+    let preview = |output: &egui::FullOutput| {
+        fn find(shape: &Shape) -> Option<std::sync::Arc<egui::Galley>> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == "cached preview paragraph\n" => {
+                    Some(std::sync::Arc::clone(&text.galley))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(find),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape))
+            .expect("rendered Markdown preview")
+    };
+
+    let before = preview(&draw(&mut app));
+    app.agentic_mode = true;
+    app.settings.appearance.ui_scale_percent = 150;
+    let _ = draw(&mut app);
+    let _ = draw(&mut app);
+    app.agentic_mode = false;
+    let returned = preview(&draw(&mut app));
+
+    assert!(!std::sync::Arc::ptr_eq(&before, &returned));
+}
+
 fn has_id_clash(shape: &Shape) -> bool {
     match shape {
         Shape::Text(text) => text.galley.text().contains("use of widget ID"),
@@ -3899,6 +4004,48 @@ fn unchanged_agent_markdown_and_diffs_reuse_their_frame_work() {
     assert!(std::sync::Arc::ptr_eq(&first.0, &unchanged.0));
     assert!(std::sync::Arc::ptr_eq(&first.1, &unchanged.1));
     assert!(!std::sync::Arc::ptr_eq(&unchanged.1, &changed.1));
+}
+
+#[test]
+fn ui_scale_change_rebuilds_cached_agent_text() {
+    let context = theme::test_context();
+    let syntaxes = SyntaxManager::built_in().unwrap();
+    let highlighter = Highlighter::new().unwrap();
+    let draw = || {
+        let mut cached = None;
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            cached = Some((
+                agent_markdown_galley(
+                    ui,
+                    Id::new("scaled_agent_markdown"),
+                    "**cached agent text**",
+                    320.0,
+                    &highlighter,
+                    &syntaxes,
+                    false,
+                    None,
+                ),
+                super::agent_code_galley(
+                    ui,
+                    Id::new("scaled_agent_code"),
+                    std::path::Path::new("cached.rs"),
+                    "fn cached_agent_code() {}",
+                    320.0,
+                    &highlighter,
+                    &syntaxes,
+                    None,
+                ),
+            ));
+        });
+        cached.unwrap()
+    };
+
+    let before = draw();
+    context.set_zoom_factor(1.5);
+    let after = draw();
+
+    assert!(!std::sync::Arc::ptr_eq(&before.0, &after.0));
+    assert!(!std::sync::Arc::ptr_eq(&before.1, &after.1));
 }
 
 #[test]
@@ -9505,7 +9652,7 @@ fn sidebar_visibility_is_shared_by_ide_and_agentic_modes() {
 }
 
 #[test]
-fn agentic_session_rail_lists_projects_before_sessions() {
+fn agentic_session_rail_lists_workspaces_before_sessions() {
     let temp = tempfile::tempdir().unwrap();
     let recent = temp.path().join("other-project");
     fs::create_dir_all(&recent).unwrap();
@@ -9554,7 +9701,7 @@ fn agentic_session_rail_lists_projects_before_sessions() {
             .find_map(|shape| text_rect(&shape.shape, expected))
     };
     let provider = find("Cursor").expect("provider");
-    let projects_header = find("PROJECTS").expect("projects header");
+    let projects_header = find("WORKSPACES").expect("workspaces header");
     let project = find(&project).expect("open project row");
     let recent_row = find("other-project").expect("recent project row");
     let sessions_header = find("SESSIONS").expect("sessions header");
@@ -9563,6 +9710,57 @@ fn agentic_session_rail_lists_projects_before_sessions() {
     assert!(project.top() >= projects_header.bottom());
     assert!(recent_row.top() >= project.bottom());
     assert!(sessions_header.top() >= recent_row.bottom());
+}
+
+#[test]
+fn agentic_workspace_row_shows_its_branch_and_pull_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.git_workspace_status = Some(crate::projects::GitWorkspaceStatus {
+        branch: "codex/session-workspaces".into(),
+        pull_request: Some(crate::projects::PullRequestStatus {
+            number: 42,
+            title: "Attach sessions to worktrees".into(),
+            url: "https://github.com/editur/editur/pull/42".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            review_decision: "APPROVED".into(),
+            merge_state_status: "CLEAN".into(),
+        }),
+    });
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1_000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    for expected in ["WORKSPACES", "codex/session-workspaces", "PR #42 · Ready"] {
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, expected)),
+            "missing {expected:?}"
+        );
+    }
 }
 
 #[test]

@@ -22,7 +22,8 @@ pub(crate) struct RetainedUpload {
 }
 
 pub(crate) fn mark_retained(painter: &Painter, rect: Rect, key: u64, revision: u64) {
-    let revision = revision ^ crate::theme::appearance().rotate_left(23);
+    let revision =
+        revision ^ crate::theme::paint_appearance(painter.pixels_per_point()).rotate_left(23);
     painter.add(PaintCallback {
         rect,
         callback: Arc::new(RetainedPaint { key, revision }),
@@ -209,6 +210,32 @@ mod tests {
         crate::theme::apply(&context);
 
         assert_ne!(dark, light);
+    }
+
+    #[test]
+    fn retained_paint_changes_revision_with_pixels_per_point() {
+        let context = crate::theme::test_context();
+        let draw = || {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(100.0))),
+                    ..RawInput::default()
+                },
+                |ui| super::mark_retained(ui.painter(), ui.max_rect(), 1, 7),
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .find_map(|primitive| super::retained_paint(&primitive.primitive).unwrap())
+                .unwrap()
+                .revision
+        };
+
+        let regular = draw();
+        context.set_pixels_per_point(1.5);
+        let scaled = draw();
+
+        assert_ne!(regular, scaled);
     }
 
     #[test]

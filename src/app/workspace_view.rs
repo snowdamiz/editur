@@ -461,14 +461,19 @@ impl EditorApp {
                     .show(ui, |ui| {
                         ui.set_width(width - 12.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if agentic_project_row(ui, &self.tree.root, true) {
+                        if agentic_project_row(
+                            ui,
+                            &self.tree.root,
+                            true,
+                            self.git_workspace_status.as_ref(),
+                        ) {
                             switch_to = Some(self.tree.root.clone());
                         }
                         for project in &self.recent_projects {
                             if project == &self.tree.root {
                                 continue;
                             }
-                            if agentic_project_row(ui, project, false) {
+                            if agentic_project_row(ui, project, false, None) {
                                 switch_to = Some(project.clone());
                             }
                         }

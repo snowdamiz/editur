@@ -202,7 +202,7 @@ impl TreeSurface {
                 width: available.to_bits(),
                 selected: is_selected,
                 hovered: is_hovered,
-                appearance: theme::appearance(),
+                appearance: theme::paint_appearance(ui.pixels_per_point()),
             };
             let label = self.labels.entry(key).or_insert_with(|| {
                 let color = if is_selected || is_hovered {

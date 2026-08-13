@@ -63,7 +63,7 @@ struct TerminalSession {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CellPosition {
-    row: u16,
+    row: usize,
     col: u16,
 }
 
@@ -82,9 +82,42 @@ impl TerminalSelection {
         }
     }
 
-    fn text(self, screen: &vt100::Screen) -> String {
+    fn text(self, screen: &mut vt100::Screen) -> String {
         let (start, end) = self.bounds();
-        screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1))
+        let original_scrollback = screen.scrollback();
+        let history_len = history_len(screen);
+        let last_row = history_len + usize::from(screen.size().0) - 1;
+        let end = CellPosition {
+            row: end.row.min(last_row),
+            col: end.col,
+        };
+        let cols = screen.size().1;
+        let mut text = String::new();
+        for row in start.row..=end.row {
+            let (scrollback, viewport_row) = if row < history_len {
+                (history_len - row, 0)
+            } else {
+                (0, (row - history_len) as u16)
+            };
+            screen.set_scrollback(scrollback);
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col.saturating_add(1).min(cols)
+            } else {
+                cols
+            };
+            text.push_str(
+                &screen
+                    .rows(start_col, end_col.saturating_sub(start_col))
+                    .nth(usize::from(viewport_row))
+                    .unwrap_or_default(),
+            );
+            if row != end.row && !screen.row_wrapped(viewport_row) {
+                text.push('\n');
+            }
+        }
+        screen.set_scrollback(original_scrollback);
+        text
     }
 
     fn contains(self, position: CellPosition) -> bool {
@@ -752,6 +785,16 @@ impl TerminalSession {
             self.master
                 .resize(pty_size(size))
                 .map_err(|error| format!("cannot resize terminal: {error}"))?;
+            let hidden_rows = self
+                .parser
+                .screen()
+                .cursor_position()
+                .0
+                .saturating_sub(rows - 1);
+            if hidden_rows > 0 && !self.parser.screen().alternate_screen() {
+                self.parser
+                    .process(format!("\x1b[{hidden_rows}S").as_bytes());
+            }
             self.parser.screen_mut().set_size(rows, cols);
             self.size = size;
         }
@@ -783,7 +826,7 @@ impl TerminalSession {
         if pointer_pressed && let Some(pointer) = pointer.filter(|pointer| rect.contains(*pointer))
         {
             response.request_focus();
-            let position = cell_at(pointer, rect, cell_width, size);
+            let position = cell_at(pointer, rect, cell_width, size, self.parser.screen_mut());
             self.selection = Some(TerminalSelection {
                 anchor: position,
                 cursor: position,
@@ -792,9 +835,30 @@ impl TerminalSession {
         } else if self.selecting
             && pointer_down
             && let Some(pointer) = pointer
-            && let Some(selection) = &mut self.selection
         {
-            selection.cursor = cell_at(pointer, rect, cell_width, size);
+            let screen = self.parser.screen_mut();
+            let scrollback = screen.scrollback();
+            let target = if pointer.y < rect.top() + CONTENT_PADDING {
+                let rows = ((rect.top() + CONTENT_PADDING - pointer.y) / LINE_HEIGHT)
+                    .ceil()
+                    .max(1.0) as usize;
+                scrollback.saturating_add(rows)
+            } else if pointer.y > rect.bottom() - CONTENT_PADDING {
+                let rows = ((pointer.y - rect.bottom() + CONTENT_PADDING) / LINE_HEIGHT)
+                    .ceil()
+                    .max(1.0) as usize;
+                scrollback.saturating_sub(rows)
+            } else {
+                scrollback
+            };
+            screen.set_scrollback(target);
+            if screen.scrollback() != scrollback {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+            let position = cell_at(pointer, rect, cell_width, size, screen);
+            if let Some(selection) = &mut self.selection {
+                selection.cursor = position;
+            }
         } else if response.clicked()
             && self
                 .selection
@@ -846,6 +910,12 @@ impl TerminalSession {
                 CURSOR_BLINK_INTERVAL - elapsed.rem_euclid(CURSOR_BLINK_INTERVAL),
             ));
         }
+        let visible_buffer_start = if self.selection.is_some() {
+            let screen = self.parser.screen_mut();
+            history_len(screen).saturating_sub(screen.scrollback())
+        } else {
+            0
+        };
         let screen = self.parser.screen();
         let cursor_visible = focused
             && (((time - self.cursor_blink_started).max(0.0) / CURSOR_BLINK_INTERVAL) as u64)
@@ -871,10 +941,12 @@ impl TerminalSession {
                         foreground = theme::surface().editor;
                     }
                 }
-                if self
-                    .selection
-                    .is_some_and(|selection| selection.contains(CellPosition { row, col }))
-                {
+                if self.selection.is_some_and(|selection| {
+                    selection.contains(CellPosition {
+                        row: visible_buffer_start + usize::from(row),
+                        col,
+                    })
+                }) {
                     background = theme::editor::selection();
                 }
                 if cursor == Some((row, col)) {
@@ -937,7 +1009,7 @@ impl TerminalSession {
                 }
                 Event::Copy if modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift) => {
                     if let Some(selection) = self.selection {
-                        let text = selection.text(self.parser.screen());
+                        let text = selection.text(self.parser.screen_mut());
                         if !text.is_empty() {
                             ui.ctx().copy_text(text);
                         }
@@ -994,15 +1066,28 @@ fn cell_at(
     rect: egui::Rect,
     cell_width: f32,
     (rows, cols): (u16, u16),
+    screen: &mut vt100::Screen,
 ) -> CellPosition {
+    let history_len = history_len(screen);
     CellPosition {
-        row: ((pointer.y - rect.top() - CONTENT_PADDING) / LINE_HEIGHT)
-            .floor()
-            .clamp(0.0, f32::from(rows.saturating_sub(1))) as u16,
+        row: history_len.saturating_sub(screen.scrollback())
+            + usize::from(
+                ((pointer.y - rect.top() - CONTENT_PADDING) / LINE_HEIGHT)
+                    .floor()
+                    .clamp(0.0, f32::from(rows.saturating_sub(1))) as u16,
+            ),
         col: ((pointer.x - rect.left() - CONTENT_PADDING) / cell_width.max(1.0))
             .floor()
             .clamp(0.0, f32::from(cols.saturating_sub(1))) as u16,
     }
+}
+
+fn history_len(screen: &mut vt100::Screen) -> usize {
+    let scrollback = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let len = screen.scrollback();
+    screen.set_scrollback(scrollback);
+    len
 }
 
 fn split_insert_preview(axis: SplitAxis, bounds: egui::Rect, center: egui::Pos2) -> egui::Rect {
@@ -1598,6 +1683,129 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn terminal_selection_stays_attached_to_content_while_scrolling() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        session.parser.screen_mut().set_size(4, 80);
+        session.size = (4, 80);
+        session.parser.process(
+            b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7",
+        );
+        session.selection = Some(TerminalSelection {
+            anchor: CellPosition { row: 5, col: 0 },
+            cursor: CellPosition { row: 5, col: 5 },
+        });
+        session.parser.screen_mut().set_scrollback(2);
+        let command = Modifiers {
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+
+        let output = context.run_ui(
+            egui::RawInput {
+                modifiers: command,
+                events: vec![egui::Event::Copy],
+                ..egui::RawInput::default()
+            },
+            |ui| session.handle_events(ui).unwrap(),
+        );
+
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "line 5")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dragging_selection_above_terminal_scrolls_into_history() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        session.parser.screen_mut().set_size(4, 80);
+        session.size = (4, 80);
+        session.parser.process(
+            b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7",
+        );
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 40.0),
+            egui::vec2(800.0, CONTENT_PADDING * 2.0 + 4.0 * LINE_HEIGHT),
+        );
+        let mut cell_width = 0.0;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            cell_width = ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        "M".into(),
+                        egui::FontId::monospace(FONT_SIZE),
+                        theme::text().primary,
+                    )
+                    .size()
+                    .x
+            });
+        });
+        let point = |row: f32, col: f32| {
+            egui::pos2(
+                rect.left() + CONTENT_PADDING + (col + 0.5) * cell_width,
+                rect.top() + CONTENT_PADDING + (row + 0.5) * LINE_HEIGHT,
+            )
+        };
+        let draw = |session: &mut TerminalSession, events| {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect.expand(40.0)),
+                    events,
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    session.show(ui, rect, false).unwrap();
+                },
+            );
+        };
+        let anchor = point(1.0, 5.0);
+        draw(
+            &mut session,
+            vec![
+                egui::Event::PointerMoved(anchor),
+                egui::Event::PointerButton {
+                    pos: anchor,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        draw(
+            &mut session,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                point(0.0, 0.0).x,
+                rect.top() - 4.0,
+            ))],
+        );
+
+        assert_eq!(
+            session
+                .selection
+                .map(|selection| selection.text(session.parser.screen_mut())),
+            Some("line 3\nline 4\nline 5".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn page_up_scrolls_terminal_history_outside_full_screen_programs() {
         let context = theme::test_context();
         let mut session = TerminalSession::spawn(
@@ -1629,6 +1837,45 @@ mod tests {
         );
 
         assert!(session.parser.screen().scrollback() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shrinking_terminal_keeps_hidden_rows_in_scrollback() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        let draw = |session: &mut TerminalSession, rows: u16| {
+            let rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, CONTENT_PADDING * 2.0 + f32::from(rows) * LINE_HEIGHT),
+            );
+            let _ = context.run_ui(egui::RawInput::default(), |ui| {
+                session.show(ui, rect, false).unwrap();
+            });
+        };
+        draw(&mut session, 10);
+        session
+            .parser
+            .process(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7\r\nline 8\r\nline 9");
+
+        draw(&mut session, 4);
+
+        assert_eq!(
+            session.parser.screen().contents(),
+            "line 6\nline 7\nline 8\nline 9"
+        );
+        session.parser.screen_mut().set_scrollback(6);
+        assert_eq!(
+            session.parser.screen().contents(),
+            "line 0\nline 1\nline 2\nline 3"
+        );
     }
 
     #[cfg(unix)]
@@ -1697,7 +1944,7 @@ mod tests {
         assert_eq!(
             session
                 .selection
-                .map(|selection| selection.text(session.parser.screen())),
+                .map(|selection| selection.text(session.parser.screen_mut())),
             Some("alpha".into())
         );
     }

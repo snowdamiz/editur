@@ -427,7 +427,13 @@ impl EditorSurface {
         } else {
             f32::INFINITY
         };
-        self.sync_lines(highlighted, document.revision, wrap_width, advance);
+        self.sync_lines(
+            highlighted,
+            document.revision,
+            wrap_width,
+            advance,
+            ui.pixels_per_point(),
+        );
         self.clamp_selection(document.character_len);
         let cursor_before_input = self.cursor;
 
@@ -631,9 +637,10 @@ impl EditorSurface {
         revision: u64,
         wrap_width: f32,
         advance: f32,
+        pixels_per_point: f32,
     ) {
         let width = wrap_width.round().to_bits();
-        let appearance = theme::appearance();
+        let appearance = theme::paint_appearance(pixels_per_point);
         if self.appearance != appearance {
             // Font size, line height, and palette are all baked into a galley.
             self.appearance = appearance;
@@ -1654,14 +1661,14 @@ mod tests {
             400.0,
         );
         let mut editor = EditorSurface::default();
-        editor.sync_lines(&job, 1, 400.0, 8.0);
+        editor.sync_lines(&job, 1, 400.0, 8.0, 1.0);
         let allocations = editor
             .lines
             .iter()
             .map(|line| line.job.text.as_ptr())
             .collect::<Vec<_>>();
 
-        editor.sync_lines(&job, 1, 800.0, 8.0);
+        editor.sync_lines(&job, 1, 800.0, 8.0, 1.0);
 
         assert_eq!(
             allocations,

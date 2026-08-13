@@ -235,6 +235,8 @@ Use the sidebar icon at the right of the titlebar to open an ACP coding agent fo
 
 The shared Agent UI supports streamed replies, plans, tool activity and supplied diffs, follow-ups, advertised model/mode controls, ACP image, audio, and resource attachments, exact permission choices, cancellation, reconnect, and bounded in-memory transcripts. History and provider-specific permission controls appear only when the connected agent advertises them. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
+The full Agent view organizes recent project roots as workspaces, including Git worktrees opened as folders. Selecting a workspace switches the agent working directory; ACP history is requested and filtered by that exact root, so each workspace shows only its own sessions. Git workspaces show their current branch. When the optional `gh` CLI is available on Editur's inherited `PATH` and authenticated, the current branch also shows its pull request state; Editur refreshes it after agent turns and silently omits it when GitHub status is unavailable.
+
 Official release builds embed one attested provider bundle. Cursor `2026.07.23-e383d2b` is provisioned during installation. Codex uses the canonical `@agentclientprotocol/codex-acp` `1.1.14` adapter, its locked `@openai/codex` `0.147.0` dependency, and a private Node.js `22.22.0` runtime; it is downloaded lazily only after its first-use license and provider-terms notice is accepted. Editur never invokes `npx`, a global Node installation, or a mutable package tag. Claude remains an unavailable catalog entry until its canonical distribution and licensing can meet the same pinned private-package policy.
 
 To run the Cursor-only local development flow, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`. A plain `cargo run` intentionally omits provider metadata.
@@ -243,7 +245,7 @@ Authentication is owned by the selected agent. Editur renders agent-launched log
 
 Prompts, relevant project code, tool results, and conversation context may be sent to the selected provider and its model providers. Editur does not add telemetry or persist the transcript. Review [Cursor's data-use policy](https://cursor.com/data-use) or [OpenAI's data controls](https://platform.openai.com/docs/guides/your-data), use provider ignore controls where available, and do not submit regulated or third-party data unless your agreements permit it.
 
-Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
 
 ## Language servers
 

@@ -27,6 +27,7 @@ impl AgentFindGalley {
 
 #[derive(Clone, Default)]
 struct AgentMarkdownCache {
+    appearance: u64,
     source: String,
     galleys: Vec<(u32, Arc<egui::Galley>)>,
     find: Option<AgentFindGalley>,
@@ -34,6 +35,7 @@ struct AgentMarkdownCache {
 
 #[derive(Clone, Default)]
 struct AgentCodeCache {
+    appearance: u64,
     source: String,
     path: PathBuf,
     galleys: Vec<(u32, Arc<egui::Galley>)>,
@@ -157,6 +159,15 @@ pub(super) fn agent_code_galley(
     syntaxes: &SyntaxManager,
     search: Option<(&str, Option<usize>)>,
 ) -> Arc<egui::Galley> {
+    let appearance = theme::paint_appearance(ui.pixels_per_point());
+    ui.data_mut(|data| {
+        let cache = data.get_temp_mut_or_default::<AgentCodeCache>(id);
+        if cache.appearance != appearance {
+            cache.appearance = appearance;
+            cache.galleys.clear();
+            cache.find = None;
+        }
+    });
     let width_key = width.round().to_bits();
     if let Some((query, active)) = search {
         let active = active.unwrap_or(usize::MAX);
@@ -252,6 +263,15 @@ pub(super) fn agent_markdown_galley(
     bright: bool,
     search: Option<(&str, Option<usize>)>,
 ) -> Arc<egui::Galley> {
+    let appearance = theme::paint_appearance(ui.pixels_per_point());
+    ui.data_mut(|data| {
+        let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
+        if cache.appearance != appearance {
+            cache.appearance = appearance;
+            cache.galleys.clear();
+            cache.find = None;
+        }
+    });
     let width_key = width.round().to_bits();
     if let Some((query, active)) = search {
         let active = active.unwrap_or(usize::MAX);

@@ -48,6 +48,13 @@ pub(crate) fn appearance() -> u64 {
     hasher.finish()
 }
 
+/// Everything baked into a laid-out galley or tessellated retained mesh.
+/// Egui recreates its font atlas when the physical pixel scale changes, so
+/// cached text must move revisions even when the palette and font sizes do not.
+pub(crate) fn paint_appearance(pixels_per_point: f32) -> u64 {
+    appearance() ^ u64::from(pixels_per_point.to_bits()).rotate_left(17)
+}
+
 #[cfg(test)]
 pub(crate) fn test_context() -> Context {
     let context = Context::default();

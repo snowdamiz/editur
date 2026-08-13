@@ -334,6 +334,10 @@ impl EditorApp {
     }
 
     pub(super) fn refresh_after_agent(&mut self, provider: ProviderId) {
+        if provider == self.selected_provider {
+            self.git_workspace_status_started = false;
+            self.git_workspace_status_rx = None;
+        }
         let changed = if provider == self.selected_provider {
             std::mem::take(&mut self.agent.refresh_queue)
         } else {
@@ -956,7 +960,7 @@ impl EditorApp {
                     let dense_agent = self.settings.appearance.dense_agent;
                     let heights_key = (
                         transcript_width.round().to_bits(),
-                        theme::appearance(),
+                        theme::paint_appearance(ui.pixels_per_point()),
                         dense_agent,
                         self.agent.active,
                     );
