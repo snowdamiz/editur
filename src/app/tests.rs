@@ -10558,6 +10558,61 @@ fn terminal_focus_leaves_paste_events_for_the_terminal_surface() {
     assert!(paste_reaches_terminal);
 }
 
+#[cfg(unix)]
+#[test]
+fn terminal_focus_leaves_tab_for_shell_completion_even_with_a_stale_editor_popup() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("current.txt");
+    fs::write(&file, "pri").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: Some(file.clone()),
+        create: false,
+    })
+    .unwrap();
+    let context = theme::test_context();
+    app.terminal.open(&app.tree.root, &context).unwrap();
+    app.terminal_open = true;
+    context.memory_mut(|memory| {
+        memory.request_focus(Id::new(("terminal_surface", 1_u64)));
+    });
+    app.lsp_completion = Some(CompletionPopup {
+        tag: RequestTag {
+            path: file,
+            revision: 0,
+            cursor: 3,
+        },
+        items: vec![CompletionItem {
+            label: "print".into(),
+            kind: None,
+            detail: None,
+            insert_text: "print".into(),
+            edit: None,
+        }],
+        selected: 0,
+        anchor: Rect::NOTHING,
+        bounds: Rect::EVERYTHING,
+    });
+    let tab = Event::Key {
+        key: Key::Tab,
+        physical_key: Some(Key::Tab),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![tab.clone()],
+            ..RawInput::default()
+        },
+        |_root| {
+            app.shortcuts(&context);
+            assert!(context.input(|input| input.events.contains(&tab)));
+        },
+    );
+}
+
 #[test]
 fn vim_operator_scope_updates_between_events_in_one_frame() {
     let temp = tempfile::tempdir().unwrap();

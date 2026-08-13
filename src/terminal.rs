@@ -918,6 +918,23 @@ impl TerminalSession {
         let modifiers = ui.input(|input| input.modifiers);
         for event in ui.input(|input| input.events.clone()) {
             let bytes = match event {
+                Event::Key {
+                    key: key @ (Key::PageUp | Key::PageDown),
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers == Modifiers::NONE && !self.parser.screen().alternate_screen() => {
+                    let screen = self.parser.screen_mut();
+                    let page = usize::from(self.size.0);
+                    let target = if key == Key::PageUp {
+                        screen.scrollback().saturating_add(page)
+                    } else {
+                        screen.scrollback().saturating_sub(page)
+                    };
+                    screen.set_scrollback(target);
+                    ui.ctx().request_repaint();
+                    Vec::new()
+                }
                 Event::Copy if modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift) => {
                     if let Some(selection) = self.selection {
                         let text = selection.text(self.parser.screen());
@@ -1081,6 +1098,7 @@ fn key_sequence(key: Key, modifiers: Modifiers, application_cursor: bool) -> Opt
 
 fn control_byte(key: Key) -> Option<u8> {
     Some(match key {
+        Key::Space => 0,
         Key::A => 1,
         Key::B => 2,
         Key::C => 3,
@@ -1153,11 +1171,12 @@ mod tests {
     #[cfg(unix)]
     use crate::theme;
 
-    use super::{
-        CONTENT_PADDING, CellPosition, FONT_SIZE, LINE_HEIGHT, TerminalSelection, key_sequence,
-    };
+    use super::key_sequence;
     #[cfg(unix)]
-    use super::{TerminalPanel, TerminalSession};
+    use super::{
+        CONTENT_PADDING, CellPosition, FONT_SIZE, LINE_HEIGHT, TerminalPanel, TerminalSelection,
+        TerminalSession,
+    };
 
     #[cfg(unix)]
     fn painted_cursor_count(output: &egui::FullOutput) -> usize {
@@ -1439,6 +1458,14 @@ mod tests {
     }
 
     #[test]
+    fn control_space_sends_the_shell_completion_fallback() {
+        assert_eq!(
+            key_sequence(Key::Space, Modifiers::CTRL, false),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
     fn mac_command_backspace_deletes_to_the_prompt_start() {
         let modifiers = Modifiers {
             mac_cmd: true,
@@ -1567,6 +1594,41 @@ mod tests {
         assert!(output.platform_output.commands.iter().any(|command| {
             matches!(command, egui::OutputCommand::CopyText(text) if text == "one\nsecond")
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_up_scrolls_terminal_history_outside_full_screen_programs() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        for line in 0..80 {
+            session
+                .parser
+                .process(format!("line {line}\r\n").as_bytes());
+        }
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::PageUp,
+                    physical_key: Some(Key::PageUp),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| session.handle_events(ui).unwrap(),
+        );
+
+        assert!(session.parser.screen().scrollback() > 0);
     }
 
     #[cfg(unix)]

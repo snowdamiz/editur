@@ -2,6 +2,7 @@ use std::{fs, path::Path, time::Duration, time::Instant};
 
 use winit::event_loop::ActiveEventLoop;
 
+#[cfg(target_os = "macos")]
 use super::TITLEBAR_HEIGHT;
 
 pub(super) const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(50);

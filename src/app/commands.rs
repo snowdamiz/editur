@@ -24,7 +24,7 @@ impl EditorApp {
         {
             return;
         }
-        if self.handle_lsp_popup_keys(ctx) {
+        if !self.terminal.focused(ctx) && self.handle_lsp_popup_keys(ctx) {
             return;
         }
         let save_quit = ctx.input(|input| {
