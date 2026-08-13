@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::mpsc::{self, Receiver},
+    time::Duration,
 };
 
 use egui::{
@@ -23,6 +24,7 @@ const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT: f32 = 18.0;
 const CONTENT_PADDING: f32 = 8.0;
 const SCROLLBACK_ROWS: usize = 2_000;
+const CURSOR_BLINK_INTERVAL: f64 = 0.5;
 
 pub(crate) struct TerminalPanel {
     sessions: Vec<TerminalSession>,
@@ -55,6 +57,8 @@ struct TerminalSession {
     exit_reported: bool,
     selection: Option<TerminalSelection>,
     selecting: bool,
+    cursor_blink_started: f64,
+    cursor_was_focused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -704,6 +708,8 @@ impl TerminalSession {
             exit_reported: false,
             selection: None,
             selecting: false,
+            cursor_blink_started: 0.0,
+            cursor_was_focused: false,
         })
     }
 
@@ -828,9 +834,24 @@ impl TerminalSession {
             self.handle_events(ui)?;
         }
 
+        let focused = response.has_focus();
+        let time = ui.input(|input| input.time);
+        if focused && !self.cursor_was_focused {
+            self.cursor_blink_started = time;
+        }
+        self.cursor_was_focused = focused;
+        if focused {
+            let elapsed = (time - self.cursor_blink_started).max(0.0);
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(
+                CURSOR_BLINK_INTERVAL - elapsed.rem_euclid(CURSOR_BLINK_INTERVAL),
+            ));
+        }
         let screen = self.parser.screen();
-        let cursor =
-            (screen.scrollback() == 0 && !screen.hide_cursor()).then(|| screen.cursor_position());
+        let cursor_visible = focused
+            && (((time - self.cursor_blink_started).max(0.0) / CURSOR_BLINK_INTERVAL) as u64)
+                .is_multiple_of(2);
+        let cursor = (cursor_visible && screen.scrollback() == 0 && !screen.hide_cursor())
+            .then(|| screen.cursor_position());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::surface().editor);
         for row in 0..rows {
@@ -1139,6 +1160,20 @@ mod tests {
     use super::{TerminalPanel, TerminalSession};
 
     #[cfg(unix)]
+    fn painted_cursor_count(output: &egui::FullOutput) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(&text.galley.job.sections),
+                _ => None,
+            })
+            .flatten()
+            .filter(|section| section.format.background == theme::accent())
+            .count()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn terminal_tabs_can_be_reordered() {
         let ctx = theme::test_context();
@@ -1282,6 +1317,64 @@ mod tests {
                 egui::Shape::Rect(rect) if rect.stroke.color == theme::border::focus_color()
             )
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_focused_terminal_pane_paints_a_typing_cursor() {
+        let ctx = theme::test_context();
+        let mut panel = TerminalPanel::default();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.add(Path::new("."), &ctx).unwrap();
+        panel.drop_tab(1, PaneId(0), DropZone::Right);
+
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                panel.show(ui, ui.max_rect(), Path::new("."));
+            },
+        );
+        assert_eq!(painted_cursor_count(&output), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_terminal_cursor_blinks() {
+        let context = theme::test_context();
+        let mut session = TerminalSession::spawn(
+            1,
+            "Terminal 1".into(),
+            PaneId(0),
+            CommandBuilder::new("/bin/cat"),
+            &context,
+        )
+        .unwrap();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let draw = |session: &mut TerminalSession, time, request_focus| {
+            context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(time),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    session.show(ui, rect, request_focus).unwrap();
+                },
+            )
+        };
+        let visible = draw(&mut session, 0.0, true);
+        let hidden = draw(&mut session, 0.6, false);
+        let visible_again = draw(&mut session, 1.1, false);
+
+        assert_eq!(painted_cursor_count(&visible), 1);
+        assert_eq!(painted_cursor_count(&hidden), 0);
+        assert_eq!(painted_cursor_count(&visible_again), 1);
     }
 
     #[cfg(unix)]

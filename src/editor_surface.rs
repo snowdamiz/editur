@@ -10,7 +10,7 @@ use crate::{keybindings::Command, renderer::mark_retained, theme};
 
 const TEXT_LEFT_PADDING: f32 = 8.0;
 const TEXT_TOP_PADDING: f32 = 6.0;
-const CARET_BLINK_INTERVAL: f64 = 0.7;
+const CARET_BLINK_INTERVAL: f64 = 0.5;
 /// One tab stop, in characters. Indent guides land on these.
 const INDENT_WIDTH: usize = 4;
 /// A wrapped continuation is pushed past its own indent by this much, so the
@@ -2259,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_caret_blinks_on_a_slow_cadence() {
+    fn focused_caret_blinks_on_a_quick_cadence() {
         let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
@@ -2277,10 +2277,10 @@ mod tests {
         let first = context.run_ui(input(0.0), |ui| {
             editor.show(ui, &mut text, &job, 1, true, None);
         });
-        let hidden = context.run_ui(input(0.8), |ui| {
+        let hidden = context.run_ui(input(0.55), |ui| {
             editor.show(ui, &mut text, &job, 1, false, None);
         });
-        let visible_again = context.run_ui(input(1.5), |ui| {
+        let visible_again = context.run_ui(input(1.05), |ui| {
             editor.show(ui, &mut text, &job, 1, false, None);
         });
 
