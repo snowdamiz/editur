@@ -5245,7 +5245,7 @@ fn sidebar_empty_state_is_centered_in_the_available_transcript() {
 fn agentic_composer_is_darker_than_the_agent_canvas() {
     assert_eq!(
         super::agentic_composer_fill(),
-        theme::mix(theme::surface().editor, theme::surface().input, 0.5)
+        theme::mix(theme::surface().editor, theme::surface().input, 0.7)
     );
 }
 

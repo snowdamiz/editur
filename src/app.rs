@@ -6149,7 +6149,7 @@ fn agent_send_button_colors(ready: bool) -> (Color32, Color32) {
 
 /// The floating composer sits just below the editor canvas in the surface stack.
 fn agentic_composer_fill() -> Color32 {
-    theme::mix(theme::surface().editor, theme::surface().input, 0.5)
+    theme::mix(theme::surface().editor, theme::surface().input, 0.7)
 }
 
 /// Send and stop: one solid 32 px control, filled by state rather than drawn
