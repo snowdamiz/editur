@@ -347,7 +347,6 @@ const AGENT_PROVIDER_ROW_HEIGHT: f32 = 44.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_MENTION_ROW_HEIGHT: f32 = 32.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
-const AGENT_FOLLOW_THRESHOLD: f32 = 48.0;
 const AGENT_TRANSCRIPT_TOP_PADDING: i8 = 14;
 const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
@@ -388,8 +387,8 @@ const WORKSPACE_MIN_HEIGHT: f32 = 160.0;
 const TITLEBAR_PAINT_KEY: u64 = 0xa000_0000_0000_0000;
 const TAB_DRAG_GHOST_PAINT_KEY: u64 = 0xb000_0000_0000_0000;
 
-fn agent_near_bottom(offset: f32, max_offset: f32) -> bool {
-    max_offset - offset <= AGENT_FOLLOW_THRESHOLD
+fn agent_at_bottom(offset: f32, max_offset: f32) -> bool {
+    (max_offset - offset).abs() <= 0.5
 }
 
 fn draw_agent_content(
@@ -1946,17 +1945,45 @@ fn draw_agent_changed_files(
             let mut search_offset = 0;
             for (path, stats) in rows {
                 let (added, removed) = (stats.added, stats.removed);
+                let deleted = if path.is_absolute() {
+                    !path.is_file()
+                } else {
+                    !root.join(path).is_file()
+                };
                 let (row, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), theme::control::ROW),
-                    Sense::click(),
+                    if deleted {
+                        Sense::hover()
+                    } else {
+                        Sense::click()
+                    },
                 );
-                let response = response
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(format!("Open diff for {}", path.display()));
-                if response.clicked() {
+                let response = if deleted {
+                    response.on_hover_text(format!("{} was deleted", path.display()))
+                } else {
+                    response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!("Open diff for {}", path.display()))
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        if deleted {
+                            egui::WidgetType::Label
+                        } else {
+                            egui::WidgetType::Button
+                        },
+                        ui.is_enabled(),
+                        if deleted {
+                            format!("{} — Deleted", path.display())
+                        } else {
+                            format!("Open diff for {}", path.display())
+                        },
+                    )
+                });
+                if !deleted && response.clicked() {
                     clicked = Some(path.clone());
                 }
-                if response.hovered() {
+                if !deleted && response.hovered() {
                     ui.painter().rect_filled(
                         row,
                         theme::corner(theme::radius::ROW),
@@ -1967,7 +1994,16 @@ fn draw_agent_changed_files(
                     egui::pos2(row.left() + 12.0, row.center().y),
                     egui::Vec2::splat(icons::GRID),
                 );
-                icons::paint(ui.painter(), Icon::File, icon, theme::text().muted);
+                icons::paint(
+                    ui.painter(),
+                    Icon::File,
+                    icon,
+                    if deleted {
+                        theme::ink(theme::semantic().danger)
+                    } else {
+                        theme::text().muted
+                    },
+                );
                 let mut counts_left = row.right() - theme::space::SNUG;
                 if added > 0 || removed > 0 {
                     let removed_galley = ui.painter().layout_no_wrap(
@@ -2008,10 +2044,25 @@ fn draw_agent_changed_files(
                     0.0,
                     TextFormat {
                         font_id: theme::typography::small(),
-                        color: theme::text().primary,
+                        color: if deleted {
+                            theme::text().muted
+                        } else {
+                            theme::text().primary
+                        },
                         ..TextFormat::default()
                     },
                 );
+                if deleted {
+                    job.append(
+                        "Deleted",
+                        theme::space::SMALL,
+                        TextFormat {
+                            font_id: theme::typography::micro(),
+                            color: theme::ink(theme::semantic().danger),
+                            ..TextFormat::default()
+                        },
+                    );
+                }
                 if let Some(directory) = directory {
                     job.append(
                         &directory,
@@ -3245,6 +3296,149 @@ fn tab_width(ui: &egui::Ui, label: &str) -> f32 {
         .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
 }
 
+fn draw_agentic_diff_tabs(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    tabs: &[AgenticDiff],
+    active: usize,
+) -> (Option<usize>, Option<usize>) {
+    let mut selected = None;
+    let mut closed = None;
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt("agentic_diff_tabs")
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.set_clip_rect(rect);
+            ScrollArea::horizontal()
+                .id_salt("agentic_diff_tabs_scroll")
+                .max_width(rect.width())
+                .max_height(rect.height())
+                .auto_shrink([false, false])
+                .content_margin(egui::Margin::ZERO)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                    for (index, panel) in tabs.iter().enumerate() {
+                        let label = panel
+                            .path
+                            .file_name()
+                            .unwrap_or(panel.path.as_os_str())
+                            .to_string_lossy();
+                        let (_, tab) = ui.allocate_space(egui::vec2(
+                            tab_width(ui, label.as_ref()),
+                            rect.height(),
+                        ));
+                        let is_active = index == active;
+                        let response = ui
+                            .interact(
+                                tab,
+                                Id::new(("agentic_diff_tab", &panel.path)),
+                                Sense::click(),
+                            )
+                            .on_hover_text(panel.path.display().to_string());
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::SelectableLabel,
+                                ui.is_enabled(),
+                                is_active,
+                                label.as_ref(),
+                            )
+                        });
+                        if is_active || response.hovered() {
+                            ui.painter().rect_filled(
+                                tab,
+                                0.0,
+                                if is_active {
+                                    theme::surface().input
+                                } else {
+                                    theme::state::hover()
+                                },
+                            );
+                        }
+                        if !is_active && index + 1 < tabs.len() && active != index + 1 {
+                            ui.painter().vline(
+                                tab.right() - 0.5,
+                                tab.y_range().shrink(theme::space::SNUG),
+                                theme::border::hairline(),
+                            );
+                        }
+                        let close_rect = egui::Rect::from_center_size(
+                            egui::pos2(tab.right() - theme::space::LARGE, tab.center().y),
+                            egui::Vec2::splat(TAB_CLOSE),
+                        );
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(tab.left() + theme::space::MEDIUM, tab.top()),
+                            egui::pos2(close_rect.left() - theme::space::SMALL, tab.bottom()),
+                        );
+                        let color = if is_active {
+                            theme::text().primary
+                        } else {
+                            theme::text().muted
+                        };
+                        let galley = egui::WidgetText::from(
+                            RichText::new(label.as_ref())
+                                .font(if is_active {
+                                    theme::typography::strong()
+                                } else {
+                                    theme::typography::small()
+                                })
+                                .color(color),
+                        )
+                        .into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Truncate),
+                            text_rect.width(),
+                            egui::FontSelection::Default,
+                        );
+                        ui.painter().galley(
+                            egui::pos2(
+                                text_rect.left(),
+                                text_rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            color,
+                        );
+                        let close = ui
+                            .interact(
+                                close_rect,
+                                Id::new(("agentic_diff_tab_close", &panel.path)),
+                                Sense::click(),
+                            )
+                            .on_hover_text(format!("Close {label}"));
+                        close.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                format!("Close {label}"),
+                            )
+                        });
+                        if is_active || response.hovered() || close.hovered() {
+                            icons::paint_button(
+                                ui.painter(),
+                                Icon::Close,
+                                close_rect,
+                                &close,
+                                ui.is_enabled(),
+                                theme::text().secondary,
+                            );
+                        }
+                        if close.clicked() {
+                            closed = Some(index);
+                        } else if response.clicked() {
+                            selected = Some(index);
+                        }
+                        if is_active {
+                            response.scroll_to_me(Some(Align::Center));
+                        }
+                    }
+                });
+        },
+    );
+    (selected, closed)
+}
+
 fn drag_label(path: &Path) -> Cow<'_, str> {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -4215,10 +4409,9 @@ impl Default for PaneFind {
     }
 }
 
-/// A changed-file diff opened from the agentic transcript, rendered as a
-/// right-hand panel beside the conversation (agentic mode shows no editor
-/// panes). Self-contained so it stays renderable across session changes; the
-/// current text is re-read from disk while the agent keeps editing the file.
+/// One changed-file tab in the agentic diff panel. Self-contained so it stays
+/// renderable across session changes; the current text is re-read from disk
+/// while the agent keeps editing the file.
 struct AgenticDiff {
     path: PathBuf,
     baseline: Option<String>,
@@ -4947,7 +5140,8 @@ pub struct EditorApp {
     terminal_dragging: bool,
     terminal: TerminalPanel,
     agentic_mode: bool,
-    agentic_diff: Option<AgenticDiff>,
+    agentic_diffs: Vec<AgenticDiff>,
+    active_agentic_diff: usize,
     agent_sidebar: bool,
     agent_sidebar_width: f32,
     agent_sidebar_dragging: bool,
@@ -5108,6 +5302,21 @@ fn settings_navigation_row(
         },
     );
     response
+}
+
+fn settings_ui_scale_slider(ui: &mut egui::Ui, value: &mut u16) -> (egui::Response, bool) {
+    ui.spacing_mut().slider_width = 190.0;
+    let mut preview = *value;
+    let response = ui.add(
+        egui::Slider::new(&mut preview, UI_SCALE_MIN_PERCENT..=UI_SCALE_MAX_PERCENT)
+            .step_by(f64::from(UI_SCALE_STEP_PERCENT))
+            .suffix("%"),
+    );
+    let changed = preview != *value && !response.is_pointer_button_down_on();
+    if changed {
+        *value = preview;
+    }
+    (response, changed)
 }
 
 /// The consistent header every settings page opens with: title, a one-line
@@ -5549,7 +5758,8 @@ impl EditorApp {
             terminal_dragging: false,
             terminal: TerminalPanel::default(),
             agentic_mode: false,
-            agentic_diff: None,
+            agentic_diffs: Vec::new(),
+            active_agentic_diff: 0,
             agent_sidebar: false,
             agent_sidebar_width: 440.0,
             agent_sidebar_dragging: false,
@@ -6410,7 +6620,7 @@ impl EditorApp {
         self.update_terminal_resize(root.ctx(), agent_column);
         let (content, terminal) =
             split_bottom_panel(agent_column, self.terminal_open, self.terminal_height);
-        let (agent, diff_panel) = split_agentic_diff(content, self.agentic_diff.is_some());
+        let (agent, diff_panel) = split_agentic_diff(content, !self.agentic_diffs.is_empty());
         if let Some(sessions) = sessions {
             root.scope_builder(
                 UiBuilder::new()
@@ -6428,7 +6638,8 @@ impl EditorApp {
             },
         );
         if let Some(rect) = diff_panel {
-            let mut dismissed = false;
+            let mut selected_tab = None;
+            let mut closed_tab = None;
             root.scope_builder(
                 UiBuilder::new()
                     .id_salt("agentic_diff_panel")
@@ -6437,18 +6648,14 @@ impl EditorApp {
                     ui.painter()
                         .rect_filled(ui.max_rect(), 0.0, theme::surface().input);
                     let panel = self
-                        .agentic_diff
-                        .as_ref()
+                        .agentic_diffs
+                        .get(self.active_agentic_diff)
                         .expect("the panel rect exists only while a diff is open");
-                    let diff = cached_agent_diff(
-                        ui,
-                        Id::new("agentic_diff"),
-                        panel.baseline.as_deref(),
-                        &panel.text,
-                    );
-                    // The file header shares the titlebar strip with the
-                    // session title, so both columns wear one continuous
-                    // header instead of the panel hanging its own below.
+                    let diff_id = Id::new(("agentic_diff", &panel.path));
+                    let diff =
+                        cached_agent_diff(ui, diff_id, panel.baseline.as_deref(), &panel.text);
+                    // Diff tabs share the titlebar strip with the session
+                    // title, so both columns wear one continuous header.
                     let strip = rect.with_max_y((rect.top() + TITLEBAR_HEIGHT).min(rect.bottom()));
                     ui.painter()
                         .rect_filled(strip, 0.0, theme::surface().chrome);
@@ -6463,22 +6670,42 @@ impl EditorApp {
                     let header_right = strip.right() - 14.0;
                     #[cfg(not(target_os = "macos"))]
                     let header_right = strip.right() - 3.0 * 46.0;
+                    let header = egui::Rect::from_min_max(
+                        strip.left_top(),
+                        egui::pos2(header_right, strip.bottom()),
+                    );
+                    let summary_width = 160.0_f32.min((header.width() - TAB_MIN_WIDTH).max(0.0));
+                    let tabs = header.with_max_x(header.right() - summary_width);
+                    let summary = header
+                        .with_min_x(tabs.right())
+                        .shrink2(egui::vec2(theme::space::MEDIUM, 0.0));
+                    (selected_tab, closed_tab) = draw_agentic_diff_tabs(
+                        ui,
+                        tabs,
+                        &self.agentic_diffs,
+                        self.active_agentic_diff,
+                    );
                     ui.scope_builder(
                         UiBuilder::new()
-                            .id_salt("agentic_diff_header")
-                            .max_rect(egui::Rect::from_min_max(
-                                egui::pos2(strip.left() + 14.0, strip.top()),
-                                egui::pos2(header_right, strip.bottom()),
-                            ))
-                            .layout(Layout::left_to_right(Align::Center)),
+                            .id_salt("agentic_diff_summary")
+                            .max_rect(summary)
+                            .layout(Layout::right_to_left(Align::Center)),
                         |ui| {
-                            dismissed = agent_diff_view_header(
-                                ui,
-                                &self.tree.root,
-                                &panel.path,
-                                &diff,
-                                panel.baseline.is_some(),
-                                "Close",
+                            ui.label(
+                                RichText::new(format!("+{}  −{}", diff.added, diff.removed))
+                                    .monospace()
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(theme::text().muted),
+                            );
+                            ui.label(
+                                RichText::new(if panel.baseline.is_some() {
+                                    "MODIFIED"
+                                } else {
+                                    "NEW FILE"
+                                })
+                                .size(theme::typography::MICRO_SIZE)
+                                .strong()
+                                .color(theme::accent()),
                             );
                         },
                     );
@@ -6489,7 +6716,7 @@ impl EditorApp {
                         |ui| {
                             draw_agent_diff_body(
                                 ui,
-                                Id::new("agentic_diff"),
+                                diff_id,
                                 &panel.path,
                                 &diff,
                                 panel.baseline.as_deref(),
@@ -6506,8 +6733,18 @@ impl EditorApp {
                 rect.y_range(),
                 egui::Stroke::new(1.0, theme::border::hairline_color()),
             );
-            if dismissed {
-                self.agentic_diff = None;
+            if let Some(index) = closed_tab {
+                self.agentic_diffs.remove(index);
+                if self.agentic_diffs.is_empty() {
+                    self.active_agentic_diff = 0;
+                } else if self.active_agentic_diff > index {
+                    self.active_agentic_diff -= 1;
+                } else {
+                    self.active_agentic_diff =
+                        self.active_agentic_diff.min(self.agentic_diffs.len() - 1);
+                }
+            } else if let Some(index) = selected_tab {
+                self.active_agentic_diff = index;
             }
         }
         if let Some(terminal) = terminal {
@@ -6715,8 +6952,8 @@ impl EditorApp {
             ),
             egui::pos2(agentic_button.left(), rect.bottom()),
         );
-        // The diff panel's file header owns its stretch of the strip, so the
-        // window drag region stops where the panel starts.
+        // The diff tabs own their stretch of the strip, so the window drag
+        // region stops where the panel starts.
         let drag_right = diff_left.map_or(controls_right, |left| controls_right.min(left));
         let drag_rect = egui::Rect::from_min_max(
             egui::pos2(
@@ -7882,39 +8119,42 @@ impl EditorApp {
                         .color(theme::text().muted),
                 );
                 ui.add_space(8.0);
-                if settings_navigation_row(
-                    ui,
-                    "settings_appearance",
-                    "Appearance",
-                    self.settings_section == SettingsSection::Appearance,
-                )
-                .clicked()
-                {
-                    self.settings_section = SettingsSection::Appearance;
-                    self.settings_search.clear();
-                }
-                if settings_navigation_row(
-                    ui,
-                    "settings_keybindings",
-                    "Keybindings",
-                    self.settings_section == SettingsSection::Keybindings,
-                )
-                .clicked()
-                {
-                    self.settings_section = SettingsSection::Keybindings;
-                    self.settings_search.clear();
-                }
-                if settings_navigation_row(
-                    ui,
-                    "settings_language_servers",
-                    "Language Servers",
-                    self.settings_section == SettingsSection::LanguageServers,
-                )
-                .clicked()
-                {
-                    self.settings_section = SettingsSection::LanguageServers;
-                    self.settings_search.clear();
-                }
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if settings_navigation_row(
+                        ui,
+                        "settings_appearance",
+                        "Appearance",
+                        self.settings_section == SettingsSection::Appearance,
+                    )
+                    .clicked()
+                    {
+                        self.settings_section = SettingsSection::Appearance;
+                        self.settings_search.clear();
+                    }
+                    if settings_navigation_row(
+                        ui,
+                        "settings_keybindings",
+                        "Keybindings",
+                        self.settings_section == SettingsSection::Keybindings,
+                    )
+                    .clicked()
+                    {
+                        self.settings_section = SettingsSection::Keybindings;
+                        self.settings_search.clear();
+                    }
+                    if settings_navigation_row(
+                        ui,
+                        "settings_language_servers",
+                        "Language Servers",
+                        self.settings_section == SettingsSection::LanguageServers,
+                    )
+                    .clicked()
+                    {
+                        self.settings_section = SettingsSection::LanguageServers;
+                        self.settings_search.clear();
+                    }
+                });
             },
         );
         root.scope_builder(
@@ -8074,17 +8314,9 @@ impl EditorApp {
                 "UI scale",
                 "Scales text, icons, spacing, panes, and hit targets together.",
                 |ui| {
-                    ui.spacing_mut().slider_width = 190.0;
-                    let before = appearance.ui_scale_percent;
-                    ui.add(
-                        egui::Slider::new(
-                            &mut appearance.ui_scale_percent,
-                            UI_SCALE_MIN_PERCENT..=UI_SCALE_MAX_PERCENT,
-                        )
-                        .step_by(f64::from(UI_SCALE_STEP_PERCENT))
-                        .suffix("%"),
-                    );
-                    dirty |= appearance.ui_scale_percent != before;
+                    let (_, changed) =
+                        settings_ui_scale_slider(ui, &mut appearance.ui_scale_percent);
+                    dirty |= changed;
                 },
             );
             ui.separator();
@@ -10197,11 +10429,7 @@ impl EditorApp {
         for (index, event) in events.iter().enumerate() {
             let scopes = self.active_keybinding_scopes(ctx);
             let (stroke, repeated, paste) = match event {
-                egui::Event::Copy => (
-                    InputStroke::new(Key::C, Some(Key::C), primary_modifiers()),
-                    false,
-                    None,
-                ),
+                egui::Event::Copy => continue,
                 egui::Event::Cut => (
                     InputStroke::new(Key::X, Some(Key::X), primary_modifiers()),
                     false,
@@ -11169,11 +11397,22 @@ impl EditorApp {
                     // file) the panel still shows the file; old == new
                     // renders every line as context.
                     let baseline = baseline.unwrap_or_else(|| Some(text.clone()));
-                    self.agentic_diff = Some(AgenticDiff {
+                    let panel = AgenticDiff {
                         path: absolute,
                         baseline,
                         text,
-                    });
+                    };
+                    if let Some(index) = self
+                        .agentic_diffs
+                        .iter()
+                        .position(|open| open.path == panel.path)
+                    {
+                        self.agentic_diffs[index] = panel;
+                        self.active_agentic_diff = index;
+                    } else {
+                        self.agentic_diffs.push(panel);
+                        self.active_agentic_diff = self.agentic_diffs.len() - 1;
+                    }
                 }
                 Err(error) => {
                     self.show_error(format!("Cannot open {}: {error}", absolute.display()));
@@ -11192,15 +11431,14 @@ impl EditorApp {
     }
 
     /// Keeps the agentic diff panel current while the agent continues to
-    /// edit the file it shows; the baseline side never moves.
+    /// edit open files; the baseline side never moves.
     fn refresh_agentic_diff(&mut self) {
-        let Some(panel) = &mut self.agentic_diff else {
-            return;
-        };
-        if let Ok(text) = fs::read_to_string(&panel.path)
-            && text != panel.text
-        {
-            panel.text = text;
+        for panel in &mut self.agentic_diffs {
+            if let Ok(text) = fs::read_to_string(&panel.path)
+                && text != panel.text
+            {
+                panel.text = text;
+            }
         }
     }
 
@@ -12263,7 +12501,6 @@ impl EditorApp {
                     } else {
                         0.0
                     };
-                    let manual_scroll = scroll_delta != 0.0;
                     let scrolling_up = scroll_delta > 0.0;
                     if scrolling_up {
                         self.agent_follow_transcript = false;
@@ -12309,7 +12546,7 @@ impl EditorApp {
                             left: 0,
                             right: 0,
                             top: AGENT_TRANSCRIPT_TOP_PADDING,
-                            bottom: 0,
+                            bottom: theme::space::LARGE as i8,
                         })
                         .stick_to_bottom(self.agent_follow_transcript)
                         .show(ui, |ui| {
@@ -13143,12 +13380,9 @@ impl EditorApp {
                     }
                     let max_offset =
                         (output.content_size.y - output.inner_rect.height()).max(0.0);
-                    let near_bottom = agent_near_bottom(output.state.offset.y, max_offset);
-                    let at_bottom = (max_offset - output.state.offset.y).abs() <= 0.5;
+                    let at_bottom = agent_at_bottom(output.state.offset.y, max_offset);
                     self.agent_follow_transcript = !scrolling_up
-                        && (self.agent_follow_transcript
-                            || at_bottom
-                            || (manual_scroll && near_bottom));
+                        && (self.agent_follow_transcript || at_bottom);
                     if self.agent_follow_transcript
                         && (output.state.offset.y - max_offset).abs() > 0.5
                     {
@@ -19051,24 +19285,25 @@ mod tests {
         PaneId, PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT,
         SettingsSection, TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH,
         TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState, UPDATE_BUTTON_SIZE,
-        WINDOW_CORNER_RADIUS, agent_collapsing_header, agent_composer_content,
+        WINDOW_CORNER_RADIUS, agent_at_bottom, agent_collapsing_header, agent_composer_content,
         agent_composer_height, agent_diff_preview, agent_markdown_galley, agent_mention_matches,
-        agent_mention_query, agent_menu_rect, agent_near_bottom, agent_new_session_rect,
-        agent_search_matches, agent_selector_button, agent_send_button_colors, agent_sessions_rect,
-        agent_toggle_rect, agentic_empty_state_top_padding, allowed_tab_drop_zone,
-        build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions,
-        completion_word_range, copy_tree_entry, defer_resize, diagnostic_highlighted_job,
-        disable_transient_egui_debug_overlays, draw_agent_diff, draw_editor_empty_state,
-        draw_provider_selector_identity, draw_sidebar_toggle_icon, draw_tab_drag_ghost,
-        editor_background, editor_column_content, file_result_job, find_highlighted_job,
-        install_repaint_wake, launch_in_current_process, match_bracket_pair, match_spans,
-        model_display_name, next_find_match, pane_header_and_content, plain_text_job,
+        agent_mention_query, agent_menu_rect, agent_new_session_rect, agent_search_matches,
+        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        agentic_empty_state_top_padding, allowed_tab_drop_zone, build_agent_diff,
+        cached_agent_diff, child_path, collect_agent_mentions, completion_word_range,
+        copy_tree_entry, defer_resize, diagnostic_highlighted_job,
+        disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
+        draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
+        draw_tab_drag_ghost, editor_background, editor_column_content, file_result_job,
+        find_highlighted_job, install_repaint_wake, launch_in_current_process, match_bracket_pair,
+        match_spans, model_display_name, next_find_match, pane_header_and_content, plain_text_job,
         presentation_job, project_chooser_ui, provider_selector_visible, repaint_deadline,
         repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
         search_group_header, search_needs_polling, search_selection_after_navigation,
-        should_show_project_chooser, skip_transition_render, slash_command_query,
-        split_agent_sidebar, split_agentic_diff, split_agentic_workspace, split_bottom_panel,
-        split_pane_content, split_workspace, stable_tab_drop_zone, tab_width, unique_copy_path,
+        settings_ui_scale_slider, should_show_project_chooser, skip_transition_render,
+        slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
+        split_bottom_panel, split_pane_content, split_workspace, stable_tab_drop_zone, tab_width,
+        unique_copy_path,
     };
 
     #[test]
@@ -19517,6 +19752,50 @@ mod tests {
                 .iter()
                 .all(|label| fills.iter().all(|(fill, _)| !fill.contains_rect(*label))),
             "navigation rows stay text, never chip-backed"
+        );
+    }
+
+    #[test]
+    fn settings_navigation_tabs_use_compact_vertical_rhythm() {
+        fn text_center(shape: &Shape, expected: &str) -> Option<f32> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(text.visual_bounding_rect().center().y)
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_center(shape, expected)),
+                _ => None,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.settings_open = true;
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let centers = ["Appearance", "Keybindings", "Language Servers"].map(|label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| text_center(&shape.shape, label))
+                .expect(label)
+        });
+
+        assert!(
+            centers.windows(2).all(|pair| pair[1] - pair[0] <= 40.0),
+            "settings tabs are too far apart: {centers:?}"
         );
     }
 
@@ -20754,6 +21033,60 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[test]
+    fn ui_scale_slider_commits_only_after_release() {
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 80.0));
+        let mut value = 100;
+        let pointer = {
+            let mut draw = |events| {
+                let mut slider = Rect::NOTHING;
+                let _ = context.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..RawInput::default()
+                    },
+                    |ui| {
+                        let (response, _) = settings_ui_scale_slider(ui, &mut value);
+                        slider = response.rect;
+                    },
+                );
+                slider
+            };
+            let slider = draw(Vec::new());
+            let pointer = pos2(slider.left() + 180.0, slider.center().y);
+            let _ = draw(vec![
+                Event::PointerMoved(pointer),
+                Event::PointerButton {
+                    pos: pointer,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            pointer
+        };
+        let held = value;
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerButton {
+                    pos: pointer,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |ui| {
+                settings_ui_scale_slider(ui, &mut value);
+            },
+        );
+
+        assert_eq!((held, value), (100, 200));
+    }
+
     fn has_id_clash(shape: &Shape) -> bool {
         match shape {
             Shape::Text(text) => text.galley.text().contains("use of widget ID"),
@@ -21836,9 +22169,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_following_reengages_within_the_near_bottom_threshold() {
-        assert!(agent_near_bottom(952.0, 1_000.0));
-        assert!(!agent_near_bottom(951.0, 1_000.0));
+    fn transcript_following_does_not_treat_one_pixel_short_as_the_bottom() {
+        assert!(!agent_at_bottom(999.0, 1_000.0));
     }
 
     #[test]
@@ -22298,7 +22630,7 @@ mod tests {
             .find(|tab| tab.buffer.path == path)
             .expect("the diff opens the file's tab");
         assert_eq!(tab.agent_diff, Some(Some("old\n".to_owned())));
-        assert!(app.agentic_diff.is_none());
+        assert!(app.agentic_diffs.is_empty());
     }
 
     #[test]
@@ -22345,11 +22677,209 @@ mod tests {
 
         app.open_agent_diff("lib.rs".into());
 
-        let panel = app.agentic_diff.as_ref().expect("the side panel opens");
+        let panel = app
+            .agentic_diffs
+            .get(app.active_agentic_diff)
+            .expect("the side panel opens");
         assert_eq!(panel.path, root.join("lib.rs"));
         assert_eq!(panel.baseline, Some("old\n".to_owned()));
         assert_eq!(panel.text, "new\n");
         assert_eq!(app.tabs.len(), tabs_before, "no editor tab is opened");
+    }
+
+    #[test]
+    fn missing_changed_file_does_not_open_its_retained_agent_diff() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: root.clone(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.agent
+            .apply(crate::agent::controller::Event::ToolCallUpdated(
+                ToolActivity {
+                    id: "edit-index".into(),
+                    title: Some("Edit index.html".into()),
+                    status: Some("Completed".into()),
+                    kind: Some("Edit".into()),
+                    paths: vec!["index.html".into()],
+                    detail: Some(ToolDetail {
+                        input: None,
+                        content: vec![crate::agent::controller::ToolOutput::Diff {
+                            path: "index.html".into(),
+                            old_text: Some("old\n".into()),
+                            new_text: "<main>retained</main>\n".into(),
+                        }],
+                        output: None,
+                    }),
+                },
+            ));
+
+        app.open_agent_diff("index.html".into());
+
+        assert!(app.agentic_diffs.is_empty());
+    }
+
+    #[test]
+    fn agentic_diff_panel_keeps_multiple_open_files_as_tabs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for file in ["first.rs", "second.rs"] {
+            fs::write(root.join(file), format!("new {file}\n")).unwrap();
+        }
+        let mut app = EditorApp::new(OpenTarget {
+            root,
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+
+        app.open_agent_diff("first.rs".into());
+        app.open_agent_diff("second.rs".into());
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        assert!(["first.rs", "second.rs"].into_iter().all(|expected| {
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, expected))
+        }));
+    }
+
+    #[test]
+    fn agentic_diff_tabs_switch_and_close_files_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("first.rs"), "first diff body\n").unwrap();
+        fs::write(root.join("second.rs"), "second diff body\n").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: root.clone(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .baselines
+            .insert("first.rs".into(), Some("old first\n".into()));
+        app.agent
+            .baselines
+            .insert("second.rs".into(), Some("old second\n".into()));
+        app.open_agent_diff("first.rs".into());
+        app.open_agent_diff("second.rs".into());
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1200.0, 700.0));
+        let draw = |app: &mut EditorApp, events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let _ = draw(&mut app, Vec::new());
+        let first = context
+            .read_response(Id::new(("agentic_diff_tab", root.join("first.rs"))))
+            .expect("first diff tab")
+            .rect
+            .center();
+        let _ = draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(first),
+                Event::PointerButton {
+                    pos: first,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: first,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let output = draw(&mut app, Vec::new());
+        fn has_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "first diff body"))
+        );
+
+        let close_first = context
+            .read_response(Id::new(("agentic_diff_tab_close", root.join("first.rs"))))
+            .expect("first diff close button")
+            .rect
+            .center();
+        let _ = draw(
+            &mut app,
+            vec![
+                Event::PointerMoved(close_first),
+                Event::PointerButton {
+                    pos: close_first,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(
+            &mut app,
+            vec![Event::PointerButton {
+                pos: close_first,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let output = draw(&mut app, Vec::new());
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, "second diff body"))
+        );
     }
 
     #[test]
@@ -22365,7 +22895,7 @@ mod tests {
         app.agentic_mode = true;
         app.agent.connection = ConnectionState::Ready;
         app.agent.session_ready = true;
-        app.agentic_diff = Some(AgenticDiff {
+        app.agentic_diffs.push(AgenticDiff {
             path: root.join("lib.rs"),
             baseline: Some("old\n".to_owned()),
             text: "new\n".to_owned(),
@@ -22398,7 +22928,7 @@ mod tests {
 
         // The file header lives in the titlebar strip beside the session
         // title, so the two columns wear one continuous header.
-        for label in ["lib.rs", "MODIFIED", "Close"] {
+        for label in ["lib.rs", "MODIFIED"] {
             let rect = find(label).unwrap_or_else(|| panic!("{label} is not on screen"));
             assert!(
                 (rect.center().y - TITLEBAR_HEIGHT * 0.5).abs() <= 1.0,
@@ -22478,6 +23008,79 @@ mod tests {
         assert!(texts.contains("README.md"), "{texts}");
         assert!(texts.contains("+2"), "{texts}");
         assert!(texts.contains("−1"), "{texts}");
+    }
+
+    #[test]
+    fn deleted_changed_file_keeps_its_counts_but_cannot_be_opened() {
+        fn find_text(shape: &Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains(expected) => {
+                    Some(text.visual_bounding_rect())
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| find_text(shape, expected)),
+                _ => None,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("deleted.html");
+        let changed = std::collections::HashMap::from([(
+            path.clone(),
+            FileChange {
+                added: 2,
+                removed: 1,
+            },
+        )]);
+        let context = theme::test_context();
+        let draw = |events| {
+            let mut clicked = None;
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(500.0, 180.0))),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| clicked = draw_agent_changed_files(ui, &root, &changed, None),
+            );
+            (output, clicked)
+        };
+
+        let (output, _) = draw(Vec::new());
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("Deleted"), "{text}");
+        assert!(text.contains("+2"), "{text}");
+        assert!(text.contains("−1"), "{text}");
+
+        let row = output
+            .shapes
+            .iter()
+            .find_map(|shape| find_text(&shape.shape, "deleted.html"))
+            .expect("deleted file row")
+            .center();
+        let _ = draw(vec![
+            Event::PointerMoved(row),
+            Event::PointerButton {
+                pos: row,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let (_, clicked) = draw(vec![Event::PointerButton {
+            pos: row,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(clicked, None);
     }
 
     #[test]
@@ -22935,6 +23538,65 @@ mod tests {
         );
         assert!(response_rows > 1);
         assert!(response_rect.right() <= response_clip.right());
+    }
+
+    #[test]
+    fn agent_output_keeps_scrollable_clearance_above_the_composer_in_both_layouts() {
+        fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains(expected) => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+                _ => None,
+            }
+        }
+
+        for agentic_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agentic_mode = agentic_mode;
+            app.agent_sidebar = !agentic_mode;
+            app.agent.connection = ConnectionState::Ready;
+            app.agent.session_ready = true;
+            for index in 0..60 {
+                app.agent
+                    .transcript
+                    .push_back(TranscriptItem::Assistant(format!("Reply number {index}")));
+            }
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant("End of transcript".into()));
+            let context = theme::test_context();
+            let input = || RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            };
+
+            let _ = context.run_ui(input(), |root| app.ui(root));
+            let output = context.run_ui(input(), |root| app.ui(root));
+            let (text, clip) = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    text_rect(&shape.shape, "End of transcript").map(|text| (text, shape.clip_rect))
+                })
+                .expect("newest output visible at the bottom");
+
+            assert!(
+                clip.bottom() - text.bottom() >= theme::space::LARGE - 1.0,
+                "end clearance must scroll with the output in agentic_mode={agentic_mode}: \
+                 text={text:?} clip={clip:?}"
+            );
+        }
     }
 
     #[test]
@@ -24535,7 +25197,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_pauses_following_for_manual_scroll_and_resticks_near_the_bottom() {
+    fn transcript_following_only_resticks_at_the_bottom() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = EditorApp::new(OpenTarget {
             root: temp.path().canonicalize().unwrap(),
@@ -26353,6 +27015,8 @@ mod tests {
             create: false,
         })
         .unwrap();
+        app.settings = Settings::default();
+        app.rebuild_keybinding_resolver().unwrap();
         app.sidebar = false;
         let context = theme::test_context();
         let screen = Rect::from_min_size(Default::default(), Vec2::new(1000.0, 700.0));
@@ -27962,6 +28626,8 @@ mod tests {
             create: false,
         })
         .unwrap();
+        app.settings = Settings::default();
+        app.rebuild_keybinding_resolver().unwrap();
         let context = theme::test_context();
         let command = Modifiers {
             command: true,
@@ -27998,6 +28664,32 @@ mod tests {
         let _ = context.run_ui(paste(), |root| app.ui(root));
 
         assert_eq!(app.tabs[0].buffer.text, "Xbase");
+    }
+
+    #[test]
+    fn agentic_mode_leaves_copy_events_for_selectable_diff_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agentic_mode = true;
+        let context = theme::test_context();
+        let mut copy_reaches_widgets = false;
+        let _ = context.run_ui(
+            RawInput {
+                events: vec![Event::Copy],
+                ..RawInput::default()
+            },
+            |_root| {
+                app.shortcuts(&context);
+                copy_reaches_widgets = context.input(|input| input.events.contains(&Event::Copy));
+            },
+        );
+
+        assert!(copy_reaches_widgets);
     }
 
     #[test]

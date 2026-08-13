@@ -197,11 +197,7 @@ pub(crate) mod diff {
 
     pub(super) fn wash_for(palette: color::Palette, semantic: Color32) -> Color32 {
         if palette.dark {
-            color::mix(
-                color::mix(palette.surface.editor, palette.surface.sunken, 0.35),
-                semantic,
-                0.25,
-            )
+            color::mix(palette.surface.sunken, semantic.gamma_multiply(0.58), 0.46)
         } else {
             color::composite(color::subtle(semantic), palette.surface.editor)
         }
@@ -254,7 +250,7 @@ pub(crate) mod editor {
 
     /// Replaces the 1.1:1 fill that made selecting a paragraph invisible.
     pub(crate) fn selection() -> Color32 {
-        color::accent().gamma_multiply(0.22)
+        color::accent().gamma_multiply(0.35)
     }
 
     /// The same selection in an unfocused pane.
@@ -280,7 +276,7 @@ pub(crate) mod editor {
 #[cfg(test)]
 mod tests {
     use super::super::color;
-    use super::{border, diff, fill, find, hover, selected_focus};
+    use super::{border, diff, editor, fill, find, hover, selected_focus};
 
     #[test]
     fn light_focus_ring_clears_non_text_contrast() {
@@ -329,17 +325,33 @@ mod tests {
         let removed = diff::removed();
 
         assert!(
-            added.g() >= editor.g() + 28 && added.g() <= editor.g() + 45,
+            added.g() >= editor.g() + 28 && added.g() <= 60,
             "the added row is too washed out or too bright: {added:?} over {editor:?}"
         );
         assert!(
-            removed.r() >= editor.r() + 35 && removed.r() <= editor.r() + 55,
+            removed.r() >= editor.r() + 35 && removed.r() <= 72,
             "the removed row is too washed out or too bright: {removed:?} over {editor:?}"
         );
         assert!(
             added.g() >= added.r() + 15 && removed.r() >= removed.g() + 25,
             "diff rows lost their semantic hues: {added:?}, {removed:?}"
         );
+    }
+
+    #[test]
+    fn selection_stands_out_on_diff_rows_without_hiding_code() {
+        for row in [diff::added(), diff::removed()] {
+            let selected = color::composite(editor::selection(), row);
+
+            assert!(
+                color::contrast_ratio(selected, row) >= 2.0,
+                "the selection disappears into the diff row: {selected:?} on {row:?}"
+            );
+            assert!(
+                color::contrast_ratio(color::text().primary, selected) >= 4.5,
+                "selected diff text is unreadable: {selected:?}"
+            );
+        }
     }
 
     #[test]
