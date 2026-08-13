@@ -35,6 +35,7 @@ pub struct Settings {
 pub struct AppearanceSettings {
     pub theme: ThemePreference,
     pub density: DensityPreference,
+    pub dense_agent: bool,
     pub ui_scale_percent: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_font_family: Option<String>,
@@ -49,6 +50,7 @@ impl Default for AppearanceSettings {
         Self {
             theme: ThemePreference::Dark,
             density: DensityPreference::Comfortable,
+            dense_agent: false,
             ui_scale_percent: 100,
             editor_font_family: None,
             editor_font_size: 14.0,
@@ -476,6 +478,7 @@ mod tests {
             appearance: AppearanceSettings {
                 theme: ThemePreference::Light,
                 density: DensityPreference::Compact,
+                dense_agent: true,
                 ui_scale_percent: 100,
                 editor_font_family: Some("Menlo".into()),
                 editor_font_size: 16.0,
@@ -520,6 +523,19 @@ mod tests {
         save(&path, &settings).unwrap();
 
         assert_eq!(load(&path).unwrap().appearance.ui_scale_percent, 150);
+    }
+
+    #[test]
+    fn dense_agent_is_opt_in_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = Settings::default();
+        assert!(!settings.appearance.dense_agent);
+        settings.appearance.dense_agent = true;
+
+        save(&path, &settings).unwrap();
+
+        assert!(load(&path).unwrap().appearance.dense_agent);
     }
 
     #[test]

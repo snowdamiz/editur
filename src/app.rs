@@ -1191,6 +1191,37 @@ fn draw_agent_working(ui: &mut egui::Ui, provider: ProviderId) -> egui::Response
     response
 }
 
+fn draw_dense_agent_working(ui: &mut egui::Ui) -> egui::Response {
+    let time = ui.input(|input| input.time);
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
+    let response = ui.interact(rect, Id::new("dense_agent_working"), Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), "Working")
+    });
+    ui.painter().text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Working",
+        theme::typography::body(),
+        theme::text().secondary,
+    );
+    for index in 0..3 {
+        let wave = (0.5
+            + 0.5 * ((time * 2.4 - f64::from(index) * 0.18) * std::f64::consts::TAU).sin())
+            as f32;
+        ui.painter().circle_filled(
+            egui::pos2(
+                rect.left() + 65.0 + index as f32 * 7.0,
+                rect.center().y - wave * 2.0,
+            ),
+            2.0,
+            theme::accent().gamma_multiply(0.4 + wave * 0.6),
+        );
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+    response
+}
+
 fn draw_provider_selector_identity(
     ui: &mut egui::Ui,
     provider: ProviderId,
@@ -1505,6 +1536,7 @@ fn agent_code_galley(
     galley
 }
 
+#[expect(clippy::too_many_arguments)]
 fn agent_markdown_galley(
     ui: &mut egui::Ui,
     id: Id,
@@ -1512,6 +1544,7 @@ fn agent_markdown_galley(
     width: f32,
     highlighter: &Highlighter,
     syntaxes: &SyntaxManager,
+    bright: bool,
     search: Option<(&str, Option<usize>)>,
 ) -> Arc<egui::Galley> {
     let width_key = width.round().to_bits();
@@ -1528,7 +1561,7 @@ fn agent_markdown_galley(
         if let Some(galley) = cached {
             return galley;
         }
-        let job = markdown::compact_layout(source, width, |language, code| {
+        let mut job = markdown::compact_layout(source, width, |language, code| {
             let syntax = language
                 .map(|language| syntaxes.detect_token(language))
                 .unwrap_or_else(|| syntaxes.plain_text());
@@ -1536,6 +1569,13 @@ fn agent_markdown_galley(
                 .highlight_job(code, syntax, syntaxes.set(), width)
                 .ok()
         });
+        if bright {
+            for section in &mut job.sections {
+                if section.format.color == theme::text().secondary {
+                    section.format.color = theme::text().primary;
+                }
+            }
+        }
         let matches = match_spans(&job.text, query);
         let job = find_highlighted_job(&job, &matches, active);
         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
@@ -1574,7 +1614,7 @@ fn agent_markdown_galley(
     if let Some(galley) = cached {
         return galley;
     }
-    let job = markdown::compact_layout(source, width, |language, code| {
+    let mut job = markdown::compact_layout(source, width, |language, code| {
         let syntax = language
             .map(|language| syntaxes.detect_token(language))
             .unwrap_or_else(|| syntaxes.plain_text());
@@ -1582,6 +1622,13 @@ fn agent_markdown_galley(
             .highlight_job(code, syntax, syntaxes.set(), width)
             .ok()
     });
+    if bright {
+        for section in &mut job.sections {
+            if section.format.color == theme::text().secondary {
+                section.format.color = theme::text().primary;
+            }
+        }
+    }
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentMarkdownCache>(id);
@@ -1911,6 +1958,470 @@ fn agent_collapsing_header(
     });
 }
 
+fn agent_dense_disclosure_row(
+    ui: &mut egui::Ui,
+    id: Id,
+    label: &str,
+    change: Option<FileChange>,
+    default_open: bool,
+    force_open: bool,
+) -> bool {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    if force_open {
+        state.set_open(true);
+    }
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
+    let response = ui.interact(rect, id, Sense::click());
+    if response.clicked() && !force_open {
+        state.toggle(ui);
+        ui.ctx().request_discard("dense agent disclosure changed");
+    }
+    let open = state.is_open();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::CollapsingHeader,
+            ui.is_enabled(),
+            open,
+            label,
+        )
+    });
+    let label_color = if response.hovered() {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    let counts = change.map(|change| {
+        let added = ui.painter().layout_no_wrap(
+            format!("+{}", change.added),
+            theme::typography::code_small(),
+            theme::ink(theme::semantic().success),
+        );
+        let removed = ui.painter().layout_no_wrap(
+            format!("−{}", change.removed),
+            theme::typography::code_small(),
+            theme::ink(theme::semantic().danger),
+        );
+        (added, removed)
+    });
+    let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
+        added.size().x + theme::space::SMALL + removed.size().x
+    });
+    let title_left = rect.left() + 4.0;
+    let chevron_size = icons::GRID * 0.7;
+    let title_gap = if counts_width > 0.0 {
+        theme::space::SMALL
+    } else {
+        0.0
+    };
+    let trailing_width = title_gap + counts_width + theme::space::TIGHT + chevron_size;
+    let title =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::typography::strong(), label_color);
+    let title_width = title
+        .size()
+        .x
+        .min((rect.right() - title_left - trailing_width).max(0.0));
+    ui.painter()
+        .with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(title_left, rect.top()),
+            egui::pos2(title_left + title_width, rect.bottom()),
+        ))
+        .galley(
+            egui::pos2(title_left, rect.center().y - title.size().y * 0.5),
+            title,
+            label_color,
+        );
+    let counts_left = title_left + title_width + title_gap;
+    if let Some((added, removed)) = counts {
+        let y = rect.center().y - added.size().y * 0.5;
+        ui.painter().galley(
+            egui::pos2(counts_left, y),
+            added.clone(),
+            theme::ink(theme::semantic().success),
+        );
+        ui.painter().galley(
+            egui::pos2(counts_left + added.size().x + theme::space::SMALL, y),
+            removed,
+            theme::ink(theme::semantic().danger),
+        );
+    }
+    let chevron_left = counts_left + counts_width + theme::space::TIGHT;
+    icons::paint(
+        ui.painter(),
+        if open {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        },
+        egui::Rect::from_center_size(
+            egui::pos2(chevron_left + chevron_size * 0.5, rect.center().y),
+            egui::Vec2::splat(chevron_size),
+        ),
+        label_color,
+    );
+    state.store(ui.ctx());
+    open
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DenseAgentWorkCluster {
+    label: String,
+    change: Option<FileChange>,
+    active: bool,
+}
+
+fn dense_agent_work_item(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Thought(_) | TranscriptItem::Plan(_) | TranscriptItem::Tool(_)
+    ) || matches!(
+        item,
+        TranscriptItem::Content {
+            role: ContentRole::Thought,
+            ..
+        }
+    )
+}
+
+fn dense_agent_final_response_starts(
+    transcript: &std::collections::VecDeque<TranscriptItem>,
+    active: bool,
+) -> Vec<bool> {
+    let mut final_responses = vec![false; transcript.len()];
+    let mut last_response_start = None;
+    let mut previous_was_assistant = false;
+    for (index, item) in transcript.iter().enumerate() {
+        let is_user = matches!(item, TranscriptItem::User(_))
+            || matches!(
+                item,
+                TranscriptItem::Content {
+                    role: ContentRole::User,
+                    ..
+                }
+            );
+        let is_assistant = matches!(item, TranscriptItem::Assistant(_))
+            || matches!(
+                item,
+                TranscriptItem::Content {
+                    role: ContentRole::Assistant,
+                    ..
+                }
+            );
+        if is_user {
+            if let Some(start) = last_response_start.take() {
+                final_responses[start] = true;
+            }
+            previous_was_assistant = false;
+        } else if is_assistant {
+            if !previous_was_assistant {
+                last_response_start = Some(index);
+            }
+            previous_was_assistant = true;
+        } else {
+            previous_was_assistant = false;
+        }
+    }
+    if !active && let Some(start) = last_response_start {
+        final_responses[start] = true;
+    }
+    final_responses
+}
+
+fn dense_agent_work_clusters(
+    transcript: &std::collections::VecDeque<TranscriptItem>,
+    tool_changes: &HashMap<String, FileChange>,
+    active_work_start: Option<usize>,
+) -> Vec<Option<DenseAgentWorkCluster>> {
+    let mut clusters = vec![None; transcript.len()];
+    let mut index = 0;
+    while index < transcript.len() {
+        if !dense_agent_work_item(&transcript[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut edited_files = HashSet::new();
+        let mut edits = 0_usize;
+        let mut reads = 0_usize;
+        let mut searches = 0_usize;
+        let mut commands = 0_usize;
+        let mut thoughts = 0_usize;
+        let mut plans = 0_usize;
+        let mut other_tools = 0_usize;
+        let mut change = FileChange::default();
+        while index < transcript.len() && dense_agent_work_item(&transcript[index]) {
+            match &transcript[index] {
+                TranscriptItem::Thought(_)
+                | TranscriptItem::Content {
+                    role: ContentRole::Thought,
+                    ..
+                } => thoughts += 1,
+                TranscriptItem::Plan(_) => plans += 1,
+                TranscriptItem::Tool(tool) => {
+                    let title = tool.display_title();
+                    let action = title
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches(':')
+                        .to_ascii_lowercase();
+                    let kind = tool
+                        .kind
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if matches!(kind.as_str(), "edit" | "delete" | "move")
+                        || matches!(action.as_str(), "edit" | "edited" | "write" | "patch")
+                    {
+                        edits += 1;
+                        let path =
+                            tool.paths
+                                .first()
+                                .map(|path| path.path.as_path())
+                                .or_else(|| {
+                                    title.split_once(char::is_whitespace).map(|(_, path)| {
+                                        Path::new(path.trim_matches(['`', '\'', '"']))
+                                    })
+                                });
+                        if let Some(path) = path.filter(|path| *path != Path::new("file")) {
+                            edited_files.insert(
+                                path.file_name()
+                                    .unwrap_or(path.as_os_str())
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                    } else if kind == "read" || matches!(action.as_str(), "read" | "opened") {
+                        reads += tool.paths.len().max(1);
+                    } else if kind == "search"
+                        || matches!(
+                            action.as_str(),
+                            "grep" | "grepped" | "glob" | "find" | "searched"
+                        )
+                    {
+                        searches += 1;
+                    } else if kind == "execute"
+                        || matches!(
+                            action.as_str(),
+                            "run" | "ran" | "exec" | "execute" | "shell" | "bash"
+                        )
+                    {
+                        commands += 1;
+                    } else {
+                        other_tools += 1;
+                    }
+                    if let Some(tool_change) = tool_changes.get(&tool.id) {
+                        change.added = change.added.saturating_add(tool_change.added);
+                        change.removed = change.removed.saturating_add(tool_change.removed);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        let mut parts = Vec::new();
+        if edited_files.len() == 1 {
+            parts.push(format!(
+                "edited {}",
+                edited_files.into_iter().next().unwrap()
+            ));
+        } else if !edited_files.is_empty() {
+            parts.push(format!("edited {} files", edited_files.len()));
+        } else if edits > 0 {
+            parts.push(format!(
+                "edited {edits} file{}",
+                if edits == 1 { "" } else { "s" }
+            ));
+        }
+        if reads > 0 || searches > 0 {
+            let mut explored = Vec::new();
+            if reads > 0 {
+                explored.push(format!("{reads} file{}", if reads == 1 { "" } else { "s" }));
+            }
+            if searches > 0 {
+                explored.push(format!(
+                    "{searches} search{}",
+                    if searches == 1 { "" } else { "es" }
+                ));
+            }
+            parts.push(format!("explored {}", explored.join(", ")));
+        }
+        if commands > 0 {
+            parts.push(format!(
+                "ran {commands} command{}",
+                if commands == 1 { "" } else { "s" }
+            ));
+        }
+        if plans > 0 {
+            parts.push(if plans == 1 {
+                "updated plan".to_owned()
+            } else {
+                format!("updated {plans} plans")
+            });
+        }
+        if thoughts > 0 && parts.is_empty() {
+            parts.push(if thoughts == 1 {
+                "thought".to_owned()
+            } else {
+                format!("thought through {thoughts} steps")
+            });
+        }
+        if other_tools > 0 {
+            parts.push(format!(
+                "used {other_tools} tool{}",
+                if other_tools == 1 { "" } else { "s" }
+            ));
+        }
+        let mut label = if parts.is_empty() {
+            "Worked".to_owned()
+        } else {
+            parts.join(", ")
+        };
+        label[..1].make_ascii_uppercase();
+        clusters[start] = Some(DenseAgentWorkCluster {
+            label,
+            change: (change != FileChange::default()).then_some(change),
+            active: active_work_start.is_some_and(|active_start| start >= active_start),
+        });
+    }
+    clusters
+}
+
+#[expect(clippy::too_many_arguments)]
+fn agent_dense_tool(
+    ui: &mut egui::Ui,
+    id: Id,
+    title: &str,
+    status: Option<&str>,
+    change: Option<FileChange>,
+    search: Option<(&str, Option<usize>)>,
+    has_body: bool,
+    add_body: impl FnOnce(&mut egui::Ui),
+) {
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    if has_body && search.is_some() {
+        state.set_open(true);
+    }
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 28.0));
+    let response = ui.interact(
+        rect,
+        id,
+        if has_body {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if response.clicked() {
+        state.toggle(ui);
+        ui.ctx().request_discard("dense tool disclosure changed");
+    }
+    let open = state.is_open();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            if has_body {
+                egui::WidgetType::CollapsingHeader
+            } else {
+                egui::WidgetType::Label
+            },
+            ui.is_enabled(),
+            open,
+            title,
+        )
+    });
+    let title_color = match status {
+        Some("Failed") => theme::ink(theme::semantic().danger),
+        _ if response.hovered() => theme::text().primary,
+        Some("InProgress" | "Pending") => theme::text().secondary,
+        _ => theme::text().muted,
+    };
+    if has_body {
+        icons::paint(
+            ui.painter(),
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::Vec2::splat(icons::GRID * 0.7),
+            ),
+            title_color,
+        );
+    }
+    let counts = change.map(|change| {
+        let added = ui.painter().layout_no_wrap(
+            format!("+{}", change.added),
+            theme::typography::code_small(),
+            theme::ink(theme::semantic().success),
+        );
+        let removed = ui.painter().layout_no_wrap(
+            format!("−{}", change.removed),
+            theme::typography::code_small(),
+            theme::ink(theme::semantic().danger),
+        );
+        (added, removed)
+    });
+    let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
+        added.size().x + theme::space::SMALL + removed.size().x
+    });
+    let title_left = rect.left() + if has_body { 24.0 } else { 4.0 };
+    let title_width = (rect.right() - theme::space::SMALL - counts_width - title_left).max(0.0);
+    let title = agent_text_job(
+        title.lines().next().unwrap_or(title),
+        title_width,
+        theme::typography::body(),
+        title_color,
+        search,
+    );
+    let title = ui.painter().layout_job(title);
+    ui.painter()
+        .with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(title_left, rect.top()),
+            egui::pos2(title_left + title_width, rect.bottom()),
+        ))
+        .galley(
+            egui::pos2(title_left, rect.center().y - title.size().y * 0.5),
+            title,
+            title_color,
+        );
+    if let Some((added, removed)) = counts {
+        let x = rect.right() - theme::space::SMALL - counts_width;
+        let y = rect.center().y - added.size().y * 0.5;
+        ui.painter().galley(
+            egui::pos2(x, y),
+            added.clone(),
+            theme::ink(theme::semantic().success),
+        );
+        ui.painter().galley(
+            egui::pos2(x + added.size().x + theme::space::SMALL, y),
+            removed,
+            theme::ink(theme::semantic().danger),
+        );
+    }
+    state.store(ui.ctx());
+    if has_body && open {
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 24,
+                right: 4,
+                top: 2,
+                bottom: 6,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add_body(ui);
+            });
+    }
+}
+
 /// The session summary card: every file the agent modified, one row per file
 /// with the accumulated added/removed line counts the state tracked as diffs
 /// arrived. Returns the path the user clicked, if any.
@@ -1919,15 +2430,28 @@ fn draw_agent_changed_files(
     root: &Path,
     changed_paths: &HashMap<PathBuf, FileChange>,
     search: Option<(&str, Option<usize>)>,
+    dense: bool,
 ) -> Option<PathBuf> {
     let mut rows = changed_paths.iter().collect::<Vec<_>>();
     rows.sort_by_key(|(path, _)| *path);
     let mut clicked = None;
     egui::Frame::new()
-        .fill(theme::surface().raised)
-        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .fill(if dense {
+            Color32::TRANSPARENT
+        } else {
+            theme::surface().raised
+        })
+        .stroke(if dense {
+            egui::Stroke::NONE
+        } else {
+            egui::Stroke::new(1.0, theme::border::hairline_color())
+        })
+        .corner_radius(if dense { 0 } else { 8 })
+        .inner_margin(if dense {
+            egui::Margin::symmetric(0, 2)
+        } else {
+            egui::Margin::symmetric(12, 10)
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -5160,8 +5684,8 @@ pub struct EditorApp {
     /// be culled into spacers instead of being laid out every frame. `NAN`
     /// means "not measured yet"; visible items re-measure every frame.
     agent_transcript_heights: Vec<f32>,
-    /// The (width, appearance) the cached heights were measured under.
-    agent_transcript_heights_key: (u32, u64),
+    /// The (width, appearance, dense mode) the cached heights were measured under.
+    agent_transcript_heights_key: (u32, u64, bool, bool),
     /// How many transcript items the last frame actually laid out (the rest
     /// were culled spacers); the culling tests key off this.
     agent_transcript_rendered: usize,
@@ -5713,6 +6237,7 @@ impl EditorApp {
             .unwrap_or_default();
         let syntaxes = SyntaxManager::built_in()?;
         let search = SearchController::new(target.root.clone())?;
+        #[cfg(not(test))]
         let (settings, settings_error) =
             match data_dir().map(|directory| directory.join("settings.json")) {
                 Ok(path) => match settings::load(&path) {
@@ -5721,6 +6246,8 @@ impl EditorApp {
                 },
                 Err(error) => (Settings::default(), Some(error)),
             };
+        #[cfg(test)]
+        let (settings, settings_error) = (Settings::default(), None);
         let keybinding_resolver = Resolver::new(
             settings.keybindings.effective_bindings()?,
             KeybindingPlatform::current(),
@@ -5775,7 +6302,7 @@ impl EditorApp {
             agent_mention_selected: 0,
             agent_find: AgentFind::default(),
             agent_transcript_heights: Vec::new(),
-            agent_transcript_heights_key: (0, 0),
+            agent_transcript_heights_key: (0, 0, false, false),
             agent_transcript_rendered: 0,
             agent_drop_hovered: false,
             agent_file_picker: None,
@@ -7007,36 +7534,6 @@ impl EditorApp {
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
-        let vim_status = (pane == self.active_pane
-            && self.settings.keybindings.active_behavior() == KeybindingBehavior::Vim)
-            .then(|| active.map(|index| self.tabs[index].vim.status()))
-            .flatten();
-        let vim_rect = vim_status.as_ref().map(|_| {
-            egui::Rect::from_min_max(
-                egui::pos2((controls_right - 78.0).max(tabs_left), rect.top() + 5.0),
-                egui::pos2(controls_right - 6.0, rect.bottom() - 5.0),
-            )
-        });
-        if let (Some(status), Some(pill)) = (&vim_status, vim_rect) {
-            let response = ui.interact(pill, Id::new(("vim_mode", pane.0)), Sense::hover());
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Label,
-                    true,
-                    format!("Vim mode: {status}"),
-                )
-            });
-            ui.painter()
-                .rect_filled(pill, 4.0, theme::state::selected());
-            ui.painter().text(
-                pill.center(),
-                Align2::CENTER_CENTER,
-                status,
-                theme::typography::code_small(),
-                theme::accent(),
-            );
-        }
-        let controls_right = vim_rect.map_or(controls_right, |pill| pill.left() - 4.0);
         let diagnostic_counts = active
             .and_then(|index| self.lsp_diagnostics.get(&self.tabs[index].buffer.path))
             .map(|state| {
@@ -7108,28 +7605,6 @@ impl EditorApp {
                     Id::new(("pane_errors", pane.0)),
                 );
             }
-        }
-        if let Some(language) = active
-            .and_then(|index| preset_for_path(&self.tabs[index].buffer.path))
-            .and_then(|(preset, _)| {
-                let status = self.lsp_status.get(&preset.id)?;
-                let color = match status {
-                    ServerStatus::Ready(_) => theme::semantic().success,
-                    ServerStatus::Starting => theme::semantic().info,
-                    ServerStatus::NotStarted | ServerStatus::Stopped => return None,
-                    ServerStatus::NotFound | ServerStatus::Failed(_) => theme::semantic().danger,
-                };
-                Some((preset.language, color, self.server_status_label(preset.id)))
-            })
-        {
-            let (name, color, state) = language;
-            pill(
-                ui,
-                name.to_owned(),
-                color,
-                format!("{name} language server: {state}"),
-                Id::new(("pane_language_server", pane.0)),
-            );
         }
         let controls_right = status_left;
         let markdown =
@@ -8308,6 +8783,17 @@ impl EditorApp {
                     (DensityPreference::Compact, "Compact"),
                 ],
             );
+            ui.separator();
+            let dense_agent = settings_switch_row(
+                ui,
+                "Dense Agent",
+                "Group each turn into compact, expandable work.",
+                appearance.dense_agent,
+            );
+            if dense_agent.clicked() {
+                appearance.dense_agent = !appearance.dense_agent;
+                dirty = true;
+            }
             ui.separator();
             settings_row(
                 ui,
@@ -12521,7 +13007,13 @@ impl EditorApp {
                     // Cached heights are only valid for the width and theme
                     // they were measured under, and only while indexes still
                     // line up: a reloaded transcript can shrink the list.
-                    let heights_key = (transcript_width.round().to_bits(), theme::appearance());
+                    let dense_agent = self.settings.appearance.dense_agent;
+                    let heights_key = (
+                        transcript_width.round().to_bits(),
+                        theme::appearance(),
+                        dense_agent,
+                        self.agent.active,
+                    );
                     if self.agent_transcript_heights_key != heights_key
                         || self.agent_transcript_heights.len() > self.agent.transcript.len()
                     {
@@ -12535,6 +13027,35 @@ impl EditorApp {
                     item_heights.resize(transcript_len, f32::NAN);
                     let mut rendered_items = 0_usize;
                     let tool_changes = &self.agent.tool_changes;
+                    let active_work_start = self.agent.active.then(|| {
+                        self.agent
+                            .transcript
+                            .iter()
+                            .rposition(|item| matches!(item, TranscriptItem::User(_)))
+                            .map_or(0, |index| index + 1)
+                    });
+                    let dense_work_clusters = dense_agent_work_clusters(
+                        &self.agent.transcript,
+                        tool_changes,
+                        active_work_start,
+                    );
+                    let dense_final_responses = if dense_agent {
+                        dense_agent_final_response_starts(
+                            &self.agent.transcript,
+                            self.agent.active,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let dense_work_items = if dense_agent {
+                        self.agent
+                            .transcript
+                            .iter()
+                            .map(dense_agent_work_item)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                     let output = ScrollArea::vertical()
                         .id_salt("agent_transcript")
                         .auto_shrink([false, false])
@@ -12556,11 +13077,39 @@ impl EditorApp {
                                     ui.set_width(transcript_width);
                                     ui.set_max_width(transcript_width);
                                     let clip = ui.clip_rect();
+                                    let item_gap = if dense_agent { 8.0 } else { 16.0 };
+                                    let mut dense_work_open = true;
                                     for (item_index, item) in
                                         self.agent.transcript.iter_mut().enumerate()
                                     {
                                 let item_top = ui.cursor().top();
                                 let item_is_selected = selected_find_item == Some(item_index);
+                                let is_dense_work = dense_agent && dense_agent_work_item(item);
+                                let dense_cluster = is_dense_work
+                                    .then(|| dense_work_clusters[item_index].as_ref())
+                                    .flatten();
+                                let gap_after_item = if is_dense_work
+                                    && dense_work_items.get(item_index + 1) == Some(&true)
+                                {
+                                    0.0
+                                } else {
+                                    item_gap
+                                };
+                                if let Some(cluster) = dense_cluster {
+                                    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                            ui.ctx(),
+                                            Id::new(("dense_agent_work", item_index, cluster.active)),
+                                            cluster.active,
+                                        );
+                                    if cluster.active || !find_matches.is_empty() {
+                                        state.set_open(true);
+                                        state.store(ui.ctx());
+                                    }
+                                    dense_work_open = state.is_open();
+                                } else if is_dense_work && !dense_work_open {
+                                    item_heights[item_index] = 0.0;
+                                    continue;
+                                }
                                 // An off-screen item with a known height only
                                 // needs its space, not its widgets: laying out
                                 // every item every frame is what made long
@@ -12576,7 +13125,7 @@ impl EditorApp {
                                 {
                                     ui.add_space(cached_height);
                                     if item_index + 1 < transcript_len || transcript_has_footer {
-                                        ui.add_space(16.0);
+                                        ui.add_space(gap_after_item);
                                     }
                                     continue;
                                 }
@@ -12589,14 +13138,35 @@ impl EditorApp {
                                         .then_some(selected_find_occurrence)
                                         .flatten(),
                                 ));
+                                if let Some(cluster) = dense_cluster {
+                                    dense_work_open = agent_dense_disclosure_row(
+                                        ui,
+                                        Id::new(("dense_agent_work", item_index, cluster.active)),
+                                        &cluster.label,
+                                        cluster.change,
+                                        cluster.active,
+                                        cluster.active || !find_matches.is_empty(),
+                                    );
+                                    if !dense_work_open {
+                                        item_heights[item_index] = ui.cursor().top() - item_top;
+                                        if item_index + 1 < transcript_len
+                                            || transcript_has_footer
+                                        {
+                                            ui.add_space(item_gap);
+                                        }
+                                        continue;
+                                    }
+                                }
                                 match item {
                                     TranscriptItem::User(text) => {
-                                        ui.label(
-                                            RichText::new("YOU")
-                                                .size(theme::typography::MICRO_SIZE)
-                                                .strong()
-                                                .color(theme::text().muted),
-                                        );
+                                        if !dense_agent {
+                                            ui.label(
+                                                RichText::new("YOU")
+                                                    .size(theme::typography::MICRO_SIZE)
+                                                    .strong()
+                                                    .color(theme::text().muted),
+                                            );
+                                        }
                                         egui::Frame::new()
                                             .fill(theme::surface().input)
                                             .stroke(egui::Stroke::new(
@@ -12618,52 +13188,90 @@ impl EditorApp {
                                             });
                                     }
                                     TranscriptItem::Assistant(text) => {
-                                        draw_provider_identity(ui, self.selected_provider);
+                                        if !dense_agent || dense_final_responses[item_index] {
+                                            draw_provider_identity(ui, self.selected_provider);
+                                        }
                                         let width = ui.available_width();
                                         let galley = agent_markdown_galley(
                                             ui,
-                                            Id::new(("agent_markdown", item_index)),
+                                            Id::new(("agent_markdown", item_index, dense_agent)),
                                             text,
                                             width,
                                             &self.highlighter,
                                             &self.syntaxes,
+                                            dense_agent,
                                             item_search,
                                         );
                                         ui.add(Label::new(galley).wrap());
                                     }
                                     TranscriptItem::Thought(text) => {
-                                        egui::CollapsingHeader::new("Thinking")
-                                            .id_salt(("thought", item_index))
-                                            .icon(paint_agent_disclosure)
-                                            .show(ui, |ui| {
+                                        let add_thought = |ui: &mut egui::Ui| {
                                                 ui.add(
                                                     Label::new(
-                                                        RichText::new(text.as_str()).weak().italics(),
+                                                        RichText::new(text.as_str()).weak(),
                                                     )
                                                     .wrap(),
                                                 );
-                                            });
+                                            };
+                                        if dense_agent {
+                                            agent_dense_tool(
+                                                ui,
+                                                Id::new(("dense_agent_thought", item_index)),
+                                                "Thought",
+                                                None,
+                                                None,
+                                                item_search,
+                                                true,
+                                                add_thought,
+                                            );
+                                        } else {
+                                            egui::CollapsingHeader::new("Thinking")
+                                                .id_salt(("thought", item_index))
+                                                .icon(paint_agent_disclosure)
+                                                .show(ui, add_thought);
+                                        }
                                     }
                                     TranscriptItem::Content { role, content } => {
-                                        match role {
-                                            ContentRole::Assistant => {
-                                                draw_provider_identity(ui, self.selected_provider)
+                                        if dense_agent && matches!(role, ContentRole::Thought) {
+                                            agent_dense_tool(
+                                                ui,
+                                                Id::new(("dense_agent_content", item_index)),
+                                                "Thought",
+                                                None,
+                                                None,
+                                                item_search,
+                                                true,
+                                                |ui| draw_agent_content(ui, content, item_search),
+                                            );
+                                        } else {
+                                            if !dense_agent
+                                                || (matches!(role, ContentRole::Assistant)
+                                                    && dense_final_responses[item_index])
+                                            {
+                                                match role {
+                                                    ContentRole::Assistant => draw_provider_identity(
+                                                        ui,
+                                                        self.selected_provider,
+                                                    ),
+                                                    ContentRole::User => {
+                                                        ui.label(
+                                                            RichText::new("You").small().strong(),
+                                                        );
+                                                    }
+                                                    ContentRole::Thought => {
+                                                        ui.label(
+                                                            RichText::new("Thinking")
+                                                                .small()
+                                                                .strong(),
+                                                        );
+                                                    }
+                                                }
                                             }
-                                            ContentRole::User => {
-                                                ui.label(RichText::new("You").small().strong());
-                                            }
-                                            ContentRole::Thought => {
-                                                ui.label(RichText::new("Thinking").small().strong());
-                                            }
+                                            draw_agent_content(ui, content, item_search);
                                         }
-                                        draw_agent_content(ui, content, item_search);
                                     }
                                     TranscriptItem::Plan(plan) => {
-                                        egui::CollapsingHeader::new("Plan")
-                                            .id_salt(("plan", item_index))
-                                            .default_open(true)
-                                            .icon(paint_agent_disclosure)
-                                            .show(ui, |ui| {
+                                        let add_plan = |ui: &mut egui::Ui| {
                                                 for item in plan {
                                                     agent_search_label(
                                                         ui,
@@ -12676,7 +13284,25 @@ impl EditorApp {
                                                         item_search,
                                                     );
                                                 }
-                                            });
+                                            };
+                                        if dense_agent {
+                                            agent_dense_tool(
+                                                ui,
+                                                Id::new(("dense_agent_plan", item_index)),
+                                                "Plan",
+                                                None,
+                                                None,
+                                                item_search,
+                                                true,
+                                                add_plan,
+                                            );
+                                        } else {
+                                            egui::CollapsingHeader::new("Plan")
+                                                .id_salt(("plan", item_index))
+                                                .default_open(true)
+                                                .icon(paint_agent_disclosure)
+                                                .show(ui, add_plan);
+                                        }
                                     }
                                     TranscriptItem::Tool(tool) => {
                                         let title = tool.display_title();
@@ -12696,19 +13322,10 @@ impl EditorApp {
                                         let is_subagent = tool_is_subagent(tool);
                                         let has_body = tool.detail.is_some()
                                             || (!title_includes_paths && !tool.paths.is_empty());
-                                        agent_collapsing_header(
-                                            ui,
-                                            ("tool", &tool.id, contains_diff),
-                                            title,
-                                            tool.status.as_deref(),
-                                            is_file_edit
-                                                .then(|| tool_changes.get(&tool.id).copied())
-                                                .flatten(),
-                                            transcript_width,
-                                            item_search,
-                                            has_body,
-                                            is_subagent || (contains_diff && !is_file_edit),
-                                            |ui| {
+                                        let change = is_file_edit
+                                            .then(|| tool_changes.get(&tool.id).copied())
+                                            .flatten();
+                                        let add_body = |ui: &mut egui::Ui| {
                                                 if is_subagent {
                                                     ui.label(
                                                         RichText::new("SUBAGENT")
@@ -12980,8 +13597,33 @@ impl EditorApp {
                                                         );
                                                     }
                                                 }
-                                            },
-                                        );
+                                            };
+                                        if dense_agent {
+                                            agent_dense_tool(
+                                                ui,
+                                                Id::new(("dense_agent_tool", tool.id.as_str())),
+                                                title,
+                                                tool.status.as_deref(),
+                                                change,
+                                                item_search,
+                                                has_body,
+                                                add_body,
+                                            );
+                                        } else {
+                                            agent_collapsing_header(
+                                                ui,
+                                                ("tool", &tool.id, contains_diff),
+                                                title,
+                                                tool.status.as_deref(),
+                                                change,
+                                                transcript_width,
+                                                item_search,
+                                                has_body,
+                                                is_subagent
+                                                    || (contains_diff && !is_file_edit),
+                                                add_body,
+                                            );
+                                        }
                                     }
                                     TranscriptItem::Permission(card) => {
                                         if let Some(selected) = card.selected.as_ref().and_then(
@@ -13334,10 +13976,10 @@ impl EditorApp {
                                         should_scroll_to_find && !item_scrolled,
                                     );
                                 if item_index + 1 < transcript_len || transcript_has_footer {
-                                    ui.add_space(16.0);
+                                    ui.add_space(gap_after_item);
                                 }
                             }
-                            if !self.agent.changed_paths.is_empty() {
+                            if !dense_agent && !self.agent.changed_paths.is_empty() {
                                 let item_top = ui.cursor().top();
                                 if let Some(path) = draw_agent_changed_files(
                                     ui,
@@ -13354,6 +13996,7 @@ impl EditorApp {
                                                 .is_ok()
                                                 .then_some((find_query.as_str(), None))
                                         }),
+                                    dense_agent,
                                 ) {
                                     open_diff_request = Some(path);
                                 }
@@ -13366,8 +14009,14 @@ impl EditorApp {
                                 );
                             }
                             if self.agent.active {
-                                ui.add_space(theme::space::SMALL);
-                                draw_agent_working(ui, self.selected_provider);
+                                if dense_agent {
+                                    if active_work_start == Some(transcript_len) {
+                                        draw_dense_agent_working(ui);
+                                    }
+                                } else {
+                                    ui.add_space(theme::space::SMALL);
+                                    draw_agent_working(ui, self.selected_provider);
+                                }
                             }
                                 });
                             });
@@ -15598,7 +16247,7 @@ impl EditorApp {
             },
         );
         if vim_enabled && (output.response.clicked() || output.response.dragged()) {
-            vim.clear_preferred_column();
+            vim.sync_pointer_selection(editor_surface, output.response.triple_clicked());
         }
         if vim_enabled && !output.inserted_text.is_empty() {
             vim.record_insert_text(&output.inserted_text);
@@ -15962,7 +16611,7 @@ impl EditorApp {
             FilePickerPurpose::OpenProject => ("Open project", "project_folder_picker"),
         };
         let frame = egui::Frame::new()
-            .fill(theme::surface().raised)
+            .fill(theme::surface().input)
             .stroke(theme::border::strong())
             .corner_radius(theme::corner(theme::radius::DIALOG))
             .shadow(theme::shadow::dialog());
@@ -15990,7 +16639,7 @@ impl EditorApp {
                 let rail = body.with_max_x(body.left() + rail_width);
                 let list = egui::Rect::from_min_max(rail.right_top(), body.right_bottom());
 
-                // One dialog surface: places, list, and footer share `raised`.
+                // One dialog surface: places, list, and footer share `input`.
                 // Structure comes from hairlines, not nested chrome fills.
                 ui.painter()
                     .hline(toolbar.x_range(), toolbar.bottom(), divider);
@@ -16088,7 +16737,7 @@ impl EditorApp {
                         ui.painter().rect_filled(
                             address_rect,
                             theme::corner(theme::radius::CONTROL),
-                            theme::surface().input,
+                            theme::surface().raised,
                         );
                         ui.painter().rect_stroke(
                             address_rect,
@@ -16126,7 +16775,7 @@ impl EditorApp {
                         ui.painter().rect_filled(
                             search_rect,
                             theme::corner(theme::radius::CONTROL),
-                            theme::surface().input,
+                            theme::surface().raised,
                         );
                         icons::paint(
                             ui.painter(),
@@ -19286,9 +19935,10 @@ mod tests {
         SettingsSection, TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH,
         TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY, TabDrop, TreeState, UPDATE_BUTTON_SIZE,
         WINDOW_CORNER_RADIUS, agent_at_bottom, agent_collapsing_header, agent_composer_content,
-        agent_composer_height, agent_diff_preview, agent_markdown_galley, agent_mention_matches,
-        agent_mention_query, agent_menu_rect, agent_new_session_rect, agent_search_matches,
-        agent_selector_button, agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
+        agent_composer_height, agent_dense_disclosure_row, agent_diff_preview,
+        agent_markdown_galley, agent_mention_matches, agent_mention_query, agent_menu_rect,
+        agent_new_session_rect, agent_search_matches, agent_selector_button,
+        agent_send_button_colors, agent_sessions_rect, agent_toggle_rect,
         agentic_empty_state_top_padding, allowed_tab_drop_zone, build_agent_diff,
         cached_agent_diff, child_path, collect_agent_mentions, completion_word_range,
         copy_tree_entry, defer_resize, diagnostic_highlighted_job,
@@ -19903,6 +20553,46 @@ mod tests {
         assert!(title.right() < dark.left());
         assert!(line_wrapping.right() < no_wrap.left());
         assert!(no_wrap.right() < wrap.left());
+    }
+
+    #[test]
+    fn appearance_settings_offer_the_dense_agent_toggle() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.settings = Settings::default();
+        app.settings_open = true;
+        app.settings_section = SettingsSection::Appearance;
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Dense Agent"))
+        );
     }
 
     #[test]
@@ -21486,6 +22176,780 @@ mod tests {
     }
 
     #[test]
+    fn dense_agent_keeps_responses_visible_and_collapses_only_work_clusters() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        for agentic_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = EditorApp::new(OpenTarget {
+                root: temp.path().canonicalize().unwrap(),
+                file: None,
+                create: false,
+            })
+            .unwrap();
+            app.agentic_mode = agentic_mode;
+            app.agent_sidebar = !agentic_mode;
+            app.settings.appearance.dense_agent = true;
+            app.agent.connection = ConnectionState::Ready;
+            app.agent.session_ready = true;
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::User("Make it compact".into()));
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant("Inspecting the renderer".into()));
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Tool(ToolActivity {
+                    id: "dense-read".into(),
+                    title: Some("Read src/app.rs".into()),
+                    status: Some("Completed".into()),
+                    kind: Some("Read".into()),
+                    paths: vec!["src/app.rs".into()],
+                    detail: None,
+                }));
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Assistant("Now the implementation".into()));
+            app.agent.changed_paths.insert(
+                "src/app.rs".into(),
+                FileChange {
+                    added: 1,
+                    removed: 0,
+                },
+            );
+            let context = theme::test_context();
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_200.0, 760.0));
+            let mut draw = |events| {
+                context.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..RawInput::default()
+                    },
+                    |root| app.ui(root),
+                )
+            };
+
+            let output = draw(Vec::new());
+
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "Explored 1 file"))
+            );
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "Inspecting the renderer"))
+            );
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "Now the implementation"))
+            );
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "Read src/app.rs"))
+            );
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "1 file changed"))
+            );
+        }
+    }
+
+    #[test]
+    fn dense_agent_responses_use_primary_text() {
+        fn text_color(shape: &Shape, expected: &str) -> Option<Color32> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_color(shape, expected)),
+                _ => None,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("Midway update".into()));
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 760.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| text_color(&shape.shape, "Midway update")),
+            Some(theme::text().primary)
+        );
+    }
+
+    #[test]
+    fn dense_agent_labels_only_the_final_response_in_each_turn() {
+        fn text_rects(shape: &Shape, expected: &str, rects: &mut Vec<Rect>) {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    rects.push(Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                Shape::Vec(shapes) => shapes
+                    .iter()
+                    .for_each(|shape| text_rects(shape, expected, rects)),
+                _ => {}
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.selected_provider = ProviderId::Cursor;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("First turn".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("Midway update".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Thought("Working".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("First final".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Second turn".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("Second final".into()));
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 900.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let rects = |expected| {
+            let mut rects = Vec::new();
+            output
+                .shapes
+                .iter()
+                .for_each(|shape| text_rects(&shape.shape, expected, &mut rects));
+            rects
+        };
+        let identities = rects("Cursor");
+        let midway = rects("Midway update")[0];
+        let first_final = rects("First final")[0];
+        let second_final = rects("Second final")[0];
+        let has_identity_above = |response: Rect| {
+            identities.iter().any(|identity| {
+                identity.bottom() <= response.top()
+                    && response.top() - identity.bottom() <= theme::space::MEDIUM
+            })
+        };
+
+        assert!(!has_identity_above(midway));
+        assert!(
+            has_identity_above(first_final),
+            "identities={identities:?}, first_final={first_final:?}"
+        );
+        assert!(
+            has_identity_above(second_final),
+            "identities={identities:?}, second_final={second_final:?}"
+        );
+    }
+
+    #[test]
+    fn dense_work_summary_combines_edits_exploration_commands_and_diff_totals() {
+        use std::collections::{HashMap, VecDeque};
+
+        let tool = |id: &str, title: &str, kind: &str| {
+            TranscriptItem::Tool(ToolActivity {
+                id: id.into(),
+                title: Some(title.into()),
+                status: Some("Completed".into()),
+                kind: Some(kind.into()),
+                paths: Vec::new(),
+                detail: None,
+            })
+        };
+        let transcript = VecDeque::from([
+            tool("edit", "Edit", "Edit"),
+            tool("read", "Read", "Read"),
+            tool("search", "Grep", "Search"),
+            tool("command", "Run tests", "Execute"),
+        ]);
+        let changes = HashMap::from([(
+            "edit".into(),
+            FileChange {
+                added: 22,
+                removed: 11,
+            },
+        )]);
+
+        let clusters = super::dense_agent_work_clusters(&transcript, &changes, None);
+        let summary = clusters[0].as_ref().unwrap();
+
+        assert_eq!(
+            summary.label,
+            "Edited 1 file, explored 1 file, 1 search, ran 1 command"
+        );
+        assert_eq!(
+            summary.change,
+            Some(FileChange {
+                added: 22,
+                removed: 11
+            })
+        );
+    }
+
+    #[test]
+    fn dense_work_summary_is_one_bold_inline_hover_target() {
+        fn text(shape: &Shape, expected: &str) -> Option<(Rect, egui::FontFamily, Color32)> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => Some((
+                    Rect::from_min_size(text.pos, text.galley.size()),
+                    text.galley.job.sections[0].format.font_id.family.clone(),
+                    text.galley.job.sections[0].format.color,
+                )),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text(shape, expected)),
+                _ => None,
+            }
+        }
+        fn has_hover_fill(shape: &Shape, row: Rect) -> bool {
+            match shape {
+                Shape::Rect(rect) => rect.rect == row && rect.fill == theme::state::hover(),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_hover_fill(shape, row)),
+                _ => false,
+            }
+        }
+
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 120.0));
+        let draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    agent_dense_disclosure_row(
+                        ui,
+                        Id::new("dense_summary_style"),
+                        "Edited app.rs",
+                        Some(FileChange {
+                            added: 44,
+                            removed: 5,
+                        }),
+                        false,
+                        false,
+                    );
+                },
+            )
+        };
+
+        let _ = draw(Vec::new());
+        let row = context
+            .read_response(Id::new("dense_summary_style"))
+            .expect("dense summary row")
+            .rect;
+        let hovered = draw(vec![Event::PointerMoved(row.center())]);
+        let label = hovered
+            .shapes
+            .iter()
+            .find_map(|shape| text(&shape.shape, "Edited app.rs"))
+            .expect("summary label");
+        let added = hovered
+            .shapes
+            .iter()
+            .find_map(|shape| text(&shape.shape, "+44"))
+            .expect("added count");
+        let removed = hovered
+            .shapes
+            .iter()
+            .find_map(|shape| text(&shape.shape, "−5"))
+            .expect("removed count");
+        let chevron = crate::icons::probe::bounds(&hovered.shapes, row, theme::text().primary)
+            .expect("hovered summary chevron");
+
+        assert_eq!(label.1, theme::typography::strong_family());
+        assert_eq!(label.2, theme::text().primary);
+        assert!((added.0.left() - label.0.right()) <= theme::space::MEDIUM);
+        assert!(
+            (chevron.left() - removed.0.right()) <= theme::space::MEDIUM,
+            "diff-to-chevron gap was {}",
+            chevron.left() - removed.0.right()
+        );
+        assert!(added.0.left() >= label.0.right());
+        assert!(chevron.left() >= removed.0.right());
+        assert!(
+            !hovered
+                .shapes
+                .iter()
+                .any(|shape| has_hover_fill(&shape.shape, row))
+        );
+    }
+
+    #[test]
+    fn dense_agent_expands_active_work_then_collapses_it_when_the_turn_finishes() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.active = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Inspect this".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("Looking now".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "active-search".into(),
+                title: Some("Grepped renderer in app.rs".into()),
+                status: Some("Completed".into()),
+                kind: Some("Search".into()),
+                paths: Vec::new(),
+                detail: None,
+            }));
+        let context = theme::test_context();
+        let draw = |app: &mut EditorApp| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1_000.0, 760.0),
+                    )),
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let active = draw(&mut app);
+        assert!(
+            active
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Grepped renderer in app.rs"))
+        );
+
+        app.agent.active = false;
+        let completed = draw(&mut app);
+        assert!(
+            !completed
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Grepped renderer in app.rs"))
+        );
+        assert!(
+            completed
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Explored 1 search"))
+        );
+    }
+
+    #[test]
+    fn dense_work_items_have_no_extra_gap_between_rows() {
+        let tool = |id: &str, title: &str| {
+            TranscriptItem::Tool(ToolActivity {
+                id: id.into(),
+                title: Some(title.into()),
+                status: Some("Completed".into()),
+                kind: Some("Read".into()),
+                paths: Vec::new(),
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![crate::agent::controller::ToolOutput::Text("details".into())],
+                    output: None,
+                }),
+            })
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.active = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Inspect this".into()));
+        app.agent
+            .transcript
+            .push_back(tool("dense-first", "Read first.rs"));
+        app.agent
+            .transcript
+            .push_back(tool("dense-second", "Read second.rs"));
+        let context = theme::test_context();
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 760.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let first = context
+            .read_response(Id::new(("dense_agent_tool", "dense-first")))
+            .expect("first dense work row")
+            .rect;
+        let second = context
+            .read_response(Id::new(("dense_agent_tool", "dense-second")))
+            .expect("second dense work row")
+            .rect;
+
+        assert!(second.top() - first.bottom() <= theme::space::TIGHT);
+    }
+
+    #[test]
+    fn dense_work_rows_are_short_and_use_text_only_hover() {
+        fn text_color(shape: &Shape, expected: &str) -> Option<Color32> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_color(shape, expected)),
+                _ => None,
+            }
+        }
+        fn has_hover_fill(shape: &Shape, row: Rect) -> bool {
+            match shape {
+                Shape::Rect(rect) => rect.rect == row && rect.fill == theme::state::hover(),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| has_hover_fill(shape, row)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.active = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Inspect this".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "dense-hover".into(),
+                title: Some("Read compact.rs".into()),
+                status: Some("Completed".into()),
+                kind: Some("Read".into()),
+                paths: Vec::new(),
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![crate::agent::controller::ToolOutput::Text("details".into())],
+                    output: None,
+                }),
+            }));
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_000.0, 760.0));
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let _ = draw(Vec::new());
+        let row = context
+            .read_response(Id::new(("dense_agent_tool", "dense-hover")))
+            .expect("dense work row")
+            .rect;
+        let hovered = draw(vec![Event::PointerMoved(row.center())]);
+
+        assert!(row.height() <= 30.0, "row height was {}", row.height());
+        assert_eq!(
+            hovered
+                .shapes
+                .iter()
+                .find_map(|shape| text_color(&shape.shape, "Read compact.rs")),
+            Some(theme::text().primary)
+        );
+        assert!(
+            !hovered
+                .shapes
+                .iter()
+                .any(|shape| has_hover_fill(&shape.shape, row))
+        );
+    }
+
+    #[test]
+    fn dense_agent_tool_rows_expand_to_their_compact_details() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text().contains(expected),
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Tighten the renderer".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Tool(ToolActivity {
+                id: "dense-edit".into(),
+                title: Some("Edit src/app.rs".into()),
+                status: Some("Completed".into()),
+                kind: Some("Edit".into()),
+                paths: Vec::new(),
+                detail: Some(ToolDetail {
+                    input: None,
+                    content: vec![crate::agent::controller::ToolOutput::Text(
+                        "compact edit details".into(),
+                    )],
+                    output: None,
+                }),
+            }));
+        app.agent.tool_changes.insert(
+            "dense-edit".into(),
+            FileChange {
+                added: 44,
+                removed: 5,
+            },
+        );
+        let context = theme::test_context();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_000.0, 760.0));
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+
+        let collapsed = draw(Vec::new());
+        assert!(
+            !collapsed
+                .shapes
+                .iter()
+                .any(|shape| { contains_text(&shape.shape, "compact edit details") })
+        );
+        assert!(
+            collapsed
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Edited app.rs"))
+        );
+        assert!(
+            collapsed
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "+44"))
+        );
+        assert!(
+            collapsed
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "−5"))
+        );
+        let cluster = context
+            .read_response(Id::new(("dense_agent_work", 1, false)))
+            .expect("dense work cluster")
+            .rect;
+        let _ = draw(vec![
+            Event::PointerMoved(cluster.center()),
+            Event::PointerButton {
+                pos: cluster.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![Event::PointerButton {
+            pos: cluster.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        let row = context
+            .read_response(Id::new(("dense_agent_tool", "dense-edit")))
+            .expect("dense tool disclosure")
+            .rect;
+        let _ = draw(vec![
+            Event::PointerMoved(row.center()),
+            Event::PointerButton {
+                pos: row.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let expanded = draw(vec![Event::PointerButton {
+            pos: row.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(
+            expanded
+                .shapes
+                .iter()
+                .any(|shape| { contains_text(&shape.shape, "compact edit details") })
+        );
+        assert!(
+            expanded
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "+44"))
+        );
+        assert!(
+            expanded
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "−5"))
+        );
+    }
+
+    #[test]
+    fn dense_agent_removes_redundant_speaker_labels() {
+        fn contains_exact_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes
+                    .iter()
+                    .any(|shape| contains_exact_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = true;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("Compact this".into()));
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::Assistant("On it".into()));
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 760.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| contains_exact_text(&shape.shape, "YOU"))
+        );
+    }
+
+    #[test]
     fn agentic_toggle_labels_share_sidebar_edge_padding() {
         fn label_rect(shape: &Shape, expected: &str) -> Option<Rect> {
             match shape {
@@ -22293,6 +23757,7 @@ mod tests {
                     320.0,
                     &highlighter,
                     &syntaxes,
+                    false,
                     None,
                 );
                 let diff = cached_agent_diff(ui, Id::new("cached_diff"), Some("before"), new_text);
@@ -22323,6 +23788,7 @@ mod tests {
                 320.0,
                 &highlighter,
                 &syntaxes,
+                false,
                 None,
             ));
         });
@@ -23041,7 +24507,7 @@ mod tests {
                     events,
                     ..RawInput::default()
                 },
-                |ui| clicked = draw_agent_changed_files(ui, &root, &changed, None),
+                |ui| clicked = draw_agent_changed_files(ui, &root, &changed, None, false),
             );
             (output, clicked)
         };
@@ -26333,6 +27799,61 @@ mod tests {
             match_bracket_pair(&buffer, text[..closing + 1].chars().count()),
             Some((opening..opening + 1, closing..closing + 1))
         );
+    }
+
+    #[test]
+    fn editor_header_omits_language_and_vim_badges() {
+        fn contains_text(shape: &Shape, expected: &str) -> bool {
+            match shape {
+                Shape::Text(text) => text.galley.text() == expected,
+                Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+                _ => false,
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: Some(file),
+            create: false,
+        })
+        .unwrap();
+        app.settings.keybindings.active_profile = "vim".into();
+        app.lsp_status.insert(
+            crate::lsp::PresetId::RustAnalyzer,
+            crate::lsp::ServerStatus::Ready(crate::lsp::ServerCapabilities {
+                sync: crate::lsp::SyncKind::Incremental,
+                open_close: true,
+                save_include_text: None,
+                completion: true,
+                completion_triggers: Vec::new(),
+                hover: true,
+                definition: true,
+            }),
+        );
+
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+
+        for badge in ["Rust", "NORMAL"] {
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, badge)),
+                "unexpected editor badge {badge}"
+            );
+        }
     }
 
     #[test]

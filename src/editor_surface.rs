@@ -257,15 +257,24 @@ impl EditorSurface {
             Command::EditorIndent => self.replace_selection(text, "    "),
             Command::EditorOutdent => self.decrease_indent(text),
             Command::EditorCursorLeft | Command::EditorSelectLeft => {
-                self.move_cursor(self.cursor.saturating_sub(1), movement(command));
+                let target = if command == Command::EditorCursorLeft && !self.selection().is_empty()
+                {
+                    self.selection().start
+                } else {
+                    self.cursor.saturating_sub(1)
+                };
+                self.move_cursor(target, movement(command));
                 self.h_pos = None;
                 false
             }
             Command::EditorCursorRight | Command::EditorSelectRight => {
-                self.move_cursor(
-                    (self.cursor + 1).min(text.chars().count()),
-                    movement(command),
-                );
+                let target =
+                    if command == Command::EditorCursorRight && !self.selection().is_empty() {
+                        self.selection().end
+                    } else {
+                        (self.cursor + 1).min(text.chars().count())
+                    };
+                self.move_cursor(target, movement(command));
                 self.h_pos = None;
                 false
             }
@@ -469,7 +478,19 @@ impl EditorSurface {
             self.clamp_horizontal_scroll(content.width(), document_width);
         }
 
-        if response.clicked() || response.drag_started() {
+        if (response.double_clicked() || response.triple_clicked())
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            response.request_focus();
+            let character = self.character_at(pointer, content);
+            let range = if response.triple_clicked() {
+                text_line_range(text, character)
+            } else {
+                text_word_range(text, character)
+            };
+            self.set_selection(range.start, range.end);
+            ensure_cursor_visible = true;
+        } else if response.clicked() || response.drag_started() {
             response.request_focus();
             if let Some(pointer) = response.interact_pointer_pos() {
                 let character = self.character_at(pointer, content);
@@ -1388,28 +1409,42 @@ fn text_line_end(text: &str, cursor: usize) -> usize {
         })
 }
 
+fn text_line_range(text: &str, cursor: usize) -> Range<usize> {
+    let start = text_line_start(text, cursor);
+    let end = text_line_end(text, cursor);
+    start..end + usize::from(end < text.chars().count())
+}
+
+fn text_word_range(text: &str, cursor: usize) -> Range<usize> {
+    let line_start = text_line_start(text, cursor);
+    let line_end = text_line_end(text, cursor);
+    let line = char_slice(text, line_start..line_end);
+    let cursor = CCursor::new(cursor.saturating_sub(line_start).min(line.chars().count()));
+    let start = egui::text_selection::text_cursor_state::ccursor_previous_word(line, cursor)
+        .index
+        .0;
+    let end = egui::text_selection::text_cursor_state::ccursor_next_word(line, cursor)
+        .index
+        .0;
+    line_start + start..line_start + end
+}
+
 fn previous_word(text: &str, cursor: usize) -> usize {
-    let characters: Vec<_> = text.chars().collect();
-    let mut index = cursor.min(characters.len());
-    while index > 0 && characters[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    while index > 0 && !characters[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    index
+    egui::text_selection::text_cursor_state::ccursor_previous_word(
+        text,
+        CCursor::new(cursor.min(text.chars().count())),
+    )
+    .index
+    .0
 }
 
 fn next_word(text: &str, cursor: usize) -> usize {
-    let characters: Vec<_> = text.chars().collect();
-    let mut index = cursor.min(characters.len());
-    while index < characters.len() && !characters[index].is_whitespace() {
-        index += 1;
-    }
-    while index < characters.len() && characters[index].is_whitespace() {
-        index += 1;
-    }
-    index
+    egui::text_selection::text_cursor_state::ccursor_next_word(
+        text,
+        CCursor::new(cursor.min(text.chars().count())),
+    )
+    .index
+    .0
 }
 
 fn selection_drag_scroll_delta(pointer_y: f32, top: f32, bottom: f32, dt: f32) -> f32 {
@@ -1444,10 +1479,13 @@ mod tests {
         EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job, theme,
     };
     use egui::{
-        Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, RawInput, Rect, TextFormat,
-        TouchPhase, Vec2, pos2, text::LayoutJob,
+        Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput,
+        Rect, TextFormat, TouchPhase, Vec2, pos2, text::LayoutJob,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        ops::Range,
+        time::{Duration, Instant},
+    };
 
     fn painted_caret(primitives: &[egui::ClippedPrimitive]) -> bool {
         primitives
@@ -1459,6 +1497,101 @@ mod tests {
                     .any(|vertex| vertex.color == theme::accent()),
                 egui::epaint::Primitive::Callback(_) => false,
             })
+    }
+
+    fn multi_click_selection(text: &str, cursor: usize, clicks: usize) -> Range<usize> {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = text.to_owned();
+        editor.set_selection(cursor, cursor);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            400.0,
+        );
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 160.0)));
+        let mut caret = None;
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                ..RawInput::default()
+            },
+            |ui| caret = editor.show(ui, &mut text, &job, 1, true, None).caret_rect,
+        );
+        let pointer = caret.unwrap().center() - Vec2::new(2.0, 0.0);
+        for click in 0..clicks {
+            for pressed in [true, false] {
+                let _ = context.run_ui(
+                    RawInput {
+                        screen_rect: screen,
+                        time: Some(click as f64 * 0.1 + if pressed { 0.01 } else { 0.02 }),
+                        events: vec![
+                            Event::PointerMoved(pointer),
+                            Event::PointerButton {
+                                pos: pointer,
+                                button: PointerButton::Primary,
+                                pressed,
+                                modifiers: Modifiers::NONE,
+                            },
+                        ],
+                        ..RawInput::default()
+                    },
+                    |ui| {
+                        editor.show(ui, &mut text, &job, 1, false, None);
+                    },
+                );
+            }
+        }
+        editor.selection()
+    }
+
+    #[test]
+    fn double_click_selects_the_complete_identifier() {
+        assert_eq!(
+            multi_click_selection("let my_value = calculate();", 8, 2),
+            4..12
+        );
+    }
+
+    #[test]
+    fn triple_click_selects_the_complete_line_including_its_break() {
+        assert_eq!(
+            multi_click_selection("first\nlet my_value = calculate();\nthird", 14, 3),
+            6..34
+        );
+    }
+
+    #[test]
+    fn horizontal_arrows_collapse_a_selection_toward_their_direction() {
+        let context = theme::test_context();
+        let mut text = "abcdef".to_owned();
+        for (command, expected) in [
+            (crate::keybindings::Command::EditorCursorLeft, 2..2),
+            (crate::keybindings::Command::EditorCursorRight, 5..5),
+        ] {
+            let mut editor = EditorSurface::default();
+            editor.set_selection(2, 5);
+            editor.execute_command(&context, &mut text, command, None);
+            assert_eq!(editor.selection(), expected, "command {command:?}");
+        }
+    }
+
+    #[test]
+    fn word_navigation_stops_at_code_punctuation() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "foo.bar".to_owned();
+        editor.set_selection(text.chars().count(), text.chars().count());
+
+        editor.execute_command(
+            &context,
+            &mut text,
+            crate::keybindings::Command::EditorCursorWordLeft,
+            None,
+        );
+
+        assert_eq!(editor.selection(), 4..4);
     }
 
     #[test]
