@@ -776,7 +776,12 @@ fn external_base64_image(
 fn external_tool_kind(name: &str) -> Option<String> {
     let name = name.to_ascii_lowercase();
     Some(
-        if name.contains("read") {
+        if matches!(
+            name.as_str(),
+            "task" | "agent" | "spawn_agent" | "spawnagent" | "spawn_agents"
+        ) {
+            "Task"
+        } else if name.contains("read") {
             "Read"
         } else if name.contains("edit") || name.contains("replace") || name.contains("write") {
             "Edit"
@@ -1329,7 +1334,17 @@ mod tests {
         ExternalMessage, ExternalSession, MAX_HANDOFF_BYTES, TranscriptFormat,
         claude_project_directory, claude_transcript, codex_transcript, cursor_database_transcript,
         cursor_project_directory, discover_claude, discover_codex, discover_cursor,
+        external_tool_kind,
     };
+
+    #[test]
+    fn provider_subagent_names_restore_as_tasks_without_matching_task_management() {
+        for name in ["task", "Agent", "spawn_agent", "spawnAgent", "spawn_agents"] {
+            assert_eq!(external_tool_kind(name).as_deref(), Some("Task"), "{name}");
+        }
+        assert_eq!(external_tool_kind("TaskCreate"), None);
+        assert_eq!(external_tool_kind("TaskUpdate"), None);
+    }
 
     #[test]
     fn cursor_discovers_active_project_sessions_with_their_transcript() {

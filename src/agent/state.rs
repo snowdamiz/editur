@@ -449,7 +449,20 @@ impl AgentState {
                                 current.input = detail.input;
                             }
                             if !detail.content.is_empty() {
+                                let task = current
+                                    .content
+                                    .iter()
+                                    .find(|content| matches!(content, ToolOutput::Task { .. }))
+                                    .cloned();
                                 current.content = detail.content;
+                                if let Some(task) = task
+                                    && !current
+                                        .content
+                                        .iter()
+                                        .any(|content| matches!(content, ToolOutput::Task { .. }))
+                                {
+                                    current.content.insert(0, task);
+                                }
                             }
                             if detail.output.is_some() {
                                 current.output = detail.output;

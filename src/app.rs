@@ -1925,8 +1925,28 @@ fn agent_dense_tool(
     let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
         added.size().x + theme::space::SMALL + removed.size().x
     });
+    let (status_label, status_color) = agent_tool_status(status);
+    let status = (!status_label.is_empty()).then(|| {
+        ui.painter().layout_no_wrap(
+            status_label.to_owned(),
+            theme::typography::code_small(),
+            status_color,
+        )
+    });
+    let status_width = status.as_ref().map_or(0.0, |status| status.size().x);
+    let trailing_gap = if status_width > 0.0 && counts_width > 0.0 {
+        theme::space::SMALL
+    } else {
+        0.0
+    };
     let title_left = rect.left() + if has_body { 24.0 } else { 4.0 };
-    let title_width = (rect.right() - theme::space::SMALL - counts_width - title_left).max(0.0);
+    let title_width = (rect.right()
+        - theme::space::SMALL
+        - counts_width
+        - trailing_gap
+        - status_width
+        - title_left)
+        .max(0.0);
     let mut title = agent_text_job(
         title.lines().next().unwrap_or(title),
         title_width,
@@ -1947,6 +1967,14 @@ fn agent_dense_tool(
             title,
             title_color,
         );
+    if let Some(status) = status {
+        let x = rect.right() - theme::space::SMALL - counts_width - trailing_gap - status_width;
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - status.size().y * 0.5),
+            status,
+            status_color,
+        );
+    }
     if let Some((added, removed)) = counts {
         let x = rect.right() - theme::space::SMALL - counts_width;
         let y = rect.center().y - added.size().y * 0.5;

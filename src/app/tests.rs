@@ -9,11 +9,11 @@ use super::{
     TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
     TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, agent_at_bottom,
     agent_collapsing_header, agent_composer_content, agent_composer_height,
-    agent_dense_disclosure_row, agent_diff_preview, agent_empty_state_rect, agent_markdown_galley,
-    agent_mention_matches, agent_mention_query, agent_menu_rect, agent_new_session_rect,
-    agent_search_matches, agent_selector_button, agent_send_button_colors, agent_toggle_rect,
-    build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions, completion_word_range,
-    copy_tree_entry, defer_resize, diagnostic_highlighted_job,
+    agent_dense_disclosure_row, agent_dense_tool, agent_diff_preview, agent_empty_state_rect,
+    agent_markdown_galley, agent_mention_matches, agent_mention_query, agent_menu_rect,
+    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_send_button_colors,
+    agent_toggle_rect, build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions,
+    completion_word_range, copy_tree_entry, defer_resize, diagnostic_highlighted_job,
     disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
     draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
     draw_tab_drag_ghost, editor_background, editor_column_content, file_result_job,
@@ -4330,6 +4330,36 @@ fn subagent_cards_are_distinct_and_collapse_their_prompt() {
     assert!(texts.contains("Running"), "{texts}");
     assert!(texts.contains("Prompt"), "{texts}");
     assert!(!texts.contains("dig through the auth flow"), "{texts}");
+}
+
+#[test]
+fn dense_subagent_rows_show_their_status() {
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        agent_dense_tool(
+            ui,
+            Id::new("dense_subagent_status"),
+            "Subagent: Review changes",
+            Some("InProgress"),
+            None,
+            None,
+            false,
+            |_| {},
+        );
+    });
+    fn contains_running(shape: &Shape) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == "Running",
+            Shape::Vec(shapes) => shapes.iter().any(contains_running),
+            _ => false,
+        }
+    }
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_running(&shape.shape))
+    );
 }
 
 #[test]

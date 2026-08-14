@@ -2292,7 +2292,9 @@ fn load_external_transcript(
 }
 
 fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
-    let content = tool
+    let task = external_subagent_task(&tool);
+    let structured_task = task.is_some();
+    let mut content = tool
         .diffs
         .into_iter()
         .map(|diff| ToolOutput::Diff {
@@ -2301,11 +2303,17 @@ fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
             new_text: diff.new_text,
         })
         .collect::<Vec<_>>();
+    if let Some(task) = task {
+        content.insert(0, task);
+        if let Some(output) = tool.output.as_ref().filter(|output| !output.is_empty()) {
+            content.push(ToolOutput::Text(output.clone()));
+        }
+    }
     let detail = (tool.input.is_some() || tool.output.is_some() || !content.is_empty()).then_some(
         ToolDetail {
-            input: tool.input,
+            input: (!structured_task).then_some(tool.input).flatten(),
             content,
-            output: tool.output,
+            output: (!structured_task).then_some(tool.output).flatten(),
         },
     );
     ToolActivity {
@@ -2324,6 +2332,48 @@ fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
         paths: tool.paths.into_iter().map(Into::into).collect(),
         detail,
     }
+}
+
+fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
+    if tool.kind.as_deref() != Some("Task") {
+        return None;
+    }
+    let input = tool.input.as_deref().and_then(parse_tool_input);
+    let input_object = input.as_ref().and_then(serde_json::Value::as_object);
+    let input_string = |keys: &[&str]| {
+        input_object.and_then(|input| {
+            keys.iter()
+                .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+        })
+    };
+    let prompt = input_string(&["prompt", "message", "task"])
+        .or_else(|| input.as_ref().and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_owned();
+    let agent_id = input_string(&["agent_id", "agentId"])
+        .or_else(|| {
+            input_object
+                .and_then(|input| input.get("receiverThreadIds"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned);
+    let duration_ms = input_object
+        .and_then(|input| input.get("duration_ms").or_else(|| input.get("durationMs")))
+        .and_then(serde_json::Value::as_u64);
+    Some(ToolOutput::Task {
+        description: input_string(&["description"])
+            .unwrap_or(&tool.name)
+            .to_owned(),
+        prompt,
+        subagent_type: input_string(&["subagent_type", "subagentType"])
+            .unwrap_or(&tool.name)
+            .to_owned(),
+        model: input_string(&["model"]).map(str::to_owned),
+        agent_id,
+        duration_ms,
+    })
 }
 
 async fn handoff_external_session(
@@ -3126,22 +3176,31 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                     .collect(),
             ),
         ),
-        SessionUpdate::ToolCall(tool) => send_event(
-            events,
-            Event::ToolCallUpdated(ToolActivity {
-                id: tool.tool_call_id.0.to_string(),
-                title: Some(tool.title),
-                status: Some(format!("{:?}", tool.status)),
-                kind: Some(format!("{:?}", tool.kind)),
-                paths: tool_paths(&tool.locations, &tool.content),
-                detail: tool_detail(
-                    tool.raw_input.as_ref(),
-                    &tool.content,
-                    tool.raw_output.as_ref(),
-                ),
-            }),
-        ),
+        SessionUpdate::ToolCall(tool) => {
+            let kind = normalized_tool_kind(events.provider, Some(tool.kind), tool.meta.as_ref());
+            let detail = normalized_tool_detail(
+                events.provider,
+                &tool.title,
+                tool.raw_input.as_ref(),
+                &tool.content,
+                tool.raw_output.as_ref(),
+                tool.meta.as_ref(),
+                true,
+            );
+            send_event(
+                events,
+                Event::ToolCallUpdated(ToolActivity {
+                    id: tool.tool_call_id.0.to_string(),
+                    title: Some(tool.title),
+                    status: Some(format!("{:?}", tool.status)),
+                    kind,
+                    paths: tool_paths(&tool.locations, &tool.content),
+                    detail,
+                }),
+            );
+        }
         SessionUpdate::ToolCallUpdate(update) => {
+            let meta = update.meta;
             let fields = update.fields;
             let content = fields.content.as_deref().unwrap_or_default();
             let locations = fields.locations.as_deref().unwrap_or_default();
@@ -3151,12 +3210,16 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                     id: update.tool_call_id.0.to_string(),
                     title: fields.title,
                     status: fields.status.map(|status| format!("{status:?}")),
-                    kind: fields.kind.map(|kind| format!("{kind:?}")),
+                    kind: normalized_tool_kind(events.provider, fields.kind, meta.as_ref()),
                     paths: tool_paths(locations, content),
-                    detail: tool_detail(
+                    detail: normalized_tool_detail(
+                        events.provider,
+                        "",
                         fields.raw_input.as_ref(),
                         content,
                         fields.raw_output.as_ref(),
+                        meta.as_ref(),
+                        false,
                     ),
                 }),
             );
@@ -3544,6 +3607,140 @@ fn tool_detail(
     })
 }
 
+fn normalized_tool_kind(
+    provider: ProviderId,
+    kind: Option<ToolKind>,
+    meta: Option<&Meta>,
+) -> Option<String> {
+    if provider_meta_is_subagent(provider, meta) {
+        Some("Task".into())
+    } else {
+        kind.map(|kind| format!("{kind:?}"))
+    }
+}
+
+fn normalized_tool_detail(
+    provider: ProviderId,
+    title: &str,
+    input: Option<&serde_json::Value>,
+    content: &[ToolCallContent],
+    output: Option<&serde_json::Value>,
+    meta: Option<&Meta>,
+    initial: bool,
+) -> Option<ToolDetail> {
+    let mut detail = tool_detail(input, content, output);
+    if initial && let Some(task) = normalized_subagent_task(provider, title, input, meta) {
+        let detail = detail.get_or_insert_with(|| ToolDetail {
+            input: None,
+            content: Vec::new(),
+            output: None,
+        });
+        if let ToolOutput::Task { prompt, .. } = &task {
+            detail
+                .content
+                .retain(|content| !matches!(content, ToolOutput::Text(text) if text == prompt));
+        }
+        detail.content.insert(0, task);
+    }
+    detail
+}
+
+fn provider_meta_is_subagent(provider: ProviderId, meta: Option<&Meta>) -> bool {
+    match provider {
+        ProviderId::Codex => meta
+            .and_then(|meta| meta.get("codex"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|codex| {
+                codex.contains_key("collaboration") || codex.contains_key("subagent")
+            }),
+        ProviderId::Claude => {
+            meta.and_then(|meta| meta.get("claudeCode"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|claude| claude.get("subagent"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }
+        ProviderId::Cursor => false,
+    }
+}
+
+fn normalized_subagent_task(
+    provider: ProviderId,
+    title: &str,
+    input: Option<&serde_json::Value>,
+    meta: Option<&Meta>,
+) -> Option<ToolOutput> {
+    if !provider_meta_is_subagent(provider, meta) {
+        return None;
+    }
+    let input = input.and_then(serde_json::Value::as_object);
+    let prompt = input
+        .and_then(|input| input.get("prompt"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let model = input
+        .and_then(|input| input.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let input_string = |keys: &[&str]| {
+        input.and_then(|input| {
+            keys.iter()
+                .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+        })
+    };
+    let (description, subagent_type, agent_id) = match provider {
+        ProviderId::Codex => {
+            let codex = meta?.get("codex")?.as_object()?;
+            let subagent_type = input_string(&["subagent_type", "subagentType"])
+                .or_else(|| {
+                    codex
+                        .get("collaboration")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|collaboration| collaboration.get("tool"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("subagent")
+                .to_owned();
+            let agent_id = codex
+                .get("subagent")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|subagent| subagent.get("threadId"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    input
+                        .and_then(|input| input.get("receiverThreadIds"))
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|ids| ids.first())
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::to_owned);
+            (title.to_owned(), subagent_type, agent_id)
+        }
+        ProviderId::Claude => {
+            let claude = meta?.get("claudeCode")?.as_object()?;
+            let subagent_type = input_string(&["subagent_type", "subagentType"])
+                .or_else(|| claude.get("toolName").and_then(serde_json::Value::as_str))
+                .unwrap_or("subagent")
+                .to_owned();
+            (
+                input_string(&["description"]).unwrap_or(title).to_owned(),
+                subagent_type,
+                input_string(&["agent_id", "agentId"]).map(str::to_owned),
+            )
+        }
+        ProviderId::Cursor => return None,
+    };
+    Some(ToolOutput::Task {
+        description,
+        prompt,
+        subagent_type,
+        model,
+        agent_id,
+        duration_ms: None,
+    })
+}
+
 fn json_has_content(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,
@@ -3655,6 +3852,7 @@ fn tool_title_needs_humanizing(title: &str) -> bool {
                 | "Grep"
                 | "Task"
                 | "Wait"
+                | "spawnAgent"
                 | "Shell"
                 | "Exec"
                 | "ApplyPatch"
@@ -3737,9 +3935,11 @@ fn humanize_machine_tool_title(
                 Some("Waiting".into())
             }
         }
-        "spawn_agent" | "spawn_agents" => input_string(&["prompt", "description", "task"])
-            .map(|prompt| format!("Spawn agent · {}", first_line(&prompt)))
-            .or_else(|| Some("Spawn agent".into())),
+        "spawnagent" | "spawn_agent" | "spawn_agents" => {
+            input_string(&["prompt", "description", "task"])
+                .map(|prompt| format!("Spawn agent · {}", first_line(&prompt)))
+                .or_else(|| Some("Spawn agent".into()))
+        }
         "send_input" => input_string(&["prompt", "input", "message", "text"])
             .map(|prompt| format!("Send input · {}", first_line(&prompt)))
             .or_else(|| Some("Send input".into())),
@@ -3823,18 +4023,22 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, mpsc};
 
-    fn one_event(update: SessionUpdate) -> Event {
+    fn one_provider_event(provider: ProviderId, update: SessionUpdate) -> Event {
         let (event_tx, event_rx) = mpsc::sync_channel(4);
         normalize_update(
             update,
             &EventSender {
-                provider: ProviderId::Cursor,
+                provider,
                 event_tx,
                 wake: Arc::new(|| {}),
                 active_session: None,
             },
         );
         event_rx.recv().expect("update should be visible")
+    }
+
+    fn one_event(update: SessionUpdate) -> Event {
+        one_provider_event(ProviderId::Cursor, update)
     }
 
     #[test]
@@ -4138,6 +4342,49 @@ mod tests {
     }
 
     #[test]
+    fn imported_subagent_tools_restore_the_structured_card() {
+        let activity = external_tool_activity(ExternalTool {
+            id: "task-1".into(),
+            name: "spawn_agent".into(),
+            status: Some("completed".into()),
+            kind: Some("Task".into()),
+            input: Some(
+                serde_json::json!({
+                    "prompt": "Review authentication",
+                    "subagent_type": "reviewer",
+                    "model": "gpt-5",
+                    "agent_id": "agent-1",
+                })
+                .to_string(),
+            ),
+            output: Some("Authentication is sound".into()),
+            paths: Vec::new(),
+            diffs: Vec::new(),
+        });
+
+        assert!(matches!(
+            activity.detail,
+            Some(ToolDetail { content, .. }) if matches!(
+                content.as_slice(),
+                [
+                    ToolOutput::Task {
+                        prompt,
+                        subagent_type,
+                        model: Some(model),
+                        agent_id: Some(agent_id),
+                        ..
+                    },
+                    ToolOutput::Text(result),
+                ] if prompt == "Review authentication"
+                    && subagent_type == "reviewer"
+                    && model == "gpt-5"
+                    && agent_id == "agent-1"
+                    && result == "Authentication is sound"
+            )
+        ));
+    }
+
+    #[test]
     fn imported_tool_diffs_reach_the_sidebar_as_structured_content() {
         use crate::agent::external_sessions::{ExternalDiff, ExternalTool};
 
@@ -4268,6 +4515,103 @@ mod tests {
                 ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
             ))),
             Event::ToolCallUpdated(tool) if tool.kind.is_none()
+        ));
+    }
+
+    #[test]
+    fn codex_subagent_metadata_becomes_a_structured_task() {
+        let event = one_provider_event(
+            ProviderId::Codex,
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-spawn-weather", "spawnAgent")
+                    .kind(ToolKind::Other)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!({
+                        "prompt": "Find the current weather in Paris.",
+                        "receiverThreadIds": ["thread-paris"],
+                        "model": "gpt-5",
+                    }))
+                    .meta(serde_json::Map::from_iter([(
+                        "codex".into(),
+                        serde_json::json!({
+                            "collaboration": {
+                                "tool": "spawnAgent",
+                                "senderThreadId": "thread-main",
+                                "receiverThreadIds": ["thread-paris"],
+                            }
+                        }),
+                    )])),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                kind: Some(kind),
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if kind == "Task" && matches!(
+                content.as_slice(),
+                [ToolOutput::Task {
+                    prompt,
+                    subagent_type,
+                    model: Some(model),
+                    agent_id: Some(agent_id),
+                    ..
+                }] if prompt == "Find the current weather in Paris."
+                    && subagent_type == "spawnAgent"
+                    && model == "gpt-5"
+                    && agent_id == "thread-paris"
+            )
+        ));
+    }
+
+    #[test]
+    fn claude_subagent_metadata_becomes_a_structured_task() {
+        let event = one_provider_event(
+            ProviderId::Claude,
+            SessionUpdate::ToolCall(
+                ToolCall::new("toolu-review", "Review changes")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![ToolCallContent::Content(Content::new(
+                        ContentBlock::Text(TextContent::new("Inspect the authentication flow.")),
+                    ))])
+                    .raw_input(serde_json::json!({
+                        "description": "Review changes",
+                        "prompt": "Inspect the authentication flow.",
+                        "subagent_type": "Explore",
+                        "model": "sonnet",
+                    }))
+                    .meta(serde_json::Map::from_iter([(
+                        "claudeCode".into(),
+                        serde_json::json!({
+                            "toolName": "Agent",
+                            "subagent": true,
+                        }),
+                    )])),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                kind: Some(kind),
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if kind == "Task" && matches!(
+                content.as_slice(),
+                [ToolOutput::Task {
+                    description,
+                    prompt,
+                    subagent_type,
+                    model: Some(model),
+                    ..
+                }] if description == "Review changes"
+                    && prompt == "Inspect the authentication flow."
+                    && subagent_type == "Explore"
+                    && model == "sonnet"
+            )
         ));
     }
 
@@ -4577,6 +4921,20 @@ mod tests {
             detail: None,
         };
         assert_eq!(bare.display_title(), "Waiting");
+
+        let spawn = ToolActivity {
+            id: "spawn-1".into(),
+            title: Some("spawnAgent".into()),
+            status: Some("InProgress".into()),
+            kind: Some("Task".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: Some(serde_json::json!({ "prompt": "Review authentication" }).to_string()),
+                content: Vec::new(),
+                output: None,
+            }),
+        };
+        assert_eq!(spawn.display_title(), "Spawn agent · Review authentication");
 
         let command = ToolActivity {
             id: "bash-1".into(),

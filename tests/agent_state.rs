@@ -425,6 +425,54 @@ fn split_tool_updates_preserve_input_and_structured_output() {
 }
 
 #[test]
+fn subagent_result_updates_keep_the_launch_metadata() {
+    let mut state = AgentState::default();
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: Some("Review changes".into()),
+        status: Some("InProgress".into()),
+        kind: Some("Task".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Task {
+                description: "Review changes".into(),
+                prompt: "Inspect authentication".into(),
+                subagent_type: "Explore".into(),
+                model: None,
+                agent_id: None,
+                duration_ms: None,
+            }],
+            output: None,
+        }),
+    }));
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: None,
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Text("Authentication is sound".into())],
+            output: None,
+        }),
+    }));
+
+    assert!(matches!(
+        state.transcript.back(),
+        Some(TranscriptItem::Tool(ToolActivity {
+            detail: Some(ToolDetail { content, .. }),
+            ..
+        })) if matches!(
+            content.as_slice(),
+            [ToolOutput::Task { prompt, .. }, ToolOutput::Text(result)]
+                if prompt == "Inspect authentication" && result == "Authentication is sound"
+        )
+    ));
+}
+
+#[test]
 fn transcript_tools_are_retained_while_changed_paths_stay_bounded() {
     let mut state = AgentState::default();
     for id in 0..5_000 {
