@@ -269,6 +269,11 @@ struct AgentDiffCache {
     diff: Option<Arc<AgentDiff>>,
 }
 
+#[cfg(test)]
+pub(super) fn agent_diff_cache_count(ctx: &egui::Context) -> usize {
+    ctx.data(|data| data.count::<AgentDiffCache>())
+}
+
 pub(super) fn cached_agent_diff(
     ui: &mut egui::Ui,
     id: Id,

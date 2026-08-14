@@ -129,9 +129,7 @@ impl EditorApp {
 
     pub(super) fn warm_providers(&mut self, ctx: &egui::Context) {
         self.ensure_provider_catalog();
-        for provider in self.available_providers.clone() {
-            self.start_provider(provider, ctx);
-        }
+        self.start_provider(self.selected_provider, ctx);
     }
 
     pub(super) fn start_provider(&mut self, provider: ProviderId, ctx: &egui::Context) {
@@ -171,6 +169,9 @@ impl EditorApp {
         if target == self.selected_provider || !self.available_providers.contains(&target) {
             return;
         }
+        if let Some(controller) = self.agent_controllers.remove(&self.selected_provider) {
+            drop(controller);
+        }
         self.select_provider_state(target);
         if let Ok(directory) = data_dir()
             && let Err(error) = crate::agent::provider::save_selected(&directory, target)
@@ -204,14 +205,14 @@ impl EditorApp {
     pub(super) fn poll_agent(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         for (&provider, controller) in &self.agent_controllers {
-            for _ in 0..64 {
+            for _ in 0..8 {
                 let Ok(event) = controller.events().try_recv() else {
                     break;
                 };
                 events.push((provider, event));
             }
         }
-        if events.len() >= 64 {
+        if events.len() >= 8 {
             ctx.request_repaint();
         }
         for (provider, event) in events {
@@ -224,7 +225,7 @@ impl EditorApp {
                     event,
                     AgentEvent::SessionReady { .. }
                         | AgentEvent::SessionLoaded { .. }
-                        | AgentEvent::SessionTranscriptLoaded(_)
+                        | AgentEvent::SessionTranscriptStarted
                 )
             {
                 self.agent_follow_transcript = true;
@@ -941,6 +942,7 @@ impl EditorApp {
                         0.0
                     };
                     let scrolling_up = scroll_delta > 0.0;
+                    let scrolling_down = scroll_delta < 0.0;
                     if scrolling_up {
                         self.agent_follow_transcript = false;
                     }
@@ -1412,7 +1414,7 @@ impl EditorApp {
                                                                         ui,
                                                                         Id::new((
                                                                             "agent_tool_code",
-                                                                            &tool.id,
+                                                                            item_index,
                                                                             content_index,
                                                                         )),
                                                                         path,
@@ -1456,7 +1458,7 @@ impl EditorApp {
                                                                         ui,
                                                                         Id::new((
                                                                             "agent_diff",
-                                                                            &tool.id,
+                                                                            item_index,
                                                                             content_index,
                                                                         )),
                                                                         path,
@@ -1538,7 +1540,7 @@ impl EditorApp {
                                                                 )
                                                                 .id_salt((
                                                                     "task_prompt",
-                                                                    &tool.id,
+                                                                    item_index,
                                                                     content_index,
                                                                 ))
                                                                 .icon(paint_agent_disclosure)
@@ -1639,9 +1641,9 @@ impl EditorApp {
                                                 }
                                             };
                                         if dense_agent {
-                                            agent_dense_tool(
-                                                ui,
-                                                Id::new(("dense_agent_tool", tool.id.as_str())),
+                                                agent_dense_tool(
+                                                    ui,
+                                                    Id::new(("dense_agent_tool", item_index)),
                                                 title,
                                                 tool.status.as_deref(),
                                                 change,
@@ -1652,7 +1654,7 @@ impl EditorApp {
                                         } else {
                                             agent_collapsing_header(
                                                 ui,
-                                                ("tool", &tool.id, contains_diff),
+                                                ("tool", item_index, contains_diff),
                                                 title,
                                                 tool.status.as_deref(),
                                                 change,
@@ -2073,7 +2075,33 @@ impl EditorApp {
                     let max_offset =
                         (output.content_size.y - output.inner_rect.height()).max(0.0);
                     let at_bottom = agent_at_bottom(output.state.offset.y, max_offset);
-                    self.agent_follow_transcript = !scrolling_up
+                    let page_result = if scrolling_up
+                        && output.state.offset.y <= 0.5
+                        && self.agent.has_earlier_transcript()
+                    {
+                        Some(self.agent.load_earlier_transcript())
+                    } else if scrolling_down
+                        && at_bottom
+                        && self.agent.has_later_transcript()
+                    {
+                        Some(self.agent.load_later_transcript())
+                    } else {
+                        None
+                    };
+                    if let Some(page_result) = page_result {
+                        match page_result {
+                            Ok(true) => {
+                                self.agent_transcript_heights.clear();
+                                self.agent_find.dirty = true;
+                                self.agent_follow_transcript = false;
+                                ui.ctx().request_discard("page the agent transcript");
+                            }
+                            Ok(false) => {}
+                            Err(error) => self.show_error(error),
+                        }
+                    }
+                    self.agent_follow_transcript = !self.agent.has_later_transcript()
+                        && !scrolling_up
                         && (self.agent_follow_transcript || at_bottom);
                     if self.agent_follow_transcript
                         && (output.state.offset.y - max_offset).abs() > 0.5
@@ -2113,11 +2141,24 @@ impl EditorApp {
                             theme::text().secondary,
                         );
                         if jump.clicked() {
-                            let mut state = output.state;
-                            state.offset.y = max_offset;
-                            state.store(ui.ctx(), output.id);
-                            self.agent_follow_transcript = true;
-                            ui.ctx().request_repaint();
+                            if self.agent.has_later_transcript() {
+                                match self.agent.load_latest_transcript() {
+                                    Ok(true) => {
+                                        self.agent_transcript_heights.clear();
+                                        self.agent_find.dirty = true;
+                                        self.agent_follow_transcript = true;
+                                        ui.ctx().request_discard("load the latest transcript page");
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => self.show_error(error),
+                                }
+                            } else {
+                                let mut state = output.state;
+                                state.offset.y = max_offset;
+                                state.store(ui.ctx(), output.id);
+                                self.agent_follow_transcript = true;
+                                ui.ctx().request_repaint();
+                            }
                         }
                     }
                 }

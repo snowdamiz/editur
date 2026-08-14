@@ -5,6 +5,7 @@ use editur::agent::controller::{
     PromptAttachment, QuestionAnswer,
 };
 use editur::agent::provider::ProviderId;
+use editur::agent::state::{AgentState, TranscriptItem};
 
 fn receive_until(
     controller: &AgentController,
@@ -23,6 +24,71 @@ fn receive_until(
         }
     }
     panic!("timed out waiting for controller event: {events:?}");
+}
+
+#[test]
+fn acp_output_is_paged_without_losing_history() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("memory-stress".into()))
+        .unwrap();
+    let mut state = AgentState::default();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let Ok(event) = controller.events().recv_timeout(Duration::from_millis(100)) else {
+            assert!(
+                Instant::now() < deadline,
+                "memory stress turn did not finish"
+            );
+            continue;
+        };
+        let finished = matches!(event, Event::TurnFinished { .. });
+        state.apply(event);
+        if finished {
+            break;
+        }
+    }
+
+    let retained_payload_bytes = state
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Tool(tool) => tool.detail.as_ref()?.input.as_deref(),
+            _ => None,
+        })
+        .map(str::len)
+        .sum::<usize>();
+    assert!(retained_payload_bytes <= 16 * 1024 * 1024);
+    assert!(state.has_earlier_transcript());
+    assert!(
+        !state
+            .transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "memory-stress-0"))
+    );
+    assert!(
+        state.transcript.iter().any(
+            |item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "memory-stress-299")
+        )
+    );
+    while state.has_earlier_transcript() {
+        state.load_earlier_transcript().unwrap();
+    }
+    assert!(
+        state
+            .transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "memory-stress-0"))
+    );
 }
 
 #[test]

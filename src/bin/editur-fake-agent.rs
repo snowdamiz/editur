@@ -638,6 +638,23 @@ async fn run(
                             stream_text(&task_connection, &request, "unknown ignored")?;
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
+                        if prompt_text(&request) == "memory-stress" {
+                            let payload = "x".repeat(64 * 1024);
+                            for index in 0..300 {
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    SessionUpdate::ToolCall(
+                                        ToolCall::new(
+                                            format!("memory-stress-{index}"),
+                                            "Memory stress",
+                                        )
+                                        .status(ToolCallStatus::Completed)
+                                        .raw_input(serde_json::json!({"payload": payload})),
+                                    ),
+                                ))?;
+                            }
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
                         if prompt_text(&request) == "tool" {
                             task_connection.send_notification(SessionNotification::new(
                                 request.session_id.clone(),

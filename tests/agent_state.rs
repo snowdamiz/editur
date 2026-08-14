@@ -129,6 +129,54 @@ fn imported_session_images_reach_the_transcript() {
 }
 
 #[test]
+fn decoded_images_count_toward_the_transcript_budget() {
+    let mut state = AgentState::default();
+    for byte in 0..3 {
+        state.apply(Event::ContentReceived {
+            role: ContentRole::User,
+            content: DisplayContent::Image {
+                mime_type: "image/png".into(),
+                uri: None,
+                encoded_bytes: 8 * 1024 * 1024,
+                data: Some(std::sync::Arc::from(vec![byte; 8 * 1024 * 1024])),
+            },
+        });
+    }
+
+    assert!(state.has_earlier_transcript());
+    assert!(state.transcript.len() <= 2);
+    assert!(state.load_earlier_transcript().unwrap());
+    assert!(state.transcript.iter().any(|item| matches!(
+        item,
+        TranscriptItem::Content {
+            content: DisplayContent::Image { data: Some(data), .. },
+            ..
+        } if data.first() == Some(&0)
+    )));
+}
+
+#[test]
+fn a_single_oversized_structured_item_is_paged() {
+    let mut state = AgentState::default();
+    state.apply(Event::PlanUpdated(
+        (0..300)
+            .map(|_| PlanItem {
+                content: "x".repeat(64 * 1024),
+                status: "Pending".into(),
+            })
+            .collect(),
+    ));
+
+    assert!(state.transcript.is_empty());
+    assert!(state.has_earlier_transcript());
+    assert!(state.load_earlier_transcript().unwrap());
+    assert!(matches!(
+        state.transcript.front(),
+        Some(TranscriptItem::Plan(_))
+    ));
+}
+
+#[test]
 fn imported_session_diffs_restore_tool_line_stats() {
     let mut state = AgentState::default();
     state.apply(Event::SessionTranscriptLoaded(vec![
@@ -302,22 +350,28 @@ fn finished_turns_finalize_tools_that_never_completed() {
 }
 
 #[test]
-fn streamed_unicode_is_retained_without_truncation() {
+fn streamed_unicode_is_trimmed_only_at_character_boundaries() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("a".repeat(64 * 1024 - 1)));
     state.apply(Event::AssistantDelta("é".into()));
 
     assert!(matches!(
         state.transcript.back(),
-        Some(TranscriptItem::Assistant(text)) if text.len() == 64 * 1024 + 1 && text.ends_with('é')
+        Some(TranscriptItem::Assistant(text)) if text.len() <= 64 * 1024 && text.ends_with('…')
+    ));
+
+    state.apply(Event::AssistantDelta("終".into()));
+    assert!(matches!(
+        state.transcript.back(),
+        Some(TranscriptItem::Assistant(text)) if text == "終"
     ));
 }
 
 #[test]
-fn transcript_retains_every_large_tool_card() {
+fn transcript_paging_preserves_every_tool_card() {
     let mut state = AgentState::default();
     state.apply(Event::AssistantDelta("keep me".into()));
-    for id in 0..17 {
+    for id in 0..300 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
             id: id.to_string(),
             title: Some("tool".into()),
@@ -332,11 +386,27 @@ fn transcript_retains_every_large_tool_card() {
         }));
     }
 
-    assert_eq!(state.transcript.len(), 18);
-    assert!(matches!(
-        state.transcript.front(),
-        Some(TranscriptItem::Assistant(text)) if text == "keep me"
-    ));
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        seen.extend(state.transcript.iter().filter_map(|item| match item {
+            TranscriptItem::Tool(tool) => Some(tool.id.clone()),
+            _ => None,
+        }));
+        if !state.has_earlier_transcript() {
+            break;
+        }
+        assert!(state.load_earlier_transcript().unwrap());
+    }
+
+    assert_eq!(seen.len(), 300);
+    assert!(state.has_later_transcript());
+    assert!(state.load_latest_transcript().unwrap());
+    assert!(
+        state
+            .transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "299"))
+    );
 }
 
 #[test]
@@ -473,7 +543,7 @@ fn subagent_result_updates_keep_the_launch_metadata() {
 }
 
 #[test]
-fn transcript_tools_are_retained_while_changed_paths_stay_bounded() {
+fn zero_detail_tools_and_changed_paths_are_bounded() {
     let mut state = AgentState::default();
     for id in 0..5_000 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
@@ -486,8 +556,9 @@ fn transcript_tools_are_retained_while_changed_paths_stay_bounded() {
         }));
     }
 
-    assert_eq!(state.transcript.len(), 5_000);
+    assert!(state.transcript.len() <= 2_048);
     assert!(state.changed_paths.len() <= 4_096);
+    assert!(state.has_earlier_transcript());
 }
 
 #[test]
@@ -614,7 +685,7 @@ fn diff_line_stats_accumulate_without_double_counting_streamed_updates() {
 }
 
 #[test]
-fn diff_line_stats_and_their_tool_survive_large_transcripts() {
+fn diff_line_stats_and_tools_survive_transcript_paging() {
     let mut state = AgentState::default();
     state.apply(Event::ToolCallUpdated(ToolActivity {
         id: "early-edit".into(),
@@ -632,7 +703,7 @@ fn diff_line_stats_and_their_tool_survive_large_transcripts() {
             output: None,
         }),
     }));
-    for id in 0..40 {
+    for id in 0..300 {
         state.apply(Event::ToolCallUpdated(ToolActivity {
             id: format!("big-{id}"),
             title: None,
@@ -647,6 +718,15 @@ fn diff_line_stats_and_their_tool_survive_large_transcripts() {
         }));
     }
 
+    assert!(
+        !state
+            .transcript
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Tool(tool) if tool.id == "early-edit"))
+    );
+    while state.has_earlier_transcript() {
+        state.load_earlier_transcript().unwrap();
+    }
     assert!(
         state
             .transcript

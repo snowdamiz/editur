@@ -18,7 +18,6 @@ const MAX_CURSOR_BUBBLE_BYTES: usize = 1024 * 1024;
 const MAX_EXTERNAL_DIFF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTERNAL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTERNAL_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CURSOR_CONTENT_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CURSOR_IMAGE_FILES: usize = 65_536;
 const EXTERNAL_ID_PREFIX: &str = "external:";
 
@@ -86,19 +85,44 @@ impl ExternalSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn transcript(&self) -> Result<Vec<ExternalMessage>, String> {
+        let mut messages = Vec::new();
+        self.visit_transcript(&mut |message| {
+            messages.push(message);
+            Ok(())
+        })?;
+        Ok(messages)
+    }
+
+    pub(crate) fn visit_transcript(
+        &self,
+        visit: &mut impl FnMut(ExternalMessage) -> Result<(), String>,
+    ) -> Result<usize, String> {
         match self.format {
             TranscriptFormat::Cursor => {
-                if let Some(database) = &self.cursor_database
-                    && let Ok(messages) = cursor_database_transcript(database, &self.id)
-                    && !messages.is_empty()
-                {
-                    return Ok(messages);
+                if let Some(database) = &self.cursor_database {
+                    let mut emitted = 0;
+                    let result =
+                        visit_cursor_database_transcript(database, &self.id, &mut |message| {
+                            visit(message)?;
+                            emitted += 1;
+                            Ok(())
+                        });
+                    match result {
+                        Ok(count) if count > 0 => return Ok(count),
+                        Err(error) if emitted > 0 => return Err(error),
+                        _ => {}
+                    }
                 }
-                cursor_transcript(&self.transcript_path)
+                visit_cursor_transcript(&self.transcript_path, visit)
             }
-            TranscriptFormat::Codex => codex_transcript(&self.transcript_path),
-            TranscriptFormat::Claude => claude_transcript(&self.transcript_path),
+            TranscriptFormat::Codex => {
+                visit_messages(codex_transcript(&self.transcript_path)?, visit)
+            }
+            TranscriptFormat::Claude => {
+                visit_messages(claude_transcript(&self.transcript_path)?, visit)
+            }
         }
     }
 
@@ -107,52 +131,66 @@ impl ExternalSession {
     }
 
     pub(crate) fn handoff_prompt(&self, next_message: &str) -> Result<String, String> {
-        let messages = self.transcript()?;
-        let mut history = messages
-            .iter()
-            .filter_map(|message| match message {
-                ExternalMessage::User(text) => Some(format!("User:\n{text}")),
-                ExternalMessage::Assistant(text) => Some(format!("Assistant:\n{text}")),
-                ExternalMessage::Thought(_) => None,
-                ExternalMessage::Image(_) => None,
-                ExternalMessage::Tool(tool) => {
-                    let mut text = format!("Tool {}", tool.name);
-                    if let Some(input) = &tool.input {
-                        text.push_str(&format!(" input:\n{input}"));
-                    }
-                    if let Some(output) = &tool.output {
-                        text.push_str(&format!("\nTool output:\n{output}"));
-                    }
-                    Some(text)
-                }
-            })
-            .collect::<Vec<_>>();
         let fixed = format!(
             "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n\n\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
         );
         let available = MAX_HANDOFF_BYTES.saturating_sub(fixed.len());
-        let mut bytes = history
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
-            .saturating_add(history.len().saturating_sub(1) * 2);
-        while bytes > available && history.len() > 1 {
-            bytes = bytes.saturating_sub(history.remove(0).len() + 2);
-        }
-        if bytes > available
-            && let Some(message) = history.first_mut()
-        {
-            let mut start = message.len().saturating_sub(available);
-            while !message.is_char_boundary(start) {
-                start += 1;
+        let mut history = Vec::new();
+        let mut bytes = 0_usize;
+        self.visit_transcript(&mut |message| {
+            let Some(message) = handoff_message(message) else {
+                return Ok(());
+            };
+            bytes = bytes.saturating_add(message.len() + usize::from(!history.is_empty()) * 2);
+            history.push(message);
+            while bytes > available && history.len() > 1 {
+                bytes = bytes.saturating_sub(history.remove(0).len() + 2);
             }
-            *message = message[start..].to_owned();
-        }
+            if bytes > available {
+                let message = &mut history[0];
+                let mut start = message.len().saturating_sub(available);
+                while !message.is_char_boundary(start) {
+                    start += 1;
+                }
+                *message = message[start..].to_owned();
+                bytes = message.len();
+            }
+            Ok(())
+        })?;
         let history = history.join("\n\n");
         Ok(format!(
             "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n{history}\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
         ))
     }
+}
+
+fn handoff_message(message: ExternalMessage) -> Option<String> {
+    match message {
+        ExternalMessage::User(text) => Some(format!("User:\n{text}")),
+        ExternalMessage::Assistant(text) => Some(format!("Assistant:\n{text}")),
+        ExternalMessage::Thought(_) | ExternalMessage::Image(_) => None,
+        ExternalMessage::Tool(tool) => {
+            let mut text = format!("Tool {}", tool.name);
+            if let Some(input) = tool.input {
+                text.push_str(&format!(" input:\n{input}"));
+            }
+            if let Some(output) = tool.output {
+                text.push_str(&format!("\nTool output:\n{output}"));
+            }
+            Some(text)
+        }
+    }
+}
+
+fn visit_messages(
+    messages: Vec<ExternalMessage>,
+    visit: &mut impl FnMut(ExternalMessage) -> Result<(), String>,
+) -> Result<usize, String> {
+    let count = messages.len();
+    for message in messages {
+        visit(message)?;
+    }
+    Ok(count)
 }
 
 pub(crate) fn is_external_choice(id: &str) -> bool {
@@ -392,10 +430,24 @@ fn discover_claude(project_root: &Path, projects: &Path) -> Result<Vec<ExternalS
     Ok(sessions)
 }
 
+#[cfg(test)]
 fn cursor_database_transcript(
     database: &Path,
     session_id: &str,
 ) -> Result<Vec<ExternalMessage>, String> {
+    let mut messages = Vec::new();
+    visit_cursor_database_transcript(database, session_id, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })?;
+    Ok(messages)
+}
+
+fn visit_cursor_database_transcript(
+    database: &Path,
+    session_id: &str,
+    visit: &mut impl FnMut(ExternalMessage) -> Result<(), String>,
+) -> Result<usize, String> {
     if !valid_session_id(session_id) {
         return Err("invalid Cursor session identifier".into());
     }
@@ -409,24 +461,18 @@ fn cursor_database_transcript(
             "SELECT CAST(value AS TEXT)
              FROM cursorDiskKV
              WHERE key >= ?1 AND key < ?2 AND length(value) <= ?3
-             ORDER BY json_extract(value, '$.createdAt'), key
-             LIMIT ?4",
+             ORDER BY json_extract(value, '$.createdAt'), key",
         )
         .map_err(|error| format!("cannot inspect Cursor transcript: {error}"))?;
     let start = format!("bubbleId:{session_id}:");
     let end = format!("bubbleId:{session_id};");
     let rows = query
-        .query_map(
-            params![
-                start,
-                end,
-                MAX_CURSOR_BUBBLE_BYTES as i64,
-                MAX_TRANSCRIPT_EVENTS as i64
-            ],
-            |row| row.get::<_, String>(0),
-        )
+        .query_map(params![start, end, MAX_CURSOR_BUBBLE_BYTES as i64], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| format!("cannot list Cursor transcript: {error}"))?;
-    let mut messages = Vec::new();
+    let mut last = None;
+    let mut count = 0;
     let mut content = CursorContentCache::new(&connection);
     let mut images = CursorImageCache::new(database);
     for row in rows {
@@ -437,7 +483,7 @@ fn cursor_database_transcript(
         match record.get("type").and_then(serde_json::Value::as_i64) {
             Some(1) => {
                 if let Some(text) = record.get("text").and_then(message_text) {
-                    push_message(&mut messages, ExternalMessage::User(text));
+                    visit_distinct(&mut last, ExternalMessage::User(text), &mut count, visit)?;
                 }
                 for image in record
                     .get("images")
@@ -448,7 +494,7 @@ fn cursor_database_transcript(
                     .filter_map(|image| image.get("uuid").and_then(serde_json::Value::as_str))
                     .filter_map(|id| images.get(id))
                 {
-                    messages.push(ExternalMessage::Image(image));
+                    visit_distinct(&mut last, ExternalMessage::Image(image), &mut count, visit)?;
                 }
             }
             Some(2) => {
@@ -457,26 +503,35 @@ fn cursor_database_transcript(
                     .or_else(|| record.get("thinking"))
                     .and_then(message_text)
                 {
-                    push_message(&mut messages, ExternalMessage::Thought(thought));
+                    visit_distinct(
+                        &mut last,
+                        ExternalMessage::Thought(thought),
+                        &mut count,
+                        visit,
+                    )?;
                 }
                 if let Some(text) = record.get("text").and_then(message_text) {
-                    push_message(&mut messages, ExternalMessage::Assistant(text));
+                    visit_distinct(
+                        &mut last,
+                        ExternalMessage::Assistant(text),
+                        &mut count,
+                        visit,
+                    )?;
                 }
                 if let Some(tool) = cursor_tool(&record, &mut content) {
-                    messages.push(ExternalMessage::Tool(tool));
+                    visit_distinct(&mut last, ExternalMessage::Tool(tool), &mut count, visit)?;
                 }
             }
             _ => {}
         }
     }
-    Ok(messages)
+    Ok(count)
 }
 
 struct CursorImageCache {
     root: Option<PathBuf>,
     paths: HashMap<String, PathBuf>,
     indexed: bool,
-    bytes: usize,
 }
 
 impl CursorImageCache {
@@ -488,7 +543,6 @@ impl CursorImageCache {
                 .map(|user| user.join("workspaceStorage")),
             paths: HashMap::new(),
             indexed: false,
-            bytes: 0,
         }
     }
 
@@ -503,14 +557,10 @@ impl CursorImageCache {
             .take((MAX_EXTERNAL_IMAGE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .ok()?;
-        if bytes.is_empty()
-            || bytes.len() > MAX_EXTERNAL_IMAGE_BYTES
-            || self.bytes.saturating_add(bytes.len()) > MAX_EXTERNAL_IMAGE_TOTAL_BYTES
-        {
+        if bytes.is_empty() || bytes.len() > MAX_EXTERNAL_IMAGE_BYTES {
             return None;
         }
         let mime_type = image_mime_bytes(&bytes).or_else(|| image_mime(&path))?;
-        self.bytes += bytes.len();
         Some(ExternalImage {
             mime_type: mime_type.to_owned(),
             bytes: bytes.into(),
@@ -640,23 +690,14 @@ fn cursor_diff(
 
 struct CursorContentCache<'a> {
     connection: &'a Connection,
-    values: HashMap<String, Arc<str>>,
-    bytes: usize,
 }
 
 impl<'a> CursorContentCache<'a> {
     fn new(connection: &'a Connection) -> Self {
-        Self {
-            connection,
-            values: HashMap::new(),
-            bytes: 0,
-        }
+        Self { connection }
     }
 
     fn get(&mut self, id: &str) -> Option<Arc<str>> {
-        if let Some(value) = self.values.get(id) {
-            return Some(Arc::clone(value));
-        }
         if !valid_cursor_content_id(id) {
             return None;
         }
@@ -668,15 +709,10 @@ impl<'a> CursorContentCache<'a> {
                 |row| row.get::<_, String>(0),
             )
             .ok()?;
-        if value.len() > MAX_EXTERNAL_DIFF_BYTES
-            || self.bytes.saturating_add(value.len()) > MAX_CURSOR_CONTENT_TOTAL_BYTES
-        {
+        if value.len() > MAX_EXTERNAL_DIFF_BYTES {
             return None;
         }
-        self.bytes += value.len();
-        let value: Arc<str> = value.into();
-        self.values.insert(id.to_owned(), Arc::clone(&value));
-        Some(value)
+        Some(value.into())
     }
 }
 
@@ -830,11 +866,25 @@ fn valid_session_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+#[cfg(test)]
 fn cursor_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
+    let mut messages = Vec::new();
+    visit_cursor_transcript(path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })?;
+    Ok(messages)
+}
+
+fn visit_cursor_transcript(
+    path: &Path,
+    visit: &mut impl FnMut(ExternalMessage) -> Result<(), String>,
+) -> Result<usize, String> {
     let file = File::open(path)
         .map_err(|error| format!("cannot read external session {}: {error}", path.display()))?;
-    let mut messages = Vec::new();
-    for line in BufReader::new(file).lines().take(MAX_TRANSCRIPT_EVENTS) {
+    let mut last = None;
+    let mut count = 0;
+    for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -846,12 +896,17 @@ fn cursor_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
             continue;
         };
         match role {
-            "user" => push_message(&mut messages, ExternalMessage::User(text)),
-            "assistant" => push_message(&mut messages, ExternalMessage::Assistant(text)),
+            "user" => visit_distinct(&mut last, ExternalMessage::User(text), &mut count, visit)?,
+            "assistant" => visit_distinct(
+                &mut last,
+                ExternalMessage::Assistant(text),
+                &mut count,
+                visit,
+            )?,
             _ => {}
         }
     }
-    Ok(messages)
+    Ok(count)
 }
 
 fn codex_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
@@ -1322,6 +1377,21 @@ fn push_message(messages: &mut Vec<ExternalMessage>, message: ExternalMessage) {
     messages.push(message);
 }
 
+fn visit_distinct(
+    last: &mut Option<ExternalMessage>,
+    message: ExternalMessage,
+    count: &mut usize,
+    visit: &mut impl FnMut(ExternalMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    if last.as_ref() == Some(&message) {
+        return Ok(());
+    }
+    *last = Some(message.clone());
+    visit(message)?;
+    *count += 1;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -1545,6 +1615,92 @@ mod tests {
                     && tool.diffs[0].old_text.as_deref() == Some("fn before() {}\n")
                     && tool.diffs[0].new_text.as_ref() == "fn after() {}\n"
         ));
+    }
+
+    #[test]
+    fn cursor_database_transcript_keeps_the_complete_session() {
+        let fixture = tempdir().unwrap();
+        let database = fixture.path().join("state.vscdb");
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);")
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..300 {
+            let bubble = serde_json::json!({
+                "bubbleId": format!("user-{index}"),
+                "createdAt": format!("2026-08-13T10:{:02}:00Z", index % 60),
+                "type": 1,
+                "text": format!("{index}:{}", "x".repeat(64 * 1024)),
+            });
+            transaction
+                .execute(
+                    "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                    (
+                        format!("bubbleId:cursor-session:{index:04}"),
+                        bubble.to_string(),
+                    ),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let transcript = cursor_database_transcript(&database, "cursor-session").unwrap();
+        assert_eq!(transcript.len(), 300);
+        assert!(matches!(&transcript[0], ExternalMessage::User(text) if text.starts_with("0:")));
+        assert!(
+            matches!(&transcript[299], ExternalMessage::User(text) if text.starts_with("299:"))
+        );
+    }
+
+    #[test]
+    fn cursor_jsonl_transcript_keeps_the_complete_session() {
+        let fixture = tempdir().unwrap();
+        let transcript_path = fixture.path().join("cursor-session.jsonl");
+        let mut contents = String::new();
+        for index in 0..300 {
+            contents.push_str(
+                &serde_json::json!({
+                    "role": "assistant",
+                    "message": {"content": format!("{index}:{}", "x".repeat(64 * 1024))},
+                })
+                .to_string(),
+            );
+            contents.push('\n');
+        }
+        fs::write(&transcript_path, contents).unwrap();
+
+        let transcript = super::cursor_transcript(&transcript_path).unwrap();
+        assert_eq!(transcript.len(), 300);
+        assert!(
+            matches!(&transcript[0], ExternalMessage::Assistant(text) if text.starts_with("0:"))
+        );
+        assert!(
+            matches!(&transcript[299], ExternalMessage::Assistant(text) if text.starts_with("299:"))
+        );
+    }
+
+    #[test]
+    fn cursor_jsonl_transcript_has_no_event_count_cutoff() {
+        let fixture = tempdir().unwrap();
+        let transcript_path = fixture.path().join("cursor-session.jsonl");
+        let contents = (0..4_100)
+            .map(|index| {
+                serde_json::json!({
+                    "role": "assistant",
+                    "message": {"content": index.to_string()},
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&transcript_path, contents).unwrap();
+
+        assert_eq!(
+            super::cursor_transcript(&transcript_path).unwrap().len(),
+            4_100
+        );
     }
 
     #[test]

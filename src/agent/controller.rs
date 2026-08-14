@@ -25,13 +25,13 @@ use super::provider::{
     normalize_auth_methods, visible_diagnostics,
 };
 
-const EVENT_CAPACITY: usize = 512;
+const EVENT_CAPACITY: usize = 8;
 const COMMAND_CAPACITY: usize = 64;
 const MAX_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_DISPLAY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const MAX_CHOICES: usize = 128;
-const MAX_PLAN_ITEMS: usize = 1_024;
+const MAX_PLAN_ITEMS: usize = MAX_CHOICES;
 const MAX_TOOL_PATHS: usize = 256;
 const MAX_STORED_SESSION_IDS: usize = 4_096;
 /// Consecutive automatic resumes after retriable transport drops, per user turn.
@@ -251,14 +251,14 @@ pub enum SessionTranscriptMessage {
     Tool(ToolActivity),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ContentRole {
     User,
     Assistant,
     Thought,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DisplayContent {
     Image {
         mime_type: String,
@@ -312,7 +312,9 @@ pub enum Event {
         modes: Vec<ModeChoice>,
         config_options: Vec<ConfigChoice>,
     },
+    SessionTranscriptStarted,
     SessionTranscriptLoaded(Vec<SessionTranscriptMessage>),
+    SessionTranscriptFinished,
     ActiveSessionChanged(String),
     ModeChanged(String),
     ConfigOptionsUpdated(Vec<ConfigChoice>),
@@ -344,13 +346,13 @@ pub enum Event {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanItem {
     pub content: String,
     pub status: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolActivity {
     pub id: String,
     pub title: Option<String>,
@@ -380,7 +382,7 @@ impl ToolActivity {
 
 /// A file the tool touched, with the optional line number the agent reported
 /// for that location.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolPath {
     pub path: PathBuf,
     pub line: Option<u32>,
@@ -404,14 +406,14 @@ impl From<&str> for ToolPath {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolDetail {
     pub input: Option<String>,
     pub content: Vec<ToolOutput>,
     pub output: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ToolOutput {
     Text(String),
     Content(DisplayContent),
@@ -449,21 +451,21 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionChoice>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionChoice {
     pub id: String,
     pub name: String,
     pub kind: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InteractionRequest {
     pub request_id: u64,
     pub tool_call_id: String,
     pub kind: InteractionKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InteractionKind {
     Questions {
         title: String,
@@ -472,7 +474,7 @@ pub enum InteractionKind {
     Plan(PlanProposal),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Question {
     pub id: String,
     pub prompt: String,
@@ -480,13 +482,13 @@ pub struct Question {
     pub allow_multiple: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QuestionOption {
     pub id: String,
     pub label: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanProposal {
     pub name: Option<String>,
     pub overview: Option<String>,
@@ -496,7 +498,7 @@ pub struct PlanProposal {
     pub phases: Vec<PlanPhase>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanPhase {
     pub name: String,
     pub todos: Vec<PlanItem>,
@@ -2263,32 +2265,41 @@ fn load_external_transcript(
     external: &ExternalSession,
     events: &EventSender,
 ) -> Result<(), String> {
-    let transcript = external
-        .transcript()?
-        .into_iter()
-        .map(|message| match message {
-            ExternalMessage::User(text) => SessionTranscriptMessage::User(text),
-            ExternalMessage::Assistant(text) => SessionTranscriptMessage::Assistant(text),
-            ExternalMessage::Thought(text) => SessionTranscriptMessage::Thought(text),
-            ExternalMessage::Image(image) => SessionTranscriptMessage::Content {
-                role: ContentRole::User,
-                content: DisplayContent::Image {
-                    mime_type: image.mime_type,
-                    uri: None,
-                    encoded_bytes: image.bytes.len().div_ceil(3) * 4,
-                    data: Some(image.bytes),
-                },
-            },
-            ExternalMessage::Tool(tool) => {
-                SessionTranscriptMessage::Tool(external_tool_activity(tool))
-            }
-        })
-        .collect::<Vec<_>>();
-    if transcript.is_empty() {
+    let mut started = false;
+    let count = external.visit_transcript(&mut |message| {
+        if !started {
+            send_event(events, Event::SessionTranscriptStarted);
+            started = true;
+        }
+        send_event(
+            events,
+            Event::SessionTranscriptLoaded(vec![external_transcript_message(message)]),
+        );
+        Ok(())
+    })?;
+    if count == 0 {
         return Err("the external session transcript is empty".into());
     }
-    send_event(events, Event::SessionTranscriptLoaded(transcript));
+    send_event(events, Event::SessionTranscriptFinished);
     Ok(())
+}
+
+fn external_transcript_message(message: ExternalMessage) -> SessionTranscriptMessage {
+    match message {
+        ExternalMessage::User(text) => SessionTranscriptMessage::User(text),
+        ExternalMessage::Assistant(text) => SessionTranscriptMessage::Assistant(text),
+        ExternalMessage::Thought(text) => SessionTranscriptMessage::Thought(text),
+        ExternalMessage::Image(image) => SessionTranscriptMessage::Content {
+            role: ContentRole::User,
+            content: DisplayContent::Image {
+                mime_type: image.mime_type,
+                uri: None,
+                encoded_bytes: image.bytes.len().div_ceil(3) * 4,
+                data: Some(image.bytes),
+            },
+        },
+        ExternalMessage::Tool(tool) => SessionTranscriptMessage::Tool(external_tool_activity(tool)),
+    }
 }
 
 fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
@@ -3170,8 +3181,8 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                     .into_iter()
                     .take(MAX_PLAN_ITEMS)
                     .map(|entry| PlanItem {
-                        content: entry.content,
-                        status: format!("{:?}", entry.status),
+                        content: bounded_detail(entry.content),
+                        status: bounded_detail(format!("{:?}", entry.status)),
                     })
                     .collect(),
             ),
@@ -3190,8 +3201,8 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
             send_event(
                 events,
                 Event::ToolCallUpdated(ToolActivity {
-                    id: tool.tool_call_id.0.to_string(),
-                    title: Some(tool.title),
+                    id: bounded_detail(tool.tool_call_id.0.to_string()),
+                    title: Some(bounded_detail(tool.title)),
                     status: Some(format!("{:?}", tool.status)),
                     kind,
                     paths: tool_paths(&tool.locations, &tool.content),
@@ -3207,8 +3218,8 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
             send_event(
                 events,
                 Event::ToolCallUpdated(ToolActivity {
-                    id: update.tool_call_id.0.to_string(),
-                    title: fields.title,
+                    id: bounded_detail(update.tool_call_id.0.to_string()),
+                    title: fields.title.map(bounded_detail),
                     status: fields.status.map(|status| format!("{status:?}")),
                     kind: normalized_tool_kind(events.provider, fields.kind, meta.as_ref()),
                     paths: tool_paths(locations, content),
@@ -3356,38 +3367,39 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                     content: update
                         .todos
                         .into_iter()
-                        .take(MAX_PLAN_ITEMS)
+                        .take(MAX_CHOICES)
                         .map(|todo| ToolOutput::Todo {
-                            id: todo.id,
-                            content: todo.content,
-                            status: todo.status,
+                            id: bounded_detail(todo.id),
+                            content: bounded_detail(todo.content),
+                            status: bounded_detail(todo.status),
                         })
                         .collect(),
                     output: None,
                 }),
             })
         }
-        "cursor/task" => {
-            serde_json::from_value::<CursorTaskUpdate>(params).map(|update| ToolActivity {
-                id: update.tool_call_id,
-                title: Some(format!("Subagent: {}", update.description)),
+        "cursor/task" => serde_json::from_value::<CursorTaskUpdate>(params).map(|update| {
+            let description = bounded_detail(update.description);
+            ToolActivity {
+                id: bounded_detail(update.tool_call_id),
+                title: Some(bounded_detail(format!("Subagent: {description}"))),
                 status: None,
                 kind: Some("Task".into()),
                 paths: Vec::new(),
                 detail: Some(ToolDetail {
                     input: None,
                     content: vec![ToolOutput::Task {
-                        description: update.description,
-                        prompt: update.prompt,
-                        subagent_type: update.subagent_type.into(),
-                        model: update.model,
-                        agent_id: update.agent_id,
+                        description,
+                        prompt: bounded_detail(update.prompt),
+                        subagent_type: bounded_detail(update.subagent_type.into()),
+                        model: update.model.map(bounded_detail),
+                        agent_id: update.agent_id.map(bounded_detail),
                         duration_ms: update.duration_ms,
                     }],
                     output: None,
                 }),
-            })
-        }
+            }
+        }),
         "cursor/generate_image" => {
             serde_json::from_value::<CursorImageUpdate>(params).map(|update| ToolActivity {
                 id: update.tool_call_id,
@@ -3403,12 +3415,12 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                 detail: Some(ToolDetail {
                     input: None,
                     content: vec![ToolOutput::GeneratedImage {
-                        description: update.description,
+                        description: bounded_detail(update.description),
                         file_path: update.file_path,
                         reference_image_paths: update
                             .reference_image_paths
                             .into_iter()
-                            .take(MAX_TOOL_PATHS)
+                            .take(MAX_CHOICES)
                             .collect(),
                     }],
                     output: None,
@@ -3450,7 +3462,7 @@ enum NormalizedContent {
 
 fn normalize_display_content(content: ContentBlock) -> Option<NormalizedContent> {
     Some(match content {
-        ContentBlock::Text(text) => NormalizedContent::Text(text.text),
+        ContentBlock::Text(text) => NormalizedContent::Text(bounded_detail(text.text)),
         ContentBlock::Image(image) => {
             let encoded_bytes = image.data.len();
             let data = (encoded_bytes <= MAX_DISPLAY_IMAGE_BYTES.div_ceil(3) * 4)
@@ -3488,7 +3500,7 @@ fn normalize_display_content(content: ContentBlock) -> Option<NormalizedContent>
                 NormalizedContent::Display(DisplayContent::TextResource {
                     uri: resource.uri,
                     mime_type: resource.mime_type,
-                    text: resource.text,
+                    text: bounded_detail(resource.text),
                 })
             }
             EmbeddedResourceResource::BlobResourceContents(resource) => {
@@ -3579,6 +3591,7 @@ fn tool_detail(
         .map(bounded_json);
     let content = content
         .iter()
+        .take(MAX_CHOICES)
         .filter_map(|content| match content {
             ToolCallContent::Content(content) => {
                 match normalize_display_content(content.content.clone())? {
@@ -3588,8 +3601,11 @@ fn tool_detail(
             }
             ToolCallContent::Diff(diff) => Some(ToolOutput::Diff {
                 path: diff.path.clone(),
-                old_text: diff.old_text.as_deref().map(Arc::from),
-                new_text: Arc::from(diff.new_text.as_str()),
+                old_text: diff
+                    .old_text
+                    .as_deref()
+                    .map(|text| Arc::from(bounded_detail(text.to_owned()))),
+                new_text: Arc::from(bounded_detail(diff.new_text.clone())),
             }),
             ToolCallContent::Terminal(terminal) => {
                 Some(ToolOutput::Terminal(terminal.terminal_id.0.to_string()))
@@ -3752,7 +3768,7 @@ fn json_has_content(value: &serde_json::Value) -> bool {
 }
 
 fn bounded_json(value: &serde_json::Value) -> String {
-    let mut detail = value
+    let detail = value
         .as_object()
         .filter(|fields| fields.len() == 1)
         .and_then(|fields| fields.values().next())
@@ -3761,8 +3777,12 @@ fn bounded_json(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| {
             serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unavailable>".into())
         });
+    bounded_detail(detail)
+}
+
+fn bounded_detail(mut detail: String) -> String {
     if detail.len() > MAX_DETAIL_BYTES {
-        let mut end = MAX_DETAIL_BYTES;
+        let mut end = MAX_DETAIL_BYTES - '…'.len_utf8();
         while !detail.is_char_boundary(end) {
             end -= 1;
         }
@@ -4103,7 +4123,7 @@ mod tests {
         assert!(external.contains_key("same-session"));
         assert!(!external.contains_key("external:same-session"));
 
-        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let (event_tx, event_rx) = mpsc::sync_channel(4);
         enrich_native_session(
             "same-session",
             &external,
@@ -4116,14 +4136,30 @@ mod tests {
         );
         assert!(matches!(
             event_rx.recv().unwrap(),
+            Event::SessionTranscriptStarted
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
             Event::SessionTranscriptLoaded(messages)
                 if matches!(
                     messages.as_slice(),
-                    [SessionTranscriptMessage::User(text), SessionTranscriptMessage::Content {
+                    [SessionTranscriptMessage::User(text)] if text == "See attached"
+                )
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            Event::SessionTranscriptLoaded(messages)
+                if matches!(
+                    messages.as_slice(),
+                    [SessionTranscriptMessage::Content {
                         role: ContentRole::User,
                         content: DisplayContent::Image { data: Some(bytes), .. },
-                    }] if text == "See attached" && bytes.as_ref() == image
+                    }] if bytes.as_ref() == image
                 )
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            Event::SessionTranscriptFinished
         ));
     }
 
@@ -4250,6 +4286,19 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn streamed_text_is_bounded_before_entering_the_event_queue() {
+        let Event::AssistantDelta(text) =
+            one_event(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new("x".repeat(MAX_DETAIL_BYTES * 2))),
+            )))
+        else {
+            panic!("expected assistant text");
+        };
+
+        assert!(text.len() <= MAX_DETAIL_BYTES);
     }
 
     #[test]

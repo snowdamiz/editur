@@ -1,7 +1,11 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fs::File,
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
 };
+
+use serde::{Deserialize, Serialize};
 
 use super::controller::{
     CommandChoice, ConfigChoice, ConnectionState, ContentRole, DisplayContent, Event,
@@ -10,13 +14,16 @@ use super::controller::{
     ToolDetail, ToolOutput,
 };
 
+const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_ITEMS: usize = 2_048;
+const TRANSCRIPT_PAGE_ITEMS: usize = 256;
 const MAX_CHANGED_PATHS: usize = 4_096;
 const MAX_CHOICES: usize = 128;
 const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
 const MAX_BASELINE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -32,7 +39,7 @@ pub enum TranscriptItem {
     Error(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionCard {
     pub request_id: u64,
     pub tool_call_id: String,
@@ -41,7 +48,7 @@ pub struct PermissionCard {
     pub selected: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InteractionCard {
     pub request: InteractionRequest,
     pub selections: HashMap<String, Vec<String>>,
@@ -56,15 +63,68 @@ pub struct UsageState {
 }
 
 /// Added/removed line counts for one file, accumulated across every diff the
-/// agent produced for it this session.
+/// agent produced for it this session. Kept beside the resident transcript
+/// page because old items can be paged to disk.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileChange {
     pub added: u64,
     pub removed: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ArchivedTranscriptItem {
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Default)]
+struct TranscriptArchive {
+    file: Option<File>,
+    earlier: Vec<ArchivedTranscriptItem>,
+    later: Vec<ArchivedTranscriptItem>,
+}
+
+impl TranscriptArchive {
+    fn store(&mut self, item: &TranscriptItem) -> Result<ArchivedTranscriptItem, String> {
+        let bytes = bincode::serialize(item)
+            .map_err(|error| format!("cannot archive agent transcript: {error}"))?;
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(
+                tempfile::tempfile()
+                    .map_err(|error| format!("cannot create agent transcript archive: {error}"))?,
+            ),
+        };
+        let offset = file
+            .seek(SeekFrom::End(0))
+            .map_err(|error| format!("cannot seek agent transcript archive: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("cannot write agent transcript archive: {error}"))?;
+        Ok(ArchivedTranscriptItem {
+            offset,
+            len: bytes.len() as u64,
+        })
+    }
+
+    fn load(&mut self, item: ArchivedTranscriptItem) -> Result<TranscriptItem, String> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| "agent transcript archive is unavailable".to_owned())?;
+        file.seek(SeekFrom::Start(item.offset))
+            .map_err(|error| format!("cannot seek agent transcript archive: {error}"))?;
+        let mut bytes = vec![0; item.len as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|error| format!("cannot read agent transcript archive: {error}"))?;
+        bincode::deserialize(&bytes)
+            .map_err(|error| format!("cannot decode agent transcript archive: {error}"))
+    }
+}
+
 struct SessionLoadBackup {
     transcript: VecDeque<TranscriptItem>,
+    transcript_records: VecDeque<Option<ArchivedTranscriptItem>>,
+    transcript_archive: TranscriptArchive,
     changed_paths: HashMap<PathBuf, FileChange>,
     baselines: HashMap<PathBuf, Option<String>>,
     baseline_bytes: usize,
@@ -82,6 +142,9 @@ pub struct AgentState {
     pub allow_run_everything: bool,
     pub prompt: String,
     pub transcript: VecDeque<TranscriptItem>,
+    transcript_records: VecDeque<Option<ArchivedTranscriptItem>>,
+    transcript_archive: TranscriptArchive,
+    transcript_streaming: bool,
     /// Every file the agent modified this session with its accumulated line
     /// stats; feeds the "files changed" card.
     pub changed_paths: HashMap<PathBuf, FileChange>,
@@ -123,6 +186,9 @@ impl Default for AgentState {
             allow_run_everything: false,
             prompt: String::new(),
             transcript: VecDeque::new(),
+            transcript_records: VecDeque::new(),
+            transcript_archive: TranscriptArchive::default(),
+            transcript_streaming: false,
             changed_paths: HashMap::new(),
             baselines: HashMap::new(),
             baseline_bytes: 0,
@@ -191,6 +257,12 @@ impl AgentState {
     }
 
     pub fn apply(&mut self, event: Event) {
+        if !self.transcript_archive.later.is_empty()
+            && matches!(&event, Event::UserMessage(_))
+            && let Err(error) = self.load_latest_transcript()
+        {
+            self.diagnostics = Some(error);
+        }
         match event {
             Event::ConnectionChanged(connection) => {
                 self.session_ready = matches!(connection, ConnectionState::Ready);
@@ -215,6 +287,9 @@ impl AgentState {
                 self.session_ready = true;
                 self.active = false;
                 self.transcript.clear();
+                self.transcript_records.clear();
+                self.transcript_archive = TranscriptArchive::default();
+                self.transcript_streaming = false;
                 self.changed_paths.clear();
                 self.baselines.clear();
                 self.baseline_bytes = 0;
@@ -239,6 +314,8 @@ impl AgentState {
             Event::SessionLoading { title } => {
                 self.session_load_backup = Some(SessionLoadBackup {
                     transcript: std::mem::take(&mut self.transcript),
+                    transcript_records: std::mem::take(&mut self.transcript_records),
+                    transcript_archive: std::mem::take(&mut self.transcript_archive),
                     changed_paths: std::mem::take(&mut self.changed_paths),
                     baselines: std::mem::take(&mut self.baselines),
                     baseline_bytes: std::mem::take(&mut self.baseline_bytes),
@@ -250,12 +327,15 @@ impl AgentState {
                 self.refresh_queue.clear();
                 self.session_ready = false;
                 self.active = false;
+                self.transcript_streaming = false;
                 self.connection = ConnectionState::Starting;
                 self.title = title.map(bounded);
             }
             Event::SessionLoadFailed => {
                 if let Some(backup) = self.session_load_backup.take() {
                     self.transcript = backup.transcript;
+                    self.transcript_records = backup.transcript_records;
+                    self.transcript_archive = backup.transcript_archive;
                     self.changed_paths = backup.changed_paths;
                     self.baselines = backup.baselines;
                     self.baseline_bytes = backup.baseline_bytes;
@@ -266,6 +346,7 @@ impl AgentState {
                 }
                 self.session_ready = true;
                 self.active = false;
+                self.transcript_streaming = false;
             }
             Event::SessionLoaded {
                 current_mode,
@@ -283,17 +364,36 @@ impl AgentState {
                     .collect();
                 self.config_options = bounded_configs(config_options);
             }
-            Event::SessionTranscriptLoaded(messages) => {
+            Event::SessionTranscriptStarted => {
                 self.session_load_backup = None;
-                self.session_ready = true;
+                self.session_ready = false;
                 self.active = false;
                 self.transcript.clear();
+                self.transcript_records.clear();
+                self.transcript_archive = TranscriptArchive::default();
                 self.changed_paths.clear();
                 self.baselines.clear();
                 self.baseline_bytes = 0;
                 self.tool_credits.clear();
                 self.tool_changes.clear();
                 self.refresh_queue.clear();
+                self.transcript_streaming = true;
+            }
+            Event::SessionTranscriptLoaded(messages) => {
+                if !self.transcript_streaming {
+                    self.session_load_backup = None;
+                    self.session_ready = true;
+                    self.active = false;
+                    self.transcript.clear();
+                    self.transcript_records.clear();
+                    self.transcript_archive = TranscriptArchive::default();
+                    self.changed_paths.clear();
+                    self.baselines.clear();
+                    self.baseline_bytes = 0;
+                    self.tool_credits.clear();
+                    self.tool_changes.clear();
+                    self.refresh_queue.clear();
+                }
                 for message in messages {
                     match message {
                         SessionTranscriptMessage::User(text) => {
@@ -316,6 +416,10 @@ impl AgentState {
                         }
                     }
                 }
+            }
+            Event::SessionTranscriptFinished => {
+                self.transcript_streaming = false;
+                self.session_ready = true;
             }
             Event::ActiveSessionChanged(session_id) => {
                 self.session_id = Some(bounded(session_id));
@@ -348,19 +452,27 @@ impl AgentState {
                 self.active = true;
                 self.prompt.clear();
                 if !text.is_empty() {
-                    self.push(TranscriptItem::User(text));
+                    self.push(TranscriptItem::User(bounded(text)));
                 }
             }
             Event::AssistantDelta(text) => {
-                if let Some(TranscriptItem::Assistant(current)) = self.transcript.back_mut() {
-                    current.push_str(&text);
+                let text = bounded(text);
+                if let Some(TranscriptItem::Assistant(current)) = self.transcript.back_mut()
+                    && current.len() < MAX_ITEM_BYTES
+                    && !current.ends_with('…')
+                {
+                    append_bounded(current, &text);
                 } else {
                     self.push(TranscriptItem::Assistant(text));
                 }
             }
             Event::ThoughtDelta(text) => {
-                if let Some(TranscriptItem::Thought(current)) = self.transcript.back_mut() {
-                    current.push_str(&text);
+                let text = bounded(text);
+                if let Some(TranscriptItem::Thought(current)) = self.transcript.back_mut()
+                    && current.len() < MAX_ITEM_BYTES
+                    && !current.ends_with('…')
+                {
+                    append_bounded(current, &text);
                 } else {
                     self.push(TranscriptItem::Thought(text));
                 }
@@ -372,8 +484,9 @@ impl AgentState {
             Event::PlanUpdated(plan) => {
                 let plan = plan
                     .into_iter()
+                    .take(MAX_TRANSCRIPT_ITEMS)
                     .map(|item| PlanItem {
-                        content: item.content,
+                        content: bounded(item.content),
                         status: bounded(item.status),
                     })
                     .collect();
@@ -535,20 +648,168 @@ impl AgentState {
                 self.active = false;
                 self.finalize_running_tools(if cancelled { "Cancelled" } else { "Failed" });
             }
-            Event::Error(error) => self.push(TranscriptItem::Error(error)),
+            Event::Error(error) => self.push(TranscriptItem::Error(bounded(error))),
             Event::ProcessExited { error, diagnostics } => {
                 self.active = false;
                 self.session_ready = false;
                 self.connection = ConnectionState::Failed(error.clone());
-                self.diagnostics = (!diagnostics.is_empty()).then_some(diagnostics);
-                self.push(TranscriptItem::Error(error));
+                self.diagnostics = (!diagnostics.is_empty()).then(|| bounded(diagnostics));
+                self.push(TranscriptItem::Error(bounded(error)));
                 self.finalize_running_tools("Failed");
             }
         }
+        self.trim();
     }
 
     fn push(&mut self, item: TranscriptItem) {
         self.transcript.push_back(item);
+        self.transcript_records.push_back(None);
+    }
+
+    fn trim(&mut self) {
+        if let Err(error) = self.trim_from_front(false) {
+            self.diagnostics = Some(error);
+        }
+    }
+
+    fn trim_from_front(&mut self, keep_one: bool) -> Result<(), String> {
+        self.sync_transcript_records();
+        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
+        while self.transcript.len() > usize::from(keep_one)
+            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES)
+        {
+            if !self.front_can_be_archived() {
+                break;
+            }
+            let size = self.transcript.front().map_or(0, item_size);
+            self.archive_front()?;
+            bytes = bytes.saturating_sub(size);
+        }
+        Ok(())
+    }
+
+    fn front_can_be_archived(&self) -> bool {
+        if !self.active {
+            return true;
+        }
+        match self.transcript.front() {
+            Some(TranscriptItem::Plan(_))
+            | Some(TranscriptItem::Permission(PermissionCard { selected: None, .. }))
+            | Some(TranscriptItem::Interaction(InteractionCard {
+                answered: false, ..
+            })) => false,
+            Some(TranscriptItem::Tool(ToolActivity {
+                status: Some(status),
+                ..
+            })) => !matches!(status.as_str(), "Pending" | "InProgress"),
+            _ => true,
+        }
+    }
+
+    pub fn has_earlier_transcript(&self) -> bool {
+        !self.transcript_archive.earlier.is_empty()
+    }
+
+    pub fn has_later_transcript(&self) -> bool {
+        !self.transcript_archive.later.is_empty()
+    }
+
+    pub fn load_earlier_transcript(&mut self) -> Result<bool, String> {
+        if self.active || !self.has_earlier_transcript() {
+            return Ok(false);
+        }
+        self.sync_transcript_records();
+        for _ in 0..TRANSCRIPT_PAGE_ITEMS {
+            let Some(record) = self.transcript_archive.earlier.pop() else {
+                break;
+            };
+            match self.transcript_archive.load(record) {
+                Ok(item) => {
+                    self.transcript.push_front(item);
+                    self.transcript_records.push_front(Some(record));
+                }
+                Err(error) => {
+                    self.transcript_archive.earlier.push(record);
+                    return Err(error);
+                }
+            }
+        }
+        self.trim_from_back()?;
+        Ok(true)
+    }
+
+    pub fn load_later_transcript(&mut self) -> Result<bool, String> {
+        if self.active || !self.has_later_transcript() {
+            return Ok(false);
+        }
+        self.sync_transcript_records();
+        for _ in 0..TRANSCRIPT_PAGE_ITEMS {
+            let Some(record) = self.transcript_archive.later.pop() else {
+                break;
+            };
+            match self.transcript_archive.load(record) {
+                Ok(item) => {
+                    self.transcript.push_back(item);
+                    self.transcript_records.push_back(Some(record));
+                }
+                Err(error) => {
+                    self.transcript_archive.later.push(record);
+                    return Err(error);
+                }
+            }
+        }
+        self.trim_from_front(true)?;
+        Ok(true)
+    }
+
+    pub fn load_latest_transcript(&mut self) -> Result<bool, String> {
+        let mut loaded = false;
+        while self.has_later_transcript() {
+            loaded |= self.load_later_transcript()?;
+        }
+        Ok(loaded)
+    }
+
+    fn sync_transcript_records(&mut self) {
+        self.transcript_records.resize(self.transcript.len(), None);
+    }
+
+    fn archive_front(&mut self) -> Result<(), String> {
+        let record = match self.transcript_records.front().copied().flatten() {
+            Some(record) => record,
+            None => self
+                .transcript_archive
+                .store(self.transcript.front().expect("transcript front"))?,
+        };
+        self.transcript.pop_front();
+        self.transcript_records.pop_front();
+        self.transcript_archive.earlier.push(record);
+        Ok(())
+    }
+
+    fn archive_back(&mut self) -> Result<(), String> {
+        let record = match self.transcript_records.back().copied().flatten() {
+            Some(record) => record,
+            None => self
+                .transcript_archive
+                .store(self.transcript.back().expect("transcript back"))?,
+        };
+        self.transcript.pop_back();
+        self.transcript_records.pop_back();
+        self.transcript_archive.later.push(record);
+        Ok(())
+    }
+
+    fn trim_from_back(&mut self) -> Result<(), String> {
+        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
+        while self.transcript.len() > 1
+            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES)
+        {
+            let size = self.transcript.back().map_or(0, item_size);
+            self.archive_back()?;
+            bytes = bytes.saturating_sub(size);
+        }
+        Ok(())
     }
 
     /// Tool updates only arrive while a turn runs, so once the turn ends any
@@ -760,12 +1021,13 @@ fn bounded_plan(item: PlanItem) -> PlanItem {
 
 fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
     ToolDetail {
-        input: detail.input,
+        input: detail.input.map(bounded),
         content: detail
             .content
             .into_iter()
+            .take(MAX_CHOICES)
             .map(|content| match content {
-                ToolOutput::Text(text) => ToolOutput::Text(text),
+                ToolOutput::Text(text) => ToolOutput::Text(bounded(text)),
                 ToolOutput::Content(content) => ToolOutput::Content(bounded_content(content)),
                 ToolOutput::Diff {
                     path,
@@ -773,8 +1035,8 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     new_text,
                 } => ToolOutput::Diff {
                     path,
-                    old_text,
-                    new_text,
+                    old_text: old_text.map(bounded_arc),
+                    new_text: bounded_arc(new_text),
                 },
                 ToolOutput::Terminal(id) => ToolOutput::Terminal(bounded(id)),
                 ToolOutput::Todo {
@@ -783,7 +1045,7 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     status,
                 } => ToolOutput::Todo {
                     id: bounded(id),
-                    content,
+                    content: bounded(content),
                     status: bounded(status),
                 },
                 ToolOutput::Task {
@@ -794,8 +1056,8 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     agent_id,
                     duration_ms,
                 } => ToolOutput::Task {
-                    description,
-                    prompt,
+                    description: bounded(description),
+                    prompt: bounded(prompt),
                     subagent_type: bounded(subagent_type),
                     model: model.map(bounded),
                     agent_id: agent_id.map(bounded),
@@ -806,13 +1068,16 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     file_path,
                     reference_image_paths,
                 } => ToolOutput::GeneratedImage {
-                    description,
+                    description: bounded(description),
                     file_path,
-                    reference_image_paths,
+                    reference_image_paths: reference_image_paths
+                        .into_iter()
+                        .take(MAX_CHOICES)
+                        .collect(),
                 },
             })
             .collect(),
-        output: detail.output,
+        output: detail.output.map(bounded),
     }
 }
 
@@ -858,7 +1123,7 @@ fn bounded_content(content: DisplayContent) -> DisplayContent {
         } => DisplayContent::TextResource {
             uri: bounded(uri),
             mime_type: mime_type.map(bounded),
-            text,
+            text: bounded(text),
         },
         DisplayContent::BlobResource {
             uri,
@@ -910,7 +1175,7 @@ fn bounded_configs(options: Vec<ConfigChoice>) -> Vec<ConfigChoice> {
 
 fn bounded(mut text: String) -> String {
     if text.len() > MAX_ITEM_BYTES {
-        let mut end = MAX_ITEM_BYTES;
+        let mut end = MAX_ITEM_BYTES - '…'.len_utf8();
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -918,4 +1183,205 @@ fn bounded(mut text: String) -> String {
         text.push('…');
     }
     text
+}
+
+fn bounded_arc(text: std::sync::Arc<str>) -> std::sync::Arc<str> {
+    if text.len() <= MAX_ITEM_BYTES {
+        text
+    } else {
+        bounded(text.to_string()).into()
+    }
+}
+
+fn append_bounded(buffer: &mut String, text: &str) {
+    let remaining = MAX_ITEM_BYTES.saturating_sub(buffer.len());
+    if text.len() <= remaining {
+        buffer.push_str(text);
+        return;
+    }
+    let target = MAX_ITEM_BYTES - '…'.len_utf8();
+    if buffer.len() > target {
+        let mut end = target;
+        while !buffer.is_char_boundary(end) {
+            end -= 1;
+        }
+        buffer.truncate(end);
+    }
+    let remaining = target.saturating_sub(buffer.len());
+    let mut end = text.len().min(remaining);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    buffer.push_str(&text[..end]);
+    buffer.push('…');
+}
+
+fn item_size(item: &TranscriptItem) -> usize {
+    match item {
+        TranscriptItem::User(text)
+        | TranscriptItem::Assistant(text)
+        | TranscriptItem::Thought(text)
+        | TranscriptItem::Error(text) => text.len(),
+        TranscriptItem::Content { content, .. } => display_content_size(content),
+        TranscriptItem::Plan(plan) => plan
+            .iter()
+            .map(|item| item.content.len() + item.status.len())
+            .sum(),
+        TranscriptItem::Tool(tool) => tool_size(tool),
+        TranscriptItem::Permission(card) => {
+            card.action.len()
+                + card.tool_call_id.len()
+                + card
+                    .options
+                    .iter()
+                    .map(|option| option.id.len() + option.name.len() + option.kind.len())
+                    .sum::<usize>()
+        }
+        TranscriptItem::Interaction(card) => interaction_size(&card.request),
+    }
+}
+
+fn tool_size(tool: &ToolActivity) -> usize {
+    tool.id.len()
+        + tool.status.as_ref().map_or(0, String::len)
+        + tool.kind.as_ref().map_or(0, String::len)
+        + tool.detail.as_ref().map_or(0, tool_detail_size)
+        + tool.title.as_ref().map_or(0, String::len)
+        + tool
+            .paths
+            .iter()
+            .map(|tool_path| tool_path.path.as_os_str().as_encoded_bytes().len())
+            .sum::<usize>()
+}
+
+fn interaction_size(request: &InteractionRequest) -> usize {
+    request.tool_call_id.len()
+        + match &request.kind {
+            InteractionKind::Questions { title, questions } => {
+                title.len()
+                    + questions
+                        .iter()
+                        .map(|question| {
+                            question.id.len()
+                                + question.prompt.len()
+                                + question
+                                    .options
+                                    .iter()
+                                    .map(|option| option.id.len() + option.label.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            InteractionKind::Plan(plan) => {
+                plan.name.as_ref().map_or(0, String::len)
+                    + plan.overview.as_ref().map_or(0, String::len)
+                    + plan.plan.len()
+                    + plan
+                        .todos
+                        .iter()
+                        .map(|todo| todo.content.len() + todo.status.len())
+                        .sum::<usize>()
+                    + plan
+                        .phases
+                        .iter()
+                        .map(|phase| {
+                            phase.name.len()
+                                + phase
+                                    .todos
+                                    .iter()
+                                    .map(|todo| todo.content.len() + todo.status.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+        }
+}
+
+fn tool_detail_size(detail: &ToolDetail) -> usize {
+    detail.input.as_ref().map_or(0, String::len)
+        + detail.output.as_ref().map_or(0, String::len)
+        + detail
+            .content
+            .iter()
+            .map(|content| match content {
+                ToolOutput::Text(text) | ToolOutput::Terminal(text) => text.len(),
+                ToolOutput::Content(content) => display_content_size(content),
+                ToolOutput::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => {
+                    path.as_os_str().as_encoded_bytes().len()
+                        + old_text.as_ref().map_or(0, |text| text.len())
+                        + new_text.len()
+                }
+                ToolOutput::Todo {
+                    id,
+                    content,
+                    status,
+                } => id.len() + content.len() + status.len(),
+                ToolOutput::Task {
+                    description,
+                    prompt,
+                    subagent_type,
+                    model,
+                    agent_id,
+                    ..
+                } => {
+                    description.len()
+                        + prompt.len()
+                        + subagent_type.len()
+                        + model.as_ref().map_or(0, String::len)
+                        + agent_id.as_ref().map_or(0, String::len)
+                }
+                ToolOutput::GeneratedImage {
+                    description,
+                    file_path,
+                    reference_image_paths,
+                } => {
+                    description.len()
+                        + file_path
+                            .as_ref()
+                            .map_or(0, |path| path.as_os_str().as_encoded_bytes().len())
+                        + reference_image_paths
+                            .iter()
+                            .map(|path| path.as_os_str().as_encoded_bytes().len())
+                            .sum::<usize>()
+                }
+            })
+            .sum::<usize>()
+}
+
+fn display_content_size(content: &DisplayContent) -> usize {
+    match content {
+        DisplayContent::Image {
+            data: Some(data), ..
+        } => data.len(),
+        DisplayContent::Image { mime_type, uri, .. } => {
+            mime_type.len() + uri.as_ref().map_or(0, String::len)
+        }
+        DisplayContent::Audio { mime_type, .. } => mime_type.len(),
+        DisplayContent::BlobResource { mime_type, uri, .. } => {
+            mime_type.as_ref().map_or(0, String::len) + uri.len()
+        }
+        DisplayContent::ResourceLink {
+            name,
+            title,
+            uri,
+            description,
+            mime_type,
+            ..
+        } => {
+            name.len()
+                + title.as_ref().map_or(0, String::len)
+                + uri.len()
+                + description.as_ref().map_or(0, String::len)
+                + mime_type.as_ref().map_or(0, String::len)
+        }
+        DisplayContent::TextResource {
+            uri,
+            mime_type,
+            text,
+        } => uri.len() + mime_type.as_ref().map_or(0, String::len) + text.len(),
+    }
 }

@@ -9,15 +9,15 @@ use super::{
     TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
     TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, agent_at_bottom,
     agent_collapsing_header, agent_composer_content, agent_composer_height,
-    agent_dense_disclosure_row, agent_dense_tool, agent_diff_preview, agent_empty_state_rect,
-    agent_markdown_galley, agent_mention_matches, agent_mention_query, agent_menu_rect,
-    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_send_button_colors,
-    agent_toggle_rect, build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions,
-    completion_word_range, copy_tree_entry, defer_resize, diagnostic_highlighted_job,
-    disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
-    draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
-    draw_tab_drag_ghost, editor_background, editor_column_content, file_result_job,
-    find_highlighted_job, install_repaint_wake, launch_in_current_process,
+    agent_dense_disclosure_row, agent_dense_tool, agent_diff_cache_count, agent_diff_preview,
+    agent_empty_state_rect, agent_markdown_galley, agent_mention_matches, agent_mention_query,
+    agent_menu_rect, agent_new_session_rect, agent_search_matches, agent_selector_button,
+    agent_send_button_colors, agent_toggle_rect, build_agent_diff, cached_agent_diff, child_path,
+    collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
+    diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
+    draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
+    draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
+    file_result_job, find_highlighted_job, install_repaint_wake, launch_in_current_process,
     load_agent_image_preview_bytes, match_bracket_pair, match_spans, model_display_name,
     next_find_match, pane_header_and_content, plain_text_job, presentation_job, project_chooser_ui,
     provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
@@ -2907,11 +2907,11 @@ fn dense_work_items_have_no_extra_gap_between_rows() {
         |root| app.ui(root),
     );
     let first = context
-        .read_response(Id::new(("dense_agent_tool", "dense-first")))
+        .read_response(Id::new(("dense_agent_tool", 1)))
         .expect("first dense work row")
         .rect;
     let second = context
-        .read_response(Id::new(("dense_agent_tool", "dense-second")))
+        .read_response(Id::new(("dense_agent_tool", 2)))
         .expect("second dense work row")
         .rect;
 
@@ -2981,7 +2981,7 @@ fn dense_work_rows_are_short_and_use_text_only_hover() {
 
     let _ = draw(Vec::new());
     let row = context
-        .read_response(Id::new(("dense_agent_tool", "dense-hover")))
+        .read_response(Id::new(("dense_agent_tool", 1)))
         .expect("dense work row")
         .rect;
     let hovered = draw(vec![Event::PointerMoved(row.center())]);
@@ -3155,7 +3155,7 @@ fn dense_agent_tool_rows_expand_to_their_compact_details() {
         modifiers: Modifiers::NONE,
     }]);
     let row = context
-        .read_response(Id::new(("dense_agent_tool", "dense-edit")))
+        .read_response(Id::new(("dense_agent_tool", 1)))
         .expect("dense tool disclosure")
         .rect;
     let _ = draw(vec![
@@ -4052,6 +4052,62 @@ fn unchanged_agent_markdown_and_diffs_reuse_their_frame_work() {
     assert!(std::sync::Arc::ptr_eq(&first.0, &unchanged.0));
     assert!(std::sync::Arc::ptr_eq(&first.1, &unchanged.1));
     assert!(!std::sync::Arc::ptr_eq(&unchanged.1, &changed.1));
+}
+
+#[test]
+fn agent_diff_caches_are_reused_across_session_reloads() {
+    use crate::agent::controller::{ToolActivity, ToolDetail, ToolOutput};
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    let load = |app: &mut EditorApp, session: &str| {
+        app.agent.session_id = Some(session.into());
+        app.agent.transcript.clear();
+        for index in 0..8 {
+            app.agent
+                .transcript
+                .push_back(TranscriptItem::Tool(ToolActivity {
+                    id: format!("{session}-{index}"),
+                    title: Some(format!("Tool {index}")),
+                    status: Some("Completed".into()),
+                    kind: None,
+                    paths: Vec::new(),
+                    detail: Some(ToolDetail {
+                        input: None,
+                        content: vec![ToolOutput::Diff {
+                            path: format!("file-{index}.rs").into(),
+                            old_text: Some("before\n".into()),
+                            new_text: format!("after {session}\n").into(),
+                        }],
+                        output: None,
+                    }),
+                }));
+        }
+    };
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 700.0),
+        )),
+        ..RawInput::default()
+    };
+
+    load(&mut app, "first");
+    let _ = context.run_ui(input(), |root| app.ui(root));
+    let first = agent_diff_cache_count(&context);
+    load(&mut app, "second");
+    let _ = context.run_ui(input(), |root| app.ui(root));
+
+    assert_eq!(agent_diff_cache_count(&context), first);
 }
 
 #[test]
@@ -5554,6 +5610,63 @@ fn agent_transcript_culls_offscreen_items_and_restores_them_when_scrolled_into_v
         oldest_visible,
         "scrolling up must bring culled items back into the transcript"
     );
+}
+
+#[test]
+fn scrolling_to_the_top_lazily_loads_earlier_transcript_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    for id in 0..2_050 {
+        app.agent
+            .apply(crate::agent::controller::Event::ToolCallUpdated(
+                ToolActivity {
+                    id: id.to_string(),
+                    title: Some(format!("Tool {id}")),
+                    status: Some("Completed".into()),
+                    kind: None,
+                    paths: Vec::new(),
+                    detail: None,
+                },
+            ));
+    }
+    assert!(app.agent.has_earlier_transcript());
+
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_000.0, 700.0));
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                Event::PointerMoved(pos2(800.0, 300.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, 1_000_000.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(!app.agent.has_earlier_transcript());
+    assert!(app.agent.has_later_transcript());
 }
 
 #[test]
