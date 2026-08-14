@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::IsTerminal,
+    io::{BufRead, Cursor, IsTerminal, Seek},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -325,17 +325,30 @@ fn agent_at_bottom(offset: f32, max_offset: f32) -> bool {
     (max_offset - offset).abs() <= 0.5
 }
 
+#[derive(Clone)]
+enum AgentImageSource {
+    Bytes(Arc<[u8]>),
+    Path(PathBuf),
+}
+
 fn draw_agent_content(
     ui: &mut egui::Ui,
     content: &DisplayContent,
     search: Option<(&str, Option<usize>)>,
-) {
+) -> Option<AgentImageSource> {
+    let mut opened = None;
     match content {
         DisplayContent::Image {
             mime_type,
             uri,
             encoded_bytes,
+            data,
         } => {
+            if let Some(data) = data
+                && agent_embedded_image_preview(ui, data).is_some_and(|preview| preview.clicked())
+            {
+                opened = Some(AgentImageSource::Bytes(Arc::clone(data)));
+            }
             agent_search_label(
                 ui,
                 &format!("Image · {mime_type} · {encoded_bytes} encoded bytes"),
@@ -462,6 +475,7 @@ fn draw_agent_content(
             );
         }
     }
+    opened
 }
 
 fn tool_contains_diff(tool: &crate::agent::controller::ToolActivity) -> bool {
@@ -516,12 +530,58 @@ fn agent_path_link(
 }
 
 const AGENT_IMAGE_PREVIEW_EDGE: u32 = 640;
+const AGENT_IMAGE_LIGHTBOX_EDGE: u32 = 4_096;
 const AGENT_IMAGE_PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const AGENT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(240.0, 180.0);
 
 #[derive(Clone)]
 enum AgentImagePreview {
     Unavailable,
     Loaded(egui::TextureHandle),
+}
+
+fn agent_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> egui::Response {
+    let source_size = texture.size_vec2();
+    let bounds = AGENT_IMAGE_THUMBNAIL_SIZE.min(egui::vec2(ui.available_width(), f32::INFINITY));
+    let scale = (bounds.x / source_size.x)
+        .min(bounds.y / source_size.y)
+        .min(1.0);
+    let response = ui
+        .add(
+            egui::Image::from_texture((texture.id(), source_size))
+                .fit_to_exact_size(source_size * scale)
+                .corner_radius(6)
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("View image");
+    ui.painter().rect_stroke(
+        response.rect,
+        6,
+        theme::border::hairline(),
+        egui::StrokeKind::Inside,
+    );
+    response
+}
+
+fn agent_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+    let cache_id = Id::new(("agent_embedded_image", data.as_ptr() as usize, data.len()));
+    let cached = ui.data(|state| state.get_temp::<AgentImagePreview>(cache_id));
+    let cached = cached.unwrap_or_else(|| {
+        let name = format!(
+            "agent_embedded_image_{:x}_{}",
+            data.as_ptr() as usize,
+            data.len()
+        );
+        let loaded = load_agent_image_preview_bytes(ui.ctx(), &name, data)
+            .map_or(AgentImagePreview::Unavailable, AgentImagePreview::Loaded);
+        ui.data_mut(|state| state.insert_temp(cache_id, loaded.clone()));
+        loaded
+    });
+    match cached {
+        AgentImagePreview::Unavailable => None,
+        AgentImagePreview::Loaded(texture) => Some(agent_image_thumbnail(ui, &texture)),
+    }
 }
 
 /// Inline preview for a generated image. The decode happens once on first
@@ -537,48 +597,74 @@ fn agent_generated_image_preview(ui: &mut egui::Ui, path: &Path) -> Option<egui:
     });
     match cached {
         AgentImagePreview::Unavailable => None,
-        AgentImagePreview::Loaded(texture) => {
-            let size = texture.size_vec2();
-            let scale = (ui.available_width() / size.x).min(1.0);
-            Some(
-                ui.add(
-                    egui::Image::from_texture((texture.id(), size))
-                        .fit_to_exact_size(size * scale)
-                        .corner_radius(6)
-                        .sense(Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Open in editor"),
-            )
-        }
+        AgentImagePreview::Loaded(texture) => Some(agent_image_thumbnail(ui, &texture)),
     }
 }
 
 fn load_agent_image_preview(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    load_agent_image_path(ctx, path, AGENT_IMAGE_PREVIEW_EDGE)
+}
+
+fn load_agent_image_path(
+    ctx: &egui::Context,
+    path: &Path,
+    max_edge: u32,
+) -> Option<egui::TextureHandle> {
     let metadata = fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > AGENT_IMAGE_PREVIEW_MAX_BYTES {
         return None;
     }
-    let mut reader = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
+    decode_agent_image_preview(ctx, path.display().to_string(), reader, max_edge)
+}
+
+fn load_agent_image_preview_bytes(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
+    load_agent_image_bytes(ctx, name, bytes, AGENT_IMAGE_PREVIEW_EDGE)
+}
+
+fn load_agent_image_bytes(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+    max_edge: u32,
+) -> Option<egui::TextureHandle> {
+    if bytes.is_empty() || bytes.len() as u64 > AGENT_IMAGE_PREVIEW_MAX_BYTES {
+        return None;
+    }
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    decode_agent_image_preview(ctx, name.to_owned(), reader, max_edge)
+}
+
+fn decode_agent_image_preview<R: BufRead + Seek>(
+    ctx: &egui::Context,
+    name: String,
+    mut reader: image::ImageReader<R>,
+    max_edge: u32,
+) -> Option<egui::TextureHandle> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let image = reader.decode().ok()?;
-    let image =
-        if image.width() > AGENT_IMAGE_PREVIEW_EDGE || image.height() > AGENT_IMAGE_PREVIEW_EDGE {
-            image.thumbnail(AGENT_IMAGE_PREVIEW_EDGE, AGENT_IMAGE_PREVIEW_EDGE)
-        } else {
-            image
-        };
+    let image = if image.width() > max_edge || image.height() > max_edge {
+        image.thumbnail(max_edge, max_edge)
+    } else {
+        image
+    };
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_rgba8();
     Some(ctx.load_texture(
-        path.display().to_string(),
+        name,
         egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw()),
         egui::TextureOptions::LINEAR,
     ))
@@ -1774,13 +1860,15 @@ fn agent_dense_tool(
     });
     let title_left = rect.left() + if has_body { 24.0 } else { 4.0 };
     let title_width = (rect.right() - theme::space::SMALL - counts_width - title_left).max(0.0);
-    let title = agent_text_job(
+    let mut title = agent_text_job(
         title.lines().next().unwrap_or(title),
         title_width,
         theme::typography::body(),
         title_color,
         search,
     );
+    title.wrap.max_rows = 1;
+    title.wrap.overflow_character = Some('…');
     let title = ui.painter().layout_job(title);
     ui.painter()
         .with_clip_rect(egui::Rect::from_min_max(
@@ -3688,6 +3776,7 @@ pub struct EditorApp {
     agent_prompt_history_index: Option<usize>,
     agent_prompt_history_draft: String,
     agent_attachments: Vec<AgentComposerAttachment>,
+    agent_image_lightbox: Option<AgentImageSource>,
     agent_mentions: Option<Vec<AgentMentionEntry>>,
     agent_mention_matches: Vec<AgentMentionEntry>,
     agent_mention_selected: usize,
@@ -3851,6 +3940,7 @@ impl EditorApp {
             agent_prompt_history_index: None,
             agent_prompt_history_draft: String::new(),
             agent_attachments: Vec::new(),
+            agent_image_lightbox: None,
             agent_mentions: None,
             agent_mention_matches: Vec::new(),
             agent_mention_selected: 0,
@@ -4683,8 +4773,13 @@ impl EditorApp {
                                 for session in sessions {
                                     let selected = self.agent.session_id.as_deref()
                                         == Some(session.id.as_str());
-                                    let (open, remove) =
-                                        agent_session_row(ui, session, selected, true);
+                                    let (open, remove) = agent_session_row(
+                                        ui,
+                                        session,
+                                        self.selected_provider,
+                                        selected,
+                                        true,
+                                    );
                                     if open {
                                         session_load = Some(session.id.clone());
                                     }
@@ -5755,7 +5850,128 @@ impl EditorApp {
         self.window_action.take()
     }
 
+    fn draw_agent_image_lightbox(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.agent_image_lightbox.clone() else {
+            return;
+        };
+        let cache_id = match &source {
+            AgentImageSource::Bytes(data) => Id::new((
+                "agent_image_lightbox_bytes",
+                data.as_ptr() as usize,
+                data.len(),
+            )),
+            AgentImageSource::Path(path) => Id::new(("agent_image_lightbox_path", path)),
+        };
+        let cached = ctx.data(|data| data.get_temp::<AgentImagePreview>(cache_id));
+        let preview = cached.unwrap_or_else(|| {
+            let loaded = match &source {
+                AgentImageSource::Bytes(data) => load_agent_image_bytes(
+                    ctx,
+                    &format!(
+                        "agent_image_lightbox_{:x}_{}",
+                        data.as_ptr() as usize,
+                        data.len()
+                    ),
+                    data,
+                    AGENT_IMAGE_LIGHTBOX_EDGE,
+                ),
+                AgentImageSource::Path(path) => {
+                    load_agent_image_path(ctx, path, AGENT_IMAGE_LIGHTBOX_EDGE)
+                }
+            };
+            let preview = loaded.map_or(AgentImagePreview::Unavailable, AgentImagePreview::Loaded);
+            ctx.data_mut(|data| data.insert_temp(cache_id, preview.clone()));
+            preview
+        });
+        let AgentImagePreview::Loaded(texture) = preview else {
+            self.agent_image_lightbox = None;
+            return;
+        };
+
+        let screen = ctx.content_rect();
+        let size = egui::vec2(
+            (screen.width() * 0.9).min(1_600.0),
+            (screen.height() * 0.9).min(1_000.0),
+        );
+        let mut close = ctx.input(|input| input.key_pressed(Key::Escape));
+        let frame = egui::Frame::new()
+            .fill(theme::surface().raised)
+            .stroke(theme::border::strong())
+            .corner_radius(theme::corner(theme::radius::DIALOG))
+            .shadow(theme::shadow::dialog());
+        let modal = egui::Modal::new(Id::new("agent_image_lightbox"))
+            .backdrop_color(theme::state::scrim())
+            .frame(frame)
+            .show(ctx, |ui| {
+                let (_, full) = ui.allocate_space(size);
+                let header = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), 44.0));
+                ui.painter()
+                    .hline(header.x_range(), header.bottom(), theme::border::hairline());
+                ui.painter().text(
+                    egui::pos2(header.left() + theme::space::LARGE, header.center().y),
+                    Align2::LEFT_CENTER,
+                    "Image preview",
+                    theme::typography::strong(),
+                    theme::text().primary,
+                );
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(header.right() - 22.0, header.center().y),
+                    egui::Vec2::splat(40.0),
+                );
+                let close_response = ui
+                    .interact(
+                        close_rect,
+                        Id::new("agent_image_lightbox_close"),
+                        Sense::click(),
+                    )
+                    .on_hover_text("Close (Esc)");
+                close_response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close image preview")
+                });
+                if close_response.hovered() {
+                    ui.painter().rect_filled(
+                        close_rect,
+                        theme::corner(theme::radius::CONTROL),
+                        theme::state::hover(),
+                    );
+                }
+                icons::paint(
+                    ui.painter(),
+                    Icon::Close,
+                    egui::Rect::from_center_size(
+                        close_rect.center(),
+                        egui::Vec2::splat(icons::GRID * 0.85),
+                    ),
+                    if close_response.hovered() {
+                        theme::text().primary
+                    } else {
+                        theme::text().muted
+                    },
+                );
+                close |= close_response.clicked();
+
+                let body = egui::Rect::from_min_max(
+                    header.left_bottom() + egui::vec2(theme::space::LARGE, theme::space::LARGE),
+                    full.right_bottom() - egui::vec2(theme::space::LARGE, theme::space::LARGE),
+                );
+                let image_size = texture.size_vec2();
+                let scale = (body.width() / image_size.x).min(body.height() / image_size.y);
+                let image_rect = egui::Rect::from_center_size(body.center(), image_size * scale);
+                ui.painter().image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            });
+        close |= modal.backdrop_response.clicked();
+        if close {
+            self.agent_image_lightbox = None;
+        }
+    }
+
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        self.draw_agent_image_lightbox(ctx);
         self.draw_agent_file_picker(ctx);
         self.draw_project_folder_picker(ctx);
         if self.tree_prompt.is_some() {
@@ -6630,6 +6846,7 @@ fn agentic_project_row(
 fn agent_session_row(
     ui: &mut egui::Ui,
     session: &SessionChoice,
+    provider: ProviderId,
     selected: bool,
     compact: bool,
 ) -> (bool, bool) {
@@ -6714,11 +6931,34 @@ fn agent_session_row(
     };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     let text_padding = theme::space::SMALL;
+    let origin_width = if session.started_in_editur { 0.0 } else { 18.0 };
+    if !session.started_in_editur {
+        let descriptor = provider_descriptor(provider);
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(open.left() + text_padding + 6.0, open.center().y),
+            egui::vec2(12.0, 14.0),
+        );
+        let origin_label = format!("Started in {}", descriptor.display_name);
+        ui.interact(
+            icon,
+            Id::new(("agent_session_origin", &session.id, provider.as_str())),
+            Sense::hover(),
+        )
+        .on_hover_text(&origin_label)
+        .widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                ui.is_enabled(),
+                origin_label.clone(),
+            )
+        });
+        paint_provider_icon(ui.painter(), icon, descriptor.icon, theme::text().muted);
+    }
     ui.painter()
         .with_clip_rect(open.shrink2(egui::vec2(theme::space::TIGHT, 0.0)))
         .galley(
             egui::pos2(
-                open.left() + text_padding,
+                open.left() + text_padding + origin_width,
                 open.center().y - galley.size().y * 0.5,
             ),
             galley,

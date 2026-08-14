@@ -1,4 +1,5 @@
 pub mod controller;
+pub(crate) mod external_sessions;
 pub mod provider;
 pub mod provision;
 pub mod state;

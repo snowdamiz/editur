@@ -15,9 +15,10 @@ use std::{
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::external_sessions::{self, ExternalMessage, ExternalSession, ExternalTool};
 pub use super::provider::{AuthChoice, AuthKind};
 use super::provider::{
     ProviderExtensions, ProviderId, authentication_required_choices, descriptor,
@@ -27,11 +28,12 @@ use super::provider::{
 const EVENT_CAPACITY: usize = 512;
 const COMMAND_CAPACITY: usize = 64;
 const MAX_DETAIL_BYTES: usize = 64 * 1024;
+const MAX_DISPLAY_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const MAX_CHOICES: usize = 128;
 const MAX_PLAN_ITEMS: usize = 1_024;
 const MAX_TOOL_PATHS: usize = 256;
-const MAX_HIDDEN_SESSIONS: usize = 4_096;
+const MAX_STORED_SESSION_IDS: usize = 4_096;
 /// Consecutive automatic resumes after retriable transport drops, per user turn.
 const MAX_TURN_RESUMES: u64 = 2;
 /// Prompt sent to resume a turn after the provider's upstream connection dropped.
@@ -234,6 +236,19 @@ pub struct SessionChoice {
     pub id: String,
     pub title: Option<String>,
     pub updated_at: Option<String>,
+    pub started_in_editur: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionTranscriptMessage {
+    User(String),
+    Assistant(String),
+    Thought(String),
+    Content {
+        role: ContentRole,
+        content: DisplayContent,
+    },
+    Tool(ToolActivity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +264,7 @@ pub enum DisplayContent {
         mime_type: String,
         uri: Option<String>,
         encoded_bytes: usize,
+        data: Option<Arc<[u8]>>,
     },
     Audio {
         mime_type: String,
@@ -296,6 +312,7 @@ pub enum Event {
         modes: Vec<ModeChoice>,
         config_options: Vec<ConfigChoice>,
     },
+    SessionTranscriptLoaded(Vec<SessionTranscriptMessage>),
     ActiveSessionChanged(String),
     ModeChanged(String),
     ConfigOptionsUpdated(Vec<ConfigChoice>),
@@ -400,8 +417,8 @@ pub enum ToolOutput {
     Content(DisplayContent),
     Diff {
         path: PathBuf,
-        old_text: Option<String>,
-        new_text: String,
+        old_text: Option<Arc<str>>,
+        new_text: Arc<str>,
     },
     Terminal(String),
     Todo {
@@ -584,11 +601,14 @@ impl AgentController {
             ".editur-test-hidden-sessions-{}.json",
             provider.as_str()
         )));
+        let editur_sessions =
+            Some(project_root.join(format!(".editur-test-sessions-{}.json", provider.as_str())));
         Self::start_launch(
             provider,
             SessionStartup {
                 history,
                 active_session: None,
+                editur_sessions,
                 preferred_session: None,
             },
             project_root,
@@ -605,11 +625,13 @@ impl AgentController {
         preferred_session: String,
     ) -> Self {
         let history = Some(project_root.join(".editur-test-hidden-sessions-cursor.json"));
+        let editur_sessions = Some(project_root.join(".editur-test-sessions-cursor.json"));
         Self::start_launch(
             ProviderId::Cursor,
             SessionStartup {
                 history,
                 active_session: None,
+                editur_sessions,
                 preferred_session: Some(preferred_session),
             },
             project_root,
@@ -698,6 +720,7 @@ enum Launch {
 struct SessionStartup {
     history: Option<PathBuf>,
     active_session: Option<PathBuf>,
+    editur_sessions: Option<PathBuf>,
     preferred_session: Option<String>,
 }
 
@@ -1057,6 +1080,7 @@ async fn run_connection(
     let interactions = Arc::new(Mutex::new(HashMap::new()));
     let next_permission = Arc::new(AtomicU64::new(1));
     let mut hidden_sessions = HiddenSessions::load(session_startup.history);
+    let mut editur_sessions = EditurSessions::load(session_startup.editur_sessions);
     let preferred_session = session_startup.preferred_session;
     agent_client_protocol::Client
         .builder()
@@ -1259,19 +1283,27 @@ async fn run_connection(
                         .session_capabilities
                         .list
                         .is_some();
+                let discovered_external = external_sessions::discover(provider, &project_root)
+                    .unwrap_or_else(|error| {
+                        if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
+                            eprintln!("editur: {error}");
+                        }
+                        Vec::new()
+                    });
                 send_event(
                     &events,
                     Event::Capabilities {
-                        history: supports_history,
+                        history: supports_history || !discovered_external.is_empty(),
                         allow_run_everything: extensions == ProviderExtensions::Cursor,
                     },
                 );
-                let (mut session_id, mut sessions) = match start_session(
+                let (mut session_id, native_sessions) = match start_session(
                     &connection,
                     &project_root,
                     &events,
                     supports_history,
                     &hidden_sessions.ids,
+                    &mut editur_sessions,
                     preferred_session.as_deref(),
                 )
                 .await
@@ -1291,6 +1323,30 @@ async fn run_connection(
                         (None, Vec::new())
                     }
                 };
+                let has_external_sessions = !discovered_external.is_empty();
+                let (mut sessions, mut external_sessions) =
+                    merge_external_sessions(
+                        native_sessions,
+                        discovered_external,
+                        &hidden_sessions.ids,
+                    );
+                let mut pending_external = None;
+                if has_external_sessions {
+                    send_event(&events, Event::SessionsUpdated(sessions.clone()));
+                }
+                if session_id.is_some()
+                    && let Some(preferred) = preferred_session.as_deref()
+                    && external_sessions::is_external_choice(preferred)
+                    && let Some(external) = external_sessions.get(preferred).cloned()
+                    && load_external_session(&external, preferred, &events).is_ok()
+                {
+                    pending_external = Some(external);
+                }
+                if pending_external.is_none()
+                    && let Some(session) = session_id.as_ref()
+                {
+                    enrich_native_session(session.0.as_ref(), &external_sessions, &events);
+                }
                 let mut terminal_auth_in_progress = false;
                 while let Ok(command) = commands.recv().await {
                     match command {
@@ -1379,13 +1435,37 @@ async fn run_connection(
                                 &events,
                                 supports_history,
                                 &hidden_sessions.ids,
+                                &mut editur_sessions,
                                 preferred_session.as_deref(),
                             )
                             .await
                             {
                                 Ok((session, listed)) => {
+                                    let loaded_id = session.0.to_string();
                                     session_id = Some(session);
-                                    sessions = listed;
+                                    let discovered = external_sessions::discover(
+                                        provider,
+                                        &project_root,
+                                    )
+                                    .unwrap_or_default();
+                                    let has_external_sessions = !discovered.is_empty();
+                                    (sessions, external_sessions) =
+                                        merge_external_sessions(
+                                            listed,
+                                            discovered,
+                                            &hidden_sessions.ids,
+                                        );
+                                    if has_external_sessions {
+                                        send_event(
+                                            &events,
+                                            Event::SessionsUpdated(sessions.clone()),
+                                        );
+                                    }
+                                    enrich_native_session(
+                                        &loaded_id,
+                                        &external_sessions,
+                                        &events,
+                                    );
                                 }
                                 Err(error) => {
                                     send_event(
@@ -1414,8 +1494,16 @@ async fn run_connection(
                                     ),
                                 );
                             } else {
-                                match new_session(&connection, &project_root, &events).await {
+                                match new_session(
+                                    &connection,
+                                    &project_root,
+                                    &events,
+                                    &mut editur_sessions,
+                                )
+                                .await
+                                {
                                     Ok(session) => {
+                                        pending_external = None;
                                         let choice = untitled_session(&session);
                                         sessions.retain(|candidate| candidate.id != choice.id);
                                         sessions.insert(0, choice);
@@ -1438,24 +1526,55 @@ async fn run_connection(
                             }
                         }
                         Command::RefreshSessions => {
-                            if supports_history {
+                            let native = if supports_history {
                                 match list_sessions(
                                     &connection,
                                     &project_root,
                                     &events,
                                     &hidden_sessions.ids,
+                                    &editur_sessions,
                                 )
                                 .await
                                 {
-                                    Ok(listed) => sessions = listed,
-                                    Err(error) => send_event(
-                                        &events,
-                                        Event::Error(acp_error(
+                                    Ok(listed) => Some(listed),
+                                    Err(error) => {
+                                        send_event(
+                                            &events,
+                                            Event::Error(acp_error(
                                             provider,
                                             "cannot list sessions",
                                             &error,
                                         )),
-                                    ),
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(
+                                    sessions
+                                        .iter()
+                                        .filter(|session| {
+                                            !external_sessions::is_external_choice(&session.id)
+                                        })
+                                        .cloned()
+                                        .collect(),
+                                )
+                            };
+                            if let Some(native) = native {
+                                let discovered = external_sessions::discover(
+                                    provider,
+                                    &project_root,
+                                )
+                                .unwrap_or_default();
+                                let send_merged = !supports_history || !discovered.is_empty();
+                                (sessions, external_sessions) =
+                                    merge_external_sessions(
+                                        native,
+                                        discovered,
+                                        &hidden_sessions.ids,
+                                    );
+                                if send_merged {
+                                    send_event(&events, Event::SessionsUpdated(sessions.clone()));
                                 }
                             }
                         }
@@ -1466,6 +1585,13 @@ async fn run_connection(
                             }
                             match hidden_sessions.hide(id.clone()) {
                                 Ok(()) => {
+                                    if pending_external
+                                        .as_ref()
+                                        .is_some_and(|session| session.choice_id() == id)
+                                    {
+                                        pending_external = None;
+                                    }
+                                    external_sessions.remove(&id);
                                     sessions.retain(|session| session.id != id);
                                     send_event(&events, Event::SessionsUpdated(sessions.clone()));
                                 }
@@ -1482,19 +1608,36 @@ async fn run_connection(
                                 );
                                 continue;
                             }
+                            if external_sessions::is_external_choice(&id)
+                                && let Some(external) = external_sessions.get(&id).cloned()
+                            {
+                                match load_external_session(&external, &id, &events) {
+                                    Ok(()) => pending_external = Some(external),
+                                    Err(error) => {
+                                        send_event(&events, Event::SessionLoadFailed);
+                                        send_event(&events, Event::Error(error));
+                                        send_event(
+                                            &events,
+                                            Event::ConnectionChanged(ConnectionState::Ready),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let Some(session) = sessions.iter().find(|session| session.id == id)
                             else {
                                 send_event(&events, Event::Error("unknown session".into()));
                                 continue;
                             };
+                            pending_external = None;
                             match load_session(&connection, &project_root, session, &events).await {
-                                Ok(loaded) => session_id = Some(loaded),
+                                Ok(loaded) => {
+                                    session_id = Some(loaded);
+                                    enrich_native_session(&id, &external_sessions, &events);
+                                }
                                 Err(error) => {
                                     send_event(&events, Event::SessionLoadFailed);
                                     if session_not_found(&error) {
-                                        if let Err(error) = hidden_sessions.hide(id.clone()) {
-                                            send_event(&events, Event::Error(error));
-                                        }
                                         sessions.retain(|session| session.id != id);
                                         send_event(
                                             &events,
@@ -1581,12 +1724,41 @@ async fn run_connection(
                         }
                         Command::Prompt(text) => {
                             turn_resume.attempts.store(0, Ordering::Release);
+                            let visible_text = text.clone();
+                            let (prompt_session, text, imported) =
+                                if let Some(external) = pending_external.take() {
+                                    match handoff_external_session(
+                                        &connection,
+                                        &project_root,
+                                        &events,
+                                        &mut editur_sessions,
+                                        &mut sessions,
+                                        &external,
+                                        &text,
+                                    )
+                                    .await
+                                    {
+                                        Ok((session, text)) => (Some(session), text, true),
+                                        Err(error) => {
+                                            send_event(&events, Event::Error(error));
+                                            send_event(
+                                                &events,
+                                                Event::TurnFinished { cancelled: false },
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    (session_id.clone(), text, false)
+                                };
+                            session_id = prompt_session.clone();
                             send_prompt(
                                 &connection,
                                 &events,
                                 &active,
-                                session_id.clone(),
+                                prompt_session,
                                 text,
+                                imported.then_some(visible_text),
                                 Vec::new(),
                                 attachment_support,
                                 turn_resume.clone(),
@@ -1594,12 +1766,41 @@ async fn run_connection(
                         }
                         Command::PromptWithAttachments { text, attachments } => {
                             turn_resume.attempts.store(0, Ordering::Release);
+                            let visible_text = text.clone();
+                            let (prompt_session, text, imported) =
+                                if let Some(external) = pending_external.take() {
+                                    match handoff_external_session(
+                                        &connection,
+                                        &project_root,
+                                        &events,
+                                        &mut editur_sessions,
+                                        &mut sessions,
+                                        &external,
+                                        &text,
+                                    )
+                                    .await
+                                    {
+                                        Ok((session, text)) => (Some(session), text, true),
+                                        Err(error) => {
+                                            send_event(&events, Event::Error(error));
+                                            send_event(
+                                                &events,
+                                                Event::TurnFinished { cancelled: false },
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    (session_id.clone(), text, false)
+                                };
+                            session_id = prompt_session.clone();
                             send_prompt(
                                 &connection,
                                 &events,
                                 &active,
-                                session_id.clone(),
+                                prompt_session,
                                 text,
+                                imported.then_some(visible_text),
                                 attachments,
                                 attachment_support,
                                 turn_resume.clone(),
@@ -1612,6 +1813,7 @@ async fn run_connection(
                                 &active,
                                 session_id.clone(),
                                 TURN_RESUME_PROMPT.into(),
+                                None,
                                 Vec::new(),
                                 attachment_support,
                                 turn_resume.clone(),
@@ -1694,13 +1896,37 @@ async fn run_connection(
                                 &events,
                                 supports_history,
                                 &hidden_sessions.ids,
+                                &mut editur_sessions,
                                 preferred_session.as_deref(),
                             )
                             .await
                             {
                                 Ok((session, listed)) => {
+                                    let loaded_id = session.0.to_string();
                                     session_id = Some(session);
-                                    sessions = listed;
+                                    let discovered = external_sessions::discover(
+                                        provider,
+                                        &project_root,
+                                    )
+                                    .unwrap_or_default();
+                                    let has_external_sessions = !discovered.is_empty();
+                                    (sessions, external_sessions) =
+                                        merge_external_sessions(
+                                            listed,
+                                            discovered,
+                                            &hidden_sessions.ids,
+                                        );
+                                    if has_external_sessions {
+                                        send_event(
+                                            &events,
+                                            Event::SessionsUpdated(sessions.clone()),
+                                        );
+                                    }
+                                    enrich_native_session(
+                                        &loaded_id,
+                                        &external_sessions,
+                                        &events,
+                                    );
                                 }
                                 Err(error) => {
                                     send_event(
@@ -1754,6 +1980,7 @@ fn send_prompt(
     active: &Arc<AtomicBool>,
     session: Option<SessionId>,
     text: String,
+    visible_text: Option<String>,
     attachments: Vec<PromptAttachment>,
     attachment_support: AttachmentSupport,
     resume: TurnResume,
@@ -1781,7 +2008,7 @@ fn send_prompt(
             return Ok(());
         }
     };
-    send_event(events, Event::UserMessage(text));
+    send_event(events, Event::UserMessage(visible_text.unwrap_or(text)));
     for content in displays {
         send_event(
             events,
@@ -1889,11 +2116,12 @@ fn prompt_content(
             .into_owned();
         match attachment.kind {
             PromptAttachmentKind::Image(mime_type) if support.image => {
-                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 displays.push(DisplayContent::Image {
                     mime_type: mime_type.into(),
                     uri: Some(uri.clone()),
                     encoded_bytes: data.len(),
+                    data: Some(bytes.into()),
                 });
                 content.push(ContentBlock::Image(
                     ImageContent::new(data, mime_type).uri(uri),
@@ -1969,16 +2197,196 @@ fn attachment_uri(path: &Path) -> String {
     uri
 }
 
+fn merge_external_sessions(
+    mut sessions: Vec<SessionChoice>,
+    external: Vec<ExternalSession>,
+    hidden_sessions: &HashSet<String>,
+) -> (Vec<SessionChoice>, HashMap<String, ExternalSession>) {
+    let native_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<HashSet<_>>();
+    let mut external_by_choice = HashMap::new();
+    for session in external {
+        let choice_id = if native_ids.contains(&session.id) {
+            session.id.clone()
+        } else {
+            let choice_id = session.choice_id();
+            if hidden_sessions.contains(&choice_id) {
+                continue;
+            }
+            sessions.push(SessionChoice {
+                id: choice_id.clone(),
+                title: session.title.clone(),
+                updated_at: session.updated_at.clone(),
+                started_in_editur: false,
+            });
+            choice_id
+        };
+        external_by_choice.insert(choice_id, session);
+    }
+    sessions.truncate(MAX_CHOICES);
+    external_by_choice.retain(|id, _| sessions.iter().any(|session| &session.id == id));
+    (sessions, external_by_choice)
+}
+
+fn load_external_session(
+    external: &ExternalSession,
+    choice_id: &str,
+    events: &EventSender,
+) -> Result<(), String> {
+    send_event(
+        events,
+        Event::SessionLoading {
+            title: external.title.clone(),
+        },
+    );
+    load_external_transcript(external, events)?;
+    send_event(events, Event::ActiveSessionChanged(choice_id.to_owned()));
+    send_event(events, Event::ConnectionChanged(ConnectionState::Ready));
+    Ok(())
+}
+
+fn enrich_native_session(
+    session_id: &str,
+    external_sessions: &HashMap<String, ExternalSession>,
+    events: &EventSender,
+) {
+    if let Some(external) = external_sessions.get(session_id)
+        && let Err(error) = load_external_transcript(external, events)
+    {
+        send_event(events, Event::Error(error));
+    }
+}
+
+fn load_external_transcript(
+    external: &ExternalSession,
+    events: &EventSender,
+) -> Result<(), String> {
+    let transcript = external
+        .transcript()?
+        .into_iter()
+        .map(|message| match message {
+            ExternalMessage::User(text) => SessionTranscriptMessage::User(text),
+            ExternalMessage::Assistant(text) => SessionTranscriptMessage::Assistant(text),
+            ExternalMessage::Thought(text) => SessionTranscriptMessage::Thought(text),
+            ExternalMessage::Image(image) => SessionTranscriptMessage::Content {
+                role: ContentRole::User,
+                content: DisplayContent::Image {
+                    mime_type: image.mime_type,
+                    uri: None,
+                    encoded_bytes: image.bytes.len().div_ceil(3) * 4,
+                    data: Some(image.bytes),
+                },
+            },
+            ExternalMessage::Tool(tool) => {
+                SessionTranscriptMessage::Tool(external_tool_activity(tool))
+            }
+        })
+        .collect::<Vec<_>>();
+    if transcript.is_empty() {
+        return Err("the external session transcript is empty".into());
+    }
+    send_event(events, Event::SessionTranscriptLoaded(transcript));
+    Ok(())
+}
+
+fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
+    let content = tool
+        .diffs
+        .into_iter()
+        .map(|diff| ToolOutput::Diff {
+            path: diff.path,
+            old_text: diff.old_text,
+            new_text: diff.new_text,
+        })
+        .collect::<Vec<_>>();
+    let detail = (tool.input.is_some() || tool.output.is_some() || !content.is_empty()).then_some(
+        ToolDetail {
+            input: tool.input,
+            content,
+            output: tool.output,
+        },
+    );
+    ToolActivity {
+        id: tool.id,
+        title: Some(tool.name),
+        status: tool
+            .status
+            .map(|status| match status.to_ascii_lowercase().as_str() {
+                "pending" => "Pending".into(),
+                "running" | "inprogress" | "in_progress" => "InProgress".into(),
+                "error" | "failed" => "Failed".into(),
+                "cancelled" | "canceled" => "Cancelled".into(),
+                _ => "Completed".into(),
+            }),
+        kind: tool.kind,
+        paths: tool.paths.into_iter().map(Into::into).collect(),
+        detail,
+    }
+}
+
+async fn handoff_external_session(
+    connection: &ConnectionTo<Agent>,
+    project_root: &Path,
+    events: &EventSender,
+    editur_sessions: &mut EditurSessions,
+    sessions: &mut Vec<SessionChoice>,
+    external: &ExternalSession,
+    next_message: &str,
+) -> Result<(SessionId, String), String> {
+    let prompt = external.handoff_prompt(next_message)?;
+    let response = connection
+        .send_request(NewSessionRequest::new(project_root))
+        .block_task()
+        .await
+        .map_err(|error| acp_error(events.provider, "cannot continue imported session", &error))?;
+    let session_id = response.session_id;
+    editur_sessions.remember(session_id.0.as_ref())?;
+    let (current_mode, modes, config_options) =
+        session_controls(response.modes.as_ref(), response.config_options.as_deref());
+    sessions.retain(|session| session.id != external.choice_id());
+    sessions.insert(
+        0,
+        SessionChoice {
+            id: session_id.0.to_string(),
+            title: external.title.clone(),
+            updated_at: external.updated_at.clone(),
+            started_in_editur: true,
+        },
+    );
+    sessions.truncate(MAX_CHOICES);
+    send_event(
+        events,
+        Event::SessionLoaded {
+            current_mode,
+            modes,
+            config_options,
+        },
+    );
+    send_event(events, Event::SessionsUpdated(sessions.clone()));
+    send_event(
+        events,
+        Event::ActiveSessionChanged(session_id.0.to_string()),
+    );
+    send_event(events, Event::ConnectionChanged(ConnectionState::Ready));
+    Ok((session_id, prompt))
+}
+
 async fn new_session(
     connection: &ConnectionTo<Agent>,
     project_root: &std::path::Path,
     events: &EventSender,
+    editur_sessions: &mut EditurSessions,
 ) -> agent_client_protocol::Result<SessionId> {
     let response = connection
         .send_request(NewSessionRequest::new(project_root))
         .block_task()
         .await?;
     let session_id = response.session_id;
+    if let Err(error) = editur_sessions.remember(session_id.0.as_ref()) {
+        send_event(events, Event::Error(error));
+    }
     let (current_mode, modes, config_options) =
         session_controls(response.modes.as_ref(), response.config_options.as_deref());
     send_event(
@@ -2003,12 +2411,19 @@ async fn start_session(
     events: &EventSender,
     supports_history: bool,
     hidden_sessions: &HashSet<String>,
+    editur_sessions: &mut EditurSessions,
     preferred_session: Option<&str>,
 ) -> agent_client_protocol::Result<(SessionId, Vec<SessionChoice>)> {
     let sessions = if supports_history {
-        list_sessions(connection, project_root, events, hidden_sessions)
-            .await
-            .unwrap_or_default()
+        list_sessions(
+            connection,
+            project_root,
+            events,
+            hidden_sessions,
+            editur_sessions,
+        )
+        .await
+        .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -2019,7 +2434,7 @@ async fn start_session(
     {
         return Ok((session_id, sessions));
     }
-    let session_id = new_session(connection, project_root, events).await?;
+    let session_id = new_session(connection, project_root, events, editur_sessions).await?;
     let mut sessions = sessions;
     sessions.insert(0, untitled_session(&session_id));
     send_event(events, Event::SessionsUpdated(sessions.clone()));
@@ -2031,6 +2446,7 @@ fn untitled_session(session_id: &SessionId) -> SessionChoice {
         id: session_id.0.to_string(),
         title: None,
         updated_at: None,
+        started_in_editur: true,
     }
 }
 
@@ -2050,6 +2466,7 @@ async fn list_sessions(
     project_root: &std::path::Path,
     events: &EventSender,
     hidden_sessions: &HashSet<String>,
+    editur_sessions: &EditurSessions,
 ) -> agent_client_protocol::Result<Vec<SessionChoice>> {
     let response = connection
         .send_request(ListSessionsRequest::new().cwd(project_root))
@@ -2065,6 +2482,7 @@ async fn list_sessions(
             id: session.session_id.0.to_string(),
             title: session.title,
             updated_at: session.updated_at,
+            started_in_editur: editur_sessions.contains(session.session_id.0.as_ref()),
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -2078,30 +2496,30 @@ struct HiddenSessions {
     ids: HashSet<String>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct HiddenSessionFile {
+    version: u8,
+    ids: Vec<String>,
+}
+
 impl HiddenSessions {
     fn load(path: Option<PathBuf>) -> Self {
-        let ids = path
-            .as_ref()
-            .and_then(|path| {
-                fs::symlink_metadata(path)
-                    .ok()
-                    .filter(|metadata| {
-                        metadata.is_file()
-                            && !metadata.file_type().is_symlink()
-                            && metadata.len() <= MAX_DETAIL_BYTES as u64
-                    })
-                    .and_then(|_| fs::read(path).ok())
+        let ids = load_bounded_json(path.as_deref())
+            .and_then(|bytes| serde_json::from_slice::<HiddenSessionFile>(&bytes).ok())
+            .filter(|history| history.version == 2)
+            .map(|history| {
+                history
+                    .ids
+                    .into_iter()
+                    .take(MAX_STORED_SESSION_IDS)
+                    .collect()
             })
-            .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .take(MAX_HIDDEN_SESSIONS)
-            .collect();
+            .unwrap_or_default();
         Self { path, ids }
     }
 
     fn hide(&mut self, id: String) -> Result<(), String> {
-        if self.ids.len() >= MAX_HIDDEN_SESSIONS && !self.ids.contains(&id) {
+        if self.ids.len() >= MAX_STORED_SESSION_IDS && !self.ids.contains(&id) {
             return Err("too many sessions have been removed from history".into());
         }
         let Some(path) = &self.path else {
@@ -2110,12 +2528,71 @@ impl HiddenSessions {
         if !self.ids.insert(id.clone()) {
             return Ok(());
         }
-        if let Err(error) = save_hidden_sessions(path, &self.ids) {
+        let mut ids = self.ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let bytes = serde_json::to_vec(&HiddenSessionFile { version: 2, ids })
+            .map_err(|error| format!("cannot encode session history: {error}"))?;
+        if let Err(error) = save_session_metadata(path, &bytes) {
             self.ids.remove(&id);
             return Err(error);
         }
         Ok(())
     }
+}
+
+struct EditurSessions {
+    path: Option<PathBuf>,
+    ids: HashSet<String>,
+}
+
+impl EditurSessions {
+    fn load(path: Option<PathBuf>) -> Self {
+        let ids = load_session_ids(path.as_deref());
+        Self { path, ids }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn remember(&mut self, id: &str) -> Result<(), String> {
+        if self.ids.len() >= MAX_STORED_SESSION_IDS && !self.ids.contains(id) {
+            return Err("too many Editur sessions have been recorded".into());
+        }
+        let Some(path) = &self.path else {
+            return Err("cannot determine where to save Editur session origins".into());
+        };
+        if !self.ids.insert(id.to_owned()) {
+            return Ok(());
+        }
+        if let Err(error) = save_session_ids(path, &self.ids) {
+            self.ids.remove(id);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn load_session_ids(path: Option<&Path>) -> HashSet<String> {
+    load_bounded_json(path)
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_STORED_SESSION_IDS)
+        .collect()
+}
+
+fn load_bounded_json(path: Option<&Path>) -> Option<Vec<u8>> {
+    path.and_then(|path| {
+        fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| {
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= MAX_DETAIL_BYTES as u64
+            })
+            .and_then(|_| fs::read(path).ok())
+    })
 }
 
 fn session_history_path(provider: ProviderId, project_root: &std::path::Path) -> Option<PathBuf> {
@@ -2133,11 +2610,15 @@ fn managed_session_startup(
     let active_session = crate::data_dir()
         .ok()
         .map(|directory| active_session_path_in(&directory, provider, project_root));
+    let editur_sessions = crate::data_dir()
+        .ok()
+        .map(|directory| editur_sessions_path_in(&directory, provider, project_root));
     let preferred_session =
         preferred_session.or_else(|| active_session.as_deref().and_then(load_active_session));
     SessionStartup {
         history,
         active_session,
+        editur_sessions,
         preferred_session,
     }
 }
@@ -2181,40 +2662,52 @@ fn active_session_path_in(data_dir: &Path, provider: ProviderId, project_root: &
         )
 }
 
+fn editur_sessions_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
+    let history = session_history_path_in(data_dir, provider, project_root);
+    super::provision::provider_root(data_dir, provider)
+        .join("editur-sessions")
+        .join(
+            history
+                .file_name()
+                .expect("session history has a file name"),
+        )
+}
+
 fn load_active_session(path: &Path) -> Option<String> {
-    HiddenSessions::load(Some(path.to_path_buf()))
-        .ids
-        .into_iter()
-        .next()
+    load_session_ids(Some(path)).into_iter().next()
 }
 
 fn save_active_session(path: &Path, id: &str) -> Result<(), String> {
-    save_hidden_sessions(path, &HashSet::from([id.to_owned()]))
+    save_session_ids(path, &HashSet::from([id.to_owned()]))
 }
 
-fn save_hidden_sessions(path: &std::path::Path, ids: &HashSet<String>) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "session history path has no parent directory".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("cannot create session history directory: {error}"))?;
+fn save_session_ids(path: &std::path::Path, ids: &HashSet<String>) -> Result<(), String> {
     let mut ids = ids.iter().collect::<Vec<_>>();
     ids.sort_unstable();
     let bytes = serde_json::to_vec(&ids)
         .map_err(|error| format!("cannot encode session history: {error}"))?;
+    save_session_metadata(path, &bytes)
+}
+
+fn save_session_metadata(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() > MAX_DETAIL_BYTES {
-        return Err("too many sessions have been removed from history".into());
+        return Err("too many session identifiers to save".into());
     }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "session metadata path has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create session metadata directory: {error}"))?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("cannot stage session history: {error}"))?;
     staged
-        .write_all(&bytes)
+        .write_all(bytes)
         .and_then(|()| staged.flush())
         .and_then(|()| staged.as_file().sync_all())
-        .map_err(|error| format!("cannot write session history: {error}"))?;
+        .map_err(|error| format!("cannot write session metadata: {error}"))?;
     staged
         .persist(path)
-        .map_err(|error| format!("cannot save session history: {}", error.error))?;
+        .map_err(|error| format!("cannot save session metadata: {}", error.error))?;
     Ok(())
 }
 
@@ -2895,11 +3388,24 @@ enum NormalizedContent {
 fn normalize_display_content(content: ContentBlock) -> Option<NormalizedContent> {
     Some(match content {
         ContentBlock::Text(text) => NormalizedContent::Text(text.text),
-        ContentBlock::Image(image) => NormalizedContent::Display(DisplayContent::Image {
-            mime_type: image.mime_type,
-            uri: image.uri,
-            encoded_bytes: image.data.len(),
-        }),
+        ContentBlock::Image(image) => {
+            let encoded_bytes = image.data.len();
+            let data = (encoded_bytes <= MAX_DISPLAY_IMAGE_BYTES.div_ceil(3) * 4)
+                .then(|| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&image.data)
+                        .ok()
+                        .filter(|bytes| bytes.len() <= MAX_DISPLAY_IMAGE_BYTES)
+                        .map(Arc::<[u8]>::from)
+                })
+                .flatten();
+            NormalizedContent::Display(DisplayContent::Image {
+                mime_type: image.mime_type,
+                uri: image.uri,
+                encoded_bytes,
+                data,
+            })
+        }
         ContentBlock::Audio(audio) => NormalizedContent::Display(DisplayContent::Audio {
             mime_type: audio.mime_type,
             encoded_bytes: audio.data.len(),
@@ -3019,8 +3525,8 @@ fn tool_detail(
             }
             ToolCallContent::Diff(diff) => Some(ToolOutput::Diff {
                 path: diff.path.clone(),
-                old_text: diff.old_text.clone(),
-                new_text: diff.new_text.clone(),
+                old_text: diff.old_text.as_deref().map(Arc::from),
+                new_text: Arc::from(diff.new_text.as_str()),
             }),
             ToolCallContent::Terminal(terminal) => {
                 Some(ToolOutput::Terminal(terminal.terminal_id.0.to_string()))
@@ -3253,11 +3759,13 @@ fn humanize_machine_tool_title(
             .or_else(input_path_label)
             .map(|path| format!("Read {path}"))
             .or_else(|| Some("Read file".into())),
-        "edit" | "write" | "write_file" | "edit_file" | "search_replace" => path_label
-            .clone()
-            .or_else(input_path_label)
-            .map(|path| format!("Edit {path}"))
-            .or_else(|| Some("Edit file".into())),
+        "edit" | "write" | "write_file" | "edit_file" | "edit_file_v2" | "search_replace" => {
+            path_label
+                .clone()
+                .or_else(input_path_label)
+                .map(|path| format!("Edit {path}"))
+                .or_else(|| Some("Edit file".into()))
+        }
         "grep" | "rg" | "search" => input_string(&["query", "pattern", "regex"])
             .map(|query| format!("Search · {query}"))
             .or_else(|| Some("Search".into())),
@@ -3340,6 +3848,82 @@ mod tests {
     }
 
     #[test]
+    fn native_session_keeps_matching_filesystem_transcript_without_a_duplicate_choice() {
+        let fixture = tempfile::tempdir().unwrap();
+        let transcript_path = fixture.path().join("rollout.jsonl");
+        let image = [0_u8, 1, 2, 3];
+        let image_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(image)
+        );
+        let records = [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": image_url}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "See attached"}
+            }),
+        ];
+        std::fs::write(
+            &transcript_path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let native = SessionChoice {
+            id: "same-session".into(),
+            title: Some("Native session".into()),
+            updated_at: None,
+            started_in_editur: false,
+        };
+
+        let (sessions, external) = merge_external_sessions(
+            vec![native],
+            vec![ExternalSession::test_fixture(
+                "same-session",
+                transcript_path,
+            )],
+            &HashSet::new(),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert!(external.contains_key("same-session"));
+        assert!(!external.contains_key("external:same-session"));
+
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        enrich_native_session(
+            "same-session",
+            &external,
+            &EventSender {
+                provider: ProviderId::Codex,
+                event_tx,
+                wake: Arc::new(|| {}),
+                active_session: None,
+            },
+        );
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            Event::SessionTranscriptLoaded(messages)
+                if matches!(
+                    messages.as_slice(),
+                    [SessionTranscriptMessage::User(text), SessionTranscriptMessage::Content {
+                        role: ContentRole::User,
+                        content: DisplayContent::Image { data: Some(bytes), .. },
+                    }] if text == "See attached" && bytes.as_ref() == image
+                )
+        ));
+    }
+
+    #[test]
     fn hidden_session_history_is_provider_scoped_and_migrates_cursor_once() {
         let data = tempfile::tempdir().unwrap();
         let project = Path::new("/work/project");
@@ -3402,6 +3986,34 @@ mod tests {
     }
 
     #[test]
+    fn editur_session_origins_survive_a_restart() {
+        let data = tempfile::tempdir().unwrap();
+        let path =
+            editur_sessions_path_in(data.path(), ProviderId::Codex, Path::new("/work/project"));
+        let mut sessions = EditurSessions::load(Some(path.clone()));
+        sessions.remember("editur-session").unwrap();
+
+        assert!(EditurSessions::load(Some(path)).contains("editur-session"));
+    }
+
+    #[test]
+    fn legacy_hidden_sessions_are_recovered_but_new_manual_removals_persist() {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("hidden.json");
+        std::fs::write(&path, br#"["stale-session"]"#).unwrap();
+
+        let mut sessions = HiddenSessions::load(Some(path.clone()));
+        assert!(!sessions.ids.contains("stale-session"));
+
+        sessions.hide("manual-session".into()).unwrap();
+        assert!(
+            HiddenSessions::load(Some(path))
+                .ids
+                .contains("manual-session")
+        );
+    }
+
+    #[test]
     fn claude_acp_errors_never_copy_provider_payloads() {
         let secret = "super-secret-provider-payload";
 
@@ -3430,6 +4042,7 @@ mod tests {
                     mime_type: "image/png".into(),
                     uri: Some("file:///shot.png".into()),
                     encoded_bytes: 4,
+                    data: Some(Arc::from(*b"abc")),
                 },
             }
         );
@@ -3522,6 +4135,66 @@ mod tests {
                 output: None,
             })
         );
+    }
+
+    #[test]
+    fn imported_tool_diffs_reach_the_sidebar_as_structured_content() {
+        use crate::agent::external_sessions::{ExternalDiff, ExternalTool};
+
+        let tool = ExternalTool {
+            id: "external-edit".into(),
+            name: "edit_file_v2".into(),
+            status: Some("completed".into()),
+            kind: Some("Edit".into()),
+            input: None,
+            output: Some("raw fallback".into()),
+            paths: vec!["src/app.rs".into()],
+            diffs: vec![ExternalDiff {
+                path: "src/app.rs".into(),
+                old_text: Some("before".into()),
+                new_text: "after".into(),
+            }],
+        };
+
+        let activity = external_tool_activity(tool);
+
+        assert!(matches!(
+            activity.detail.as_ref().map(|detail| detail.content.as_slice()),
+            Some([ToolOutput::Diff { path, old_text: Some(old_text), new_text }])
+                if path == Path::new("src/app.rs")
+                    && &**old_text == "before"
+                    && &**new_text == "after"
+        ));
+    }
+
+    #[test]
+    fn imported_tool_diffs_keep_shared_snapshots() {
+        use crate::agent::external_sessions::{ExternalDiff, ExternalTool};
+
+        let snapshot: Arc<str> = "after".into();
+        let activity = external_tool_activity(ExternalTool {
+            id: "external-edit".into(),
+            name: "edit_file_v2".into(),
+            status: Some("completed".into()),
+            kind: Some("Edit".into()),
+            input: None,
+            output: None,
+            paths: vec!["src/app.rs".into()],
+            diffs: vec![ExternalDiff {
+                path: "src/app.rs".into(),
+                old_text: None,
+                new_text: Arc::clone(&snapshot),
+            }],
+        });
+        let Some(ToolOutput::Diff { new_text, .. }) = activity
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.content.first())
+        else {
+            panic!("imported diff was not structured");
+        };
+
+        assert!(Arc::ptr_eq(new_text, &snapshot));
     }
 
     #[test]
@@ -3939,6 +4612,20 @@ mod tests {
             detail: None,
         };
         assert_eq!(human.display_title(), "Read src/app.rs");
+    }
+
+    #[test]
+    fn cursor_edit_title_includes_the_detected_file_name() {
+        let edit = ToolActivity {
+            id: "edit".into(),
+            title: Some("edit_file_v2".into()),
+            status: Some("Completed".into()),
+            kind: Some("Edit".into()),
+            paths: vec!["src/app.rs".into()],
+            detail: None,
+        };
+
+        assert_eq!(edit.display_title(), "Edit app.rs");
     }
 
     #[cfg(target_os = "macos")]

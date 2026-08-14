@@ -6,7 +6,8 @@ use std::{
 use super::controller::{
     CommandChoice, ConfigChoice, ConnectionState, ContentRole, DisplayContent, Event,
     InteractionKind, InteractionRequest, ModeChoice, PermissionChoice, PlanItem, PlanPhase,
-    PlanProposal, Question, QuestionOption, SessionChoice, ToolActivity, ToolDetail, ToolOutput,
+    PlanProposal, Question, QuestionOption, SessionChoice, SessionTranscriptMessage, ToolActivity,
+    ToolDetail, ToolOutput,
 };
 
 const MAX_ITEM_BYTES: usize = 64 * 1024;
@@ -281,6 +282,40 @@ impl AgentState {
                     .map(bounded_mode)
                     .collect();
                 self.config_options = bounded_configs(config_options);
+            }
+            Event::SessionTranscriptLoaded(messages) => {
+                self.session_load_backup = None;
+                self.session_ready = true;
+                self.active = false;
+                self.transcript.clear();
+                self.changed_paths.clear();
+                self.baselines.clear();
+                self.baseline_bytes = 0;
+                self.tool_credits.clear();
+                self.tool_changes.clear();
+                self.refresh_queue.clear();
+                for message in messages {
+                    match message {
+                        SessionTranscriptMessage::User(text) => {
+                            self.push(TranscriptItem::User(bounded(text)));
+                        }
+                        SessionTranscriptMessage::Assistant(text) => {
+                            self.push(TranscriptItem::Assistant(bounded(text)));
+                        }
+                        SessionTranscriptMessage::Thought(text) => {
+                            self.push(TranscriptItem::Thought(bounded(text)));
+                        }
+                        SessionTranscriptMessage::Content { role, content } => {
+                            self.push(TranscriptItem::Content {
+                                role,
+                                content: bounded_content(content),
+                            });
+                        }
+                        SessionTranscriptMessage::Tool(tool) => {
+                            self.apply(Event::ToolCallUpdated(tool));
+                        }
+                    }
+                }
             }
             Event::ActiveSessionChanged(session_id) => {
                 self.session_id = Some(bounded(session_id));
@@ -774,10 +809,12 @@ fn bounded_content(content: DisplayContent) -> DisplayContent {
             mime_type,
             uri,
             encoded_bytes,
+            data,
         } => DisplayContent::Image {
             mime_type: bounded(mime_type),
             uri: uri.map(bounded),
             encoded_bytes,
+            data,
         },
         DisplayContent::Audio {
             mime_type,

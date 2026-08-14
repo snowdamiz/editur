@@ -452,6 +452,46 @@ fn reconnecting_restores_the_newest_project_session() {
 }
 
 #[test]
+fn session_history_distinguishes_provider_sessions_from_editur_sessions() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+    );
+    receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
+
+    controller.send(Command::NewSession).unwrap();
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::SessionsUpdated(sessions) if sessions[0].id == "fake-session"),
+    );
+    let origins = events.iter().find_map(|event| match event {
+        Event::SessionsUpdated(sessions) if sessions[0].id == "fake-session" => Some(
+            sessions
+                .iter()
+                .map(|session| (session.id.as_str(), session.started_in_editur))
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    });
+
+    assert_eq!(
+        origins,
+        Some(vec![
+            ("fake-session", true),
+            ("newest-session", false),
+            ("older-session", false),
+        ])
+    );
+}
+
+#[test]
 fn reconnecting_can_restore_the_providers_active_session() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process_resuming(

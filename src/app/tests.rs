@@ -17,15 +17,15 @@ use super::{
     disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
     draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
     draw_tab_drag_ghost, editor_background, editor_column_content, file_result_job,
-    find_highlighted_job, install_repaint_wake, launch_in_current_process, match_bracket_pair,
-    match_spans, model_display_name, next_find_match, pane_header_and_content, plain_text_job,
-    presentation_job, project_chooser_ui, provider_selector_visible, repaint_deadline,
-    repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
-    search_group_header, search_needs_polling, search_selection_after_navigation,
-    settings_ui_scale_slider, should_show_project_chooser, skip_transition_render,
-    slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
-    split_bottom_panel, split_pane_content, split_workspace, stable_tab_drop_zone, tab_width,
-    unique_copy_path,
+    find_highlighted_job, install_repaint_wake, launch_in_current_process,
+    load_agent_image_preview_bytes, match_bracket_pair, match_spans, model_display_name,
+    next_find_match, pane_header_and_content, plain_text_job, presentation_job, project_chooser_ui,
+    provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
+    resize_divider_stroke, run_everything_state, search_group_header, search_needs_polling,
+    search_selection_after_navigation, settings_ui_scale_slider, should_show_project_chooser,
+    skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_diff,
+    split_agentic_workspace, split_bottom_panel, split_pane_content, split_workspace,
+    stable_tab_drop_zone, tab_width, unique_copy_path,
 };
 
 #[test]
@@ -3003,6 +3003,54 @@ fn dense_work_rows_are_short_and_use_text_only_hover() {
 }
 
 #[test]
+fn dense_tool_titles_stay_on_one_line_at_the_minimum_sidebar_width() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent_sidebar_width = 320.0;
+    app.settings.appearance.dense_agent = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.active = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::User("Fix the shell startup".into()));
+    let command = "const patch = '*** Begin Patch *** Update File: /Users/example/.zshrc @@ remove a very long stale shell startup entry *** End Patch'";
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "narrow-command".into(),
+            title: Some(command.into()),
+            status: Some("Completed".into()),
+            kind: Some("Execute".into()),
+            paths: Vec::new(),
+            detail: None,
+        }));
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1_000.0, 760.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let rows = output.shapes.iter().find_map(|shape| match &shape.shape {
+        Shape::Text(text) if text.galley.text() == command => Some(text.galley.rows.len()),
+        _ => None,
+    });
+
+    assert_eq!(rows, Some(1));
+}
+
+#[test]
 fn dense_agent_tool_rows_expand_to_their_compact_details() {
     fn contains_text(shape: &Shape, expected: &str) -> bool {
         match shape {
@@ -5159,8 +5207,8 @@ fn agent_file_edits_are_collapsed_by_default() {
         input: Some("raw edit request".into()),
         content: vec![crate::agent::controller::ToolOutput::Diff {
             path: "sample.rs".into(),
-            old_text: Some(old_text),
-            new_text,
+            old_text: Some(old_text.into()),
+            new_text: new_text.into(),
         }],
         output: Some("generic completion summary".into()),
     });
@@ -5620,7 +5668,7 @@ fn find_navigation_scrolls_the_matching_diff_row_into_view() {
                 content: vec![ToolOutput::Diff {
                     path: "big.txt".into(),
                     old_text: None,
-                    new_text: new_text.clone(),
+                    new_text: new_text.clone().into(),
                 }],
                 output: None,
             }),
@@ -5905,7 +5953,7 @@ fn agent_assistant_responses_render_compact_markdown() {
         match shape {
             Shape::Text(text)
                 if text.galley.text()
-                    == "Result\n\n• Done\n• Run cargo-test-with-an-unbroken-argument-that-is-much-wider-than-the-agent-sidebar." =>
+                    == "Result\n\n  • Done\n  • Run cargo-test-with-an-unbroken-argument-that-is-much-wider-than-the-agent-sidebar." =>
             {
                 Some((
                     Rect::from_min_size(text.pos, text.galley.size()),
@@ -5930,7 +5978,7 @@ fn agent_assistant_responses_render_compact_markdown() {
         })
         .expect("rendered Markdown response");
 
-    assert!((18.0..=19.0).contains(&max_font_size));
+    assert!((19.5..=20.0).contains(&max_font_size));
     assert!(rect.right() <= clip.right());
     let cursor_metrics = output
         .shapes
@@ -6176,6 +6224,272 @@ fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
             .any(|shape| contains_thumbnail(&shape.shape)),
         "the dropped image should render as a small thumbnail"
     );
+}
+
+#[test]
+fn embedded_session_image_bytes_decode_to_a_thumbnail() {
+    let context = theme::test_context();
+
+    let preview = load_agent_image_preview_bytes(
+        &context,
+        "detected-session-image",
+        include_bytes!("../../assets/icons/editur.png"),
+    );
+
+    assert!(preview.is_some());
+}
+
+#[test]
+fn embedded_session_image_is_painted_in_the_transcript() {
+    use crate::agent::controller::DisplayContent;
+
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 700.0))),
+            ..RawInput::default()
+        },
+        |ui| {
+            super::draw_agent_content(
+                ui,
+                &DisplayContent::Image {
+                    mime_type: "image/png".into(),
+                    uri: None,
+                    encoded_bytes: 0,
+                    data: Some(std::sync::Arc::from(
+                        include_bytes!("../../assets/icons/editur.png").as_slice(),
+                    )),
+                },
+                None,
+            );
+        },
+    );
+
+    let bounds = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
+                Some(mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                    bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                }))
+            }
+            Shape::Rect(rect) if rect.brush.is_some() => Some(rect.rect),
+            _ => None,
+        })
+        .expect("embedded image texture");
+
+    assert!(bounds.width() <= 240.0 && bounds.height() <= 180.0);
+}
+
+#[test]
+fn user_prompt_image_opens_a_large_lightbox_and_escape_closes_it() {
+    use crate::agent::controller::{ContentRole, DisplayContent};
+    use crate::agent::state::TranscriptItem;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.transcript.push_back(TranscriptItem::Content {
+        role: ContentRole::User,
+        content: DisplayContent::Image {
+            mime_type: "image/png".into(),
+            uri: None,
+            encoded_bytes: 0,
+            data: Some(std::sync::Arc::from(
+                include_bytes!("../../assets/icons/editur.png").as_slice(),
+            )),
+        },
+    });
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    {
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        fn image_bounds(output: &egui::FullOutput) -> Vec<Rect> {
+            fn collect(shape: &Shape, bounds: &mut Vec<Rect>) {
+                match shape {
+                    Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
+                        bounds.push(mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                            bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                        }));
+                    }
+                    Shape::Rect(rect) if rect.brush.is_some() => bounds.push(rect.rect),
+                    Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, bounds);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut bounds = Vec::new();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut bounds);
+            }
+            bounds
+        }
+
+        let initial = draw(Vec::new());
+        let thumbnail = image_bounds(&initial)
+            .into_iter()
+            .find(|rect| rect.width() <= 240.0 && rect.height() <= 180.0)
+            .expect("prompt image thumbnail");
+        let _ = draw(vec![
+            Event::PointerMoved(thumbnail.center()),
+            Event::PointerButton {
+                pos: thumbnail.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![Event::PointerButton {
+            pos: thumbnail.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        let lightbox = draw(Vec::new());
+
+        context
+            .read_response(Id::new("agent_image_lightbox_close"))
+            .expect("lightbox close button");
+        let lightbox_images = image_bounds(&lightbox);
+        assert!(
+            lightbox_images
+                .iter()
+                .any(|rect| rect.width() > 240.0 || rect.height() > 180.0),
+            "lightbox should render a larger image, got {lightbox_images:?}"
+        );
+
+        let _ = draw(vec![Event::Key {
+            key: Key::Escape,
+            physical_key: Some(Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]);
+    }
+    assert!(app.agent_image_lightbox.is_none());
+}
+
+#[test]
+fn agent_originated_image_starts_collapsed() {
+    use crate::agent::controller::{ContentRole, DisplayContent};
+    use crate::agent::state::TranscriptItem;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.transcript.push_back(TranscriptItem::Content {
+        role: ContentRole::Assistant,
+        content: DisplayContent::Image {
+            mime_type: "image/png".into(),
+            uri: None,
+            encoded_bytes: 0,
+            data: Some(std::sync::Arc::from(
+                include_bytes!("../../assets/icons/editur.png").as_slice(),
+            )),
+        },
+    });
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    {
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let output = draw(Vec::new());
+
+        assert!(!output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+            Shape::Rect(rect) => rect.brush.is_some(),
+            _ => false,
+        }));
+        let header = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == "Image" => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .expect("collapsed image disclosure");
+        let _ = draw(vec![
+            Event::PointerMoved(header.center()),
+            Event::PointerButton {
+                pos: header.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let expanded = draw(vec![Event::PointerButton {
+            pos: header.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        let thumbnail = expanded
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
+                    Some(mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                        bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                    }))
+                }
+                Shape::Rect(rect) if rect.brush.is_some() => Some(rect.rect),
+                _ => None,
+            })
+            .expect("expanded image thumbnail");
+        let _ = draw(vec![
+            Event::PointerMoved(thumbnail.center()),
+            Event::PointerButton {
+                pos: thumbnail.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let _ = draw(vec![Event::PointerButton {
+            pos: thumbnail.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+    }
+    assert!(app.agent_image_lightbox.is_some());
 }
 
 #[test]
@@ -7582,6 +7896,7 @@ fn agent_history_menu_lists_restorable_sessions() {
         id: "session-1".into(),
         title: Some("Previous landing page".into()),
         updated_at: Some("2026-08-07T12:00:00Z".into()),
+        started_in_editur: true,
     }]);
     app.agent_menu = Some(super::AgentMenu::Sessions);
     let output = theme::test_context().run_ui(
@@ -7617,6 +7932,65 @@ fn agent_history_menu_lists_restorable_sessions() {
 }
 
 #[test]
+fn agent_history_marks_only_sessions_started_outside_editur_with_the_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.selected_provider = ProviderId::Codex;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![
+        SessionChoice {
+            id: "provider-session".into(),
+            title: Some("Started in Codex".into()),
+            updated_at: None,
+            started_in_editur: false,
+        },
+        SessionChoice {
+            id: "editur-session".into(),
+            title: Some("Started in Editur".into()),
+            updated_at: None,
+            started_in_editur: true,
+        },
+    ]);
+    app.agent_menu = Some(super::AgentMenu::Sessions);
+    let context = theme::test_context();
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        context
+            .read_response(Id::new((
+                "agent_session_origin",
+                "provider-session",
+                "codex",
+            )))
+            .is_some()
+    );
+    assert!(
+        context
+            .read_response(Id::new(
+                ("agent_session_origin", "editur-session", "codex",)
+            ))
+            .is_none()
+    );
+}
+
+#[test]
 fn session_history_does_not_overscroll_past_its_last_row() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -7635,6 +8009,7 @@ fn session_history_does_not_overscroll_past_its_last_row() {
                 id: format!("session-{index:02}"),
                 title: Some(format!("Session {index:02}")),
                 updated_at: None,
+                started_in_editur: true,
             })
             .collect(),
     );
@@ -9508,6 +9883,7 @@ fn agentic_mode_replaces_the_editor_with_project_sessions() {
         id: "session-1".into(),
         title: Some("Build the agentic workspace".into()),
         updated_at: None,
+        started_in_editur: true,
     }]);
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
@@ -9618,6 +9994,7 @@ fn sidebar_visibility_is_shared_by_ide_and_agentic_modes() {
         id: "hidden-session".into(),
         title: Some("Agent sidebar entry".into()),
         updated_at: None,
+        started_in_editur: true,
     }]);
     let input = || RawInput {
         screen_rect: Some(Rect::from_min_size(
@@ -9904,6 +10281,7 @@ fn agentic_session_remove_control_stays_hidden_until_the_row_is_hovered() {
         id: "session-1".into(),
         title: Some("Polish the agentic workspace".into()),
         updated_at: None,
+        started_in_editur: true,
     }]);
     let output = theme::test_context().run_ui(
         RawInput {
@@ -9943,6 +10321,7 @@ fn agentic_session_rows_are_compact() {
         id: "session-1".into(),
         title: Some("Compact session".into()),
         updated_at: None,
+        started_in_editur: true,
     }]);
     let context = theme::test_context();
     let _ = context.run_ui(
@@ -9983,6 +10362,7 @@ fn agentic_sidebar_marks_the_controller_active_session_as_selected() {
         id: "session-1".into(),
         title: Some("Current session".into()),
         updated_at: None,
+        started_in_editur: true,
     }]);
     app.agent
         .apply(crate::agent::controller::Event::ActiveSessionChanged(

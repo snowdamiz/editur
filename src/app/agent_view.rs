@@ -222,7 +222,9 @@ impl EditorApp {
             if selected
                 && matches!(
                     event,
-                    AgentEvent::SessionReady { .. } | AgentEvent::SessionLoaded { .. }
+                    AgentEvent::SessionReady { .. }
+                        | AgentEvent::SessionLoaded { .. }
+                        | AgentEvent::SessionTranscriptLoaded(_)
                 )
             {
                 self.agent_follow_transcript = true;
@@ -732,6 +734,7 @@ impl EditorApp {
         let mut interaction_responses = Vec::new();
         let mut open_path_request: Option<(PathBuf, Option<u32>)> = None;
         let mut open_diff_request: Option<PathBuf> = None;
+        let mut open_image_request: Option<AgentImageSource> = None;
         let transcript_padding = if self.agentic_mode {
             ((transcript.width() - AGENTIC_CONTENT_WIDTH) * 0.5).max(28.0)
         } else {
@@ -1182,7 +1185,27 @@ impl EditorApp {
                                         }
                                     }
                                     TranscriptItem::Content { role, content } => {
-                                        if dense_agent && matches!(role, ContentRole::Thought) {
+                                        let image = matches!(content, DisplayContent::Image { .. });
+                                        if image && !matches!(role, ContentRole::User) {
+                                            if matches!(role, ContentRole::Assistant) {
+                                                draw_provider_identity(ui, self.selected_provider);
+                                            }
+                                            egui::CollapsingHeader::new("Image")
+                                                .id_salt(("agent_content_image", item_index))
+                                                .default_open(false)
+                                                .icon(paint_agent_disclosure)
+                                                .show(ui, |ui| {
+                                                    if let Some(source) = draw_agent_content(
+                                                        ui,
+                                                        content,
+                                                        item_search,
+                                                    ) {
+                                                        open_image_request = Some(source);
+                                                    }
+                                                });
+                                        } else if dense_agent
+                                            && matches!(role, ContentRole::Thought)
+                                        {
                                             agent_dense_tool(
                                                 ui,
                                                 Id::new(("dense_agent_content", item_index)),
@@ -1191,7 +1214,15 @@ impl EditorApp {
                                                 None,
                                                 item_search,
                                                 true,
-                                                |ui| draw_agent_content(ui, content, item_search),
+                                                |ui| {
+                                                    if let Some(source) = draw_agent_content(
+                                                        ui,
+                                                        content,
+                                                        item_search,
+                                                    ) {
+                                                        open_image_request = Some(source);
+                                                    }
+                                                },
                                             );
                                         } else {
                                             if !dense_agent
@@ -1217,7 +1248,11 @@ impl EditorApp {
                                                     }
                                                 }
                                             }
-                                            draw_agent_content(ui, content, item_search);
+                                            if let Some(source) =
+                                                draw_agent_content(ui, content, item_search)
+                                            {
+                                                open_image_request = Some(source);
+                                            }
                                         }
                                     }
                                     TranscriptItem::Plan(plan) => {
@@ -1351,11 +1386,13 @@ impl EditorApp {
                                                                 }
                                                             }
                                                             ToolOutput::Content(content) => {
-                                                                draw_agent_content(
+                                                                if let Some(source) = draw_agent_content(
                                                                     ui,
                                                                     content,
                                                                     item_search,
-                                                                );
+                                                                ) {
+                                                                    open_image_request = Some(source);
+                                                                }
                                                             }
                                                             ToolOutput::Diff {
                                                                 path,
@@ -1482,10 +1519,11 @@ impl EditorApp {
                                                                         )
                                                                         && preview.clicked()
                                                                     {
-                                                                        open_path_request = Some((
+                                                                        open_image_request = Some(
+                                                                            AgentImageSource::Path(
                                                                             file_path.clone(),
-                                                                            None,
-                                                                        ));
+                                                                            ),
+                                                                        );
                                                                     }
                                                                     if agent_path_link(
                                                                         ui,
@@ -2788,7 +2826,11 @@ impl EditorApp {
                                                     }
                                                     for session in sessions {
                                                         let (open, remove) = agent_session_row(
-                                                            ui, session, false, false,
+                                                            ui,
+                                                            session,
+                                                            self.selected_provider,
+                                                            false,
+                                                            false,
                                                         );
                                                         if open {
                                                             session_load = Some(session.id.clone());
@@ -3150,6 +3192,9 @@ impl EditorApp {
                     response,
                 });
             }
+        }
+        if let Some(source) = open_image_request {
+            self.agent_image_lightbox = Some(source);
         }
         if let Some((path, line)) = open_path_request {
             self.open_agent_path(path, line);

@@ -1,7 +1,7 @@
 use editur::agent::{
     controller::{
-        ConnectionState, Event, PermissionChoice, PermissionRequest, PlanItem, ToolActivity,
-        ToolDetail, ToolOutput,
+        ConnectionState, ContentRole, DisplayContent, Event, PermissionChoice, PermissionRequest,
+        PlanItem, SessionTranscriptMessage, ToolActivity, ToolDetail, ToolOutput,
     },
     state::{AgentState, FileChange, TranscriptItem},
 };
@@ -68,6 +68,95 @@ fn loading_a_session_keeps_the_replayed_transcript() {
     assert_eq!(state.transcript.len(), 2);
     assert!(state.session_ready);
     assert!(!state.active);
+}
+
+#[test]
+fn imported_sessions_restore_thoughts_and_tool_cards() {
+    let mut state = AgentState::default();
+    state.apply(Event::SessionTranscriptLoaded(vec![
+        SessionTranscriptMessage::User("fix it".into()),
+        SessionTranscriptMessage::Thought("checking".into()),
+        SessionTranscriptMessage::Tool(ToolActivity {
+            id: "tool-1".into(),
+            title: Some("Bash".into()),
+            status: Some("Completed".into()),
+            kind: Some("Execute".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: Some("cargo test".into()),
+                content: Vec::new(),
+                output: Some("passed".into()),
+            }),
+        }),
+        SessionTranscriptMessage::Assistant("done".into()),
+    ]));
+
+    assert!(matches!(state.transcript[0], TranscriptItem::User(ref text) if text == "fix it"));
+    assert!(matches!(state.transcript[1], TranscriptItem::Thought(ref text) if text == "checking"));
+    assert!(matches!(
+        state.transcript[2],
+        TranscriptItem::Tool(ref tool)
+            if tool.id == "tool-1"
+                && tool.detail.as_ref().and_then(|detail| detail.output.as_deref()) == Some("passed")
+    ));
+    assert!(matches!(state.transcript[3], TranscriptItem::Assistant(ref text) if text == "done"));
+}
+
+#[test]
+fn imported_session_images_reach_the_transcript() {
+    let mut state = AgentState::default();
+    let bytes = std::sync::Arc::<[u8]>::from([1, 2, 3]);
+
+    state.apply(Event::SessionTranscriptLoaded(vec![
+        SessionTranscriptMessage::Content {
+            role: ContentRole::User,
+            content: DisplayContent::Image {
+                mime_type: "image/png".into(),
+                uri: None,
+                encoded_bytes: 4,
+                data: Some(bytes.clone()),
+            },
+        },
+    ]));
+
+    assert!(matches!(
+        state.transcript.front(),
+        Some(TranscriptItem::Content {
+            role: ContentRole::User,
+            content: DisplayContent::Image { data: Some(data), .. },
+        }) if std::sync::Arc::ptr_eq(data, &bytes)
+    ));
+}
+
+#[test]
+fn imported_session_diffs_restore_tool_line_stats() {
+    let mut state = AgentState::default();
+    state.apply(Event::SessionTranscriptLoaded(vec![
+        SessionTranscriptMessage::Tool(ToolActivity {
+            id: "cursor-edit".into(),
+            title: Some("Edit app.rs".into()),
+            status: Some("Completed".into()),
+            kind: Some("Edit".into()),
+            paths: vec!["/w/app.rs".into()],
+            detail: Some(ToolDetail {
+                input: None,
+                content: vec![ToolOutput::Diff {
+                    path: "/w/app.rs".into(),
+                    old_text: Some("keep\nremove\n".into()),
+                    new_text: "keep\nadd one\nadd two\n".into(),
+                }],
+                output: None,
+            }),
+        }),
+    ]));
+
+    assert_eq!(
+        state.tool_change("cursor-edit"),
+        Some(FileChange {
+            added: 2,
+            removed: 1,
+        })
+    );
 }
 
 #[test]
@@ -536,7 +625,7 @@ fn diff_event(id: &str, path: &str, old_text: Option<&str>, new_text: &str) -> E
             input: None,
             content: vec![ToolOutput::Diff {
                 path: path.into(),
-                old_text: old_text.map(str::to_owned),
+                old_text: old_text.map(Into::into),
                 new_text: new_text.into(),
             }],
             output: None,
