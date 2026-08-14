@@ -5527,6 +5527,227 @@ fn agent_transcript_culls_offscreen_items_and_restores_them_when_scrolled_into_v
 }
 
 #[test]
+fn completed_permission_cards_use_the_dense_transcript_gap() {
+    fn gap(dense: bool) -> f32 {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.agent_sidebar = true;
+        app.settings.appearance.dense_agent = dense;
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.transcript.extend([
+            TranscriptItem::Permission(PermissionCard {
+                request_id: 1,
+                tool_call_id: "permission".into(),
+                action: "Edit protected.rs".into(),
+                options: vec![PermissionChoice {
+                    id: "once".into(),
+                    name: "Allow once".into(),
+                    kind: "AllowOnce".into(),
+                }],
+                selected: Some("once".into()),
+            }),
+            TranscriptItem::Assistant("After permission".into()),
+        ]);
+        let output = theme::test_context().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |ui| app.ui(ui),
+        );
+        fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == expected => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+                _ => None,
+            }
+        }
+        fn card_rect(shape: &Shape, action: Rect) -> Option<Rect> {
+            match shape {
+                Shape::Rect(rect)
+                    if rect.fill == theme::surface().raised
+                        && rect.rect.contains(action.center()) =>
+                {
+                    Some(rect.rect)
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| card_rect(shape, action)),
+                _ => None,
+            }
+        }
+        let action = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, "Edit protected.rs"))
+            .expect("permission action");
+        let card = output
+            .shapes
+            .iter()
+            .find_map(|shape| card_rect(&shape.shape, action))
+            .expect("completed permission card");
+        let next = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, "After permission"))
+            .expect("following reply");
+        next.top() - card.bottom()
+    }
+
+    assert!((gap(false) - gap(true) - 8.0).abs() <= 0.5);
+}
+
+#[test]
+fn collapsed_dense_work_clusters_keep_their_trailing_gap_when_culled() {
+    assert_eq!(
+        super::dense_agent_gap_after_item(8.0, true, false, true),
+        8.0
+    );
+    assert_eq!(
+        super::dense_agent_gap_after_item(8.0, true, true, true),
+        0.0
+    );
+}
+
+#[test]
+fn switching_sessions_remeasures_the_new_transcript_before_culling() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.session_id = Some("first-session".into());
+    app.agent
+        .transcript
+        .extend((0..120).map(|index| TranscriptItem::Assistant(format!("First reply {index}"))));
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0));
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |ui| app.ui(ui),
+        )
+    };
+
+    let _ = draw(&mut app, Vec::new());
+    let _ = draw(&mut app, Vec::new());
+    assert!(app.agent_transcript_rendered < 60);
+
+    app.agent.session_id = Some("second-session".into());
+    app.agent.transcript = (0..120)
+        .map(|index| TranscriptItem::Assistant(format!("Second reply {index}")))
+        .collect();
+    let _ = draw(&mut app, vec![Event::PointerMoved(pos2(700.0, 350.0))]);
+
+    assert_eq!(app.agent_transcript_rendered, 120);
+}
+
+#[test]
+fn switching_sessions_keeps_latest_reply_visible_on_pointer_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.session_id = Some("first-session".into());
+    app.agent
+        .transcript
+        .extend((0..120).map(|index| TranscriptItem::Assistant(format!("First reply {index}"))));
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0));
+    let draw = |app: &mut EditorApp, events, time| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                time: Some(time),
+                ..RawInput::default()
+            },
+            |ui| app.ui(ui),
+        )
+    };
+
+    fn contains_text(shape: &Shape, needle: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(needle),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, needle)),
+            _ => false,
+        }
+    }
+
+    let _ = draw(&mut app, Vec::new(), 0.0);
+    let _ = draw(&mut app, Vec::new(), 1.0);
+    let _ = draw(
+        &mut app,
+        vec![
+            Event::PointerMoved(pos2(700.0, 350.0)),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, 1_000_000.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        2.0,
+    );
+    assert!(!app.agent_follow_transcript);
+    let _ = draw(
+        &mut app,
+        vec![Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: Vec2::ZERO,
+            phase: TouchPhase::End,
+            modifiers: Modifiers::NONE,
+        }],
+        2.1,
+    );
+
+    app.agent.session_id = Some("second-session".into());
+    app.agent.transcript = (0..120)
+        .map(|index| TranscriptItem::Assistant(format!("Second reply {index}")))
+        .collect();
+    app.agent_follow_transcript = true;
+
+    for time in [3.0, 4.0, 5.0] {
+        let output = draw(
+            &mut app,
+            vec![Event::PointerMoved(pos2(700.0, 350.0))],
+            time,
+        );
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, "Second reply 119")),
+            "latest reply vanished on a pointer-only frame"
+        );
+    }
+}
+
+#[test]
 fn agent_diff_body_culls_rows_far_outside_the_viewport() {
     let temp = tempfile::tempdir().unwrap();
     let app = EditorApp::new(OpenTarget {
@@ -6240,6 +6461,21 @@ fn embedded_session_image_bytes_decode_to_a_thumbnail() {
 }
 
 #[test]
+fn prompt_image_square_uses_a_center_crop() {
+    let landscape = super::agent_image_cover_uv(Vec2::new(200.0, 100.0), Vec2::splat(72.0));
+    let portrait = super::agent_image_cover_uv(Vec2::new(100.0, 200.0), Vec2::splat(72.0));
+
+    assert_eq!(
+        landscape,
+        Rect::from_min_max(pos2(0.25, 0.0), pos2(0.75, 1.0))
+    );
+    assert_eq!(
+        portrait,
+        Rect::from_min_max(pos2(0.0, 0.25), pos2(1.0, 0.75))
+    );
+}
+
+#[test]
 fn embedded_session_image_is_painted_in_the_transcript() {
     use crate::agent::controller::DisplayContent;
 
@@ -6283,7 +6519,7 @@ fn embedded_session_image_is_painted_in_the_transcript() {
 }
 
 #[test]
-fn user_prompt_image_opens_a_large_lightbox_and_escape_closes_it() {
+fn user_prompt_image_is_a_square_inside_the_prompt_and_opens_a_lightbox() {
     use crate::agent::controller::{ContentRole, DisplayContent};
     use crate::agent::state::TranscriptItem;
 
@@ -6297,6 +6533,9 @@ fn user_prompt_image_opens_a_large_lightbox_and_escape_closes_it() {
     app.agentic_mode = true;
     app.agent.connection = ConnectionState::Ready;
     app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::User("Review this image".into()));
     app.agent.transcript.push_back(TranscriptItem::Content {
         role: ContentRole::User,
         content: DisplayContent::Image {
@@ -6345,11 +6584,50 @@ fn user_prompt_image_opens_a_large_lightbox_and_escape_closes_it() {
             bounds
         }
 
+        fn text_bounds(output: &egui::FullOutput, needle: &str) -> Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == needle => {
+                        Some(Rect::from_min_size(text.pos, text.galley.size()))
+                    }
+                    _ => None,
+                })
+                .expect("prompt text")
+        }
+
+        fn prompt_surfaces(output: &egui::FullOutput) -> Vec<Rect> {
+            fn collect(shape: &Shape, bounds: &mut Vec<Rect>) {
+                match shape {
+                    Shape::Rect(rect) if rect.fill == theme::surface().input => {
+                        bounds.push(rect.rect);
+                    }
+                    Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, bounds);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut bounds = Vec::new();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut bounds);
+            }
+            bounds
+        }
+
         let initial = draw(Vec::new());
         let thumbnail = image_bounds(&initial)
             .into_iter()
-            .find(|rect| rect.width() <= 240.0 && rect.height() <= 180.0)
+            .find(|rect| rect.width() <= 96.0 && rect.height() <= 96.0)
             .expect("prompt image thumbnail");
+        assert!((thumbnail.width() - thumbnail.height()).abs() <= 0.5);
+        let prompt_text = text_bounds(&initial, "Review this image");
+        assert!(prompt_surfaces(&initial).iter().any(|rect| {
+            rect.contains(prompt_text.center()) && rect.contains(thumbnail.center())
+        }));
         let _ = draw(vec![
             Event::PointerMoved(thumbnail.center()),
             Event::PointerButton {
@@ -10138,6 +10416,50 @@ fn agentic_workspace_row_shows_its_branch_and_pull_request() {
             "missing {expected:?}"
         );
     }
+}
+
+#[test]
+fn agentic_workspace_branch_only_row_has_no_empty_third_line() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.git_workspace_status = Some(crate::projects::GitWorkspaceStatus {
+        branch: "heads/release".into(),
+        pull_request: None,
+    });
+    let root = app.tree.root.clone();
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1_000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |ui| app.ui(ui),
+    );
+    let row = context
+        .read_response(Id::new(("agentic_project", root)))
+        .expect("selected workspace row")
+        .rect;
+    let branch = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.text() == "heads/release" => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        })
+        .expect("branch label");
+
+    assert!(row.bottom() - branch.bottom() <= 8.0);
 }
 
 #[test]

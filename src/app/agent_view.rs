@@ -957,15 +957,18 @@ impl EditorApp {
                     let find_query = self.agent_find.query.clone();
                     let should_scroll_to_find = self.agent_find.scroll_to_match;
                     let mut scrolled_to_find = false;
-                    // Cached heights are only valid for the width and theme
-                    // they were measured under, and only while indexes still
-                    // line up: a reloaded transcript can shrink the list.
+                    // Cached heights are valid only for the layout and
+                    // provider session that produced those item indexes.
                     let dense_agent = self.settings.appearance.dense_agent;
+                    let mut session_hasher = DefaultHasher::new();
+                    (self.selected_provider, self.agent.session_id.as_deref())
+                        .hash(&mut session_hasher);
                     let heights_key = (
                         transcript_width.round().to_bits(),
                         theme::paint_appearance(ui.pixels_per_point()),
                         dense_agent,
                         self.agent.active,
+                        session_hasher.finish(),
                     );
                     if self.agent_transcript_heights_key != heights_key
                         || self.agent_transcript_heights.len() > self.agent.transcript.len()
@@ -975,6 +978,30 @@ impl EditorApp {
                     }
                     let mut item_heights = std::mem::take(&mut self.agent_transcript_heights);
                     let transcript_len = self.agent.transcript.len();
+                    let mut user_prompt_images = vec![Vec::new(); transcript_len];
+                    let mut merged_user_images = vec![false; transcript_len];
+                    let mut user_prompt_index = None;
+                    for (index, item) in self.agent.transcript.iter().enumerate() {
+                        match item {
+                            TranscriptItem::User(_) => user_prompt_index = Some(index),
+                            TranscriptItem::Content {
+                                role: ContentRole::User,
+                                content: DisplayContent::Image {
+                                    data: Some(data), ..
+                                },
+                            } => {
+                                if let Some(prompt_index) = user_prompt_index {
+                                    user_prompt_images[prompt_index].push(Arc::clone(data));
+                                    merged_user_images[index] = true;
+                                }
+                            }
+                            TranscriptItem::Content {
+                                role: ContentRole::User,
+                                ..
+                            } => {}
+                            _ => user_prompt_index = None,
+                        }
+                    }
                     let transcript_has_footer =
                         !self.agent.changed_paths.is_empty() || self.agent.active;
                     item_heights.resize(transcript_len, f32::NAN);
@@ -1035,19 +1062,16 @@ impl EditorApp {
                                     for (item_index, item) in
                                         self.agent.transcript.iter_mut().enumerate()
                                     {
+                                if merged_user_images[item_index] {
+                                    item_heights[item_index] = 0.0;
+                                    continue;
+                                }
                                 let item_top = ui.cursor().top();
                                 let item_is_selected = selected_find_item == Some(item_index);
                                 let is_dense_work = dense_agent && dense_agent_work_item(item);
                                 let dense_cluster = is_dense_work
                                     .then(|| dense_work_clusters[item_index].as_ref())
                                     .flatten();
-                                let gap_after_item = if is_dense_work
-                                    && dense_work_items.get(item_index + 1) == Some(&true)
-                                {
-                                    0.0
-                                } else {
-                                    item_gap
-                                };
                                 if let Some(cluster) = dense_cluster {
                                     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                                             ui.ctx(),
@@ -1063,6 +1087,12 @@ impl EditorApp {
                                     item_heights[item_index] = 0.0;
                                     continue;
                                 }
+                                let gap_after_item = dense_agent_gap_after_item(
+                                    item_gap,
+                                    is_dense_work,
+                                    dense_work_open,
+                                    dense_work_items.get(item_index + 1) == Some(&true),
+                                );
                                 // An off-screen item with a known height only
                                 // needs its space, not its widgets: laying out
                                 // every item every frame is what made long
@@ -1130,14 +1160,36 @@ impl EditorApp {
                                             .corner_radius(8)
                                             .show(ui, |ui| {
                                                 ui.set_width(ui.available_width());
-                                                let job = agent_text_job(
-                                                    text,
-                                                    ui.available_width(),
-                                                    theme::typography::body(),
-                                                    theme::text().primary,
-                                                    item_search,
-                                                );
-                                                ui.add(Label::new(job).wrap());
+                                                if !text.is_empty() {
+                                                    let job = agent_text_job(
+                                                        text,
+                                                        ui.available_width(),
+                                                        theme::typography::body(),
+                                                        theme::text().primary,
+                                                        item_search,
+                                                    );
+                                                    ui.add(Label::new(job).wrap());
+                                                }
+                                                if !user_prompt_images[item_index].is_empty() {
+                                                    if !text.is_empty() {
+                                                        ui.add_space(theme::space::MEDIUM);
+                                                    }
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        for data in &user_prompt_images[item_index] {
+                                                            if agent_prompt_image_preview(ui, data)
+                                                                .is_some_and(|preview| {
+                                                                    preview.clicked()
+                                                                })
+                                                            {
+                                                                open_image_request = Some(
+                                                                    AgentImageSource::Bytes(
+                                                                        Arc::clone(data),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                }
                                             });
                                     }
                                     TranscriptItem::Assistant(text) => {
@@ -1669,7 +1721,11 @@ impl EditorApp {
                                                 item_is_selected,
                                                 should_scroll_to_find,
                                             );
-                                            ui.add_space(16.0);
+                                            if item_index + 1 < transcript_len
+                                                || transcript_has_footer
+                                            {
+                                                ui.add_space(gap_after_item);
+                                            }
                                             continue;
                                         }
                                         egui::Frame::new()
@@ -2025,7 +2081,7 @@ impl EditorApp {
                         let mut state = output.state;
                         state.offset.y = max_offset;
                         state.store(ui.ctx(), output.id);
-                        ui.ctx().request_repaint();
+                        ui.ctx().request_discard("pin the agent transcript before painting");
                     }
                     if !self.agent_follow_transcript {
                         let button = egui::Rect::from_min_size(

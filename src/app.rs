@@ -533,6 +533,7 @@ const AGENT_IMAGE_PREVIEW_EDGE: u32 = 640;
 const AGENT_IMAGE_LIGHTBOX_EDGE: u32 = 4_096;
 const AGENT_IMAGE_PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const AGENT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(240.0, 180.0);
+const AGENT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0);
 
 #[derive(Clone)]
 enum AgentImagePreview {
@@ -564,7 +565,28 @@ fn agent_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> eg
     response
 }
 
-fn agent_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+fn agent_image_cover_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+    let source_aspect = source_size.x / source_size.y;
+    let target_aspect = target_size.x / target_size.y;
+    if source_aspect > target_aspect {
+        let width = target_aspect / source_aspect;
+        egui::Rect::from_min_max(
+            egui::pos2((1.0 - width) / 2.0, 0.0),
+            egui::pos2((1.0 + width) / 2.0, 1.0),
+        )
+    } else {
+        let height = source_aspect / target_aspect;
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, (1.0 - height) / 2.0),
+            egui::pos2(1.0, (1.0 + height) / 2.0),
+        )
+    }
+}
+
+fn agent_embedded_image_texture(
+    ui: &mut egui::Ui,
+    data: &Arc<[u8]>,
+) -> Option<egui::TextureHandle> {
     let cache_id = Id::new(("agent_embedded_image", data.as_ptr() as usize, data.len()));
     let cached = ui.data(|state| state.get_temp::<AgentImagePreview>(cache_id));
     let cached = cached.unwrap_or_else(|| {
@@ -580,8 +602,40 @@ fn agent_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<e
     });
     match cached {
         AgentImagePreview::Unavailable => None,
-        AgentImagePreview::Loaded(texture) => Some(agent_image_thumbnail(ui, &texture)),
+        AgentImagePreview::Loaded(texture) => Some(texture),
     }
+}
+
+fn agent_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+    let texture = agent_embedded_image_texture(ui, data)?;
+    Some(agent_image_thumbnail(ui, &texture))
+}
+
+fn agent_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+    let texture = agent_embedded_image_texture(ui, data)?;
+    let edge = AGENT_PROMPT_IMAGE_THUMBNAIL_SIZE
+        .x
+        .min(ui.available_width());
+    let size = egui::Vec2::splat(edge);
+    let source_size = texture.size_vec2();
+    let response = ui
+        .add(
+            egui::Image::from_texture((texture.id(), source_size))
+                .fit_to_exact_size(size)
+                .maintain_aspect_ratio(false)
+                .uv(agent_image_cover_uv(source_size, size))
+                .corner_radius(8)
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("View image");
+    ui.painter().rect_stroke(
+        response.rect,
+        8,
+        theme::border::hairline(),
+        egui::StrokeKind::Inside,
+    );
+    Some(response)
 }
 
 /// Inline preview for a generated image. The decode happens once on first
@@ -1571,6 +1625,19 @@ fn dense_agent_work_item(item: &TranscriptItem) -> bool {
             ..
         }
     )
+}
+
+fn dense_agent_gap_after_item(
+    item_gap: f32,
+    is_dense_work: bool,
+    dense_work_open: bool,
+    next_is_dense_work: bool,
+) -> f32 {
+    if is_dense_work && dense_work_open && next_is_dense_work {
+        0.0
+    } else {
+        item_gap
+    }
 }
 
 fn dense_agent_final_response_starts(
@@ -3785,8 +3852,8 @@ pub struct EditorApp {
     /// be culled into spacers instead of being laid out every frame. `NAN`
     /// means "not measured yet"; visible items re-measure every frame.
     agent_transcript_heights: Vec<f32>,
-    /// The (width, appearance, dense mode) the cached heights were measured under.
-    agent_transcript_heights_key: (u32, u64, bool, bool),
+    /// The layout and provider-session identity that produced the cached heights.
+    agent_transcript_heights_key: (u32, u64, bool, bool, u64),
     /// How many transcript items the last frame actually laid out (the rest
     /// were culled spacers); the culling tests key off this.
     agent_transcript_rendered: usize,
@@ -3946,7 +4013,7 @@ impl EditorApp {
             agent_mention_selected: 0,
             agent_find: AgentFind::default(),
             agent_transcript_heights: Vec::new(),
-            agent_transcript_heights_key: (0, 0, false, false),
+            agent_transcript_heights_key: (0, 0, false, false, 0),
             agent_transcript_rendered: 0,
             agent_drop_hovered: false,
             agent_file_picker: None,
@@ -6754,10 +6821,10 @@ fn agentic_project_row(
         .file_name()
         .unwrap_or(root.as_os_str())
         .to_string_lossy();
-    let height = if status.is_some() {
-        58.0
-    } else {
-        theme::control::ROW + theme::space::TIGHT
+    let height = match status {
+        Some(status) if status.pull_request.is_some() => 58.0,
+        Some(_) => 44.0,
+        None => theme::control::ROW + theme::space::TIGHT,
     };
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
