@@ -28,6 +28,29 @@ use super::{
     stable_tab_drop_zone, tab_width, unique_copy_path,
 };
 
+fn click_response(
+    context: &egui::Context,
+    draw: &mut impl FnMut(Vec<Event>) -> egui::FullOutput,
+    id: Id,
+) -> egui::FullOutput {
+    let position = context.read_response(id).expect("response").rect.center();
+    let _ = draw(vec![
+        Event::PointerMoved(position),
+        Event::PointerButton {
+            pos: position,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    draw(vec![Event::PointerButton {
+        pos: position,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    }])
+}
+
 #[test]
 fn composer_mentions_only_use_the_active_at_token() {
     assert_eq!(
@@ -2283,7 +2306,7 @@ fn open_agent_toggle_belongs_to_the_agent_header() {
 }
 
 #[test]
-fn agent_header_is_title_only_and_working_follows_the_latest_output() {
+fn agent_header_is_title_only_and_working_follows_the_latest_output_in_both_modes() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -2343,6 +2366,16 @@ fn agent_header_is_title_only_and_working_follows_the_latest_output() {
     assert!(working.top() > latest.bottom());
     assert!(working.bottom() < 592.0);
     assert!(context.read_response(Id::new("agent_working")).is_some());
+
+    app.settings.appearance.dense_agent = true;
+    let dense = draw(&mut app);
+    let working = find(&dense, "Working").unwrap().0;
+    assert!(working.top() > find(&dense, "Latest output").unwrap().0.bottom());
+    assert!(
+        context
+            .read_response(Id::new("dense_agent_working"))
+            .is_some()
+    );
 }
 
 #[test]
@@ -2783,7 +2816,7 @@ fn dense_work_summary_is_one_bold_inline_hover_target() {
 }
 
 #[test]
-fn dense_agent_expands_active_work_then_collapses_it_when_the_turn_finishes() {
+fn dense_agent_collapses_work_while_the_turn_is_active() {
     fn contains_text(shape: &Shape, expected: &str) -> bool {
         match shape {
             Shape::Text(text) => text.galley.text().contains(expected),
@@ -2836,10 +2869,16 @@ fn dense_agent_expands_active_work_then_collapses_it_when_the_turn_finishes() {
 
     let active = draw(&mut app);
     assert!(
-        active
+        !active
             .shapes
             .iter()
             .any(|shape| contains_text(&shape.shape, "Grepped renderer in app.rs"))
+    );
+    assert!(
+        active
+            .shapes
+            .iter()
+            .any(|shape| contains_text(&shape.shape, "Explored 1 search"))
     );
 
     app.agent.active = false;
@@ -2896,16 +2935,20 @@ fn dense_work_items_have_no_extra_gap_between_rows() {
         .transcript
         .push_back(tool("dense-second", "Read second.rs"));
     let context = theme::test_context();
-    let _ = context.run_ui(
-        RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(1_000.0, 760.0),
-            )),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_000.0, 760.0));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+    let _ = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, true)));
+    let _ = draw(Vec::new());
     let first = context
         .read_response(Id::new(("dense_agent_tool", 1)))
         .expect("first dense work row")
@@ -2915,7 +2958,11 @@ fn dense_work_items_have_no_extra_gap_between_rows() {
         .expect("second dense work row")
         .rect;
 
-    assert!(second.top() - first.bottom() <= theme::space::TIGHT);
+    assert!(
+        second.top() - first.bottom() <= theme::space::TIGHT,
+        "dense row gap was {}",
+        second.top() - first.bottom()
+    );
 }
 
 #[test]
@@ -2980,6 +3027,7 @@ fn dense_work_rows_are_short_and_use_text_only_hover() {
     };
 
     let _ = draw(Vec::new());
+    let _ = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, true)));
     let row = context
         .read_response(Id::new(("dense_agent_tool", 1)))
         .expect("dense work row")
@@ -3032,16 +3080,20 @@ fn dense_tool_titles_stay_on_one_line_at_the_minimum_sidebar_width() {
             detail: None,
         }));
 
-    let output = theme::test_context().run_ui(
-        RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(1_000.0, 760.0),
-            )),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1_000.0, 760.0));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+    let output = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, true)));
     let rows = output.shapes.iter().find_map(|shape| match &shape.shape {
         Shape::Text(text) if text.galley.text() == command => Some(text.galley.rows.len()),
         _ => None,
@@ -3135,44 +3187,8 @@ fn dense_agent_tool_rows_expand_to_their_compact_details() {
             .iter()
             .any(|shape| contains_text(&shape.shape, "−5"))
     );
-    let cluster = context
-        .read_response(Id::new(("dense_agent_work", 1, false)))
-        .expect("dense work cluster")
-        .rect;
-    let _ = draw(vec![
-        Event::PointerMoved(cluster.center()),
-        Event::PointerButton {
-            pos: cluster.center(),
-            button: PointerButton::Primary,
-            pressed: true,
-            modifiers: Modifiers::NONE,
-        },
-    ]);
-    let _ = draw(vec![Event::PointerButton {
-        pos: cluster.center(),
-        button: PointerButton::Primary,
-        pressed: false,
-        modifiers: Modifiers::NONE,
-    }]);
-    let row = context
-        .read_response(Id::new(("dense_agent_tool", 1)))
-        .expect("dense tool disclosure")
-        .rect;
-    let _ = draw(vec![
-        Event::PointerMoved(row.center()),
-        Event::PointerButton {
-            pos: row.center(),
-            button: PointerButton::Primary,
-            pressed: true,
-            modifiers: Modifiers::NONE,
-        },
-    ]);
-    let expanded = draw(vec![Event::PointerButton {
-        pos: row.center(),
-        button: PointerButton::Primary,
-        pressed: false,
-        modifiers: Modifiers::NONE,
-    }]);
+    let _ = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, false)));
+    let expanded = click_response(&context, &mut draw, Id::new(("dense_agent_tool", 1)));
 
     assert!(
         expanded

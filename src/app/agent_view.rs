@@ -1076,11 +1076,11 @@ impl EditorApp {
                                     .flatten();
                                 if let Some(cluster) = dense_cluster {
                                     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                                            ui.ctx(),
-                                            Id::new(("dense_agent_work", item_index, cluster.active)),
-                                            cluster.active,
-                                        );
-                                    if cluster.active || !find_matches.is_empty() {
+                                        ui.ctx(),
+                                        Id::new(("dense_agent_work", item_index, cluster.active)),
+                                        false,
+                                    );
+                                    if !find_matches.is_empty() {
                                         state.set_open(true);
                                         state.store(ui.ctx());
                                     }
@@ -1129,8 +1129,8 @@ impl EditorApp {
                                         Id::new(("dense_agent_work", item_index, cluster.active)),
                                         &cluster.label,
                                         cluster.change,
-                                        cluster.active,
-                                        cluster.active || !find_matches.is_empty(),
+                                        false,
+                                        !find_matches.is_empty(),
                                     );
                                     if !dense_work_open {
                                         item_heights[item_index] = ui.cursor().top() - item_top;
@@ -2055,9 +2055,7 @@ impl EditorApp {
                             }
                             if self.agent.active {
                                 if dense_agent {
-                                    if active_work_start == Some(transcript_len) {
-                                        draw_dense_agent_working(ui);
-                                    }
+                                    draw_dense_agent_working(ui);
                                 } else {
                                     ui.add_space(theme::space::SMALL);
                                     draw_agent_working(ui, self.selected_provider);
