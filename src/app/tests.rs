@@ -4884,6 +4884,73 @@ fn changed_files_render_as_a_summary_card_with_line_stats() {
 }
 
 #[test]
+fn changed_files_card_collapses_to_five_rows_and_toggles() {
+    fn contains_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let changed = (0..6)
+        .map(|index| (root.join(format!("file-{index}.rs")), FileChange::default()))
+        .collect();
+    let context = theme::test_context();
+    let draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(500.0, 400.0))),
+                events,
+                ..RawInput::default()
+            },
+            |ui| {
+                draw_agent_changed_files(ui, &root, &changed, None);
+            },
+        )
+    };
+    let contains = |output: &egui::FullOutput, expected| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_text(&shape.shape, expected))
+    };
+    let click = |rect: Rect| {
+        let _ = draw(vec![
+            Event::PointerMoved(rect.center()),
+            Event::PointerButton {
+                pos: rect.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        draw(vec![Event::PointerButton {
+            pos: rect.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }])
+    };
+
+    let collapsed = draw(Vec::new());
+    assert!(contains(&collapsed, "file-4.rs"));
+    assert!(!contains(&collapsed, "file-5.rs"));
+
+    let toggle = context
+        .read_response(Id::new("agent_changed_files_toggle"))
+        .expect("changed files disclosure")
+        .rect;
+    let expanded = click(toggle);
+    assert!(contains(&expanded, "file-5.rs"));
+
+    let collapsed_again = click(toggle);
+    assert!(!contains(&collapsed_again, "file-5.rs"));
+}
+
+#[test]
 fn deleted_changed_file_keeps_its_counts_but_cannot_be_opened() {
     fn find_text(shape: &Shape, expected: &str) -> Option<Rect> {
         match shape {

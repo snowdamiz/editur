@@ -331,6 +331,14 @@ pub(super) fn draw_agent_changed_files(
 ) -> Option<PathBuf> {
     let mut rows = changed_paths.iter().collect::<Vec<_>>();
     rows.sort_by_key(|(path, _)| *path);
+    let can_toggle = rows.len() > 5;
+    let toggle_id = Id::new("agent_changed_files_toggle");
+    let expanded = search.is_some()
+        || ui.data(|data| {
+            data.get_temp::<bool>(toggle_id.with("expanded"))
+                .unwrap_or(false)
+        });
+    let visible_rows = if expanded { rows.len() } else { 5 };
     let mut clicked = None;
     egui::Frame::new()
         .fill(theme::surface().raised)
@@ -339,20 +347,47 @@ pub(super) fn draw_agent_changed_files(
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(format!(
-                    "{} file{} changed",
-                    rows.len(),
-                    if rows.len() == 1 { "" } else { "s" }
-                ))
-                .size(theme::typography::SMALL_SIZE)
-                .strong()
-                .color(theme::text().secondary),
-            );
+            let mut toggle = None;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} file{} changed",
+                        rows.len(),
+                        if rows.len() == 1 { "" } else { "s" }
+                    ))
+                    .size(theme::typography::SMALL_SIZE)
+                    .strong()
+                    .color(theme::text().secondary),
+                );
+                if can_toggle && search.is_none() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        toggle = Some(icons::button_with_id(
+                            ui,
+                            Some(toggle_id),
+                            if expanded {
+                                Icon::ChevronUp
+                            } else {
+                                Icon::ChevronDown
+                            },
+                            if expanded {
+                                "Collapse changed files"
+                            } else {
+                                "Expand changed files"
+                            },
+                            theme::text().secondary,
+                            egui::Vec2::splat(theme::control::COMPACT + 2.0),
+                        ));
+                    });
+                }
+            });
+            if toggle.is_some_and(|toggle| toggle.clicked()) {
+                ui.data_mut(|data| data.insert_temp(toggle_id.with("expanded"), !expanded));
+                ui.ctx().request_discard("changed files disclosure changed");
+            }
             ui.add_space(theme::space::SNUG);
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut search_offset = 0;
-            for (path, stats) in rows {
+            for (path, stats) in rows.into_iter().take(visible_rows) {
                 let (added, removed) = (stats.added, stats.removed);
                 let deleted = if path.is_absolute() {
                     !path.is_file()

@@ -482,7 +482,9 @@ fn visit_cursor_database_transcript(
         };
         match record.get("type").and_then(serde_json::Value::as_i64) {
             Some(1) => {
-                if let Some(text) = record.get("text").and_then(message_text) {
+                if let Some(tool) = cursor_simulated_task(&record) {
+                    visit_distinct(&mut last, ExternalMessage::Tool(tool), &mut count, visit)?;
+                } else if let Some(text) = record.get("text").and_then(message_text) {
                     visit_distinct(&mut last, ExternalMessage::User(text), &mut count, visit)?;
                 }
                 for image in record
@@ -526,6 +528,56 @@ fn visit_cursor_database_transcript(
         }
     }
     Ok(count)
+}
+
+fn cursor_simulated_task(record: &serde_json::Value) -> Option<ExternalTool> {
+    if record
+        .get("isSimulatedMsg")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || record
+            .get("simulatedMsgReason")
+            .and_then(serde_json::Value::as_i64)
+            != Some(3)
+    {
+        return None;
+    }
+    let metadata = record.get("simulatedMessageMetadata")?;
+    let title = metadata.get("title")?.as_str()?.trim();
+    let id = metadata
+        .get("taskId")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| record.get("bubbleId").and_then(serde_json::Value::as_str))?;
+    let text = record
+        .get("text")
+        .and_then(message_text)
+        .unwrap_or_default();
+    let status = text
+        .lines()
+        .find_map(|line| line.strip_prefix("status: "))
+        .map(str::to_owned);
+    let output = text
+        .split_once("<response>")
+        .and_then(|(_, response)| response.split_once("</response>"))
+        .map(|(response, _)| response.trim())
+        .filter(|response| !response.is_empty())
+        .or_else(|| {
+            text.split_once("\ndetail: ")
+                .and_then(|(_, detail)| detail.split_once("\n</task>"))
+                .map(|(detail, _)| detail.trim())
+                .filter(|detail| !detail.is_empty())
+        })
+        .unwrap_or(text.trim());
+    Some(ExternalTool {
+        id: id.to_owned(),
+        name: format!("Background task · {title}"),
+        status,
+        kind: None,
+        input: None,
+        output: (!output.is_empty()).then(|| bounded_external_text(output)),
+        paths: Vec::new(),
+        diffs: Vec::new(),
+    })
 }
 
 struct CursorImageCache {
@@ -1414,6 +1466,104 @@ mod tests {
         }
         assert_eq!(external_tool_kind("TaskCreate"), None);
         assert_eq!(external_tool_kind("TaskUpdate"), None);
+    }
+
+    #[test]
+    fn cursor_simulated_task_notifications_restore_as_tools() {
+        let fixture = tempdir().unwrap();
+        let database = fixture.path().join("state.vscdb");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                (
+                    "bubbleId:cursor-session:task-result",
+                    serde_json::json!({
+                        "bubbleId": "task-result",
+                        "createdAt": "2026-08-14T19:48:54.340Z",
+                        "type": 1,
+                        "isSimulatedMsg": true,
+                        "simulatedMsgReason": 3,
+                        "simulatedMessageMetadata": {
+                            "title": "Review authentication",
+                            "taskId": "task-42"
+                        },
+                        "text": concat!(
+                            "<system_notification>\n<task>\n",
+                            "kind: subagent\nstatus: success\n",
+                            "detail: <user_visible_high_level_summary>Done</user_visible_high_level_summary>\n",
+                            "<response># Findings\nUse the shared callback.</response>\n",
+                            "</task>\n</system_notification>"
+                        )
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        drop(connection);
+
+        let transcript = cursor_database_transcript(&database, "cursor-session").unwrap();
+        let [ExternalMessage::Tool(tool)] = transcript.as_slice() else {
+            panic!("simulated task was not restored as a tool: {transcript:?}");
+        };
+        assert_eq!(tool.id, "task-42");
+        assert_eq!(tool.name, "Background task · Review authentication");
+        assert_eq!(tool.status.as_deref(), Some("success"));
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("# Findings\nUse the shared callback.")
+        );
+    }
+
+    #[test]
+    fn cursor_simulated_shell_notifications_keep_only_the_failure_detail() {
+        let fixture = tempdir().unwrap();
+        let database = fixture.path().join("state.vscdb");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                (
+                    "bubbleId:cursor-session:shell-result",
+                    serde_json::json!({
+                        "bubbleId": "shell-result",
+                        "createdAt": "2026-08-14T20:19:09.108Z",
+                        "type": 1,
+                        "isSimulatedMsg": true,
+                        "simulatedMsgReason": 3,
+                        "simulatedMessageMetadata": {
+                            "title": "Typecheck backend",
+                            "taskId": "679425"
+                        },
+                        "text": concat!(
+                            "<system_notification>\n<task>\n",
+                            "kind: shell\nstatus: error\ntask_id: 679425\n",
+                            "detail: exit_code=-1\noutput_path: /tmp/result.txt\n",
+                            "</task>\n</system_notification>"
+                        )
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        drop(connection);
+
+        let transcript = cursor_database_transcript(&database, "cursor-session").unwrap();
+        let [ExternalMessage::Tool(tool)] = transcript.as_slice() else {
+            panic!("simulated shell task was not restored as a tool: {transcript:?}");
+        };
+        assert_eq!(tool.name, "Background task · Typecheck backend");
+        assert_eq!(tool.status.as_deref(), Some("error"));
+        assert_eq!(
+            tool.output.as_deref(),
+            Some("exit_code=-1\noutput_path: /tmp/result.txt")
+        );
     }
 
     #[test]
