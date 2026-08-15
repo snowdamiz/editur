@@ -34,7 +34,10 @@ use window_state::*;
 use runtime::draw_editor_empty_state;
 pub use runtime::{choose_project, launch, quit_running, run, should_choose_project};
 #[cfg(test)]
-use runtime::{launch_in_current_process, project_chooser_ui, should_show_project_chooser};
+use runtime::{
+    editor_watermark_color, launch_in_current_process, project_chooser_ui,
+    should_show_project_chooser,
+};
 
 use egui::{
     Align, Align2, Color32, CursorIcon, Id, Key, Label, Layout, RichText, ScrollArea, Sense,
@@ -296,7 +299,7 @@ const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
-const AGENT_EMPTY_STATE_HEIGHT: f32 = 136.0;
+const AGENT_EMPTY_STATE_HEIGHT: f32 = 88.0;
 /// Keep the panel flush with the transcript while retaining bottom window
 /// clearance. The strip stays taller by the bottom margin so the inner text
 /// area matches the docked composer.
@@ -733,7 +736,7 @@ fn decode_agent_image_preview<R: BufRead + Seek>(
 
 fn agent_tool_status(status: Option<&str>) -> (&'static str, Color32) {
     match status.unwrap_or_default() {
-        "Completed" => ("Completed", theme::ink(theme::semantic().success)),
+        "Completed" => ("", theme::text().muted),
         "InProgress" | "Pending" => ("Running", theme::accent()),
         "Failed" => ("Failed", theme::ink(theme::semantic().danger)),
         "Cancelled" => ("Cancelled", theme::text().muted),
@@ -844,8 +847,8 @@ fn draw_agent_connecting(
 ) {
     let region = ui.max_rect();
     let block = egui::Rect::from_center_size(
-        egui::pos2(region.center().x, region.top() + region.height() * 0.42),
-        egui::vec2(region.width().min(280.0), 150.0),
+        region.center(),
+        egui::vec2(region.width().min(280.0), 126.0),
     );
     let time = ui.input(|input| input.time);
     ui.scope_builder(
@@ -854,18 +857,17 @@ fn draw_agent_connecting(
             ui.vertical_centered(|ui| {
                 let pulse =
                     0.55 + 0.45 * (0.5 + 0.5 * (time * std::f64::consts::TAU / 2.4).sin()) as f32;
-                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(40.0), Sense::hover());
+                let (mark, _) = ui.allocate_exact_size(egui::vec2(40.0, 44.0), Sense::hover());
                 paint_provider_icon(
                     ui.painter(),
-                    mark,
+                    egui::Rect::from_center_size(mark.center(), egui::Vec2::splat(40.0)),
                     provider_descriptor(provider).icon,
                     theme::text().primary.gamma_multiply(pulse),
                 );
-                ui.add_space(theme::space::LARGE);
+                ui.add_space(theme::space::MEDIUM);
                 ui.label(
                     RichText::new(headline)
-                        .size(theme::typography::TITLE_SIZE)
-                        .strong()
+                        .font(theme::typography::title())
                         .color(theme::text().primary),
                 );
                 ui.add_space(theme::space::TIGHT);
@@ -929,18 +931,7 @@ fn draw_agent_empty_state(
             .max_rect(block)
             .layout(Layout::top_down(Align::Center)),
         |ui| {
-            let (_, mark) = ui.allocate_space(egui::Vec2::splat(48.0));
-            ui.painter().rect_filled(
-                mark,
-                theme::corner(theme::radius::DIALOG),
-                theme::surface().raised,
-            );
-            ui.painter().rect_stroke(
-                mark,
-                theme::corner(theme::radius::DIALOG),
-                theme::border::hairline(),
-                egui::StrokeKind::Inside,
-            );
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(40.0, 44.0), Sense::hover());
             if agentic_mode {
                 icons::paint(
                     ui.painter(),
@@ -954,41 +945,20 @@ fn draw_agent_empty_state(
             } else {
                 paint_provider_icon(
                     ui.painter(),
-                    egui::Rect::from_center_size(mark.center(), egui::Vec2::splat(24.0)),
+                    egui::Rect::from_center_size(mark.center(), egui::Vec2::splat(40.0)),
                     provider_descriptor(provider).icon,
                     theme::text().primary,
                 );
             }
-            ui.add_space(theme::space::LARGE);
+            ui.add_space(theme::space::MEDIUM);
             ui.label(
                 RichText::new(if agentic_mode {
                     format!("What should we work on in {project}?")
                 } else {
                     "Start a task".to_owned()
                 })
-                .size(if agentic_mode {
-                    22.0
-                } else {
-                    theme::typography::TITLE_SIZE
-                })
-                .strong()
+                .font(theme::typography::title())
                 .color(theme::text().primary),
-            );
-            ui.add_space(theme::space::TIGHT);
-            ui.add(
-                Label::new(
-                    RichText::new(if agentic_mode {
-                        "Describe a task, ask a question, or review changes.".to_owned()
-                    } else {
-                        format!(
-                            "Ask {} to edit, explain, or run commands in {project}.",
-                            provider_descriptor(provider).display_name
-                        )
-                    })
-                    .size(theme::typography::BODY_SIZE)
-                    .color(theme::text().secondary),
-                )
-                .wrap(),
             );
         },
     );
@@ -1089,6 +1059,7 @@ fn draw_provider_selector_identity(
     ui: &mut egui::Ui,
     provider: ProviderId,
     enabled: bool,
+    show_label: bool,
 ) -> egui::Response {
     let provider = provider_descriptor(provider);
     let response = ui
@@ -1103,8 +1074,12 @@ fn draw_provider_selector_identity(
                 theme::typography::body(),
                 text_color,
             );
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(41.0 + galley.size().x, 20.0), Sense::click());
+            let width = if show_label {
+                41.0 + galley.size().x
+            } else {
+                39.0
+            };
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 20.0), Sense::click());
             if response.hovered() || response.is_pointer_button_down_on() {
                 ui.painter().rect_filled(
                     rect.expand2(egui::vec2(4.0, 2.0)),
@@ -1122,13 +1097,18 @@ fn draw_provider_selector_identity(
             );
             paint_provider_icon(ui.painter(), icon, provider.icon, text_color);
             let text_pos = egui::pos2(rect.left() + 20.0, rect.center().y - galley.size().y * 0.5);
-            let text_right = text_pos.x + galley.size().x;
-            ui.painter().galley(text_pos, galley, text_color);
+            let chevron_x = if show_label {
+                let text_right = text_pos.x + galley.size().x;
+                ui.painter().galley(text_pos, galley, text_color);
+                text_right + 14.0
+            } else {
+                rect.left() + 28.0
+            };
             icons::paint(
                 ui.painter(),
                 Icon::ChevronDown,
                 egui::Rect::from_center_size(
-                    egui::pos2(text_right + 14.0, rect.center().y),
+                    egui::pos2(chevron_x, rect.center().y),
                     egui::Vec2::splat(icons::GRID),
                 ),
                 text_color,
@@ -1387,7 +1367,7 @@ fn agent_collapsing_header(
             })
             .show(ui, |ui| {
                 let (label, color) = agent_tool_status(status);
-                let completed = status == Some("Completed");
+                let failed = status == Some("Failed");
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.spacing_mut().icon_width = 24.0;
@@ -1398,7 +1378,7 @@ fn agent_collapsing_header(
                     {
                         ui.ctx().request_discard("tool card disclosure changed");
                     }
-                    let status_width = if completed {
+                    let status_width = if failed {
                         24.0
                     } else if label.is_empty() {
                         0.0
@@ -1449,7 +1429,7 @@ fn agent_collapsing_header(
                             theme::ink(theme::semantic().danger),
                         );
                     }
-                    if completed {
+                    if failed {
                         let (rect, response) =
                             ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
                         response.widget_info(|| {
@@ -1461,7 +1441,7 @@ fn agent_collapsing_header(
                         });
                         icons::paint(
                             ui.painter(),
-                            Icon::CheckCircle,
+                            Icon::Error,
                             egui::Rect::from_center_size(
                                 rect.center(),
                                 egui::Vec2::splat(icons::GRID),
@@ -1933,14 +1913,19 @@ fn agent_dense_tool(
         added.size().x + theme::space::SMALL + removed.size().x
     });
     let (status_label, status_color) = agent_tool_status(status);
-    let status = (!status_label.is_empty()).then(|| {
+    let failed = status == Some("Failed");
+    let status = (!failed && !status_label.is_empty()).then(|| {
         ui.painter().layout_no_wrap(
             status_label.to_owned(),
             theme::typography::code_small(),
             status_color,
         )
     });
-    let status_width = status.as_ref().map_or(0.0, |status| status.size().x);
+    let status_width = if failed {
+        icons::GRID
+    } else {
+        status.as_ref().map_or(0.0, |status| status.size().x)
+    };
     let trailing_gap = if status_width > 0.0 && counts_width > 0.0 {
         theme::space::SMALL
     } else {
@@ -1979,6 +1964,17 @@ fn agent_dense_tool(
         ui.painter().galley(
             egui::pos2(x, rect.center().y - status.size().y * 0.5),
             status,
+            status_color,
+        );
+    } else if failed {
+        let x = rect.right() - theme::space::SMALL - counts_width - trailing_gap - status_width;
+        icons::paint(
+            ui.painter(),
+            Icon::Error,
+            egui::Rect::from_center_size(
+                egui::pos2(x + status_width * 0.5, rect.center().y),
+                egui::Vec2::splat(icons::GRID),
+            ),
             status_color,
         );
     }
@@ -2378,8 +2374,8 @@ fn agent_toggle_rect(header: egui::Rect) -> egui::Rect {
     #[cfg(not(target_os = "macos"))]
     let controls_right = header.right() - 3.0 * 46.0;
     egui::Rect::from_center_size(
-        egui::pos2(controls_right - 17.0, header.center().y),
-        egui::vec2(34.0, header.height()),
+        egui::pos2(controls_right - 14.0, header.center().y),
+        egui::vec2(28.0, header.height()),
     )
 }
 
@@ -2398,8 +2394,8 @@ fn file_tree_toggle_rect(titlebar: egui::Rect, _editor_header: egui::Rect) -> eg
     #[cfg(not(target_os = "macos"))]
     let controls_right = _editor_header.left();
     egui::Rect::from_center_size(
-        egui::pos2(controls_right + 17.0, titlebar.center().y),
-        egui::vec2(34.0, titlebar.height()),
+        egui::pos2(controls_right + 16.0, titlebar.center().y),
+        egui::vec2(32.0, titlebar.height()),
     )
 }
 
@@ -2436,7 +2432,7 @@ fn draw_sidebar_toggle_icon(
     response: &egui::Response,
     open: bool,
 ) {
-    let icon = egui::Rect::from_center_size(button.center(), egui::vec2(16.0, 13.0));
+    let icon = egui::Rect::from_center_size(button.center(), egui::vec2(15.0, 12.0));
     let icon_color = if response.hovered() || open {
         theme::text().primary
     } else {
@@ -2465,8 +2461,8 @@ fn draw_sidebar_toggle_icon(
 fn agent_new_session_rect(header: egui::Rect) -> egui::Rect {
     let toggle = agent_toggle_rect(header);
     egui::Rect::from_center_size(
-        egui::pos2(toggle.center().x - 33.0, header.center().y),
-        egui::vec2(32.0, 32.0),
+        egui::pos2(toggle.center().x - toggle.width(), header.center().y),
+        egui::Vec2::splat(toggle.width()),
     )
 }
 
@@ -4908,6 +4904,7 @@ impl EditorApp {
         let mut new_session = false;
         let mut add_project = false;
         let mut switch_to = None;
+        let mut sessions_top = content.top();
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agentic_session_content")
@@ -4917,7 +4914,7 @@ impl EditorApp {
                 ui.set_width(content.width());
                 if provider_selector_visible(&self.available_providers) {
                     let response =
-                        draw_provider_selector_identity(ui, self.selected_provider, true);
+                        draw_provider_selector_identity(ui, self.selected_provider, true, true);
                     self.provider_menu_anchor = Some(response.rect);
                     if response.clicked() {
                         let menu = AgentMenu::Providers;
@@ -4928,41 +4925,60 @@ impl EditorApp {
                     self.provider_menu_anchor = None;
                 }
                 ui.add_space(theme::space::SMALL);
-                ScrollArea::vertical()
-                    .id_salt("agentic_session_list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        add_project = agentic_section_header(
-                            ui,
-                            "Workspaces",
-                            Some(("agentic_add_project", "Add workspace")),
-                        );
-                        ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                        if agentic_project_row(
-                            ui,
-                            &self.tree.root,
-                            true,
-                            self.git_workspace_status.as_ref(),
-                        ) {
-                            switch_to = Some(self.tree.root.clone());
-                        }
-                        for root in &self.recent_projects {
-                            if root == &self.tree.root {
-                                continue;
-                            }
-                            if agentic_project_row(ui, root, false, None) {
-                                switch_to = Some(root.clone());
-                            }
-                        }
-                        ui.add_space(theme::space::LARGE);
-                        new_session = agentic_section_header(
-                            ui,
-                            "Sessions",
-                            self.agent
-                                .session_ready
-                                .then_some(("agentic_new_session", "New session")),
-                        );
-                        match &self.agent.sessions {
+                add_project = agentic_section_header(
+                    ui,
+                    "Workspaces",
+                    Some(("agentic_add_project", "Add workspace")),
+                );
+                ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                if agentic_project_row(
+                    ui,
+                    &self.tree.root,
+                    true,
+                    self.git_workspace_status.as_ref(),
+                ) {
+                    switch_to = Some(self.tree.root.clone());
+                }
+                for root in &self.recent_projects {
+                    if root == &self.tree.root {
+                        continue;
+                    }
+                    if agentic_project_row(ui, root, false, None) {
+                        switch_to = Some(root.clone());
+                    }
+                }
+                ui.add_space(theme::space::LARGE);
+                new_session = agentic_section_header(
+                    ui,
+                    "Sessions",
+                    self.agent
+                        .session_ready
+                        .then_some(("agentic_new_session", "New session")),
+                );
+                sessions_top = ui.cursor().top();
+            },
+        );
+        if sessions_top < content.bottom() {
+            let sessions = egui::Rect::from_min_max(
+                egui::pos2(content.left(), sessions_top),
+                egui::pos2(rect.right(), content.bottom()),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("agentic_session_list_region")
+                    .max_rect(sessions)
+                    .layout(Layout::top_down(Align::LEFT)),
+                |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("agentic_session_list")
+                        .auto_shrink([false, false])
+                        .content_margin(egui::Margin {
+                            left: 0,
+                            right: 14,
+                            top: 0,
+                            bottom: 0,
+                        })
+                        .show(ui, |ui| match &self.agent.sessions {
                             _ if !self.agent.history_available => {
                                 ui.horizontal(|ui| {
                                     ui.add_space(theme::space::SMALL);
@@ -5003,10 +5019,10 @@ impl EditorApp {
                                     }
                                 }
                             }
-                        }
-                    });
-            },
-        );
+                        });
+                },
+            );
+        }
         let (open_settings, update) = self.draw_settings_row(ui, settings);
         if open_settings {
             self.execute_keybinding(KeybindingCommand::AppOpenSettings, None, ui.ctx());
@@ -5116,12 +5132,16 @@ impl EditorApp {
         controls_right: f32,
         preview_path: Option<&Path>,
     ) -> (f32, f32) {
-        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom() - 0.5,
-            egui::Stroke::new(1.0, theme::border::hairline_color()),
-        );
+        if preview_path.is_some() || self.tabs.iter().any(|tab| tab.pane == pane) {
+            ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+            ui.painter().hline(
+                rect.x_range(),
+                rect.bottom() - 0.5,
+                egui::Stroke::new(1.0, theme::border::hairline_color()),
+            );
+        } else {
+            ui.painter().rect_filled(rect, 0.0, editor_background());
+        }
         let active = self
             .pane_active_tabs
             .get(&pane)
@@ -5407,7 +5427,7 @@ impl EditorApp {
                 egui::Rect::from_min_max(editor_header.right_top(), rect.right_bottom());
             let title = self.agent.title.as_deref().unwrap_or("Agent");
             let title_x = if provider_selector_visible(&self.available_providers) {
-                agent_header.left() + 112.0
+                agent_header.left() + 64.0
             } else {
                 agent_header.left() + 14.0
             };
@@ -5847,7 +5867,11 @@ impl EditorApp {
         };
         icons::paint(
             ui.painter(),
-            Icon::Sparkle,
+            if self.agent_sidebar {
+                Icon::Close
+            } else {
+                Icon::Robot
+            },
             egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
             color,
         );
@@ -5873,9 +5897,8 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        icons::paint(
+        devin_view::paint_devin_icon(
             ui.painter(),
-            Icon::Bolt,
             egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
             if response.hovered() || self.devin_sidebar {
                 theme::accent()

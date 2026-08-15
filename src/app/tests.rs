@@ -22,15 +22,17 @@ use super::{
     diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
     draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
     draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
-    file_result_job, find_highlighted_job, install_repaint_wake, launch_in_current_process,
-    load_agent_image_preview_bytes, match_bracket_pair, match_spans, model_display_name,
-    next_find_match, pane_header_and_content, plain_text_job, presentation_job, project_chooser_ui,
-    provider_selector_visible, repaint_deadline, repaint_delay_after_texture_update,
-    resize_divider_stroke, run_everything_state, search_group_header, search_needs_polling,
+    editor_watermark_color, file_result_job, file_tree_toggle_rect, find_highlighted_job,
+    install_repaint_wake, launch_in_current_process, load_agent_image_preview_bytes,
+    match_bracket_pair, match_spans, model_display_name, next_find_match, pane_header_and_content,
+    plain_text_job, presentation_job, project_chooser_ui, provider_selector_visible,
+    repaint_deadline, repaint_delay_after_texture_update, resize_divider_stroke,
+    run_everything_state, search_group_header, search_needs_polling,
     search_selection_after_navigation, settings_ui_scale_slider, should_show_project_chooser,
     skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_diff,
     split_agentic_workspace, split_bottom_panel, split_pane_content, split_workspace,
-    split_workspace_with_devin, stable_tab_drop_zone, tab_width, unique_copy_path,
+    split_workspace_with_devin, stable_tab_drop_zone, tab_width, terminal_toggle_rect,
+    unique_copy_path,
 };
 
 fn click_response(
@@ -1318,7 +1320,7 @@ fn provider_selector_requires_two_available_providers() {
 fn provider_selector_uses_a_drawn_chevron() {
     let mut selector = Rect::NOTHING;
     let output = theme::test_context().run_ui(RawInput::default(), |ui| {
-        selector = draw_provider_selector_identity(ui, ProviderId::Cursor, true).rect;
+        selector = draw_provider_selector_identity(ui, ProviderId::Cursor, true, true).rect;
     });
     let glyph = output.shapes.iter().any(|shape| match &shape.shape {
         Shape::Text(text) => text.galley.text() == "⌄",
@@ -1344,6 +1346,24 @@ fn provider_selector_uses_a_drawn_chevron() {
     assert!(chevron.width() > 4.0);
     assert!(chevron_left - label.right() >= 10.0);
     assert!(chevron_right - chevron_left >= 8.0);
+}
+
+#[test]
+fn compact_provider_selector_omits_the_label_but_keeps_the_chevron() {
+    let mut selector = Rect::NOTHING;
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        selector = draw_provider_selector_identity(ui, ProviderId::Cursor, true, false).rect;
+    });
+    assert!(selector.width() <= 40.0);
+    assert!(output.shapes.iter().all(|shape| match &shape.shape {
+        Shape::Text(text) => text.galley.text() != "Cursor",
+        _ => true,
+    }));
+    let chevron_region = selector.with_min_x(selector.center().x);
+    assert!(
+        crate::icons::probe::bounds(&output.shapes, chevron_region, theme::text().primary)
+            .is_some()
+    );
 }
 
 #[test]
@@ -1572,7 +1592,8 @@ fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
     })
     .unwrap();
     app.devin_sidebar = true;
-    let output = theme::test_context().run_ui(
+    let context = theme::test_context();
+    let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
                 pos2(0.0, 0.0),
@@ -1588,6 +1609,57 @@ fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
             .shapes
             .iter()
             .any(|shape| has_text(&shape.shape, "Connect to Devin"))
+    );
+    assert!(output.shapes.iter().all(|shape| {
+        !has_text(
+            &shape.shape,
+            "Use a personal access token or service-user key",
+        )
+    }));
+    fn has_texture(shape: &Shape) -> bool {
+        match shape {
+            Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+            Shape::Vec(shapes) => shapes.iter().any(has_texture),
+            _ => false,
+        }
+    }
+    assert!(
+        output.shapes.iter().any(|shape| has_texture(&shape.shape)),
+        "the connect card shows the Devin mark above its title"
+    );
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+    let connect = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "Connect"))
+        .expect("connect action text");
+    let organization = context
+        .read_response(Id::new("devin_org_id"))
+        .expect("organization input")
+        .rect;
+    let framed = output.shapes.iter().any(|shape| match &shape.shape {
+        Shape::Rect(rect)
+            if rect.rect.contains(connect.center())
+                && rect.rect.height() <= theme::control::PRIMARY + 1.0 =>
+        {
+            rect.fill != Color32::TRANSPARENT || rect.stroke != egui::Stroke::NONE
+        }
+        _ => false,
+    });
+    assert!((connect.center().x - organization.center().x).abs() <= 1.0);
+    assert!(!framed, "the connect action should be text-only");
+    let gap = connect.top() - organization.bottom();
+    assert!(
+        gap <= theme::space::XWIDE + theme::space::TIGHT,
+        "connect action is {gap}px below the organization input"
     );
 }
 
@@ -1921,6 +1993,56 @@ fn connecting_states_show_identity_and_a_progress_bar() {
 }
 
 #[test]
+fn connecting_state_is_centered_in_its_available_region() {
+    fn include_state_shape(shape: &Shape, bounds: &mut Rect) {
+        let belongs_to_state = match shape {
+            Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+            Shape::Text(text) => matches!(
+                text.galley.text(),
+                "Starting Codex Agent" | "Connecting to this project…"
+            ),
+            Shape::Rect(rect) => rect.rect.height() <= 4.0,
+            _ => false,
+        };
+        if belongs_to_state {
+            *bounds = bounds.union(shape.visual_bounding_rect());
+        }
+        if let Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                include_state_shape(shape, bounds);
+            }
+        }
+    }
+
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 400.0));
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |ui| {
+            super::draw_agent_connecting(
+                ui,
+                ProviderId::Codex,
+                "Starting Codex Agent",
+                "Connecting to this project…",
+                None,
+            );
+        },
+    );
+    let mut state = Rect::NOTHING;
+    for shape in output.shapes {
+        include_state_shape(&shape.shape, &mut state);
+    }
+
+    assert!(!state.is_negative(), "connecting state was not painted");
+    assert!(
+        (state.center().y - screen.center().y).abs() <= 1.0,
+        "state={state:?}, screen={screen:?}"
+    );
+}
+
+#[test]
 fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() {
     fn collect_text(shape: &Shape, text: &mut Vec<String>) {
         match shape {
@@ -1956,12 +2078,11 @@ fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() 
         ),
         can_authenticate: false,
     }]);
-    let output = theme::test_context().run_ui(
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let output = context.run_ui(
         RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(1000.0, 700.0),
-            )),
+            screen_rect: Some(screen),
             ..RawInput::default()
         },
         |root| app.ui(root),
@@ -1974,7 +2095,6 @@ fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() 
 
     for expected in [
         "Connect Claude",
-        "Configure API or supported commercial cloud credentials outside Editur, then retry this provider.",
         "Anthropic API or commercial cloud credentials",
         "variables: ANTHROPIC_API_KEY or supported commercial cloud credentials",
         "Retry",
@@ -1987,6 +2107,78 @@ fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() 
     assert!(!joined.contains("subscription"));
     assert!(!joined.contains("secret"));
     assert!(!joined.contains("Authenticate"));
+    assert!(!joined.contains(
+        "Configure API or supported commercial cloud credentials outside Editur, then retry this provider."
+    ));
+    let auth = context
+        .read_response(Id::new("agent_auth_state"))
+        .expect("centered ACP authentication state")
+        .rect;
+    let (_, _, sidebar) = split_workspace(
+        screen,
+        app.sidebar,
+        app.sidebar_width,
+        true,
+        app.agent_sidebar_width,
+    );
+    let (_, transcript, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    assert!((auth.center().x - transcript.center().x).abs() <= 1.0);
+}
+
+#[test]
+fn disconnected_acp_provider_uses_centered_connect_state() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Disconnected;
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Connect Cursor"))
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .all(|shape| !has_text(&shape.shape, "Cursor Agent is offline."))
+    );
+    let state = context
+        .read_response(Id::new("agent_disconnected_state"))
+        .expect("centered ACP disconnected state")
+        .rect;
+    let (_, _, sidebar) = split_workspace(
+        screen,
+        app.sidebar,
+        app.sidebar_width,
+        true,
+        app.agent_sidebar_width,
+    );
+    let (_, transcript, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    assert!((state.center().x - transcript.center().x).abs() <= 1.0);
 }
 
 #[test]
@@ -2251,7 +2443,11 @@ fn cli_or_explicit_path_launch_skips_the_project_chooser() {
 
 #[test]
 fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
-    let button = Rect::from_center_size(pos2(50.0, 17.0), Vec2::new(34.0, 34.0));
+    let titlebar = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(200.0, 34.0));
+    let button = file_tree_toggle_rect(titlebar, titlebar);
+    let terminal = terminal_toggle_rect(button);
+    assert_eq!(button.width(), 32.0);
+    assert_eq!(terminal.center().x - button.center().x, 32.0);
     let draw = |open| {
         let context = theme::test_context();
         let output = context.run_ui(
@@ -2272,7 +2468,7 @@ fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                Shape::Rect(rect) if rect.rect.size() == Vec2::new(16.0, 13.0) => {
+                Shape::Rect(rect) if rect.rect.size() == Vec2::new(15.0, 12.0) => {
                     Some((rect.rect.center(), rect.stroke.color))
                 }
                 _ => None,
@@ -2287,7 +2483,36 @@ fn active_sidebar_toggle_icons_are_white_and_do_not_shift() {
 }
 
 #[test]
-fn agent_toggle_is_a_sparkle_rather_than_a_panel_glyph() {
+fn agent_toggle_uses_a_robot_until_the_sidebar_opens_then_a_close_icon() {
+    fn robot_dots(shape: &Shape, button: Rect, color: Color32) -> usize {
+        match shape {
+            Shape::Circle(circle) if circle.fill == color && button.contains(circle.center) => 1,
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .map(|shape| robot_dots(shape, button, color))
+                .sum(),
+            _ => 0,
+        }
+    }
+    fn close_strokes(shape: &Shape, button: Rect, color: Color32) -> usize {
+        match shape {
+            Shape::Path(path)
+                if path.points.len() == 2
+                    && path.stroke.color == egui::epaint::ColorMode::Solid(color)
+                    && path.points.iter().all(|point| button.contains(*point))
+                    && (path.points[1].x - path.points[0].x).abs() > 4.0
+                    && (path.points[1].y - path.points[0].y).abs() > 4.0 =>
+            {
+                1
+            }
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .map(|shape| close_strokes(shape, button, color))
+                .sum(),
+            _ => 0,
+        }
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -2298,6 +2523,81 @@ fn agent_toggle_is_a_sparkle_rather_than_a_panel_glyph() {
     .unwrap();
     let context = theme::test_context();
 
+    let closed = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let closed_button = context
+        .read_response(Id::new("agent_sidebar_toggle"))
+        .expect("agent toggle")
+        .rect;
+    assert_eq!(
+        closed
+            .shapes
+            .iter()
+            .map(|shape| robot_dots(&shape.shape, closed_button, theme::text().muted))
+            .sum::<usize>(),
+        3
+    );
+
+    app.agent_sidebar = true;
+    let opened = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let open_button = context
+        .read_response(Id::new("agent_sidebar_toggle"))
+        .expect("agent close toggle")
+        .rect;
+    assert_eq!(
+        opened
+            .shapes
+            .iter()
+            .map(|shape| close_strokes(&shape.shape, open_button, theme::text().primary))
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[test]
+fn assistant_toggles_are_compact_and_the_devin_button_uses_its_brand_mark() {
+    fn tinted_texture(shape: &Shape, button: Rect, color: Color32) -> bool {
+        match shape {
+            Shape::Mesh(mesh) => {
+                mesh.texture_id != egui::TextureId::default()
+                    && !mesh.vertices.is_empty()
+                    && mesh
+                        .vertices
+                        .iter()
+                        .all(|vertex| button.contains(vertex.pos) && vertex.color == color)
+            }
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| tinted_texture(shape, button, color)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let context = theme::test_context();
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -2308,20 +2608,21 @@ fn agent_toggle_is_a_sparkle_rather_than_a_panel_glyph() {
         },
         |root| app.ui(root),
     );
-
-    let button = context
+    let agent = context
         .read_response(Id::new("agent_sidebar_toggle"))
-        .expect("agent toggle")
+        .unwrap()
         .rect;
-    let sparkle = crate::icons::probe::bounds(&output.shapes, button, theme::text().muted)
-        .expect("sparkle glyph inside the agent toggle");
-    assert!(sparkle.width() <= crate::icons::GRID + 1.0);
-    assert!(!output.shapes.iter().any(|shape| match &shape.shape {
-        Shape::Rect(rect) => {
-            button.contains_rect(rect.rect) && rect.rect.size() == Vec2::new(16.0, 13.0)
-        }
-        _ => false,
-    }));
+    let devin = context
+        .read_response(Id::new("devin_sidebar_toggle"))
+        .unwrap()
+        .rect;
+
+    assert_eq!(agent.center().x - devin.center().x, 28.0);
+    assert!(output.shapes.iter().any(|shape| tinted_texture(
+        &shape.shape,
+        devin,
+        theme::text().muted
+    )));
 }
 
 #[test]
@@ -2545,7 +2846,7 @@ fn open_agent_toggle_belongs_to_the_agent_header() {
     assert!(header.contains_rect(toggle));
     assert_eq!(toggle.height(), header.height());
     assert!(toggle.center().x > header.center().x);
-    assert_eq!(toggle.center().x - new_session.center().x, 33.0);
+    assert_eq!(toggle.center().x - new_session.center().x, 28.0);
     assert_eq!(toggle.center().y, new_session.center().y);
 }
 
@@ -3865,9 +4166,12 @@ fn collapsed_agent_leaves_no_rail_or_empty_space() {
 #[test]
 fn titlebar_starts_a_fresh_paint_batch_after_window_resize() {
     let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let file = root.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
     let mut app = EditorApp::new(OpenTarget {
-        root: temp.path().canonicalize().unwrap(),
-        file: None,
+        root,
+        file: Some(file),
         create: false,
     })
     .unwrap();
@@ -4179,8 +4483,8 @@ fn agent_layout_keeps_the_composer_inside_the_sidebar() {
     assert_eq!(header.bottom(), transcript.top());
     assert_eq!(transcript.bottom(), composer.top());
     assert_eq!(composer.bottom(), sidebar.bottom());
-    assert!(agent_toggle_rect(header).width() >= 32.0);
-    assert!(agent_new_session_rect(header).size().min_elem() >= 32.0);
+    assert!(agent_toggle_rect(header).width() >= 28.0);
+    assert!(agent_new_session_rect(header).size().min_elem() >= 28.0);
 }
 
 #[test]
@@ -4738,6 +5042,46 @@ fn dense_subagent_rows_show_their_status() {
             .iter()
             .any(|shape| contains_running(&shape.shape))
     );
+}
+
+#[test]
+fn dense_failed_tool_rows_show_a_red_error_icon() {
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        agent_dense_tool(
+            ui,
+            Id::new("dense_failed_status"),
+            "Run cargo test",
+            Some("Failed"),
+            None,
+            None,
+            false,
+            |_| {},
+        );
+    });
+    let danger = theme::ink(theme::semantic().danger);
+    let mut circle = false;
+    let mut crosses = 0;
+    let mut failed_text = false;
+    for clipped in output.shapes {
+        match clipped.shape {
+            Shape::Text(text) if text.galley.text() == "Failed" => failed_text = true,
+            Shape::Circle(shape)
+                if shape.fill == Color32::TRANSPARENT && shape.stroke.color == danger =>
+            {
+                circle = true;
+            }
+            Shape::Path(path)
+                if !path.closed && path.stroke.color == egui::epaint::ColorMode::Solid(danger) =>
+            {
+                crosses += 1;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!failed_text);
+    assert!(circle);
+    assert_eq!(crosses, 2);
 }
 
 #[test]
@@ -5718,6 +6062,25 @@ fn agentic_empty_state_centers_at_every_available_height() {
 
 #[test]
 fn sidebar_empty_state_is_centered_in_the_available_transcript() {
+    fn contains_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+    fn contains_boxed_mark(shape: &Shape, empty: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => {
+                rect.fill == theme::surface().raised
+                    && (rect.rect.width() - 48.0).abs() <= 1.0
+                    && (rect.rect.height() - 48.0).abs() <= 1.0
+                    && empty.contains(rect.rect.center())
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_boxed_mark(shape, empty)),
+            _ => false,
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -5761,6 +6124,15 @@ fn sidebar_empty_state_is_centered_in_the_available_transcript() {
     assert_eq!(
         heading.galley.job.sections[0].format.color,
         theme::text().primary
+    );
+    assert!(output.shapes.iter().all(|shape| {
+        !contains_text(&shape.shape, "Ask Cursor to edit, explain, or run commands")
+    }));
+    assert!(
+        output
+            .shapes
+            .iter()
+            .all(|shape| !contains_boxed_mark(&shape.shape, empty))
     );
 }
 
@@ -6539,7 +6911,7 @@ fn detail_less_tool_cards_are_not_expandable() {
 }
 
 #[test]
-fn tool_card_disclosure_is_optically_centered_and_radius_is_compact() {
+fn successful_tool_card_has_no_status_mark_and_keeps_compact_disclosure() {
     let output = theme::test_context().run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 100.0))),
@@ -6618,8 +6990,50 @@ fn tool_card_disclosure_is_optically_centered_and_radius_is_compact() {
     assert!(!filled_triangle);
     assert!(card_radius.unwrap() <= theme::radius::CONTROL);
     assert!(!done_text);
-    assert!(completion_circle);
-    assert!(completion_check);
+    assert!(!completion_circle);
+    assert!(!completion_check);
+}
+
+#[test]
+fn failed_tool_card_shows_a_red_error_icon() {
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        agent_collapsing_header(
+            ui,
+            "failed-tool-card",
+            "Run cargo test",
+            Some("Failed"),
+            None,
+            340.0,
+            None,
+            false,
+            false,
+            |_| {},
+        );
+    });
+    let danger = theme::ink(theme::semantic().danger);
+    let mut circle = false;
+    let mut crosses = 0;
+    let mut failed_text = false;
+    for clipped in output.shapes {
+        match clipped.shape {
+            Shape::Text(text) if text.galley.text() == "Failed" => failed_text = true,
+            Shape::Circle(shape)
+                if shape.fill == Color32::TRANSPARENT && shape.stroke.color == danger =>
+            {
+                circle = true;
+            }
+            Shape::Path(path)
+                if !path.closed && path.stroke.color == egui::epaint::ColorMode::Solid(danger) =>
+            {
+                crosses += 1;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!failed_text);
+    assert!(circle);
+    assert_eq!(crosses, 2);
 }
 
 #[test]
@@ -9497,6 +9911,103 @@ fn editor_header_omits_language_and_vim_badges() {
 }
 
 #[test]
+fn empty_editor_is_seamless_until_a_file_is_opened() {
+    fn has_header_surface(shape: &Shape, header: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.rect == header && rect.fill == theme::surface().chrome,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_header_surface(shape, header)),
+            _ => false,
+        }
+    }
+    fn has_editor_surface(shape: &Shape, header: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.rect == header && rect.fill == editor_background(),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_editor_surface(shape, header)),
+            _ => false,
+        }
+    }
+    fn has_header_divider(shape: &Shape, header: Rect) -> bool {
+        match shape {
+            Shape::LineSegment { points, stroke } => {
+                *points
+                    == [
+                        pos2(header.left(), header.bottom() - 0.5),
+                        pos2(header.right(), header.bottom() - 0.5),
+                    ]
+                    && stroke.color == theme::border::hairline_color()
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_header_divider(shape, header)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.sidebar = false;
+    app.agent_sidebar = false;
+    app.devin_sidebar = false;
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 600.0));
+    let header = screen.with_max_y(TITLEBAR_HEIGHT);
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let empty = draw(&mut app);
+    assert!(
+        empty
+            .shapes
+            .iter()
+            .all(|shape| !has_header_surface(&shape.shape, header))
+    );
+    assert!(
+        empty
+            .shapes
+            .iter()
+            .all(|shape| !has_header_divider(&shape.shape, header))
+    );
+    assert!(
+        empty
+            .shapes
+            .iter()
+            .any(|shape| has_editor_surface(&shape.shape, header))
+    );
+    let agent_toggle = context
+        .read_response(Id::new("agent_sidebar_toggle"))
+        .expect("top-right Agent control remains available");
+    assert!((agent_toggle.rect.center().y - header.center().y).abs() <= 1.0);
+
+    let file = root.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    app.open_tab(file, false);
+    let opened = draw(&mut app);
+    assert!(
+        opened
+            .shapes
+            .iter()
+            .any(|shape| has_header_surface(&shape.shape, header))
+    );
+    assert!(
+        opened
+            .shapes
+            .iter()
+            .any(|shape| has_header_divider(&shape.shape, header))
+    );
+}
+
+#[test]
 fn unchanged_editor_presentation_borrows_the_highlighted_document() {
     let job = plain_text_job("large document", 800.0);
 
@@ -9506,9 +10017,12 @@ fn unchanged_editor_presentation_borrows_the_highlighted_document() {
 #[test]
 fn sidebar_divider_uses_the_horizontal_resize_cursor() {
     let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let file = root.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
     let mut app = EditorApp::new(OpenTarget {
-        root: temp.path().canonicalize().unwrap(),
-        file: None,
+        root,
+        file: Some(file),
         create: false,
     })
     .unwrap();
@@ -9542,7 +10056,9 @@ fn sidebar_divider_uses_the_horizontal_resize_cursor() {
     );
     fn active_divider_width(shape: &Shape) -> Option<f32> {
         match shape {
-            Shape::LineSegment { stroke, .. } if stroke.color == theme::accent() => {
+            Shape::LineSegment { points, stroke }
+                if stroke.color == theme::accent() && (points[1].y - points[0].y).abs() > 200.0 =>
+            {
                 Some(stroke.width)
             }
             Shape::Vec(shapes) => shapes.iter().find_map(active_divider_width),
@@ -10746,6 +11262,109 @@ fn agentic_mode_replaces_the_editor_with_project_sessions() {
     );
 }
 
+#[test]
+fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
+    fn has_scrollbar_at(shape: &Shape, right: f32) -> bool {
+        match shape {
+            Shape::Rect(rect) => {
+                rect.rect.width() <= 10.0
+                    && rect.rect.height() >= 24.0
+                    && (rect.rect.right() - right).abs() <= 1.0
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_scrollbar_at(shape, right)),
+            _ => false,
+        }
+    }
+    fn text_top(shape: &Shape, expected: &str) -> Option<f32> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => Some(text.pos.y),
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_top(shape, expected)),
+            _ => None,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(
+        (0..40)
+            .map(|index| SessionChoice {
+                id: format!("session-{index}"),
+                title: Some(format!("Session {index}")),
+                updated_at: None,
+                started_in_editur: true,
+            })
+            .collect(),
+    );
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let sidebar = split_agentic_workspace(screen, true, app.sidebar_width)
+        .0
+        .expect("agentic sidebar");
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let initial = draw(&mut app, Vec::new());
+    let project_id = Id::new(("agentic_project", app.tree.root.clone()));
+    let project_before = context.read_response(project_id.clone()).unwrap().rect;
+    let session_before = initial
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, "Session 10"))
+        .unwrap();
+    let scroll_from = context
+        .read_response(Id::new(("agent_session_open", "session-5")))
+        .unwrap()
+        .rect;
+    let _ = draw(
+        &mut app,
+        vec![
+            Event::PointerMoved(scroll_from.center()),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, -300.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let scrolled = draw(&mut app, Vec::new());
+    let project_after = context.read_response(project_id).unwrap().rect;
+    let session_after = scrolled
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, "Session 10"))
+        .unwrap();
+
+    assert!(
+        scrolled
+            .shapes
+            .iter()
+            .any(|shape| has_scrollbar_at(&shape.shape, sidebar.right()))
+    );
+    assert_eq!(project_after.top(), project_before.top());
+    assert!(
+        session_after < session_before,
+        "session row did not scroll: before={session_before:?}, after={session_after:?}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn agentic_session_sidebar_keeps_titlebar_controls_inside_at_minimum_window_width() {
@@ -11378,52 +11997,65 @@ fn the_active_tab_continues_the_document_without_an_accent_border() {
 }
 
 #[test]
-fn the_empty_editor_names_the_project_and_lists_only_bound_keys() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    let app = EditorApp::new(OpenTarget {
-        root: root.clone(),
-        file: None,
-        create: false,
-    })
-    .unwrap();
-    let hints = app.keybinding_hints();
-    assert!(hints.iter().all(|(_, chord)| !chord.is_empty()));
-    assert!(
-        hints.iter().all(|(label, _)| *label != "Open agent"),
-        "a command with no chord in this profile has no hint to show: {hints:?}"
-    );
-    assert_eq!(hints.len(), 4, "{hints:?}");
+fn the_empty_editor_is_only_the_bare_gray_mark() {
+    fn has_texture(shape: &Shape) -> bool {
+        match shape {
+            Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+            Shape::Vec(shapes) => shapes.iter().any(has_texture),
+            _ => false,
+        }
+    }
 
-    let project = root.file_name().unwrap().to_string_lossy().into_owned();
     let context = theme::test_context();
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 600.0))),
             ..RawInput::default()
         },
-        |ui| draw_editor_empty_state(ui, &project, &hints[..2]),
+        draw_editor_empty_state,
     );
 
-    let painted = |text: &str| {
-        output.shapes.iter().any(|shape| match &shape.shape {
-            Shape::Text(painted) => painted.galley.text() == text,
-            _ => false,
-        })
-    };
-    assert!(painted(&project), "the window says what is open");
-    for (label, chord) in &hints[..2] {
-        assert!(painted(label), "{label} is missing");
-        assert!(painted(chord), "{chord} is missing");
-    }
     assert!(
-        !painted(hints[3].0),
-        "a command that was not passed must not appear"
+        !output
+            .shapes
+            .iter()
+            .any(|shape| matches!(&shape.shape, Shape::Text(_))),
+        "the empty editor paints no words, only the mark"
+    );
+    assert!(
+        !output.shapes.iter().any(|shape| has_texture(&shape.shape)),
+        "the mark is the bare strips, not the shipped tile"
+    );
+    let strips: Vec<&egui::epaint::PathShape> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            Shape::Path(path) if path.fill == editor_watermark_color() => Some(path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        strips.len(),
+        4,
+        "the bare mark is three strips, the middle one split in two"
+    );
+    let bounds = strips.iter().fold(Rect::NOTHING, |bounds, path| {
+        bounds.union(path.visual_bounding_rect())
+    });
+    assert!(
+        bounds.height() >= 96.0,
+        "the mark reads as a watermark, not an icon: {bounds:?}"
+    );
+    let screen_center = pos2(450.0, 300.0);
+    assert!(
+        bounds.center().distance(screen_center) <= 2.0,
+        "the mark sits centered in the pane: {:?}",
+        bounds.center()
     );
 }
 
 #[test]
-fn the_empty_editor_and_the_project_chooser_paint_the_shipped_logo() {
+fn the_project_chooser_paints_the_shipped_logo() {
     fn has_logo_texture(shape: &Shape) -> bool {
         match shape {
             Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
@@ -11433,24 +12065,15 @@ fn the_empty_editor_and_the_project_chooser_paint_the_shipped_logo() {
     }
 
     let context = theme::test_context();
-    let input = || RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 600.0))),
-        ..RawInput::default()
-    };
-    let empty_state = context.run_ui(input(), |ui| {
-        draw_editor_empty_state(ui, "project", &[]);
-    });
-    assert!(
-        empty_state
-            .shapes
-            .iter()
-            .any(|shape| has_logo_texture(&shape.shape)),
-        "the empty editor redraws the mark instead of showing the shipped logo"
+    let chooser = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 600.0))),
+            ..RawInput::default()
+        },
+        |ui| {
+            let _ = project_chooser_ui(ui, None);
+        },
     );
-
-    let chooser = context.run_ui(input(), |ui| {
-        let _ = project_chooser_ui(ui, None);
-    });
     assert!(
         chooser
             .shapes

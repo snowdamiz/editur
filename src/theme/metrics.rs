@@ -15,10 +15,9 @@ pub(crate) mod space {
     pub(crate) const LARGE: f32 = 16.0;
     pub(crate) const WIDE: f32 = 20.0;
     pub(crate) const XWIDE: f32 = 24.0;
-    pub(crate) const HUGE: f32 = 32.0;
 
     #[cfg(test)]
-    pub(crate) const SCALE: [f32; 9] = [HAIR, TIGHT, SNUG, SMALL, MEDIUM, LARGE, WIDE, XWIDE, HUGE];
+    pub(crate) const SCALE: [f32; 8] = [HAIR, TIGHT, SNUG, SMALL, MEDIUM, LARGE, WIDE, XWIDE];
 }
 
 pub(crate) mod radius {

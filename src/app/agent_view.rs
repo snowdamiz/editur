@@ -3,8 +3,10 @@ use super::*;
 impl EditorApp {
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        // The same frosted material as the file tree, so the window reads as
+        // one glass rail on each side of the document.
         ui.painter()
-            .rect_filled(rect, 0.0, theme::state::secondary_material());
+            .rect_filled(rect, 0.0, theme::state::sidebar_material());
         self.draw_agent(ui, rect);
     }
 
@@ -599,7 +601,12 @@ impl EditorApp {
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
-        painter.rect_filled(header, 0.0, theme::surface().chrome);
+        // On the agentic canvas the header is its own chrome strip; in the
+        // sidebar it stays bare so the frosted material runs edge to edge,
+        // exactly like the file tree.
+        if self.agentic_mode {
+            painter.rect_filled(header, 0.0, theme::surface().chrome);
+        }
         painter.hline(
             header.x_range(),
             header.bottom() - 0.5,
@@ -632,7 +639,7 @@ impl EditorApp {
             let provider_rect = egui::Rect::from_min_max(
                 egui::pos2(header.left() + 10.0, header.top() + 3.0),
                 egui::pos2(
-                    (header.left() + 102.0).min(header.right()),
+                    (header.left() + 50.0).min(header.right()),
                     header.bottom() - 2.0,
                 ),
             );
@@ -643,7 +650,7 @@ impl EditorApp {
                     .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
                     let response =
-                        draw_provider_selector_identity(ui, self.selected_provider, true);
+                        draw_provider_selector_identity(ui, self.selected_provider, true, false);
                     self.provider_menu_anchor = Some(response.rect);
                     if response.clicked() {
                         let menu = AgentMenu::Providers;
@@ -653,11 +660,11 @@ impl EditorApp {
                 },
             );
             painter.vline(
-                header.left() + 100.0,
+                header.left() + 52.0,
                 (header.center().y - 7.0)..=(header.center().y + 7.0),
                 egui::Stroke::new(1.0, theme::border::strong_color()),
             );
-            title_x = header.left() + 112.0;
+            title_x = header.left() + 64.0;
         } else if !self.agentic_mode {
             self.provider_menu_anchor = None;
         }
@@ -796,64 +803,93 @@ impl EditorApp {
                         && methods.iter().all(|method| {
                             method.kind == AuthKind::Environment && !method.can_authenticate
                         });
-                    egui::Frame::new()
-                        .fill(theme::surface().raised)
-                        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
-                        .inner_margin(egui::Margin::same(14))
-                        .corner_radius(7)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                RichText::new(format!(
-                                    "Connect {}",
-                                    provider_descriptor(self.selected_provider).display_name
-                                ))
-                                    .size(theme::typography::TITLE_SIZE)
-                                    .strong()
-                                    .color(theme::text().primary),
-                            );
-                            ui.add_space(3.0);
-                            ui.add(
-                                Label::new(
-                                    RichText::new(if environment_only {
-                                        "Configure API or supported commercial cloud credentials outside Editur, then retry this provider."
-                                            .to_owned()
-                                    } else {
-                                        format!(
-                                            "Sign in with your {} account to start an Agent session in this project.",
-                                            provider_descriptor(self.selected_provider).display_name
-                                        )
-                                    })
-                                    .color(theme::text().muted),
-                                )
-                                .wrap(),
-                            );
-                            ui.add_space(10.0);
-                            for method in methods {
+                    let provider = provider_descriptor(self.selected_provider);
+                    let title = format!("Connect {}", provider.display_name);
+                    let region = ui.max_rect();
+                    let width = region.width().min(288.0);
+                    let height = region
+                        .height()
+                        .min(132.0 + methods.len() as f32 * 92.0 + if environment_only { 52.0 } else { 0.0 });
+                    let top = region.top() + (region.height() - height).max(0.0) * 0.42;
+                    let block = egui::Rect::from_min_size(
+                        egui::pos2(region.center().x - width * 0.5, top),
+                        egui::vec2(width, height),
+                    );
+                    let response = ui.interact(
+                        block,
+                        Id::new("agent_auth_state"),
+                        Sense::hover(),
+                    );
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &title)
+                    });
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .id_salt("agent_auth_state_content")
+                            .max_rect(block)
+                            .layout(Layout::top_down(Align::LEFT)),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.vertical_centered(|ui| {
+                                let (mark, _) = ui.allocate_exact_size(
+                                    egui::vec2(40.0, 44.0),
+                                    Sense::hover(),
+                                );
+                                paint_provider_icon(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        mark.center(),
+                                        egui::Vec2::splat(40.0),
+                                    ),
+                                    provider.icon,
+                                    theme::text().primary,
+                                );
+                                ui.add_space(theme::space::MEDIUM);
+                                ui.label(
+                                    RichText::new(&title)
+                                        .font(theme::typography::title())
+                                        .color(theme::text().primary),
+                                );
+                            });
+                            ui.add_space(theme::space::XWIDE);
+                            for (index, method) in methods.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(theme::space::LARGE);
+                                }
                                 if method.can_authenticate {
+                                    let label = if method.kind == AuthKind::Environment {
+                                        "Use environment API key"
+                                    } else {
+                                        &method.name
+                                    };
                                     let button = egui::Button::new(
-                                        RichText::new(if method.kind == AuthKind::Environment {
-                                            "Use environment API key"
-                                        } else {
-                                            &method.name
-                                        })
-                                            .strong()
+                                        RichText::new(label)
+                                            .font(theme::typography::strong())
                                             .color(theme::text().on_accent),
                                     )
                                     .fill(theme::accent())
                                     .stroke(egui::Stroke::NONE)
-                                    .corner_radius(5)
-                                    .min_size(egui::vec2(ui.available_width(), 30.0));
+                                    .corner_radius(theme::corner(theme::radius::CONTROL))
+                                    .min_size(egui::vec2(width, theme::control::PRIMARY));
                                     if ui.add(button).clicked() {
                                         authenticate = Some(method.id.clone());
                                     }
                                 } else {
-                                    ui.label(RichText::new(&method.name).strong());
+                                    ui.label(
+                                        RichText::new(&method.name)
+                                            .font(theme::typography::small_strong())
+                                            .color(theme::text().secondary),
+                                    );
                                 }
                                 if let Some(description) = &method.description {
+                                    ui.add_space(theme::space::TIGHT);
                                     ui.add(
-                                        Label::new(RichText::new(description).small().weak())
-                                            .wrap(),
+                                        Label::new(
+                                            RichText::new(description)
+                                                .font(theme::typography::small())
+                                                .color(theme::text().muted),
+                                        )
+                                        .wrap(),
                                     );
                                 }
                                 let setup = match method.kind {
@@ -869,19 +905,46 @@ impl EditorApp {
                                     ),
                                 };
                                 if let Some(setup) = setup {
-                                    ui.add(Label::new(RichText::new(setup).small().weak()).wrap());
+                                    ui.add_space(theme::space::TIGHT);
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(setup)
+                                                .font(theme::typography::small())
+                                                .color(theme::text().muted),
+                                        )
+                                        .wrap(),
+                                    );
                                 }
                                 if let Some(details) = &method.setup {
+                                    ui.add_space(theme::space::TIGHT);
                                     ui.add(
-                                        Label::new(RichText::new(details).small().monospace().weak())
-                                            .wrap(),
+                                        Label::new(
+                                            RichText::new(details)
+                                                .font(theme::typography::small())
+                                                .monospace()
+                                                .color(theme::text().muted),
+                                        )
+                                        .wrap(),
                                     );
                                 }
                             }
-                            if environment_only && ui.button("Retry").clicked() {
-                                reconnect = true;
+                            if environment_only {
+                                ui.add_space(theme::space::XWIDE);
+                                let button = egui::Button::new(
+                                    RichText::new("Retry")
+                                        .font(theme::typography::strong())
+                                        .color(theme::text().on_accent),
+                                )
+                                .fill(theme::accent())
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(theme::corner(theme::radius::CONTROL))
+                                .min_size(egui::vec2(width, theme::control::PRIMARY));
+                                if ui.add(button).clicked() {
+                                    reconnect = true;
+                                }
                             }
-                        });
+                        },
+                    );
                 }
                 ConnectionState::Failed(error) => {
                     egui::Frame::new()
@@ -913,14 +976,64 @@ impl EditorApp {
                         });
                 }
                 ConnectionState::Disconnected => {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} Agent is offline.",
-                            provider_descriptor(self.selected_provider).display_name
-                        ))
-                        .weak(),
+                    let provider = provider_descriptor(self.selected_provider);
+                    let title = format!("Connect {}", provider.display_name);
+                    let region = ui.max_rect();
+                    let width = region.width().min(288.0);
+                    let height = region.height().min(140.0);
+                    let block = egui::Rect::from_min_size(
+                        egui::pos2(
+                            region.center().x - width * 0.5,
+                            region.top() + (region.height() - height).max(0.0) * 0.42,
+                        ),
+                        egui::vec2(width, height),
                     );
-                    reconnect = ui.button("Connect").clicked();
+                    let response =
+                        ui.interact(block, Id::new("agent_disconnected_state"), Sense::hover());
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &title)
+                    });
+                    ui.scope_builder(
+                        UiBuilder::new()
+                            .id_salt("agent_disconnected_state_content")
+                            .max_rect(block)
+                            .layout(Layout::top_down(Align::LEFT)),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.vertical_centered(|ui| {
+                                let (mark, _) = ui.allocate_exact_size(
+                                    egui::vec2(40.0, 44.0),
+                                    Sense::hover(),
+                                );
+                                paint_provider_icon(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        mark.center(),
+                                        egui::Vec2::splat(40.0),
+                                    ),
+                                    provider.icon,
+                                    theme::text().primary,
+                                );
+                                ui.add_space(theme::space::MEDIUM);
+                                ui.label(
+                                    RichText::new(&title)
+                                        .font(theme::typography::title())
+                                        .color(theme::text().primary),
+                                );
+                            });
+                            ui.add_space(theme::space::XWIDE);
+                            let button = egui::Button::new(
+                                RichText::new("Connect")
+                                    .font(theme::typography::strong())
+                                    .color(theme::text().on_accent),
+                            )
+                            .fill(theme::accent())
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(theme::corner(theme::radius::CONTROL))
+                            .min_size(egui::vec2(width, theme::control::PRIMARY));
+                            reconnect = ui.add(button).clicked();
+                        },
+                    );
                 }
                 ConnectionState::Ready if self.agent.transcript.is_empty() && !self.agent.active => {
                     let project = self

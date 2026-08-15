@@ -19,7 +19,6 @@ pub(crate) enum Icon {
     ChevronRight,
     Close,
     Check,
-    CheckCircle,
     Plus,
     Minus,
     #[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
@@ -38,6 +37,7 @@ pub(crate) enum Icon {
     Warning,
     Error,
     Info,
+    Robot,
     Sparkle,
     Bolt,
 }
@@ -75,13 +75,6 @@ const CLOSE: &[Segment] = &[
     Segment::Line(&[(11.8, 4.2), (4.2, 11.8)]),
 ];
 const CHECK: &[Segment] = &[Segment::Line(&[(3.2, 8.6), (6.4, 11.8), (12.8, 4.6)])];
-const CHECK_CIRCLE: &[Segment] = &[
-    Segment::Circle {
-        center: (8.0, 8.0),
-        radius: 5.8,
-    },
-    Segment::Line(&[(5.3, 8.2), (7.2, 10.2), (10.9, 5.8)]),
-];
 const PLUS: &[Segment] = &[
     Segment::Line(&[(8.0, 3.2), (8.0, 12.8)]),
     Segment::Line(&[(3.2, 8.0), (12.8, 8.0)]),
@@ -204,6 +197,32 @@ const INFO: &[Segment] = &[
         radius: 0.8,
     },
 ];
+const ROBOT: &[Segment] = &[
+    Segment::Line(&[(8.0, 4.6), (8.0, 2.6)]),
+    Segment::Dot {
+        center: (8.0, 2.0),
+        radius: 0.7,
+    },
+    Segment::Outline(&[
+        (3.2, 5.0),
+        (12.8, 5.0),
+        (13.6, 5.8),
+        (13.6, 12.4),
+        (12.8, 13.2),
+        (3.2, 13.2),
+        (2.4, 12.4),
+        (2.4, 5.8),
+    ]),
+    Segment::Dot {
+        center: (5.8, 8.6),
+        radius: 0.8,
+    },
+    Segment::Dot {
+        center: (10.2, 8.6),
+        radius: 0.8,
+    },
+    Segment::Line(&[(5.8, 11.2), (10.2, 11.2)]),
+];
 const SPARKLE: &[Segment] = &[
     Segment::Solid(&[
         (6.4, 2.0),
@@ -243,7 +262,6 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::ChevronRight => CHEVRON_RIGHT,
         Icon::Close => CLOSE,
         Icon::Check => CHECK,
-        Icon::CheckCircle => CHECK_CIRCLE,
         Icon::Plus => PLUS,
         Icon::Minus => MINUS,
         Icon::Square => SQUARE,
@@ -261,6 +279,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Warning => WARNING,
         Icon::Error => ERROR,
         Icon::Info => INFO,
+        Icon::Robot => ROBOT,
         Icon::Sparkle => SPARKLE,
         Icon::Bolt => BOLT,
     }
@@ -275,7 +294,6 @@ pub(crate) const ALL: [Icon; 26] = [
     Icon::ChevronRight,
     Icon::Close,
     Icon::Check,
-    Icon::CheckCircle,
     Icon::Plus,
     Icon::Minus,
     Icon::Square,
@@ -293,6 +311,7 @@ pub(crate) const ALL: [Icon; 26] = [
     Icon::Warning,
     Icon::Error,
     Icon::Info,
+    Icon::Robot,
     Icon::Sparkle,
     Icon::Bolt,
 ];

@@ -596,90 +596,101 @@ pub(super) fn project_chooser_ui(
     (browse, window_action)
 }
 
-/// What the window says when nothing is open: what project this is, and the
-/// five keys worth knowing. Unbound commands are simply absent rather than
-/// shown with a blank chord.
-pub(super) fn draw_editor_empty_state(
-    ui: &mut egui::Ui,
-    project: &str,
-    hints: &[(&'static str, String)],
-) {
-    const MARK: f32 = 80.0;
-    let rows = hints.len() as f32;
-    let block = egui::Rect::from_center_size(
-        ui.max_rect().center(),
-        egui::vec2(
-            320.0,
-            MARK + theme::space::WIDE
-                + theme::typography::DISPLAY_LINE
-                + theme::space::HUGE
-                + rows * theme::control::ROW,
-        ),
+/// The empty editor says nothing at all: only the product's bare mark, large
+/// and gray, sitting in the middle of the pane like a watermark.
+pub(super) fn draw_editor_empty_state(ui: &mut egui::Ui) {
+    let rect = ui.max_rect();
+    let side = (rect.width().min(rect.height()) * 0.26).clamp(56.0, 128.0);
+    paint_editur_glyph(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side)),
+        editor_watermark_color(),
     );
-    ui.scope_builder(
-        UiBuilder::new()
-            .id_salt("editor_empty_state")
-            .max_rect(block),
-        |ui| {
-            ui.vertical_centered(|ui| {
-                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(MARK), Sense::hover());
-                paint_editur_mark(ui.painter(), mark);
-                ui.add_space(theme::space::WIDE);
-                ui.label(
-                    RichText::new(project)
-                        .font(theme::typography::display())
-                        .color(theme::text().primary),
-                );
-                ui.add_space(theme::space::HUGE);
-            });
-            for (label, chord) in hints {
-                let (row, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), theme::control::ROW),
-                    Sense::hover(),
-                );
-                ui.painter().text(
-                    egui::pos2(row.left(), row.center().y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    theme::typography::small(),
-                    theme::text().secondary,
-                );
-                let width = ui
-                    .painter()
-                    .layout_no_wrap(
-                        chord.clone(),
-                        theme::typography::code_small(),
-                        theme::text().muted,
-                    )
-                    .size()
-                    .x;
-                let key = egui::Rect::from_min_max(
-                    egui::pos2(
-                        row.right() - width - theme::space::MEDIUM,
-                        row.center().y - theme::control::COMPACT * 0.5 + theme::space::TIGHT,
-                    ),
-                    egui::pos2(
-                        row.right(),
-                        row.center().y + theme::control::COMPACT * 0.5 - theme::space::TIGHT,
-                    ),
-                );
-                ui.painter().rect(
-                    key,
-                    theme::corner(theme::radius::ROW),
-                    theme::surface().input,
-                    theme::border::hairline(),
-                    egui::StrokeKind::Inside,
-                );
-                ui.painter().text(
-                    key.center(),
-                    Align2::CENTER_CENTER,
-                    chord,
-                    theme::typography::code_small(),
-                    theme::text().muted,
-                );
-            }
-        },
+}
+
+/// Dimmer than disabled text: the watermark is texture, not content.
+pub(super) fn editor_watermark_color() -> Color32 {
+    theme::text().muted.gamma_multiply(0.35)
+}
+
+/// The icon's bare mark — three slanted strips, the middle one split — traced
+/// from the shipped icon so the watermark keeps its exact geometry without the
+/// tile behind it. Coordinates live in the mark's own 576 x 555 unit box.
+pub(super) fn paint_editur_glyph(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    const BOX: egui::Vec2 = egui::vec2(576.0, 555.0);
+    let scale = (rect.width() / BOX.x).min(rect.height() / BOX.y);
+    let origin = rect.center() - BOX * scale * 0.5;
+    let at = move |x: f32, y: f32| origin + egui::vec2(x, y) * scale;
+    // The large curved corners on the left. Flattened here because the mark is
+    // painted as convex polygons; endpoints belong to the caller's outline.
+    let curve = |points: &mut Vec<egui::Pos2>,
+                 from: (f32, f32),
+                 control_a: (f32, f32),
+                 control_b: (f32, f32),
+                 to: (f32, f32)| {
+        const SEGMENTS: usize = 16;
+        for step in 1..=SEGMENTS {
+            let t = step as f32 / SEGMENTS as f32;
+            let rest = 1.0 - t;
+            let blend = |a: f32, b: f32, c: f32, d: f32| {
+                rest * rest * rest * a
+                    + 3.0 * rest * rest * t * b
+                    + 3.0 * rest * t * t * c
+                    + t * t * t * d
+            };
+            points.push(at(
+                blend(from.0, control_a.0, control_b.0, to.0),
+                blend(from.1, control_a.1, control_b.1, to.1),
+            ));
+        }
+    };
+    let mut top = vec![
+        at(124.0, 0.0),
+        at(576.0, 0.0),
+        at(495.0, 144.0),
+        at(0.0, 144.0),
+    ];
+    curve(
+        &mut top,
+        (0.0, 144.0),
+        (0.0, 49.0),
+        (89.0, 0.0),
+        (124.0, 0.0),
     );
+    top.pop();
+    let middle_left = vec![
+        at(0.0, 205.0),
+        at(235.0, 205.0),
+        at(235.0, 349.0),
+        at(0.0, 349.0),
+    ];
+    let middle_right = vec![
+        at(282.0, 205.0),
+        at(576.0, 205.0),
+        at(495.0, 349.0),
+        at(282.0, 349.0),
+    ];
+    let mut bottom = vec![
+        at(0.0, 411.0),
+        at(576.0, 411.0),
+        at(495.0, 555.0),
+        at(124.0, 555.0),
+    ];
+    curve(
+        &mut bottom,
+        (124.0, 555.0),
+        (89.0, 555.0),
+        (0.0, 506.0),
+        (0.0, 411.0),
+    );
+    bottom.pop();
+    for strip in [top, middle_left, middle_right, bottom] {
+        painter.add(egui::Shape::convex_polygon(
+            strip,
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
 }
 
 /// The product mark is the shipped icon rather than a redrawn approximation,

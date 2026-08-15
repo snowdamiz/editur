@@ -26,8 +26,6 @@ pub(crate) const BODY_SIZE: f32 = 13.0;
 pub(crate) const TITLE_SIZE: f32 = 15.0;
 pub(crate) const DISPLAY_SIZE: f32 = 20.0;
 
-pub(crate) const DISPLAY_LINE: f32 = 28.0;
-
 /// Section labels and badges: uppercase, semibold, with +6% tracking.
 pub(crate) fn micro() -> FontId {
     FontId::new(MICRO_SIZE, strong_family())

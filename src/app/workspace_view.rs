@@ -412,33 +412,6 @@ impl EditorApp {
         }
     }
 
-    /// The five things a new window can do, labelled with the chords that are
-    /// actually bound right now, so a rebind changes the hint with it.
-    pub(super) fn keybinding_hints(&self) -> Vec<(&'static str, String)> {
-        let platform = KeybindingPlatform::current();
-        let bindings = self
-            .settings
-            .keybindings
-            .effective_bindings()
-            .unwrap_or_default();
-        let chord = |command: KeybindingCommand| {
-            bindings
-                .iter()
-                .find(|binding| binding.rule.command == command.id())
-                .map(|binding| binding.rule.label(platform))
-        };
-        [
-            ("Search project", KeybindingCommand::SearchProject),
-            ("Toggle file tree", KeybindingCommand::ViewToggleSidebar),
-            ("Open agent", KeybindingCommand::AppToggleAgentSidebar),
-            ("Toggle terminal", KeybindingCommand::ViewToggleTerminal),
-            ("Settings", KeybindingCommand::AppOpenSettings),
-        ]
-        .into_iter()
-        .filter_map(|(label, command)| Some((label, chord(command)?)))
-        .collect()
-    }
-
     /// The project switcher that opens under the tree's root header: recent
     /// roots plus a folder chooser for anything not in the list.
     pub(super) fn draw_project_menu(&mut self, tree_ui: &mut egui::Ui, opened_this_frame: bool) {
@@ -1009,14 +982,7 @@ impl EditorApp {
         let Some(index) = active_tab else {
             ui.painter()
                 .rect_filled(ui.max_rect(), 0.0, editor_background());
-            let project = self
-                .tree
-                .root
-                .file_name()
-                .unwrap_or(self.tree.root.as_os_str())
-                .to_string_lossy()
-                .into_owned();
-            draw_editor_empty_state(ui, &project, &self.keybinding_hints());
+            draw_editor_empty_state(ui);
             return;
         };
         let diagnostics = self

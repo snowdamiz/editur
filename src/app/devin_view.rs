@@ -72,14 +72,14 @@ impl EditorApp {
             .text_styles
             .insert(egui::TextStyle::Button, theme::typography::body());
         let rect = ui.max_rect();
+        // The same frosted material as the file tree, with no opaque header
+        // strip, so both assistant rails match the left one.
         ui.painter()
-            .rect_filled(rect, 0.0, theme::state::secondary_material());
+            .rect_filled(rect, 0.0, theme::state::sidebar_material());
         let header = rect.with_max_y((rect.top() + TITLEBAR_HEIGHT).min(rect.bottom()));
         let body = rect.with_min_y(header.bottom());
         let mut action = None;
 
-        ui.painter()
-            .rect_filled(header, 0.0, theme::surface().chrome);
         // The trailing inset is a hair, not a full step: the close control's
         // 32 px hit target carries its own dead zone, and the agent header
         // centers its trailing glyph 17 px from the edge.
@@ -108,6 +108,7 @@ impl EditorApp {
                 if self.devin_needs_connect_card() {
                     ScrollArea::vertical()
                         .id_salt("devin_connect_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             self.draw_devin_connect(ui, &mut action);
                         });
@@ -299,72 +300,100 @@ impl EditorApp {
                 && self.devin_state.sessions.is_empty())
     }
 
+    /// The connect card sits centered in the panel like a sign-in sheet: a
+    /// capped column, generous field spacing, and one full-width primary
+    /// action, rather than a form crammed under the header.
     fn draw_devin_connect(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
+        const CARD_WIDTH: f32 = 288.0;
+        const CARD_HEIGHT: f32 = 316.0;
         let field_label = |text: &str| {
             RichText::new(text)
                 .font(theme::typography::small_strong())
                 .color(theme::text().secondary)
         };
-        ui.set_width(ui.available_width());
-        ui.label(
-            RichText::new("Connect to Devin")
-                .size(theme::typography::TITLE_SIZE)
-                .strong()
-                .color(theme::text().primary),
-        );
-        ui.add_space(3.0);
-        ui.add(
-            Label::new(
-                RichText::new("Use a personal access token or service-user key. It is saved only in your operating-system credential store.")
-                    .font(theme::typography::body())
-                    .color(theme::text().muted),
-            )
-            .wrap(),
-        );
-        ui.add_space(10.0);
-        ui.label(field_label("API key"));
-        ui.add(
-            TextEdit::singleline(&mut self.devin_api_key)
-                .id(Id::new("devin_api_key"))
-                .password(true)
-                .hint_text("cog_…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(theme::space::SNUG);
-        ui.label(field_label("Organization ID (when required)"));
-        ui.add(
-            TextEdit::singleline(&mut self.devin_org_id)
-                .id(Id::new("devin_org_id"))
-                .hint_text("Optional")
-                .desired_width(f32::INFINITY),
-        );
-        if let Some(error) = self.devin_state.error.as_ref() {
-            ui.add_space(theme::space::SNUG);
-            devin_callout(ui, &error.message, theme::semantic().danger);
-        }
-        let connecting = self.devin_state.connection == DevinConnectionState::Connecting;
-        let enabled = !connecting && self.devin_api_key.trim().starts_with("cog_");
-        if connecting {
-            ui.add_space(theme::space::SNUG);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    RichText::new("Validating credentials…")
-                        .font(theme::typography::small())
-                        .color(theme::text().muted),
+        const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(10, 8);
+        let width = ui.available_width().min(CARD_WIDTH);
+        let indent = ((ui.available_width() - width) / 2.0).max(0.0);
+        // Optically centered: a touch above true center, and the scroll area
+        // still owns overflow when the panel is short.
+        ui.add_space(((ui.available_height() - CARD_HEIGHT) * 0.42).max(theme::space::WIDE));
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.vertical_centered(|ui| {
+                    let (mark, _) = ui.allocate_exact_size(egui::vec2(40.0, 44.0), Sense::hover());
+                    paint_devin_mark(ui.painter(), mark);
+                    ui.add_space(theme::space::MEDIUM);
+                    ui.label(
+                        RichText::new("Connect to Devin")
+                            .font(theme::typography::title())
+                            .color(theme::text().primary),
+                    );
+                });
+                ui.add_space(theme::space::XWIDE);
+                ui.label(field_label("API key"));
+                ui.add_space(theme::space::TIGHT);
+                ui.add(
+                    TextEdit::singleline(&mut self.devin_api_key)
+                        .id(Id::new("devin_api_key"))
+                        .font(theme::typography::body())
+                        .margin(FIELD_MARGIN)
+                        .desired_width(f32::INFINITY)
+                        .password(true)
+                        .hint_text(devin_field_hint("cog_…")),
                 );
+                ui.add_space(theme::space::MEDIUM);
+                ui.label(field_label("Organization ID"));
+                ui.add_space(theme::space::TIGHT);
+                ui.add(
+                    TextEdit::singleline(&mut self.devin_org_id)
+                        .id(Id::new("devin_org_id"))
+                        .font(theme::typography::body())
+                        .margin(FIELD_MARGIN)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(devin_field_hint("Only when your key requires it")),
+                );
+                if let Some(error) = self.devin_state.error.as_ref() {
+                    ui.add_space(theme::space::MEDIUM);
+                    devin_callout(ui, &error.message, theme::semantic().danger);
+                }
+                let connecting = self.devin_state.connection == DevinConnectionState::Connecting;
+                let enabled = !connecting && self.devin_api_key.trim().starts_with("cog_");
+                ui.add_space(theme::space::MEDIUM);
+                let color = if enabled {
+                    theme::accent()
+                } else {
+                    theme::text_disabled()
+                };
+                let button = egui::Button::new(
+                    RichText::new("Connect")
+                        .font(theme::typography::strong())
+                        .color(color),
+                )
+                .frame(false);
+                if ui
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add_sized(egui::vec2(width, theme::control::PRIMARY), button)
+                    })
+                    .inner
+                    .clicked()
+                {
+                    *action = Some(DevinUiAction::Connect);
+                }
+                if connecting {
+                    ui.add_space(theme::space::MEDIUM);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Validating credentials…")
+                                .font(theme::typography::small())
+                                .color(theme::text().muted),
+                        );
+                    });
+                }
             });
-        }
-        ui.add_space(10.0);
-        let (fill, color) = agent_send_button_colors(enabled);
-        let button = egui::Button::new(RichText::new("Connect").strong().color(color))
-            .fill(fill)
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(5)
-            .min_size(egui::vec2(ui.available_width(), 30.0));
-        if ui.add_enabled(enabled, button).clicked() {
-            *action = Some(DevinUiAction::Connect);
-        }
+        });
     }
 
     fn draw_devin_connection_banner(&self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
@@ -427,7 +456,8 @@ impl EditorApp {
             ui.add(
                 TextEdit::singleline(&mut self.devin_filter)
                     .id(Id::new("devin_filter"))
-                    .hint_text("Filter sessions…")
+                    .font(theme::typography::body())
+                    .hint_text(devin_field_hint("Filter sessions…"))
                     .desired_width(
                         (ui.available_width() - if compact { 82.0 } else { 126.0 }).max(80.0),
                     ),
@@ -711,7 +741,8 @@ impl EditorApp {
                     !self.devin_state.busy,
                     TextEdit::singleline(&mut self.devin_repository)
                         .id(Id::new("devin_repository"))
-                        .hint_text("owner/repository")
+                        .font(theme::typography::body())
+                        .hint_text(devin_field_hint("owner/repository"))
                         .desired_width(f32::INFINITY),
                 );
                 if matches!(self.devin_state.repository, RepositoryState::SelectionRequired) {
@@ -727,7 +758,8 @@ impl EditorApp {
                     !self.devin_state.busy,
                     TextEdit::multiline(&mut self.devin_create_prompt)
                         .id(Id::new("devin_create_prompt"))
-                        .hint_text("Describe the task for Devin…")
+                        .font(theme::typography::body())
+                        .hint_text(devin_field_hint("Describe the task for Devin…"))
                         .desired_rows(8)
                         .desired_width(f32::INFINITY),
                 );
@@ -1004,6 +1036,7 @@ impl EditorApp {
         let input = ui.add(
             TextEdit::multiline(&mut self.devin_message)
                 .id(Id::new("devin_prompt"))
+                .font(theme::typography::body())
                 .hint_text(
                     RichText::new(hint)
                         .size(theme::typography::BODY_SIZE)
@@ -1786,6 +1819,70 @@ fn draw_devin_activity(ui: &mut egui::Ui, activity: &Activity) {
         ui.hyperlink_to(
             RichText::new("Open remote link").font(theme::typography::small()),
             url,
+        );
+    }
+}
+
+/// Hint text carries its own face: the sidebar maps the default body style to
+/// the title face, which would render placeholders large and semibold.
+fn devin_field_hint(text: &str) -> RichText {
+    RichText::new(text).font(theme::typography::body())
+}
+
+/// The Devin mark from the official brand lockup, so the connect card reads
+/// as Devin's own sign-in sheet.
+fn paint_devin_mark(painter: &egui::Painter, rect: egui::Rect) {
+    paint_devin_texture(painter, rect, Color32::WHITE, false);
+}
+
+pub(super) fn paint_devin_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+    paint_devin_texture(painter, rect, color, true);
+}
+
+fn paint_devin_texture(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: Color32,
+    monochrome: bool,
+) {
+    let ctx = painter.ctx();
+    let cache_id = Id::new(("devin_mark_texture", monochrome));
+    let texture = ctx.data_mut(|data| data.get_temp::<egui::TextureHandle>(cache_id));
+    let texture = texture.or_else(|| {
+        let bytes = &include_bytes!("../../assets/icons/devin.png")[..];
+        let mut pixels = image::load_from_memory(bytes).ok()?.into_rgba8();
+        if monochrome {
+            for pixel in pixels.pixels_mut() {
+                let alpha = if pixel.0[..3].iter().copied().max().unwrap_or(0) > 32 {
+                    pixel.0[3]
+                } else {
+                    0
+                };
+                pixel.0 = [255, 255, 255, alpha];
+            }
+        }
+        let size = [pixels.width() as usize, pixels.height() as usize];
+        let texture = ctx.load_texture(
+            if monochrome {
+                "Devin icon"
+            } else {
+                "Devin logo"
+            },
+            egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        ctx.data_mut(|data| data.insert_temp(cache_id, texture.clone()));
+        Some(texture)
+    });
+    if let Some(texture) = texture {
+        let source = texture.size_vec2();
+        let scale = (rect.width() / source.x).min(rect.height() / source.y);
+        let rect = egui::Rect::from_center_size(rect.center(), source * scale);
+        painter.image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            color,
         );
     }
 }

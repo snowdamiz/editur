@@ -9,15 +9,12 @@ const html = readFileSync(
   "utf8",
 );
 
-test("ships both verified install commands", () => {
+test("ships the verified macOS install command", () => {
   assert.match(
     html,
     /curl --proto '=https' --tlsv1\.2 --retry 5 --retry-all-errors -LsSf https:\/\/raw\.githubusercontent\.com\/snowdamiz\/editur\/release\/install\.sh \| sh/,
   );
-  assert.match(
-    html,
-    /irm https:\/\/raw\.githubusercontent\.com\/snowdamiz\/editur\/release\/install\.ps1 \| iex/,
-  );
+  assert.doesNotMatch(html, /install\.ps1/);
 });
 
 test("document is named, skippable, and branded", () => {
@@ -48,7 +45,7 @@ test("install commands truncate instead of scrolling sideways", () => {
   assert.match(html, /data-command="[^"]+" class="[^"]*\btruncate\b/);
 });
 
-test("offers a native download for each release target and a terminal installer", () => {
+test("offers both macOS downloads and no unsupported release targets", () => {
   assert.match(
     html,
     /https:\/\/github\.com\/snowdamiz\/editur\/releases\/download\/release\/editur-macos-aarch64\.zip/,
@@ -57,15 +54,7 @@ test("offers a native download for each release target and a terminal installer"
     html,
     /https:\/\/github\.com\/snowdamiz\/editur\/releases\/download\/release\/editur-macos-x86_64\.zip/,
   );
-  assert.match(
-    html,
-    /https:\/\/github\.com\/snowdamiz\/editur\/releases\/download\/release\/editur-linux-x86_64"/,
-  );
-  assert.match(
-    html,
-    /https:\/\/github\.com\/snowdamiz\/editur\/releases\/download\/release\/editur-windows-x86_64\.exe/,
-  );
+  assert.doesNotMatch(html, /editur-(?:linux|windows)/);
   assert.match(html, /Download Editur\.app/);
-  assert.match(html, /Download Editur\.exe/);
   assert.match(html, /Install from the terminal/);
 });

@@ -3,7 +3,8 @@ use egui::{Id, Rect, Sense, Ui, pos2};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
-pub(crate) const WIDTH: f32 = 10.0;
+pub(crate) const WIDTH: f32 = 2.0;
+const HIT_SLOP: f32 = 4.0;
 pub(crate) const HOLD_SECONDS: f64 = 0.25;
 pub(crate) const FADE_SECONDS: f64 = 0.18;
 
@@ -92,13 +93,13 @@ fn axis_geometry(
     }
     let track = if horizontal {
         Rect::from_min_max(
-            pos2(viewport.left() + 2.0, viewport.bottom() - WIDTH + 2.0),
-            pos2(viewport.right() - 2.0, viewport.bottom() - 2.0),
+            pos2(viewport.left() + 2.0, viewport.bottom() - WIDTH),
+            pos2(viewport.right() - 2.0, viewport.bottom()),
         )
     } else {
         Rect::from_min_max(
-            pos2(viewport.right() - WIDTH + 2.0, viewport.top() + 2.0),
-            pos2(viewport.right() - 2.0, viewport.bottom() - 2.0),
+            pos2(viewport.right() - WIDTH, viewport.top() + 2.0),
+            pos2(viewport.right(), viewport.bottom() - 2.0),
         )
     };
     let max_scroll = content_length - viewport_length;
@@ -210,7 +211,7 @@ fn show_axis(
         state.drag_offset = None;
         return false;
     };
-    let response = ui.interact(layout.track.expand(2.0), id, Sense::click_and_drag());
+    let response = ui.interact(layout.track.expand(HIT_SLOP), id, Sense::click_and_drag());
     let pointer = response.interact_pointer_pos();
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = pointer

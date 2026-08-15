@@ -2,7 +2,7 @@
 import CopyCommand from "./CopyCommand.astro";
 import DownloadButton from "./DownloadButton.astro";
 import { DOWNLOADS, DOWNLOAD_ORDER } from "../lib/downloads";
-import { UNIX_INSTALL, WIN_INSTALL } from "../lib/commands";
+import { UNIX_INSTALL } from "../lib/commands";
 ---
 
 <div class="grid min-w-0 gap-8 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] lg:gap-10">
@@ -12,8 +12,7 @@ import { UNIX_INSTALL, WIN_INSTALL } from "../lib/commands";
     </p>
     <h3 class="mt-2 text-xl font-semibold tracking-tight text-ink">Get the native build</h3>
     <p class="mt-2 text-[15px] leading-relaxed text-ink-2">
-      A checksummed archive from the continuous release: <code class="text-ink-2">Editur.app</code> on macOS,
-      <code class="text-ink-2">Editur.exe</code> on Windows, or the Linux binary.
+      A checksummed <code class="text-ink-2">Editur.app</code> archive from the continuous macOS release.
     </p>
     <div class="mt-5">
       <DownloadButton />
@@ -61,8 +60,7 @@ import { UNIX_INSTALL, WIN_INSTALL } from "../lib/commands";
       <CopyCommand command={UNIX_INSTALL} id="cta-cmd" />
     </div>
     <p class="mt-3 min-w-0 text-sm break-words text-ink-3">
-      Windows: <code class="text-ink-2">{WIN_INSTALL}</code>
-      · Full steps in <a class="text-accent underline decoration-accent/40 underline-offset-2" href="#install">Install</a>.
+      Full steps in <a class="text-accent underline decoration-accent/40 underline-offset-2" href="#install">Install</a>.
     </p>
   </div>
 </div>

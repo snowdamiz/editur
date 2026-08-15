@@ -1,9 +1,4 @@
-import { WIN_INSTALL } from "../lib/commands";
-import {
-  DOWNLOADS,
-  downloadIdFromNavigator,
-  type DownloadId,
-} from "../lib/downloads";
+import { DOWNLOADS, type DownloadId } from "../lib/downloads";
 
 const root = document.documentElement;
 const toggle = document.getElementById("theme-toggle");
@@ -32,27 +27,6 @@ toggle?.addEventListener("click", () => {
   }
 });
 
-const ua = navigator.userAgent;
-const platform =
-  (navigator as Navigator & { userAgentData?: { platform?: string } })
-    .userAgentData?.platform || navigator.platform || "";
-const isWindows = /win/i.test(platform) || /Windows/i.test(ua);
-const isLinux =
-  !isWindows &&
-  (/linux/i.test(platform) || /Linux|X11/i.test(ua)) &&
-  !/Android/i.test(ua);
-const renderer = isWindows ? "d3d12" : isLinux ? "vulkan" : "metal";
-
-document
-  .querySelector(`[data-renderer="${renderer}"]`)
-  ?.setAttribute("data-host", "true");
-
-const installCmd = document.getElementById("cta-cmd") ?? document.getElementById("hero-cmd");
-if (isWindows && installCmd) {
-  installCmd.textContent = WIN_INSTALL;
-  installCmd.dataset.command = WIN_INSTALL;
-}
-
 function applyDownload(id: DownloadId) {
   const spec = DOWNLOADS[id];
   document.querySelectorAll<HTMLAnchorElement>("[data-download]").forEach((el) => {
@@ -71,12 +45,7 @@ function applyDownload(id: DownloadId) {
   });
 }
 
-applyDownload(
-  downloadIdFromNavigator({
-    platform,
-    userAgent: ua,
-  }),
-);
+applyDownload("macos-arm");
 
 document.querySelectorAll("[data-download-option]").forEach((el) => {
   el.addEventListener("click", (event) => {
@@ -85,42 +54,6 @@ document.querySelectorAll("[data-download-option]").forEach((el) => {
     if (id && id in DOWNLOADS) applyDownload(id as DownloadId);
   });
 });
-
-if (isWindows || isLinux) {
-  document.querySelectorAll(".mod").forEach((node) => {
-    node.textContent = "Ctrl";
-  });
-}
-
-const tabs = [
-  document.getElementById("tab-unix"),
-  document.getElementById("tab-win"),
-].filter((tab): tab is HTMLElement => Boolean(tab));
-
-function selectTab(active: HTMLElement) {
-  for (const tab of tabs) {
-    const on = tab === active;
-    tab.setAttribute("aria-selected", String(on));
-    const panel = document.getElementById(tab.getAttribute("aria-controls") || "");
-    if (panel instanceof HTMLElement) panel.hidden = !on;
-  }
-}
-
-tabs.forEach((tab, index) => {
-  tab.addEventListener("click", () => selectTab(tab));
-  tab.addEventListener("keydown", (event) => {
-    const step =
-      event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-    if (!step) return;
-    event.preventDefault();
-    const next = tabs[(index + step + tabs.length) % tabs.length];
-    if (!next) return;
-    selectTab(next);
-    next.focus();
-  });
-});
-
-if (isWindows && tabs[1]) selectTab(tabs[1]);
 
 document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) => {
   const label = button.querySelector("span");

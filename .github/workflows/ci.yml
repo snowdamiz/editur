@@ -27,12 +27,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact: editur-linux-x86_64
-            archive: dist/editur-linux-x86_64.tar.gz
-            update_asset: editur-linux-x86_64
-            agent_os: linux
-            agent_arch: x86_64
           - os: macos-latest
             artifact: editur-macos-aarch64
             archive: dist/editur-macos-aarch64.zip
@@ -44,12 +38,6 @@ jobs:
             archive: dist/editur-macos-x86_64.zip
             update_asset: editur-macos-x86_64
             agent_os: macos
-            agent_arch: x86_64
-          - os: windows-latest
-            artifact: editur-windows-x86_64
-            archive: dist/editur-windows-x86_64.zip
-            update_asset: editur-windows-x86_64.exe
-            agent_os: windows
             agent_arch: x86_64
     steps:
       - uses: actions/checkout@v6
@@ -518,10 +506,8 @@ jobs:
           set -eu
           base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
           for asset in \
-            editur-linux-x86_64.sha256 \
             editur-macos-aarch64.sha256 \
-            editur-macos-x86_64.sha256 \
-            editur-windows-x86_64.exe.sha256
+            editur-macos-x86_64.sha256
           do
             ready=0
             for _ in $(seq 1 30); do
@@ -550,12 +536,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: Unix
-            os: ubuntu-latest
           - platform: macOS
             os: macos-latest
-          - platform: Windows
-            os: windows-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install and update on Unix

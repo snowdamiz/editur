@@ -386,6 +386,60 @@ mod tests {
     }
 
     #[test]
+    fn file_tree_scrollbar_matches_the_agent_sidebar_style() {
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows: Vec<_> = (0..40)
+            .map(|index| TreeRow {
+                entry: TreeEntry {
+                    name: OsString::from(format!("file-{index}.rs")),
+                    path: PathBuf::from(format!("file-{index}.rs")),
+                    is_dir: false,
+                    is_symlink: false,
+                },
+                label: format!("file-{index}.rs"),
+                depth: 0,
+                directory: false,
+                expanded: false,
+                revision: index,
+            })
+            .collect();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(200.0, 240.0));
+        let mut agent_width = 0.0;
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    Event::PointerMoved(screen.center()),
+                    Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -40.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                agent_width = ui.spacing().scroll.floating_width;
+                surface.show(ui, Path::new("/tmp/project"), &rows, None, false);
+            },
+        );
+        let thumb = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Rect(shape) if shape.fill == theme::state::scrollbar::thumb() => {
+                    Some(shape.rect)
+                }
+                _ => None,
+            })
+            .expect("visible file tree scrollbar thumb");
+        assert_eq!(thumb.width(), agent_width);
+        assert_eq!(thumb.right(), screen.right());
+    }
+
+    #[test]
     fn selected_row_retention_changes_during_sidebar_resize() {
         let context = theme::test_context();
         let mut surface = TreeSurface::default();
