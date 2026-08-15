@@ -13,6 +13,7 @@ pub(super) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(not(feature = "network"), allow(dead_code))]
 pub(super) enum TransportError {
+    CredentialsMissing,
     Authentication,
     Forbidden,
     RateLimited(Option<u64>),
@@ -25,6 +26,7 @@ pub(super) enum TransportError {
 impl fmt::Debug for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CredentialsMissing => formatter.write_str("CredentialsMissing"),
             Self::Authentication => formatter.write_str("Authentication"),
             Self::Forbidden => formatter.write_str("Forbidden"),
             Self::RateLimited(retry) => formatter.debug_tuple("RateLimited").field(retry).finish(),
@@ -485,6 +487,7 @@ fn normalized(value: &str) -> String {
 impl TransportError {
     pub(super) fn user_message(&self) -> &'static str {
         match self {
+            Self::CredentialsMissing => "Connect to Devin to continue",
             Self::Authentication => "Devin authentication failed",
             Self::Forbidden => "This credential does not have permission for that Devin action",
             Self::RateLimited(_) => "Devin is rate limiting requests",

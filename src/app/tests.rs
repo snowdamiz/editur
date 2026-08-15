@@ -3955,6 +3955,68 @@ fn height_only_resize_invalidates_retained_workspace_geometry() {
 }
 
 #[test]
+fn devin_divider_invalidates_retained_paint_through_hover_drag_and_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_sidebar_width = 400.0;
+    let context = theme::test_context();
+    let (inactive, hovered, dragged, released) = {
+        let mut draw = |events| {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        Vec2::new(1000.0, 700.0),
+                    )),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .into_iter()
+                .find_map(|primitive| {
+                    crate::renderer::retained_paint(&primitive.primitive)
+                        .ok()
+                        .flatten()
+                        .filter(|paint| paint.key == 0x6000_0000_0000_0000)
+                })
+                .expect("retained Devin divider")
+                .revision
+        };
+
+        let inactive = draw(Vec::new());
+        let hovered = draw(vec![Event::PointerMoved(pos2(600.0, 100.0))]);
+        let _ = draw(vec![Event::PointerButton {
+            pos: pos2(600.0, 100.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        let dragged = draw(vec![Event::PointerMoved(pos2(650.0, 100.0))]);
+        let _ = draw(vec![Event::PointerButton {
+            pos: pos2(650.0, 100.0),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        let released = draw(vec![Event::PointerMoved(pos2(500.0, 100.0))]);
+        (inactive, hovered, dragged, released)
+    };
+
+    assert_ne!(inactive, hovered);
+    assert_ne!(dragged, released);
+    assert!(!app.devin_sidebar_dragging);
+}
+
+#[test]
 fn closing_the_open_agent_sidebar_does_not_reopen_it_in_the_same_frame() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {

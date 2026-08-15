@@ -4590,6 +4590,14 @@ impl EditorApp {
                 ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
             let active = hovered || self.devin_sidebar_dragging;
+            crate::renderer::mark_retained(
+                root.painter(),
+                divider,
+                0x6000_0000_0000_0000,
+                u64::from(divider.center().x.to_bits())
+                    ^ u64::from(divider.height().to_bits()).rotate_left(32)
+                    ^ ((active as u64) << 63),
+            );
             root.painter().line_segment(
                 [divider.center_top(), divider.center_bottom()],
                 resize_divider_stroke(&ctx, active),

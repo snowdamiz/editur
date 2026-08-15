@@ -336,7 +336,7 @@ impl Worker {
         if self.transport.is_none() {
             let credentials = Credentials::load()
                 .map_err(TransportError::Protocol)?
-                .ok_or(TransportError::Authentication)?;
+                .ok_or(TransportError::CredentialsMissing)?;
             self.emit(DevinEvent::CredentialsChanged(Some(credentials.source())));
             self.connect(credentials)?;
         }
@@ -554,6 +554,15 @@ impl Worker {
     }
 
     fn request_failed(&mut self, error: TransportError) {
+        if error == TransportError::CredentialsMissing {
+            self.transport = None;
+            self.emit(DevinEvent::CredentialsChanged(None));
+            self.emit(DevinEvent::ConnectionChanged(
+                ConnectionState::AuthenticationRequired,
+            ));
+            self.schedule.set_visible(false, Instant::now());
+            return;
+        }
         if matches!(
             error,
             TransportError::Authentication | TransportError::Forbidden | TransportError::Offline
@@ -787,6 +796,32 @@ mod tests {
 
         schedule.failed(now, None);
         assert!(schedule.wait(now).unwrap() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn missing_credentials_open_the_connect_state_without_an_error() {
+        let (event_tx, event_rx) = mpsc::sync_channel(8);
+        let mut worker = super::Worker::new(
+            std::env::temp_dir(),
+            super::ENDPOINT.into(),
+            event_tx,
+            Arc::new(|| {}),
+        );
+        let now = Instant::now();
+        worker.schedule.set_visible(true, now);
+
+        worker.request_failed(super::TransportError::CredentialsMissing);
+
+        assert_eq!(
+            event_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                super::DevinEvent::CredentialsChanged(None),
+                super::DevinEvent::ConnectionChanged(
+                    super::ConnectionState::AuthenticationRequired,
+                ),
+            ]
+        );
+        assert_eq!(worker.schedule.wait(now), None);
     }
 
     #[test]
