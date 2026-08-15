@@ -3,6 +3,7 @@ pub mod app;
 pub mod buffer;
 pub mod cli;
 mod components;
+pub mod devin;
 mod dialog;
 pub mod editor_surface;
 pub mod file_io;

@@ -19,6 +19,7 @@ egui = { version = "0.35.0", default-features = false, features = ["bytemuck", "
 egui-winit = { version = "0.35.0", default-features = false, features = ["accesskit"] }
 flate2 = "1.1.9"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+keyring = "4.1.6"
 lsp-types = "=0.97.0"
 pulldown-cmark = "=0.13.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

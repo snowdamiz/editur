@@ -4,6 +4,7 @@ use super::{
     WORKSPACE_MIN_HEIGHT,
 };
 
+#[cfg(test)]
 pub(super) fn split_workspace(
     content: egui::Rect,
     explorer_open: bool,
@@ -11,7 +12,30 @@ pub(super) fn split_workspace(
     agent_open: bool,
     agent_width: f32,
 ) -> (Option<egui::Rect>, egui::Rect, egui::Rect) {
-    let right_width = if agent_open {
+    let (explorer, editor, agent, _) = split_workspace_with_devin(
+        content,
+        explorer_open,
+        explorer_width,
+        agent_open,
+        agent_width,
+        false,
+        0.0,
+    );
+    (explorer, editor, agent)
+}
+
+pub(super) fn split_workspace_with_devin(
+    content: egui::Rect,
+    explorer_open: bool,
+    explorer_width: f32,
+    agent_open: bool,
+    agent_width: f32,
+    devin_open: bool,
+    devin_width: f32,
+) -> (Option<egui::Rect>, egui::Rect, egui::Rect, egui::Rect) {
+    let right_width = if devin_open {
+        devin_width.max(320.0).min(content.width() * 0.52)
+    } else if agent_open {
         agent_width.max(320.0).min(content.width() * 0.52)
     } else {
         0.0
@@ -21,9 +45,19 @@ pub(super) fn split_workspace(
         .min((content.width() - right_width - 160.0).max(SIDEBAR_MIN_WIDTH));
     let explorer = explorer_open
         .then(|| content.with_max_x((content.left() + explorer_width).min(content.right())));
-    let agent = content.with_min_x((content.right() - right_width).max(content.left()));
-    let editor_right = if agent_open {
-        agent.left()
+    let right = content.with_min_x((content.right() - right_width).max(content.left()));
+    let agent = if agent_open && !devin_open {
+        right
+    } else {
+        content.with_min_x(content.right())
+    };
+    let devin = if devin_open {
+        right
+    } else {
+        content.with_min_x(content.right())
+    };
+    let editor_right = if agent_open || devin_open {
+        right.left()
     } else {
         content.right()
     };
@@ -34,7 +68,7 @@ pub(super) fn split_workspace(
         ),
         egui::pos2(editor_right, content.bottom()),
     );
-    (explorer, editor, agent)
+    (explorer, editor, agent, devin)
 }
 
 pub(super) fn split_agentic_workspace(

@@ -1,14 +1,19 @@
-use crate::pane::allowed_tab_drop_zone;
+use crate::{
+    devin::{
+        ConnectionState as DevinConnectionState, CredentialSource, DevinEvent, StatusCategory,
+    },
+    pane::allowed_tab_drop_zone,
+};
 
 #[cfg(unix)]
 use super::picker_breadcrumb_segments;
 use super::{
     AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, AgenticDiff, CompletionPopup,
-    DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId, PaneLayout,
-    PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection, TAB_CLOSE,
-    TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
-    TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, agent_at_bottom,
-    agent_collapsing_header, agent_composer_content, agent_composer_height,
+    DevinView, DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId,
+    PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection,
+    TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
+    TITLEBAR_PAINT_KEY, TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS,
+    agent_at_bottom, agent_collapsing_header, agent_composer_content, agent_composer_height,
     agent_dense_disclosure_row, agent_dense_tool, agent_diff_cache_count, agent_diff_preview,
     agent_empty_state_rect, agent_markdown_galley, agent_mention_matches, agent_mention_query,
     agent_menu_rect, agent_new_session_rect, agent_search_matches, agent_selector_button,
@@ -25,7 +30,7 @@ use super::{
     search_selection_after_navigation, settings_ui_scale_slider, should_show_project_chooser,
     skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_diff,
     split_agentic_workspace, split_bottom_panel, split_pane_content, split_workspace,
-    stable_tab_drop_zone, tab_width, unique_copy_path,
+    split_workspace_with_devin, stable_tab_drop_zone, tab_width, unique_copy_path,
 };
 
 fn click_response(
@@ -61,6 +66,16 @@ fn composer_mentions_only_use_the_active_at_token() {
     assert_eq!(agent_mention_query("mail dev@example.com"), None);
     assert_eq!(agent_mention_query("Review @src then explain"), None);
     assert_eq!(agent_mention_query("Review @src "), None);
+}
+
+#[test]
+fn agent_and_devin_sidebars_share_one_right_hand_slot() {
+    let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1400.0, 800.0));
+    let (_, editor, agent, devin) =
+        split_workspace_with_devin(window, false, 0.0, true, 360.0, true, 400.0);
+
+    assert_eq!(agent.width(), 0.0);
+    assert_eq!(editor.right(), devin.left());
 }
 
 #[test]
@@ -1494,6 +1509,235 @@ fn provider_selector_and_provider_specific_controls_follow_capabilities() {
     app.agent_menu = Some(super::AgentMenu::Permissions);
     draw(&mut app);
     assert!(app.agent_menu_popup.is_some());
+}
+
+#[test]
+fn devin_sidebar_command_hides_but_does_not_reset_the_local_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.prompt = "local draft".into();
+
+    app.execute_keybinding(
+        crate::keybindings::Command::AppToggleDevinSidebar,
+        None,
+        &theme::test_context(),
+    );
+
+    assert!(!app.agent_sidebar && app.devin_sidebar);
+    assert_eq!(app.agent.prompt, "local draft");
+}
+
+#[test]
+fn agent_sidebar_command_hides_but_does_not_reset_devin() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_create_prompt = "remote draft".into();
+
+    app.execute_keybinding(
+        crate::keybindings::Command::AppToggleAgentSidebar,
+        None,
+        &theme::test_context(),
+    );
+
+    assert!(!app.devin_sidebar && app.agent_sidebar);
+    assert_eq!(app.devin_create_prompt, "remote draft");
+}
+
+#[test]
+fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1100.0, 760.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Connect to Devin"))
+    );
+}
+
+#[test]
+fn devin_home_groups_waiting_sessions_first_at_minimum_width() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_sidebar_width = 320.0;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    app.devin_state.apply(DevinEvent::SessionsLoaded {
+        sessions: vec![
+            crate::devin::SessionSummary {
+                id: "working".into(),
+                title: "Working task".into(),
+                status: "running".into(),
+                category: StatusCategory::Active,
+                ..Default::default()
+            },
+            crate::devin::SessionSummary {
+                id: "waiting".into(),
+                title: "Waiting task".into(),
+                status: "blocked".into(),
+                category: StatusCategory::Waiting,
+                ..Default::default()
+            },
+        ],
+        next_cursor: None,
+        append: false,
+    });
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "NEEDS YOU"))
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "WORKING"))
+    );
+}
+
+#[test]
+fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "waiting".into(),
+        title: "Waiting task".into(),
+        status: "blocked".into(),
+        category: StatusCategory::Waiting,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_focus_detail = true;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let generation = app.devin_state.select(summary.id.clone());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            ..Default::default()
+        },
+    });
+    app.devin_state.apply(DevinEvent::ActivityLoaded {
+        session_id: "waiting".into(),
+        generation,
+        activity: vec![crate::devin::Activity {
+            id: "remote".into(),
+            category: "shell".into(),
+            summary: "Ran tests".into(),
+            ..Default::default()
+        }],
+        next_cursor: None,
+        replace: true,
+    });
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(context.memory(|memory| memory.has_focus(Id::new("devin_prompt"))));
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "waiting for your reply"))
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "remote action"))
+    );
 }
 
 #[test]

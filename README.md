@@ -86,6 +86,7 @@ application.openKeyboardShortcuts
 application.openSettings
 application.toggleAgentSidebar
 application.toggleAgenticView
+application.toggleDevinSidebar
 
 Files and workbench
 file.closeActiveEditor
@@ -245,7 +246,17 @@ Authentication is owned by the selected agent. Editur renders agent-launched log
 
 Prompts, relevant project code, tool results, and conversation context may be sent to the selected provider and its model providers. Editur does not add telemetry or persist the transcript. Review [Cursor's data-use policy](https://cursor.com/data-use) or [OpenAI's data controls](https://platform.openai.com/docs/guides/your-data), use provider ignore controls where available, and do not submit regulated or third-party data unless your agreements permit it.
 
-Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. The ACP surface has no cloud sessions, parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
+
+## Devin cloud sidebar
+
+Use the bolt icon at the right of the titlebar, or bind `application.toggleDevinSidebar`, to supervise cloud Devin sessions separately from the local ACP Agent. The two assistant sidebars share one right-hand slot but retain independent state and drafts. Devin lists visible sessions from every supported origin, including Slack, and supports creation, messages, remote activity, attachments, pull requests, child-session links, pagination, and sleep/archive/unarchive/terminate controls.
+
+Connect with a Devin personal access token or service-user key beginning with `cog_`. User-entered credentials are stored only in the operating-system credential store. Developer builds can instead inherit `DEVIN_API_KEY` and optional `DEVIN_ORG_ID`; environment values take precedence and are never copied into Editur settings. The credential needs `ViewOrgSessions` for discovery and detail, `ManageOrgSessions` for messages and lifecycle controls, and `UseDevinSessions` for creation. Editur connects only to Devin's documented MCP endpoint, `https://mcp.devin.ai/mcp`. See [Devin authentication](https://docs.devin.ai/api-reference/authentication), [personal access tokens](https://docs.devin.ai/api-reference/personal-access-tokens), and the [v3 permission model](https://docs.devin.ai/api-reference/v3/overview).
+
+Devin works from its remote clone: it cannot see unsaved buffers, uncommitted changes, or commits that have not been pushed. Editur never uploads a local diff, turns remote paths into local file links, checks out a Devin pull request, or adds remote activity to local changed-file state. Polling runs only while the Devin sidebar is visible, resumes immediately when reopened, and stopping the polling does not stop the remote session.
+
+Sleep and archive are reversible; sending to a sleeping session wakes it, and archived sessions can be unarchived from the Archived scope. Termination permanently stops remote work and always requires the danger confirmation dialog. Disconnect removes only the stored local token after confirmation and does not alter remote sessions. Authentication, transport, rate-limit, offline, and lifecycle errors shown by the UI are sanitized; raw response bodies, authorization headers, and credential-bearing URL parameters are never written to preferences, diagnostics, or logs.
 
 ## Language servers
 

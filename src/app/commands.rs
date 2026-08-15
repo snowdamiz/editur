@@ -19,6 +19,8 @@ impl EditorApp {
             || self.error.is_some()
             || self.agent_file_picker.is_some()
             || self.project_folder_picker.is_some()
+            || self.devin_confirm_terminate
+            || self.devin_confirm_disconnect
             || self.tree_prompt.is_some()
             || self.tree_delete.is_some()
         {
@@ -179,6 +181,20 @@ impl EditorApp {
         if ctx.memory(|memory| memory.has_focus(Id::new("agent_prompt"))) {
             return vec![Scope::Agent];
         }
+        if ctx.memory(|memory| {
+            [
+                "devin_api_key",
+                "devin_org_id",
+                "devin_filter",
+                "devin_repository",
+                "devin_create_prompt",
+                "devin_prompt",
+            ]
+            .into_iter()
+            .any(|id| memory.has_focus(Id::new(id)))
+        }) {
+            return vec![Scope::Devin];
+        }
         if self.agent_find.open
             && ctx.memory(|memory| memory.has_focus(Id::new("agent_find_query")))
         {
@@ -233,7 +249,24 @@ impl EditorApp {
                 self.agent_sidebar = !self.agent_sidebar;
                 self.agent_sidebar_dragging = false;
                 if self.agent_sidebar {
+                    self.devin_sidebar = false;
+                    self.devin_sidebar_dragging = false;
+                    if let Some(controller) = self.devin_controller.as_ref() {
+                        let _ = controller.send(DevinCommand::SetVisible(false));
+                    }
                     self.open_agent(ctx);
+                }
+            }
+            KeybindingCommand::AppToggleDevinSidebar => {
+                self.devin_sidebar = !self.devin_sidebar;
+                self.devin_sidebar_dragging = false;
+                if self.devin_sidebar {
+                    self.agent_sidebar = false;
+                    self.agent_sidebar_dragging = false;
+                    self.agentic_mode = false;
+                    self.open_devin(ctx);
+                } else if let Some(controller) = self.devin_controller.as_ref() {
+                    let _ = controller.send(DevinCommand::SetVisible(false));
                 }
             }
             KeybindingCommand::AppToggleAgenticView => {

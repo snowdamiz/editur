@@ -14,6 +14,7 @@ mod agent_diff;
 mod agent_text;
 mod agent_view;
 mod commands;
+mod devin_view;
 mod language_server;
 mod layout;
 mod runtime;
@@ -25,6 +26,7 @@ mod workspace_view;
 
 use agent_diff::*;
 use agent_text::*;
+use devin_view::{DevinLifecycle, DevinScope, DevinView, PendingDevinMessage};
 use layout::*;
 use settings_ui::*;
 use window_state::*;
@@ -67,6 +69,10 @@ use crate::{
         selectable_row,
     },
     data_dir,
+    devin::{
+        ConnectionState as DevinConnectionState, CredentialSource, DevinCommand, DevinController,
+        DevinEvent, DevinState, RepositoryState, StatusCategory,
+    },
     dialog::{Dialog, Outcome, Severity},
     editor_surface::{
         DocumentMetrics, EditorShowOptions, EditorSurface, TextInputMode, editor_background,
@@ -250,6 +256,7 @@ fn text_scope_owns_printable(scopes: &[Scope], behavior: KeybindingBehavior) -> 
                 | Scope::Find
                 | Scope::ProjectSearch
                 | Scope::Agent
+                | Scope::Devin
                 | Scope::Terminal
                 | Scope::Settings
         ) || (*scope == Scope::DocumentEditor && behavior == KeybindingBehavior::Standard)
@@ -2376,6 +2383,15 @@ fn agent_toggle_rect(header: egui::Rect) -> egui::Rect {
     )
 }
 
+fn devin_toggle_rect(header: egui::Rect, agent_open: bool) -> egui::Rect {
+    let agent = agent_toggle_rect(header);
+    if agent_open {
+        agent
+    } else {
+        agent.translate(egui::vec2(-agent.width(), 0.0))
+    }
+}
+
 fn file_tree_toggle_rect(titlebar: egui::Rect, _editor_header: egui::Rect) -> egui::Rect {
     #[cfg(target_os = "macos")]
     let controls_right = titlebar.left() + 72.0;
@@ -3864,6 +3880,30 @@ pub struct EditorApp {
     agent_sidebar: bool,
     agent_sidebar_width: f32,
     agent_sidebar_dragging: bool,
+    devin_sidebar: bool,
+    devin_sidebar_width: f32,
+    devin_sidebar_dragging: bool,
+    devin_state: DevinState,
+    devin_controller: Option<DevinController>,
+    devin_api_key: String,
+    devin_org_id: String,
+    devin_view: DevinView,
+    devin_scope: DevinScope,
+    devin_filter: String,
+    devin_list_cursor: usize,
+    devin_focus_list: bool,
+    devin_focus_create: bool,
+    devin_focus_detail: bool,
+    devin_repository: String,
+    devin_create_prompt: String,
+    devin_creating: bool,
+    devin_message: String,
+    devin_attachment_ids: HashSet<String>,
+    devin_expanded_activity_groups: HashSet<String>,
+    devin_pending_message: Option<PendingDevinMessage>,
+    devin_pending_lifecycle: Option<DevinLifecycle>,
+    devin_confirm_terminate: bool,
+    devin_confirm_disconnect: bool,
     agent_menu: Option<AgentMenu>,
     agent_menu_popup: Option<egui::Rect>,
     agent_menu_scroll_y: f32,
@@ -4028,6 +4068,30 @@ impl EditorApp {
             agent_sidebar: false,
             agent_sidebar_width: 440.0,
             agent_sidebar_dragging: false,
+            devin_sidebar: false,
+            devin_sidebar_width: 440.0,
+            devin_sidebar_dragging: false,
+            devin_state: DevinState::default(),
+            devin_controller: None,
+            devin_api_key: String::new(),
+            devin_org_id: String::new(),
+            devin_view: DevinView::default(),
+            devin_scope: DevinScope::default(),
+            devin_filter: String::new(),
+            devin_list_cursor: 0,
+            devin_focus_list: false,
+            devin_focus_create: false,
+            devin_focus_detail: false,
+            devin_repository: String::new(),
+            devin_create_prompt: String::new(),
+            devin_creating: false,
+            devin_message: String::new(),
+            devin_attachment_ids: HashSet::new(),
+            devin_expanded_activity_groups: HashSet::new(),
+            devin_pending_message: None,
+            devin_pending_lifecycle: None,
+            devin_confirm_terminate: false,
+            devin_confirm_disconnect: false,
             agent_menu: None,
             agent_menu_popup: None,
             agent_menu_scroll_y: 0.0,
@@ -4223,6 +4287,7 @@ impl EditorApp {
         }
         self.poll_git_workspace_status();
         self.poll_agent(&ctx);
+        self.poll_devin(&ctx);
         if self.agent.active {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -4264,12 +4329,15 @@ impl EditorApp {
         }
         self.update_sidebar_resizes(&ctx, window);
         let agent_sidebar_at_frame_start = self.agent_sidebar;
-        let (sidebar, editor_column, agent) = split_workspace(
+        let devin_sidebar_at_frame_start = self.devin_sidebar;
+        let (sidebar, editor_column, agent, devin) = split_workspace_with_devin(
             window,
             self.sidebar,
             self.sidebar_width,
             self.agent_sidebar,
             self.agent_sidebar_width,
+            self.devin_sidebar,
+            self.devin_sidebar_width,
         );
         let workspace = egui::Rect::from_min_max(editor_column.left_top(), window.right_bottom());
         self.update_terminal_resize(&ctx, workspace);
@@ -4277,6 +4345,7 @@ impl EditorApp {
             split_bottom_panel(workspace, self.terminal_open, self.terminal_height);
         let editor_column = editor_column.with_max_y(workspace.bottom());
         let agent = agent.with_max_y(workspace.bottom());
+        let devin = devin.with_max_y(workspace.bottom());
         let editor = editor_column_content(editor_column);
         if let Some(sidebar) = sidebar {
             root.scope_builder(
@@ -4422,6 +4491,12 @@ impl EditorApp {
                 |ui| self.draw_agent_sidebar(ui),
             );
         }
+        if self.devin_sidebar {
+            root.scope_builder(
+                UiBuilder::new().id_salt("devin_sidebar").max_rect(devin),
+                |ui| self.draw_devin_sidebar(ui),
+            );
+        }
         if let Some(terminal) = terminal {
             let output = self.terminal.show(root, terminal, &self.tree.root);
             if output.empty {
@@ -4437,7 +4512,7 @@ impl EditorApp {
             titlebar,
             editor,
             &pane_rects,
-            agent_sidebar_at_frame_start,
+            (agent_sidebar_at_frame_start, devin_sidebar_at_frame_start),
             dragged_pane,
         );
         if !self.terminal.focused(&ctx)
@@ -4504,6 +4579,22 @@ impl EditorApp {
                 resize_divider_stroke(&ctx, active),
             );
         }
+        if self.devin_sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(devin.left(), devin.center().y),
+                egui::vec2(5.0, devin.height()),
+            );
+            let pointer = ctx.pointer_hover_pos();
+            let hovered = pointer.is_some_and(|pointer| divider.contains(pointer));
+            if hovered || self.devin_sidebar_dragging {
+                ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            let active = hovered || self.devin_sidebar_dragging;
+            root.painter().line_segment(
+                [divider.center_top(), divider.center_bottom()],
+                resize_divider_stroke(&ctx, active),
+            );
+        }
         if let Some(drop) = self.tab_drop.filter(|drop| drop.zone == DropZone::Center) {
             root.painter().rect_filled(
                 drop.preview.shrink(4.0),
@@ -4532,12 +4623,14 @@ impl EditorApp {
     }
 
     fn update_sidebar_resizes(&mut self, ctx: &egui::Context, window: egui::Rect) {
-        let (sidebar, _, agent) = split_workspace(
+        let (sidebar, _, agent, devin) = split_workspace_with_devin(
             window,
             self.sidebar,
             self.sidebar_width,
             self.agent_sidebar,
             self.agent_sidebar_width,
+            self.devin_sidebar,
+            self.devin_sidebar_width,
         );
         let pointer = ctx.pointer_hover_pos();
         let (pressed, down) = ctx.input(|input| {
@@ -4564,15 +4657,33 @@ impl EditorApp {
                 self.agent_sidebar_dragging = true;
             }
         }
+        if self.devin_sidebar {
+            let divider = egui::Rect::from_center_size(
+                egui::pos2(devin.left(), devin.center().y),
+                egui::vec2(5.0, devin.height()),
+            );
+            if pressed && pointer.is_some_and(|pointer| divider.contains(pointer)) {
+                self.devin_sidebar_dragging = true;
+            }
+        }
         if !down {
             self.sidebar_dragging = false;
             self.agent_sidebar_dragging = false;
+            self.devin_sidebar_dragging = false;
         } else if let Some(pointer) = pointer {
             if self.sidebar_dragging {
                 self.sidebar_width = (pointer.x - window.left()).clamp(SIDEBAR_MIN_WIDTH, 500.0);
             }
             if self.agent_sidebar_dragging {
-                self.agent_sidebar_width = (window.right() - pointer.x).clamp(320.0, 720.0);
+                let right = if self.devin_sidebar {
+                    devin.left()
+                } else {
+                    window.right()
+                };
+                self.agent_sidebar_width = (right - pointer.x).clamp(320.0, 720.0);
+            }
+            if self.devin_sidebar_dragging {
+                self.devin_sidebar_width = (window.right() - pointer.x).clamp(320.0, 720.0);
             }
         }
     }
@@ -5200,9 +5311,10 @@ impl EditorApp {
         rect: egui::Rect,
         editor: egui::Rect,
         panes: &[(PaneId, egui::Rect)],
-        agent_sidebar_open: bool,
+        assistant_sidebars: (bool, bool),
         dragged_pane: Option<PaneId>,
     ) {
+        let (agent_sidebar_open, devin_sidebar_open) = assistant_sidebars;
         let dragged_path = self.tab_drag.clone();
         crate::renderer::mark_retained(
             ui.painter(),
@@ -5223,6 +5335,8 @@ impl EditorApp {
         #[cfg(not(target_os = "macos"))]
         let controls_left = editor_header.right().min(rect.right() - 3.0 * 46.0);
         let agent_button = (!agent_sidebar_open).then(|| agent_toggle_rect(editor_header));
+        let devin_button =
+            (!devin_sidebar_open).then(|| devin_toggle_rect(editor_header, agent_sidebar_open));
         #[cfg(target_os = "macos")]
         let first_tabs_left = if self.sidebar {
             if agentic_button.right() > editor_header.left() {
@@ -5250,7 +5364,11 @@ impl EditorApp {
                 header.left()
             };
             let controls_right = if (pane_rect.right() - editor.right()).abs() <= 0.5 {
-                agent_button.map_or(controls_left, |button| button.left())
+                [agent_button, devin_button]
+                    .into_iter()
+                    .flatten()
+                    .map(|button| button.left())
+                    .fold(controls_left, f32::min)
             } else {
                 header.right()
             };
@@ -5309,6 +5427,10 @@ impl EditorApp {
 
         if agent_button.is_some_and(|button| self.draw_agent_toggle(ui, button)) {
             self.execute_keybinding(KeybindingCommand::AppToggleAgentSidebar, None, ui.ctx());
+            ui.ctx().request_repaint();
+        }
+        if devin_button.is_some_and(|button| self.draw_devin_toggle(ui, button)) {
+            self.execute_keybinding(KeybindingCommand::AppToggleDevinSidebar, None, ui.ctx());
             ui.ctx().request_repaint();
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
@@ -5731,6 +5853,31 @@ impl EditorApp {
         response.clicked()
     }
 
+    fn draw_devin_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
+        let label = if self.devin_sidebar {
+            "Close Devin"
+        } else {
+            "Open Devin"
+        };
+        let response = ui
+            .interact(button, Id::new("devin_sidebar_toggle"), Sense::click())
+            .on_hover_text(label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        icons::paint(
+            ui.painter(),
+            Icon::Bolt,
+            egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
+            if response.hovered() || self.devin_sidebar {
+                theme::accent()
+            } else {
+                theme::text().muted
+            },
+        );
+        response.clicked()
+    }
+
     fn draw_file_tree_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
         let label = if self.sidebar {
             "Hide File Tree"
@@ -5876,6 +6023,12 @@ impl EditorApp {
             self.agent_find.focus = false;
         }
         if enabled {
+            if self.devin_sidebar {
+                self.devin_sidebar = false;
+                if let Some(controller) = self.devin_controller.as_ref() {
+                    let _ = controller.send(DevinCommand::SetVisible(false));
+                }
+            }
             if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
                 let _ = controller.send(AgentCommand::RefreshSessions);
             } else {
@@ -6070,6 +6223,44 @@ impl EditorApp {
         self.draw_agent_image_lightbox(ctx);
         self.draw_agent_file_picker(ctx);
         self.draw_project_folder_picker(ctx);
+        if self.devin_confirm_terminate {
+            let title = self
+                .devin_state
+                .detail
+                .as_ref()
+                .map_or("Terminate Devin session", |detail| {
+                    detail.summary.title.as_str()
+                });
+            let outcome = Dialog::new("devin_terminate_dialog", title)
+                .severity(Severity::Danger)
+                .body("Terminate this remote Devin session? Its work stops permanently and cannot be resumed. Closing or hiding the sidebar does not stop it.")
+                .destructive("Terminate session")
+                .show(ctx);
+            match outcome {
+                Outcome::Destructive => {
+                    self.devin_confirm_terminate = false;
+                    self.devin_pending_lifecycle = Some(DevinLifecycle::Terminate);
+                    self.devin_state.busy = true;
+                    self.send_devin(DevinCommand::TerminateConfirmed);
+                }
+                Outcome::Cancel | Outcome::Dismissed => self.devin_confirm_terminate = false,
+                _ => {}
+            }
+        }
+        if self.devin_confirm_disconnect {
+            let outcome = Dialog::new("devin_disconnect_dialog", "Disconnect Devin")
+                .body("Remove the stored Devin token from this machine? Remote sessions keep running.")
+                .primary("Remove token")
+                .show(ctx);
+            match outcome {
+                Outcome::Primary => {
+                    self.devin_confirm_disconnect = false;
+                    self.send_devin(DevinCommand::Disconnect);
+                }
+                Outcome::Cancel | Outcome::Dismissed => self.devin_confirm_disconnect = false,
+                _ => {}
+            }
+        }
         if self.tree_prompt.is_some() {
             let action = self.tree_prompt.as_ref().map(|prompt| prompt.action);
             let title = match action {

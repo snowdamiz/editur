@@ -63,6 +63,7 @@ pub enum Scope {
     Find,
     ProjectSearch,
     Agent,
+    Devin,
     Terminal,
     Settings,
 }
@@ -81,6 +82,7 @@ impl Scope {
             Self::Find => "Find",
             Self::ProjectSearch => "Project search",
             Self::Agent => "Agent",
+            Self::Devin => "Devin",
             Self::Terminal => "Terminal",
             Self::Settings => "Settings",
         }
@@ -106,6 +108,7 @@ pub enum Command {
     AppDecreaseUiScale,
     AppCloseWindow,
     AppToggleAgentSidebar,
+    AppToggleDevinSidebar,
     AppToggleAgenticView,
     FileSave,
     FileSaveAndClose,
@@ -272,7 +275,12 @@ const DOCUMENT: &[Scope] = &[
     Scope::VimVisual,
     Scope::VimOperator,
 ];
-const DOCUMENT_AND_FIND: &[Scope] = &[Scope::DocumentEditor, Scope::Find, Scope::Agent];
+const DOCUMENT_AND_FIND: &[Scope] = &[
+    Scope::DocumentEditor,
+    Scope::Find,
+    Scope::Agent,
+    Scope::Devin,
+];
 const TREE: &[Scope] = &[Scope::FilesTree];
 const VIM_COMMAND: &[Scope] = &[Scope::VimNormal, Scope::VimVisual, Scope::VimOperator];
 const VIM_NORMAL: &[Scope] = &[Scope::VimNormal];
@@ -329,6 +337,15 @@ pub static CATALOG: &[CommandInfo] = &[
         AppToggleAgentSidebar,
         "application.toggleAgentSidebar",
         "Toggle Agent Sidebar",
+        "Application",
+        GLOBAL,
+        false,
+        false
+    ),
+    info!(
+        AppToggleDevinSidebar,
+        "application.toggleDevinSidebar",
+        "Toggle Devin Sidebar",
         "Application",
         GLOBAL,
         false,
@@ -440,7 +457,12 @@ pub static CATALOG: &[CommandInfo] = &[
         "search.close",
         "Close Search",
         "Search",
-        &[Scope::Find, Scope::ProjectSearch, Scope::Agent],
+        &[
+            Scope::Find,
+            Scope::ProjectSearch,
+            Scope::Agent,
+            Scope::Devin
+        ],
         false,
         false
     ),
@@ -2997,6 +3019,7 @@ pub fn validate_rule(rule: &BindingRule) -> Result<(), String> {
                 | Scope::Find
                 | Scope::ProjectSearch
                 | Scope::Agent
+                | Scope::Devin
                 | Scope::Settings
         ) && printable(key)
             && !stroke.primary

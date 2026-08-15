@@ -113,7 +113,7 @@ pub(crate) fn sidebar_material() -> Color32 {
 pub(crate) fn content_material() -> Color32 {
     #[cfg(target_os = "macos")]
     {
-        let editor = color::surface().editor;
+        let editor = color::mix(color::surface().editor, color::surface().sunken, 0.20);
         Color32::from_rgba_unmultiplied(editor.r(), editor.g(), editor.b(), 216)
     }
     #[cfg(not(target_os = "macos"))]
@@ -122,15 +122,15 @@ pub(crate) fn content_material() -> Color32 {
     }
 }
 
-pub(crate) fn settings_material() -> Color32 {
-    let content = color::settings().content;
+pub(crate) fn secondary_material() -> Color32 {
     #[cfg(target_os = "macos")]
     {
+        let content = color::mix(color::settings().content, color::surface().sunken, 0.20);
         Color32::from_rgba_unmultiplied(content.r(), content.g(), content.b(), 216)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        content
+        color::settings().content
     }
 }
 
@@ -317,7 +317,8 @@ pub(crate) mod editor {
 mod tests {
     use super::super::color;
     use super::{
-        border, content_material, diff, editor, fill, find, hover, selected_focus, sidebar_material,
+        border, content_material, diff, editor, fill, find, hover, secondary_material,
+        selected_focus, sidebar_material,
     };
 
     #[cfg(target_os = "macos")]
@@ -326,12 +327,15 @@ mod tests {
         let backdrop = egui::Color32::from_rgb(72, 64, 112);
         let sidebar = color::composite(sidebar_material(), backdrop);
         let content = color::composite(content_material(), backdrop);
+        let secondary = color::composite(secondary_material(), backdrop);
         let brightness = |color: egui::Color32| {
             u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b())
         };
 
         assert!(content_material().a() > sidebar_material().a());
         assert!(brightness(content) < brightness(sidebar));
+        assert_eq!(secondary_material().a(), content_material().a());
+        assert!(brightness(secondary) < brightness(content));
     }
 
     #[test]

@@ -4,7 +4,7 @@ impl EditorApp {
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter()
-            .rect_filled(rect, 0.0, theme::state::content_material());
+            .rect_filled(rect, 0.0, theme::state::secondary_material());
         self.draw_agent(ui, rect);
     }
 
