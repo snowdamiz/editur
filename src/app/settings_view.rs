@@ -89,7 +89,7 @@ impl EditorApp {
         root.painter()
             .rect_filled(rail, 0.0, theme::state::sidebar_material());
         root.painter()
-            .rect_filled(content, 0.0, theme::settings().content);
+            .rect_filled(content, 0.0, theme::state::settings_material());
         root.painter().vline(
             rail.right(),
             rail.y_range(),

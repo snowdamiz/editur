@@ -186,7 +186,8 @@ impl TerminalPanel {
         rect: egui::Rect,
         root: &Path,
     ) -> TerminalOutput {
-        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        ui.painter()
+            .rect_filled(rect, 0.0, theme::state::content_material());
         let mut error = None;
         let panes = self.pane_layout.rects(rect);
         self.update_tab_drag(ui.ctx(), rect, &panes);
@@ -923,7 +924,6 @@ impl TerminalSession {
         let cursor = (cursor_visible && screen.scrollback() == 0 && !screen.hide_cursor())
             .then(|| screen.cursor_position());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme::surface().editor);
         for row in 0..rows {
             let mut job = LayoutJob::default();
             job.wrap.max_width = f32::INFINITY;

@@ -23,7 +23,7 @@ fn line_height() -> f32 {
 }
 
 pub(crate) fn editor_background() -> Color32 {
-    theme::surface().editor
+    theme::state::content_material()
 }
 
 struct RetainedLine {

@@ -7100,7 +7100,7 @@ fn draw_markdown_preview(
     pane: PaneId,
 ) {
     let rect = ui.available_rect_before_wrap();
-    ui.painter().rect_filled(rect, 0.0, theme::surface().editor);
+    ui.painter().rect_filled(rect, 0.0, editor_background());
     let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
     let side = ((rect.width() - content_width) * 0.5).max(0.0);
     let key = (

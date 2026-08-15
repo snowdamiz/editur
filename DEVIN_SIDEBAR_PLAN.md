@@ -21,7 +21,7 @@ The integration must:
 - Treat Devin file, shell, browser, and Git activity as remote activity. It must not enter Editur's local buffer reconciliation or changed-file state.
 - Keep credentials out of source, preferences, transcripts, diagnostics, and logs.
 
-The detailed visual design is intentionally not defined here. Section 10 records the design work that must be filled in by a separate UI pass.
+The detailed interface design is recorded in Section 10.
 
 ## 3. Non-goals
 
@@ -232,7 +232,7 @@ Exit condition: a deliberately plain internal sidebar can be shown and hidden, s
 
 ### Phase 3: UI design and implementation
 
-Fill in Section 10 before implementing the final sidebar. The design pass may reuse existing Agent visual components, but it must not merge ownership or lifecycle with the Agent sidebar.
+Implement the design recorded in Section 10. The implementation may reuse existing Agent visual components, but it must not merge ownership or lifecycle with the Agent sidebar.
 
 Exit condition: the dedicated Devin sidebar satisfies the approved design states and accessibility checks while preserving the backend contract.
 
@@ -246,9 +246,9 @@ Exit condition: the dedicated Devin sidebar satisfies the approved design states
 
 Exit condition: the definition of done and manual smoke matrix pass without environment-only credentials being required for ordinary users.
 
-## 10. UI design plan — intentionally open
+## 10. UI design plan
 
-The only fixed UI requirements are:
+The fixed UI requirements remain:
 
 - Devin has its own dedicated sidebar.
 - The sidebar has its own show/hide action.
@@ -258,29 +258,278 @@ The only fixed UI requirements are:
 - Authentication, loading, empty, waiting, failure, offline, and rate-limited states must be designed, not left as raw errors.
 - The result must remain keyboard operable and accessible.
 
-The UI design contributor must decide and record:
+The rest of this section records the design decisions that satisfy those requirements. No backend phase should invent temporary product behavior; the Phase 2 development shell exposes the data and commands plainly, then is replaced by this design.
 
-- Sidebar placement, sizing, resizing, and behavior relative to other sidebars and narrow windows.
-- Whether multiple sidebars can coexist or are mutually exclusive presentation surfaces.
-- Session discovery, grouping, filtering, selection, and creation flows.
-- Conversation and activity information hierarchy.
-- Status, origin, ACU, pull-request, attachment, and child-session presentation.
-- Follow-up messaging and lifecycle-control placement.
-- Confirmation and recovery behavior for sleep, archive, unarchive, and terminate.
-- Authentication and organization-selection flows.
-- Notification behavior while the sidebar is hidden.
-- Which existing Agent components should be reused visually and which should remain Devin-specific.
-- Focus order, shortcuts, accessible labels, reduced-motion behavior, minimum hit targets, and screen-reader announcements.
+### 10.1 The user's job, and the design principle that follows
 
-Expected UI-plan outputs:
+The local Agent sidebar is a conversation the user actively drives: one provider, one turn at a time, full attention. Supervising cloud Devin is a different job. The user has kicked off (or been pulled into, via Slack) several long-running remote sessions, then returned to local work. They check in occasionally. Three moments carry almost all of the value:
 
-- State and transition inventory.
-- Wireframes for the chosen desktop widths.
-- Keyboard and accessibility behavior.
-- Component-reuse decision.
-- Final UI acceptance criteria and visual test cases.
+1. **Devin is blocked on them.** A session is waiting for a reply and the remote work is stalled until the user answers. This is the moment the sidebar must make loud, and the reply must be fast to send.
+2. **Devin finished.** The user wants the outcome — usually a pull request — and a way to open it, not a transcript scroll.
+3. **The user wants to kick off new work** against the current repository without leaving the editor.
 
-No backend phase should invent temporary product behavior to answer these design questions. The Phase 2 development shell should expose the data and commands plainly, then be replaced by the approved design.
+Everything else — transcripts, activity feeds, lifecycle controls — is drill-in detail. Therefore the sidebar is **list-first, not chat-first**: its home surface is a triage list of sessions grouped by whether they need the user, and a session's conversation is one level deeper. This is the inverse of the Agent sidebar's hierarchy and is the correct inversion for a supervision surface.
+
+Two boundary truths must stay visible without nagging: Devin works from its remote clone and cannot see unsaved or unpushed local work (surfaced once, in the create flow), and remote activity is remote (activity rows are labeled and never act like local file links).
+
+### 10.2 Placement, sizing, and coexistence
+
+The Devin sidebar docks on the **right**, in the same slot the Agent sidebar uses, with the same geometry: minimum width 320, default 440, drag-resizable up to 720, capped at 52% of content width, using the existing 5px divider and `CursorIcon::ResizeHorizontal` affordance. It stores its own persisted width field (`devin_sidebar_width`), independent of `agent_sidebar_width`.
+
+**Coexistence decisions:**
+
+- The Files explorer coexists with the Devin sidebar exactly as it does with the Agent sidebar.
+- The Agent sidebar and the Devin sidebar are **mutually exclusive presentation surfaces**. Opening one hides the other. Both keep their full state (selected session, scroll position, composer draft) so toggling back restores the surface exactly. Rationale: `split_workspace` has one right slot; two right panels plus the explorer would crush the editor below usable width at common window sizes; and the user's attention model is one assistant surface at a time. This is a presentation constraint only — Devin polling rules follow Devin sidebar visibility, never Agent state.
+- Toggling the Devin sidebar while the full agentic view is active first returns to the IDE layout (`set_agentic_mode(false)`), then opens the sidebar. The agentic view remains an Agent-only surface.
+
+**Show/hide affordances:**
+
+- New command `application.toggleDevinSidebar` in the keybindings catalog, `Global` scope, no default chord (matching `application.toggleAgentSidebar`), bindable through the existing Keybindings UI.
+- A titlebar toggle icon in the right cluster, adjacent to the Agent sparkle toggle, following the existing rect-helper + interact pattern. When the sidebar is open, the icon state inverts and a close control also appears in the sidebar header, mirroring Agent behavior.
+
+At the 320px minimum every layout below must remain functional: repository paths truncate in the middle, timestamps switch to compact relative form, and the metadata strip wraps. Nothing may overflow horizontally.
+
+### 10.3 Navigation model
+
+The sidebar has three views in a push/pop stack:
+
+```text
+Sessions list  ──open session──▶  Session detail
+      │                                 ▲
+      └──New session──▶  Create form ───┘ (on successful create)
+```
+
+- **Back** is a visible chevron button in the detail and create headers. Escape also navigates back when focus is inside the sidebar and no text field consumes it.
+- Selection, scroll position, and composer drafts survive navigation and sidebar hide/show within a run.
+- Hiding the sidebar never changes the view stack; reopening resumes exactly where the user left off, with an immediate refresh per Section 5.5.
+
+### 10.4 Sessions list (home view)
+
+**Header:** the title "Devin", a refresh button, a "New session" button, and an overflow menu (Open Devin web app, Disconnect). A close control on the far edge hides the sidebar.
+
+**Filter row:** a single-line filter field (matches title, prompt snippet, and repository) and a segmented scope control — `Active | All | Archived` — using the existing `segment` component. Default scope: Active.
+
+**Grouped list**, in fixed group order with sticky group labels:
+
+| Group | Contents | Rationale |
+| --- | --- | --- |
+| Needs you | Sessions blocked on user input | The whole point of the surface; always pinned first |
+| Working | Actively running sessions | Ambient awareness |
+| Idle | Sleeping or suspended sessions | Resumable by messaging |
+| Done | Completed, failed, and terminated sessions | Outcomes to review |
+
+Within each group, most recently updated first. Archived sessions appear only under the Archived scope. Empty groups are omitted, not rendered empty.
+
+**Row anatomy** (two lines, standard row height and hover/selection overlays from the theme):
+
+- Line 1: status dot (colors per 10.7) · session title (or first-prompt snippet when untitled) · pull-request chip when the session has one.
+- Line 2 (muted, smaller): status phrase · relative time since last activity · origin glyph (Slack, Devin web, Editur) · `owner/repository`.
+
+The status dot carries the raw `status_detail` as hover text. Rows are focusable and open the detail view on click or Enter.
+
+**Footer freshness line** (single muted line, always present when connected): "Updated 8s ago", switching to "Retrying…" during transient failures and "Rate limited — refresh slowed" during backoff. This line is the *only* surface for transient poll problems; they must not toast, flash, or clear the list.
+
+**List empty states:**
+
+- Connected, no sessions in scope: a centered empty state with one sentence and a "New session" button (Archived scope: sentence only).
+- Not connected: the connect card (10.9) replaces the list entirely.
+
+### 10.5 Session detail
+
+Top-to-bottom anatomy:
+
+1. **Header:** back chevron · session title · status pill (semantic category text; raw `status_detail` beneath it in micro type) · overflow menu with lifecycle actions: Sleep, Archive (or Unarchive), Open in Devin web app, and Terminate (styled with the danger token, separated last).
+2. **Metadata strip** (wrapping, muted): `owner/repository` · origin · created time · ACU usage as `used / limit` when a limit exists, otherwise `used ACUs` · parent-session link when present · child-session links when present. Parent and child links navigate within the sidebar to that session's detail view; there is no tree UI (per Section 3 non-goals).
+3. **Pull-request card**, pinned above the conversation whenever the session has one or more pull requests: PR title, state (draft/open/merged/closed), and an "Open" action that launches the system browser. This is the payoff artifact and must not be buried in the transcript. Multiple PRs stack as compact rows in one card.
+4. **Conversation and activity stream** (scrollable, stick-to-bottom, height-culled like the Agent transcript):
+   - User messages and Devin messages reuse the Agent bubble and markdown-galley rendering.
+   - Remote activity events (shell, file, browser, Git, MCP, todo) render as dense collapsed rows, visually akin to the Agent's dense tool rows but clearly badged as remote. Consecutive activity events between two messages collapse into one expandable group row summarizing the burst (e.g. "14 remote actions — commands, file edits"). Expansion reveals individual rows with category icon, summary, timestamp, and bounded detail.
+   - Remote file paths render as plain styled text with the session's repository as context. They are **not** `agent_path_link`s and never open local buffers.
+   - Message attachments render as chips on the owning message; activating one opens the attachment URL in the system browser. Attachments are never auto-downloaded, and attachment URLs are never displayed raw (they may embed credentials).
+5. **Waiting-on-you callout:** when the session is blocked on user input, a warning-toned callout sits directly above the composer — "Devin is waiting for your reply" — and the composer receives focus when the detail view opens in this state.
+6. **Composer:** multiline text field at the bottom, Enter sends, Shift+Enter inserts a newline — identical muscle memory to the Agent composer, with its own focus id (`devin_prompt`). Behavior by session state:
+   - Active or blocked: enabled, placeholder "Message Devin".
+   - Sleeping: enabled, placeholder "Message Devin — sending will wake this session".
+   - Terminated or archived: replaced by a single muted line stating why messaging is unavailable (with an Unarchive action for archived sessions).
+
+Sent messages append optimistically with a pending affordance and reconcile against polled results by identity; a send failure marks the message with a retry action rather than silently dropping it.
+
+### 10.6 Create-session flow
+
+Creation is a pushed view (10.3), not a modal. Fields, in order:
+
+1. **Repository** — prefilled from the normalized `origin` remote (Section 7). When the remote is absent or ambiguous, the field is empty with inline guidance and requires explicit entry; the form never guesses. Free-text `owner/repository` entry is always permitted.
+2. **Prompt** — multiline, the dominant element of the form, autofocused when the repository is prefilled.
+3. A passive one-line boundary note: "Devin works from the remote repository. Local uncommitted or unpushed changes are not visible to it." When the local project has uncommitted changes or unpushed commits, this line is present-tense and specific ("You have unpushed commits on `branch`"); otherwise it stays generic.
+
+The first release intentionally exposes no tags, playbook, mode, or ACU-limit controls; sessions are tagged `editur` invisibly (Section 7). "Create" disables the form, shows an inline progress row, and on success navigates to the new session's detail view. On failure the form re-enables with a sanitized inline error callout above the actions — never a toast, since the user's prompt text is at stake and must remain visible and editable.
+
+### 10.7 Status vocabulary and visual language
+
+The backend's semantic categories (Section 5.3) map to fixed presentation:
+
+| Category | Typical raw statuses | Color token | Motion |
+| --- | --- | --- | --- |
+| Needs you | blocked, awaiting user input | `semantic.warning` | None |
+| Working | running, executing | `accent` | Subtle pulse on the status dot |
+| Idle | sleeping, suspended | muted text tone | None |
+| Finished | completed | `semantic.success` | None |
+| Failed | failed, errored, terminated | `semantic.danger` | None |
+
+Raw status and `status_detail` are always reachable — hover text on list dots, micro type under the detail status pill — but the category wording above is what the UI leads with. Unknown raw statuses map to a neutral category rendered with the raw string, never an error state.
+
+Origin is a small glyph plus hover text (Slack, Devin web, Editur, other/unknown), used identically in list rows and the detail metadata strip. The Working pulse is the only animation on this surface and must degrade to a static dot when animations are disabled.
+
+### 10.8 Lifecycle controls, confirmation, and recovery
+
+All lifecycle controls live in the detail overflow menu (10.5). None appear on list rows — accidental lifecycle actions from a triage list are worse than one extra click.
+
+| Action | Confirmation | Feedback | Recovery |
+| --- | --- | --- | --- |
+| Sleep | None (reversible by messaging) | Status pill updates on next poll; menu item disables while in flight | Send a message to wake |
+| Archive | None (reversible) | Toast "Session archived"; view pops back to the list | Archived scope → Unarchive |
+| Unarchive | None | Status updates in place | — |
+| Terminate | **Modal `Dialog`, danger severity**, destructive-styled "Terminate session" button; body states that remote work stops permanently and cannot be resumed | Toast on success; session moves to Done | None — that is the point of the dialog |
+| Send message | None | Optimistic append (10.5) | Inline retry on the failed message |
+
+A lifecycle command failure surfaces as a danger toast with a sanitized message; the session's displayed state always re-converges to polled truth rather than trusting the optimistic transition.
+
+The existing Agent `Cancel` action, keybindings, and permission cards are not connected to any of this (Section 5.2).
+
+### 10.9 Authentication and connection states
+
+There is no Devin section in Settings in the first release; connection lives entirely in the sidebar, mirroring how Agent providers authenticate in-surface.
+
+- **Disconnected:** the sidebar body is a single connect card: one sentence of explanation, a masked single-line token field, a "Connect" button, and a link to Devin's personal-access-token documentation. The token is stored per Section 6 (environment for dev builds, OS credential store before release) and is never echoed back after entry.
+- **Developer environment key:** when `DEVIN_API_KEY` is present, the connect card is skipped and the list header overflow shows "Using environment credentials" as a non-interactive informational item.
+- **Organization selection:** if the authenticated identity requires choosing an organization, the connect card gains one dropdown after token validation. Single-organization identities never see it.
+- **Connecting / validating:** the connect card's button shows inline progress; the sidebar never blocks the rest of the editor.
+- **Auth failure at connect:** inline danger callout on the connect card ("That token was rejected" / "That token lacks session permissions"), field preserved for correction. Raw response bodies never render.
+- **Auth failure mid-session (401/403 after connect):** a persistent warning banner pinned above the current view — "Devin connection lost — Reconnect" — with the last-fetched data left visible and clearly stale via the freshness line. Reconnect returns to the connect card with context intact.
+- **Disconnect:** in the list-header overflow, confirmed with a neutral dialog ("Remove the stored Devin token from this machine?"). Disconnecting clears in-memory Devin state and shows the connect card; it never touches remote sessions.
+
+### 10.10 State and transition inventory
+
+Surface-level states the implementation must render and test:
+
+| State | Entered when | Visible UI |
+| --- | --- | --- |
+| Disconnected | No credentials | Connect card (10.9) |
+| Connecting | Token submitted | Connect card with inline progress |
+| Auth failed | 401/403 at connect | Connect card with danger callout |
+| Auth lost | 401/403 after connect | Reconnect banner over stale data |
+| List loading | First fetch after connect | Skeleton rows or centered progress, header enabled |
+| List empty | Fetch succeeded, no sessions in scope | Empty state with create action |
+| List loaded | Sessions present | Grouped list (10.4) |
+| List stale / retrying | Transient poll failure | Unchanged list, footer "Retrying…" |
+| Rate limited | 429 / backoff active | Unchanged list, footer "Rate limited — refresh slowed" |
+| Detail loading | Session opened, first fetch pending | Header + metadata immediately (from list data), stream placeholder |
+| Detail loaded | Messages/events present | Full detail (10.5) |
+| Needs-you detail | Session blocked on input | Waiting callout, composer focused |
+| Terminal-session detail | Completed/failed/terminated | Stream intact, composer replaced per 10.5 |
+| Create form | "New session" | Form (10.6) |
+| Create submitting | Create sent | Disabled form, inline progress |
+| Create failed | Create rejected | Re-enabled form, inline callout, prompt preserved |
+| Offline | Network unreachable | Footer "Offline — will retry", stale data preserved |
+
+Transitions between these states must never discard user-entered text (filter, composer drafts, create prompt) and must never clear fetched data in response to a fetch failure.
+
+### 10.11 Notification behavior while the sidebar is hidden
+
+**None in the first release.** Polling stops when the sidebar hides (Section 5.5), so any hidden-state badge would show stale data and train the user to distrust it. The titlebar toggle is a plain icon with no attention dot. Background desktop notifications and a live "needs you" badge are one deferred follow-on (Section 12) and must ship together with an explicitly designed background-polling mode, since both require the same data freshness guarantee.
+
+While the sidebar is *visible*, no separate notification mechanism is needed — the Needs-you group at the top of the list is the notification.
+
+### 10.12 Keyboard, focus, and accessibility
+
+- **Scope:** a new `Scope::Devin` is active when focus is on `devin_prompt`, the list filter field, or the create form fields, following the existing scope-detection pattern.
+- **Focus order:** opening the sidebar focuses the sessions list. In the list: Up/Down move between rows across group boundaries, Enter opens detail, type-ahead goes to the filter field. In detail: focus lands on the composer (always when the session needs a reply), Escape steps back to the list, Shift+Tab reaches the header controls. In the create form: repository → prompt → create/cancel.
+- **Composer keys:** Enter sends, Shift+Enter newline — identical to the Agent composer.
+- **Hit targets:** all interactive elements use standard control heights from the theme metrics; the status dot itself is not the hit target — the whole row is.
+- **Accessible labels:** every interactive element sets `WidgetInfo`. Session rows announce title, semantic status, repository, and relative time as one label. The status pill announces the semantic category and the raw detail. The terminate dialog inherits the existing `Dialog` keyboard behavior (Enter confirms only the safe default, Escape cancels).
+- **Reduced motion:** the Working pulse (10.7) is the only animation and falls back to a static dot when animations are disabled.
+- **Color independence:** status is never conveyed by dot color alone — the status phrase on line 2 of each row and the pill text in detail carry the same information.
+
+### 10.13 Component-reuse decision
+
+| Reuse as-is | Adapt | Devin-specific (new) | Explicitly not reused |
+| --- | --- | --- | --- |
+| Theme tokens (`surface`, `semantic`, `accent`, metrics, motion) | Right-sidebar split, resize, and toggle plumbing (new fields, same pattern) | Session list rows and group headers | Agent provider selector and provider identity marks |
+| `Dialog` for terminate/disconnect | Transcript `ScrollArea` with height culling and stick-to-bottom | Status pill and origin glyphs | Agent permission cards |
+| `Toasts` for lifecycle feedback | Message bubbles and markdown galleys | Metadata strip and PR card | Agent diff rendering and changed-files footer (remote activity never becomes local diffs) |
+| `chip`, `segment`, `selectable_row`, `icon_button` | Dense tool-row visuals → remote activity rows (re-badged, non-linking) | Connect card and reconnect banner | `agent_path_link` (would imply local files) |
+| `TextEdit` composer anatomy (Enter/Shift+Enter) | Titlebar toggle rect/draw pattern | Create form and freshness footer | Agent session selector menus |
+
+The adapted components share visual language with the Agent sidebar so the app feels like one product, while every piece that implies *local* agency (paths, diffs, permissions, provider identity) stays out so the remote boundary is never blurred.
+
+### 10.14 Wireframes
+
+Sessions list at the default 440px width:
+
+```text
+┌────────────────────────────────────────────┐
+│ Devin                        ⟳   + New  ⋯ ✕│  header
+├────────────────────────────────────────────┤
+│ [ Filter sessions…      ] Active│All│Arch  │  filter + scope
+├────────────────────────────────────────────┤
+│ NEEDS YOU                                  │
+│ ● Fix flaky auth retry test                │
+│   Waiting for reply · 4m · ⧉ · owner/repo  │
+│ WORKING                                    │
+│ ◐ Add CSV export to reports                │
+│   Writing code · 12m · ✎ · owner/repo      │
+│ DONE                                       │
+│ ✓ Refactor tree traversal      [PR #142]   │
+│   Completed · 2h · ⌂ · owner/repo          │
+├────────────────────────────────────────────┤
+│ Updated 8s ago                             │  freshness footer
+└────────────────────────────────────────────┘
+```
+
+Session detail at 440px, session blocked on the user:
+
+```text
+┌────────────────────────────────────────────┐
+│ ‹  Fix flaky auth retry test            ⋯ │  back · title · menu
+│    Needs you — waiting for your reply      │  pill + raw detail
+├────────────────────────────────────────────┤
+│ snowdamiz/editur · Slack · started 2h ago  │  metadata strip
+│ 3.2 / 10 ACUs                              │
+├────────────────────────────────────────────┤
+│ ▣ PR #142 · Fix flaky auth retry    Open ↗ │  PR card (when present)
+├────────────────────────────────────────────┤
+│ YOU   Investigate the flaky auth test      │
+│ DEVIN I reproduced it; the token refresh   │
+│       races the retry timer…               │
+│ ▸ 14 remote actions — commands, edits      │  collapsed activity group
+│ DEVIN Should I pin the clock in the test   │
+│       or widen the retry window?           │
+│ ⚠ Devin is waiting for your reply          │  callout
+├────────────────────────────────────────────┤
+│ [ Message Devin…                    ] Send │  composer (focused)
+└────────────────────────────────────────────┘
+```
+
+At the 320px minimum: repository paths middle-truncate, the scope segment collapses to a dropdown, the metadata strip wraps to as many lines as needed, timestamps use compact form ("4m"), and the PR card compresses to one row. No horizontal scrolling anywhere.
+
+### 10.15 UI acceptance criteria and visual test cases
+
+Acceptance criteria (all must hold, in addition to the Section 11 definition of done):
+
+1. Opening the Devin sidebar while the Agent sidebar is open hides Agent and restores it fully — transcript, draft, scroll — when toggled back, and vice versa.
+2. A session blocked on user input appears in the Needs-you group within one selected-session poll interval, and opening it focuses the composer with the waiting callout visible.
+3. Enter sends and Shift+Enter inserts a newline in the Devin composer, matching the Agent composer exactly.
+4. Terminate is impossible without the danger dialog; Escape cancels it; no other lifecycle action shows a modal.
+5. A transient poll failure changes only the freshness footer; the list, detail stream, and all user-entered text are untouched.
+6. Rate limiting and offline states are visibly distinguished in the footer and never toast.
+7. The connect card never echoes a stored token, and no token fragment appears in any rendered error.
+8. Remote file paths in activity rows are not clickable into local buffers, and no Devin activity appears in the editor's changed-files or diff surfaces.
+9. Create with an absent or ambiguous origin requires explicit repository entry and shows the boundary note; a failed create preserves the prompt text.
+10. Every session row, control, and dialog is reachable and operable by keyboard alone, and each carries an accessible label including status conveyed as text.
+11. At 320px width, all views render without horizontal overflow or clipped controls.
+12. With animations disabled, the Working indicator renders static.
+
+Visual test cases: capture each state in the Section 10.10 inventory at 320px and 440px, plus the terminate dialog, the disconnect dialog, an expanded activity group, a multi-PR card, and a detail view for each of the five semantic status categories. These captures form the review set for the Phase 3 exit condition.
 
 ## 11. Definition of done
 
@@ -295,7 +544,7 @@ The integration is complete when:
 - Remote activity never appears as a local file mutation.
 - Credentials and sensitive response material are not persisted or logged.
 - Automated fake-transport tests and the manual authenticated smoke matrix pass.
-- Section 10 has been completed by the UI design pass and its acceptance criteria pass.
+- The Section 10 design is implemented and its acceptance criteria and visual test cases pass.
 
 ## 12. Deferred follow-ons
 

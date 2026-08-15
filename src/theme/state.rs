@@ -108,6 +108,32 @@ pub(crate) fn sidebar_material() -> Color32 {
     }
 }
 
+/// The quieter native material used behind primary content. It reveals less
+/// of the desktop than the sidebar so code and long-form text stay dominant.
+pub(crate) fn content_material() -> Color32 {
+    #[cfg(target_os = "macos")]
+    {
+        let editor = color::surface().editor;
+        Color32::from_rgba_unmultiplied(editor.r(), editor.g(), editor.b(), 216)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        color::surface().editor
+    }
+}
+
+pub(crate) fn settings_material() -> Color32 {
+    let content = color::settings().content;
+    #[cfg(target_os = "macos")]
+    {
+        Color32::from_rgba_unmultiplied(content.r(), content.g(), content.b(), 216)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        content
+    }
+}
+
 pub(crate) mod border {
     use egui::{Color32, Stroke};
 
@@ -290,7 +316,23 @@ pub(crate) mod editor {
 #[cfg(test)]
 mod tests {
     use super::super::color;
-    use super::{border, diff, editor, fill, find, hover, selected_focus};
+    use super::{
+        border, content_material, diff, editor, fill, find, hover, selected_focus, sidebar_material,
+    };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn main_canvas_material_is_darker_and_quieter_than_the_sidebar() {
+        let backdrop = egui::Color32::from_rgb(72, 64, 112);
+        let sidebar = color::composite(sidebar_material(), backdrop);
+        let content = color::composite(content_material(), backdrop);
+        let brightness = |color: egui::Color32| {
+            u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b())
+        };
+
+        assert!(content_material().a() > sidebar_material().a());
+        assert!(brightness(content) < brightness(sidebar));
+    }
 
     #[test]
     fn light_focus_ring_clears_non_text_contrast() {

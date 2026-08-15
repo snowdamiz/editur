@@ -3,7 +3,8 @@ use super::*;
 impl EditorApp {
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        ui.painter()
+            .rect_filled(rect, 0.0, theme::state::content_material());
         self.draw_agent(ui, rect);
     }
 
@@ -2217,7 +2218,6 @@ impl EditorApp {
                     composer.bottom() - AGENTIC_COMPOSER_BOTTOM_MARGIN,
                 ),
             );
-            ui.painter().rect_filled(composer, 0.0, editor_background());
             ui.painter()
                 .rect_filled(panel, AGENTIC_COMPOSER_RADIUS, agentic_composer_fill());
             ui.painter().rect_stroke(
@@ -2228,8 +2228,6 @@ impl EditorApp {
             );
             panel
         } else {
-            ui.painter()
-                .rect_filled(composer, 0.0, theme::surface().chrome);
             ui.painter().hline(
                 composer.x_range(),
                 composer.top() + 0.5,
