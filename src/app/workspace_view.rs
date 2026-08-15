@@ -3,7 +3,8 @@ use super::*;
 impl EditorApp {
     pub(super) fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        ui.painter()
+            .rect_filled(rect, 0.0, theme::state::sidebar_material());
         let settings = sidebar_settings_rect(rect);
         let tree = rect.with_max_y(settings.top());
         #[cfg(target_os = "macos")]

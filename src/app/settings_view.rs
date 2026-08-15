@@ -77,8 +77,6 @@ impl EditorApp {
     }
 
     pub(super) fn draw_settings(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        root.painter()
-            .rect_filled(window, 0.0, theme::surface().chrome);
         let rail_width = 270.0_f32.min((window.width() * 0.38).max(210.0));
         let rail = egui::Rect::from_min_max(
             window.left_top(),
@@ -89,7 +87,7 @@ impl EditorApp {
             window.right_bottom(),
         );
         root.painter()
-            .rect_filled(rail, 0.0, theme::surface().chrome);
+            .rect_filled(rail, 0.0, theme::state::sidebar_material());
         root.painter()
             .rect_filled(content, 0.0, theme::settings().content);
         root.painter().vline(

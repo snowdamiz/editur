@@ -94,6 +94,20 @@ pub(crate) fn scrim() -> Color32 {
     color::palette().surface.sunken.gamma_multiply(0.45)
 }
 
+/// Tint over macOS's native sidebar material. The partial opacity keeps the
+/// blur visible without letting a bright wallpaper wash out the sidebar.
+pub(crate) fn sidebar_material() -> Color32 {
+    #[cfg(target_os = "macos")]
+    {
+        let chrome = color::surface().chrome;
+        Color32::from_rgba_unmultiplied(chrome.r(), chrome.g(), chrome.b(), 120)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        color::surface().chrome
+    }
+}
+
 pub(crate) mod border {
     use egui::{Color32, Stroke};
 

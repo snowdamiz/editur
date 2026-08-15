@@ -66,7 +66,6 @@ impl TreeSurface {
         scroll_to_selected: bool,
     ) -> TreeOutput {
         let (id, full) = ui.allocate_space(ui.available_size());
-        ui.painter().rect_filled(full, 0.0, theme::surface().chrome);
         let header = full.with_max_y((full.top() + theme::control::ROW).min(full.bottom()));
         let root_clicked = self.draw_root_header(ui, id, header, root);
         let rect = full.with_min_y(header.bottom());

@@ -4777,7 +4777,8 @@ impl EditorApp {
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
+        ui.painter()
+            .rect_filled(rect, 0.0, theme::state::sidebar_material());
         let settings = sidebar_settings_rect(rect);
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
