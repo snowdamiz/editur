@@ -60,6 +60,7 @@ pub enum Scope {
     VimVisual,
     VimOperator,
     FilesTree,
+    SourceControl,
     Find,
     ProjectSearch,
     Agent,
@@ -79,6 +80,7 @@ impl Scope {
             Self::VimVisual => "Vim Visual",
             Self::VimOperator => "Vim Operator-pending",
             Self::FilesTree => "Files tree",
+            Self::SourceControl => "Source control",
             Self::Find => "Find",
             Self::ProjectSearch => "Project search",
             Self::Agent => "Agent",
@@ -128,6 +130,8 @@ pub enum Command {
     FileFocusLeftPane,
     FileFocusRightPane,
     ViewToggleSidebar,
+    ViewToggleExplorer,
+    ViewToggleSourceControl,
     ViewFocusExplorer,
     ViewToggleTerminal,
     ViewToggleMarkdownPreview,
@@ -423,6 +427,14 @@ pub static CATALOG: &[CommandInfo] = &[
     info!(
         ViewToggleSidebar,
         "workbench.toggleSidebar", "Toggle Files Sidebar", "View", GLOBAL, false, false
+    ),
+    info!(
+        ViewToggleExplorer,
+        "workbench.toggleExplorer", "Toggle Explorer", "View", GLOBAL, false, false
+    ),
+    info!(
+        ViewToggleSourceControl,
+        "workbench.toggleSourceControl", "Toggle Source Control", "View", GLOBAL, false, false
     ),
     info!(
         ViewFocusExplorer,
@@ -1851,6 +1863,12 @@ pub fn vscode_bindings() -> Vec<BuiltinBinding> {
             Command::ViewFocusExplorer,
             Scope::Global,
             vec![Stroke::primary(Key::E).with_shift()],
+        ),
+        builtin(
+            "vscode.view.scm",
+            Command::ViewToggleSourceControl,
+            Scope::Global,
+            vec![Stroke::primary(Key::G).with_shift()],
         ),
         builtin(
             "vscode.file.split",

@@ -1155,6 +1155,7 @@ impl ApplicationHandler<InstanceEvent> for Shell {
             }
             WindowEvent::Focused(true) => {
                 self.editor.reconcile_open_buffer();
+                self.editor.schedule_git_refresh();
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),

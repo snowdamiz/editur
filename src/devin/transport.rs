@@ -352,6 +352,48 @@ impl McpTransport {
         self.post(&body, false).map(|_| ())
     }
 
+    /// Downloads attachment bytes from a signed URL. The URL carries its own
+    /// authorization, so no credentials are attached — sending the API key to
+    /// an arbitrary storage host would leak it.
+    #[cfg(feature = "network")]
+    pub(super) fn fetch_attachment(&mut self, url: &str) -> Result<Vec<u8>, TransportError> {
+        if !url.starts_with("https://") {
+            return Err(TransportError::Protocol(
+                "attachment downloads require https".into(),
+            ));
+        }
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Accept", "*/*")
+            .call()
+            .map_err(|_| TransportError::Offline)?;
+        let status = response.status().as_u16();
+        match status {
+            200..=299 => {}
+            401 => return Err(TransportError::Authentication),
+            403 => return Err(TransportError::Forbidden),
+            429 => return Err(TransportError::RateLimited(None)),
+            500..=599 => return Err(TransportError::Offline),
+            _ => return Err(TransportError::Remote(format!("HTTP {status}"))),
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_to_vec()
+            .map_err(|_| TransportError::Offline)?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(TransportError::Oversized);
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(not(feature = "network"))]
+    pub(super) fn fetch_attachment(&mut self, _url: &str) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::Offline)
+    }
+
     #[cfg(feature = "network")]
     fn post(
         &mut self,

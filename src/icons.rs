@@ -29,6 +29,7 @@ pub(crate) enum Icon {
     Home,
     Search,
     Terminal,
+    SourceControl,
     Gear,
     ArrowUp,
     Download,
@@ -40,6 +41,7 @@ pub(crate) enum Icon {
     Robot,
     Sparkle,
     Bolt,
+    Ellipsis,
 }
 
 /// One piece of an icon, in grid coordinates.
@@ -132,6 +134,22 @@ const TERMINAL: &[Segment] = &[
     Segment::Line(&[(4.8, 6.6), (7.0, 8.4), (4.8, 10.2)]),
     Segment::Line(&[(8.4, 10.2), (11.4, 10.2)]),
 ];
+const SOURCE_CONTROL: &[Segment] = &[
+    Segment::Circle {
+        center: (4.0, 4.0),
+        radius: 1.6,
+    },
+    Segment::Circle {
+        center: (4.0, 12.0),
+        radius: 1.6,
+    },
+    Segment::Circle {
+        center: (12.0, 4.0),
+        radius: 1.6,
+    },
+    Segment::Line(&[(4.0, 5.6), (4.0, 10.4)]),
+    Segment::Line(&[(5.6, 4.0), (10.4, 4.0)]),
+];
 const GEAR: &[Segment] = &[
     Segment::Circle {
         center: (8.0, 8.0),
@@ -157,11 +175,28 @@ const DOWNLOAD: &[Segment] = &[
     Segment::Line(&[(3.2, 13.2), (12.8, 13.2)]),
 ];
 const REFRESH: &[Segment] = &[
-    Segment::Circle {
-        center: (8.0, 8.0),
-        radius: 5.2,
-    },
-    Segment::Line(&[(10.4, 2.4), (13.6, 2.4), (13.6, 5.6)]),
+    Segment::Line(&[
+        (3.0, 6.0),
+        (3.7, 4.5),
+        (5.0, 3.3),
+        (6.6, 2.7),
+        (8.3, 2.7),
+        (10.1, 3.2),
+        (11.5, 4.3),
+        (12.3, 5.6),
+    ]),
+    Segment::Line(&[(9.8, 5.6), (12.3, 5.6), (12.3, 3.1)]),
+    Segment::Line(&[
+        (13.0, 10.0),
+        (12.3, 11.5),
+        (11.0, 12.7),
+        (9.4, 13.3),
+        (7.7, 13.3),
+        (5.9, 12.8),
+        (4.5, 11.7),
+        (3.7, 10.4),
+    ]),
+    Segment::Line(&[(6.2, 10.4), (3.7, 10.4), (3.7, 12.9)]),
 ];
 const HISTORY: &[Segment] = &[
     Segment::Circle {
@@ -253,6 +288,20 @@ const BOLT: &[Segment] = &[Segment::Solid(&[
     (12.2, 6.6),
     (8.8, 6.6),
 ])];
+const ELLIPSIS: &[Segment] = &[
+    Segment::Dot {
+        center: (3.4, 8.0),
+        radius: 1.1,
+    },
+    Segment::Dot {
+        center: (8.0, 8.0),
+        radius: 1.1,
+    },
+    Segment::Dot {
+        center: (12.6, 8.0),
+        radius: 1.1,
+    },
+];
 
 fn segments(icon: Icon) -> &'static [Segment] {
     match icon {
@@ -271,6 +320,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Home => HOME,
         Icon::Search => SEARCH,
         Icon::Terminal => TERMINAL,
+        Icon::SourceControl => SOURCE_CONTROL,
         Icon::Gear => GEAR,
         Icon::ArrowUp => ARROW_UP,
         Icon::Download => DOWNLOAD,
@@ -282,12 +332,13 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Robot => ROBOT,
         Icon::Sparkle => SPARKLE,
         Icon::Bolt => BOLT,
+        Icon::Ellipsis => ELLIPSIS,
     }
 }
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 26] = [
+pub(crate) const ALL: [Icon; 28] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -303,6 +354,7 @@ pub(crate) const ALL: [Icon; 26] = [
     Icon::Home,
     Icon::Search,
     Icon::Terminal,
+    Icon::SourceControl,
     Icon::Gear,
     Icon::ArrowUp,
     Icon::Download,
@@ -314,6 +366,7 @@ pub(crate) const ALL: [Icon; 26] = [
     Icon::Robot,
     Icon::Sparkle,
     Icon::Bolt,
+    Icon::Ellipsis,
 ];
 
 /// Paints `icon` centered inside `rect`, scaled from the 16 px grid so the
@@ -579,5 +632,14 @@ mod tests {
                 other => panic!("{icon:?} painted {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn refresh_is_two_joined_directional_arcs() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Refresh, rect, Color32::WHITE);
+
+        assert_eq!(painted.len(), 4);
+        assert!(painted.iter().all(|shape| matches!(shape, Shape::Path(_))));
     }
 }

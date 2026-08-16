@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -12,7 +13,9 @@ use std::{
 use super::{
     credentials::Credentials,
     normalize,
-    state::{ConnectionState, DevinError, DevinEvent, RepositoryState, StatusCategory},
+    state::{
+        Attachment, ConnectionState, DevinError, DevinEvent, RepositoryState, StatusCategory,
+    },
     transport::{ENDPOINT, InteractAction, McpTransport, TransportError},
 };
 
@@ -23,6 +26,7 @@ const LIST_POLL: Duration = Duration::from_secs(20);
 const TERMINAL_POLL: Duration = Duration::from_secs(30);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_ATTACHMENT_REFERENCES: usize = 16;
+const MAX_PREVIEW_FETCHES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DevinCommand {
@@ -140,6 +144,9 @@ struct Worker {
     sessions_cursor: Option<String>,
     schedule: PollSchedule,
     repository_resolved: bool,
+    /// Attachment ids already fetched (or attempted) for the selected
+    /// session, so refresh polls do not re-download previews.
+    fetched_previews: HashSet<String>,
 }
 
 impl Worker {
@@ -159,6 +166,7 @@ impl Worker {
             sessions_cursor: None,
             schedule: PollSchedule::new(Instant::now()),
             repository_resolved: false,
+            fetched_previews: HashSet::new(),
         }
     }
 
@@ -205,6 +213,7 @@ impl Worker {
                     events_cursor: None,
                     category: StatusCategory::Unknown,
                 });
+                self.fetched_previews.clear();
                 self.run_request(Self::refresh_selected);
             }
             DevinCommand::LoadMoreMessages => self.run_request(Self::load_messages),
@@ -428,13 +437,51 @@ impl Worker {
         {
             current.category = detail.summary.category;
         }
+        let previews = detail
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                image_attachment_url(attachment)
+                    .map(|url| (attachment.id.clone(), url.to_owned()))
+            })
+            .collect::<Vec<_>>();
         self.emit(DevinEvent::SessionLoaded {
             session_id: selected.id.clone(),
             generation: selected.generation,
             detail,
         });
         self.load_messages()?;
-        self.load_events()
+        self.load_events()?;
+        self.fetch_attachment_previews(&selected, previews);
+        Ok(())
+    }
+
+    /// Downloads image attachments so the transcript can paint the same
+    /// previews the Agent paints for local prompt images. Previews are an
+    /// enhancement: failures are swallowed and never retried for the
+    /// selection, and the text transcript stands on its own without them.
+    fn fetch_attachment_previews(
+        &mut self,
+        selected: &SelectedSession,
+        previews: Vec<(String, String)>,
+    ) {
+        for (attachment_id, url) in previews.into_iter().take(MAX_PREVIEW_FETCHES) {
+            if !self.fetched_previews.insert(attachment_id.clone()) {
+                continue;
+            }
+            let Ok(bytes) = self
+                .ensure_connected()
+                .and_then(|transport| transport.fetch_attachment(&url))
+            else {
+                continue;
+            };
+            self.emit(DevinEvent::AttachmentFetched {
+                session_id: selected.id.clone(),
+                generation: selected.generation,
+                attachment_id,
+                bytes: bytes.into(),
+            });
+        }
     }
 
     fn load_messages(&mut self) -> Result<(), TransportError> {
@@ -668,6 +715,23 @@ impl PollSchedule {
     }
 }
 
+/// The download URL for an attachment worth previewing inline: an image by
+/// declared media type or by file extension, with a link to fetch it from.
+fn image_attachment_url(attachment: &Attachment) -> Option<&str> {
+    let url = attachment.url.as_deref()?;
+    let by_media_type = attachment
+        .media_type
+        .as_deref()
+        .is_some_and(|media_type| media_type.to_ascii_lowercase().starts_with("image/"));
+    let by_extension = attachment.name.rsplit_once('.').is_some_and(|(_, extension)| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        )
+    });
+    (by_media_type || by_extension).then_some(url)
+}
+
 fn repository_from_origin(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["-C"])
@@ -825,6 +889,38 @@ mod tests {
     }
 
     #[test]
+    fn only_linked_images_qualify_for_preview_downloads() {
+        let image = super::Attachment {
+            id: "a".into(),
+            name: "mock.png".into(),
+            media_type: None,
+            size: None,
+            url: Some("https://storage.example/mock.png?sig=abc".into()),
+        };
+        assert_eq!(
+            super::image_attachment_url(&image),
+            Some("https://storage.example/mock.png?sig=abc")
+        );
+
+        let by_media_type = super::Attachment {
+            name: "mock".into(),
+            media_type: Some("image/webp".into()),
+            ..image.clone()
+        };
+        assert!(super::image_attachment_url(&by_media_type).is_some());
+
+        let log = super::Attachment {
+            name: "results.txt".into(),
+            media_type: Some("text/plain".into()),
+            ..image.clone()
+        };
+        assert_eq!(super::image_attachment_url(&log), None);
+
+        let unlinked = super::Attachment { url: None, ..image };
+        assert_eq!(super::image_attachment_url(&unlinked), None);
+    }
+
+    #[test]
     fn github_remotes_normalize_without_accepting_arbitrary_hosts() {
         assert_eq!(
             super::normalize_github_repository("git@github.com:editur/editor.git").as_deref(),
@@ -901,7 +997,13 @@ mod tests {
         let server = thread::spawn(move || {
             while !server_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => serve_mcp_request(&mut stream),
+                    Ok((mut stream, _)) => {
+                        // Accepted sockets inherit the listener's non-blocking
+                        // mode on macOS; the request reader expects blocking
+                        // reads, so WouldBlock would panic it under load.
+                        stream.set_nonblocking(false).unwrap();
+                        serve_mcp_request(&mut stream);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }

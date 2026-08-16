@@ -130,6 +130,20 @@ pub(crate) fn close_icon_button(ui: &mut Ui) -> Response {
     )
 }
 
+/// The width `chip` will take for `label`, so a row can reserve trailing
+/// space for it before truncating the text that leads.
+pub(crate) fn chip_width(ui: &Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            theme::typography::code_small(),
+            theme::text().primary,
+        )
+        .size()
+        .x
+        + theme::space::MEDIUM
+}
+
 /// A key cap, a mode, a provider: one small piece of state rendered as a solid
 /// token rather than as bare text.
 pub(crate) fn chip(ui: &mut Ui, label: &str) -> Response {
@@ -138,10 +152,7 @@ pub(crate) fn chip(ui: &mut Ui, label: &str) -> Response {
         theme::typography::code_small(),
         theme::text().primary,
     );
-    let size = egui::vec2(
-        galley.size().x + theme::space::MEDIUM,
-        theme::control::COMPACT,
-    );
+    let size = egui::vec2(chip_width(ui, label), theme::control::COMPACT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(
         rect,

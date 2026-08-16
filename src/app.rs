@@ -20,6 +20,7 @@ mod layout;
 mod runtime;
 mod settings_ui;
 mod settings_view;
+mod source_control_view;
 mod window_state;
 mod workspace;
 mod workspace_view;
@@ -68,8 +69,8 @@ use crate::{
     },
     buffer::{Buffer, LARGE_FILE_BYTES},
     components::{
-        chevron_icon_button, chip, close_icon_button, icon_button, segment, selectable_content_row,
-        selectable_row,
+        chevron_icon_button, chip, chip_width, close_icon_button, icon_button, segment,
+        selectable_content_row, selectable_row,
     },
     data_dir,
     devin::{
@@ -83,6 +84,11 @@ use crate::{
     file_io::{
         OpenTarget, ReconcileOutcome, SaveError, child_path, copy_tree_entry, load_buffer,
         reconcile_buffer, resolve_target, reveal_in_file_manager, safe_save, unique_copy_path,
+    },
+    git::{
+        controller::{DiffArea, GitCommand, GitController, GitEvent},
+        state::{GitAvailability, GitState},
+        status::{BranchInfo, ChangeKind, GitEntry, RepositoryStatus},
     },
     icons::{self, Icon},
     instance::{Claim, InstanceEvent, claim, open_running, spawn_listener},
@@ -126,6 +132,20 @@ enum PendingAction {
     OpenTarget(OpenTarget),
     CloseTab(usize),
     Close,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SidebarPane {
+    #[default]
+    Files,
+    SourceControl,
+}
+
+#[derive(Clone)]
+struct GitDiscardRequest {
+    repository: PathBuf,
+    paths: Vec<PathBuf>,
+    untracked: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -309,7 +329,7 @@ const AGENTIC_MODE_TOGGLE_WIDTH: f32 = 48.0;
 const AGENTIC_DIFF_MIN_CONVERSATION: f32 = 420.0;
 const AGENTIC_DIFF_MIN_PANEL: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = if cfg!(target_os = "macos") {
-    72.0 + 2.0 * 34.0 + AGENTIC_MODE_TOGGLE_WIDTH
+    72.0 + 3.0 * 32.0 + AGENTIC_MODE_TOGGLE_WIDTH
 } else {
     120.0
 };
@@ -964,20 +984,55 @@ fn draw_agent_empty_state(
     );
 }
 
-fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
-    let provider = provider_descriptor(provider);
+/// One chat turn's identity line — a small mark, a strong name, and an
+/// optional muted timestamp — shared by every assistant transcript so the
+/// Agent and Devin panels read as the same product.
+fn chat_identity(
+    ui: &mut egui::Ui,
+    name: &str,
+    timestamp: Option<&str>,
+    paint_mark: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(17.0, 20.0), Sense::hover());
-        paint_provider_icon(ui.painter(), rect, provider.icon, theme::text().primary);
+        paint_mark(ui.painter(), rect, theme::text().primary);
         ui.label(
-            RichText::new(provider.display_name)
+            RichText::new(name)
                 .size(theme::typography::BODY_SIZE)
                 .strong()
                 .color(theme::text().primary),
         );
+        if let Some(timestamp) = timestamp.filter(|timestamp| !timestamp.is_empty()) {
+            ui.label(
+                RichText::new(timestamp)
+                    .size(theme::typography::MICRO_SIZE)
+                    .color(theme::text().muted),
+            );
+        }
     });
     ui.add_space(5.0);
+}
+
+/// The user-message bubble every transcript shares: input fill, strong
+/// border, 12 px inset, 8 px corners.
+fn chat_user_bubble(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(theme::surface().input)
+        .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
+        .inner_margin(egui::Margin::same(12))
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add_contents(ui);
+        });
+}
+
+fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
+    let provider = provider_descriptor(provider);
+    chat_identity(ui, provider.display_name, None, |painter, rect, color| {
+        paint_provider_icon(painter, rect, provider.icon, color);
+    });
 }
 
 /// A live provider-branded pulse that follows the latest transcript output.
@@ -2403,26 +2458,24 @@ fn terminal_toggle_rect(file_tree_button: egui::Rect) -> egui::Rect {
     file_tree_button.translate(egui::vec2(file_tree_button.width(), 0.0))
 }
 
+fn source_control_toggle_rect(terminal_button: egui::Rect) -> egui::Rect {
+    terminal_button.translate(egui::vec2(terminal_button.width(), 0.0))
+}
+
 fn sidebar_settings_rect(sidebar: egui::Rect) -> egui::Rect {
     sidebar.with_min_y((sidebar.bottom() - SIDEBAR_SETTINGS_ROW_HEIGHT).max(sidebar.top()))
 }
 
-fn agentic_toggle_rect(file_tree_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
+fn agentic_toggle_rect(preceding_button: egui::Rect, sidebar_right: Option<f32>) -> egui::Rect {
     let right = sidebar_right
-        .map(|right| {
-            if file_tree_button.left() >= right {
-                right
-            } else {
-                right.max(file_tree_button.right() + AGENTIC_MODE_TOGGLE_WIDTH)
-            }
-        })
-        .unwrap_or(file_tree_button.right() + AGENTIC_MODE_TOGGLE_WIDTH);
+        .unwrap_or_default()
+        .max(preceding_button.right() + AGENTIC_MODE_TOGGLE_WIDTH);
     egui::Rect::from_center_size(
         egui::pos2(
             right - AGENTIC_MODE_TOGGLE_WIDTH * 0.5,
-            file_tree_button.center().y,
+            preceding_button.center().y,
         ),
-        egui::vec2(AGENTIC_MODE_TOGGLE_WIDTH, file_tree_button.height()),
+        egui::vec2(AGENTIC_MODE_TOGGLE_WIDTH, preceding_button.height()),
     )
 }
 
@@ -3072,6 +3125,17 @@ struct GalleyKey {
 
 type MarkdownLayoutCache = Option<((u64, u32, u64), Arc<egui::Galley>)>;
 
+#[derive(Clone)]
+struct GitDiffTab {
+    repository: PathBuf,
+    path: PathBuf,
+    area: DiffArea,
+    old: Option<String>,
+    new: String,
+    generation: u64,
+    unsaved_editor_changes: bool,
+}
+
 struct FileTab {
     buffer: Buffer,
     editor_surface: EditorSurface,
@@ -3083,6 +3147,7 @@ struct FileTab {
     /// against the live buffer) instead of the editor. `None` inside means
     /// the agent created the file, so every line shows as added.
     agent_diff: Option<Option<String>>,
+    git_diff: Option<GitDiffTab>,
     vim: VimState,
 }
 
@@ -3829,6 +3894,7 @@ impl FileTab {
             markdown_preview: false,
             markdown_layout: None,
             agent_diff: None,
+            git_diff: None,
             vim: VimState::default(),
         }
     }
@@ -3864,8 +3930,13 @@ pub struct EditorApp {
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     bracket_pair_key: Option<(u64, usize)>,
     sidebar: bool,
+    sidebar_pane: SidebarPane,
     sidebar_width: f32,
     sidebar_dragging: bool,
+    git_state: GitState,
+    git_controller: Option<GitController>,
+    git_refresh_at: Option<Instant>,
+    git_discard: Option<GitDiscardRequest>,
     terminal_open: bool,
     terminal_height: f32,
     terminal_dragging: bool,
@@ -3894,8 +3965,6 @@ pub struct EditorApp {
     devin_create_prompt: String,
     devin_creating: bool,
     devin_message: String,
-    devin_attachment_ids: HashSet<String>,
-    devin_expanded_activity_groups: HashSet<String>,
     devin_pending_message: Option<PendingDevinMessage>,
     devin_pending_lifecycle: Option<DevinLifecycle>,
     devin_confirm_terminate: bool,
@@ -3935,6 +4004,7 @@ pub struct EditorApp {
     pending_agent_prompt: bool,
     focus_editor: bool,
     tree_focused: bool,
+    scm_focused: bool,
     tree_prompt: Option<TreePrompt>,
     tree_delete: Option<PathBuf>,
     tree_clipboard: Option<TreeClipboard>,
@@ -4052,8 +4122,13 @@ impl EditorApp {
             bracket_pair: None,
             bracket_pair_key: None,
             sidebar: true,
+            sidebar_pane: SidebarPane::Files,
             sidebar_width: 248.0,
             sidebar_dragging: false,
+            git_state: GitState::default(),
+            git_controller: None,
+            git_refresh_at: None,
+            git_discard: None,
             terminal_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_dragging: false,
@@ -4082,8 +4157,6 @@ impl EditorApp {
             devin_create_prompt: String::new(),
             devin_creating: false,
             devin_message: String::new(),
-            devin_attachment_ids: HashSet::new(),
-            devin_expanded_activity_groups: HashSet::new(),
             devin_pending_message: None,
             devin_pending_lifecycle: None,
             devin_confirm_terminate: false,
@@ -4117,6 +4190,7 @@ impl EditorApp {
             pending_agent_prompt: false,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
+            scm_focused: false,
             tree_prompt: None,
             tree_delete: None,
             tree_clipboard: None,
@@ -4282,6 +4356,8 @@ impl EditorApp {
             self.open_agent(&ctx);
         }
         self.poll_git_workspace_status();
+        self.flush_git_refresh(&ctx);
+        self.poll_git();
         self.poll_agent(&ctx);
         self.poll_devin(&ctx);
         if self.agent.active {
@@ -5071,8 +5147,11 @@ impl EditorApp {
         );
         let file_tree_button = file_tree_toggle_rect(rect, agent_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
-        let agentic_button =
-            agentic_toggle_rect(terminal_button, sessions.map(|sessions| sessions.right()));
+        let source_control_button = source_control_toggle_rect(terminal_button);
+        let agentic_button = agentic_toggle_rect(
+            source_control_button,
+            sessions.map(|sessions| sessions.right()),
+        );
         #[cfg(target_os = "macos")]
         let controls_right = rect.right();
         #[cfg(not(target_os = "macos"))]
@@ -5080,7 +5159,7 @@ impl EditorApp {
         let sidebar_drag_rect = egui::Rect::from_min_max(
             egui::pos2(
                 if cfg!(target_os = "macos") {
-                    terminal_button.right()
+                    source_control_button.right()
                 } else {
                     rect.left()
                 },
@@ -5093,7 +5172,7 @@ impl EditorApp {
         let drag_right = diff_left.map_or(controls_right, |left| controls_right.min(left));
         let drag_rect = egui::Rect::from_min_max(
             egui::pos2(
-                agentic_button.right().max(terminal_button.right()) + 4.0,
+                agentic_button.right().max(source_control_button.right()) + 4.0,
                 rect.top(),
             ),
             egui::pos2(drag_right, rect.bottom()),
@@ -5107,11 +5186,15 @@ impl EditorApp {
             }
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
-            self.execute_keybinding(KeybindingCommand::ViewToggleSidebar, None, ui.ctx());
+            self.execute_keybinding(KeybindingCommand::ViewToggleExplorer, None, ui.ctx());
             self.sidebar_dragging = false;
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
+        }
+        if self.draw_source_control_toggle(ui, source_control_button) {
+            self.execute_keybinding(KeybindingCommand::ViewToggleSourceControl, None, ui.ctx());
+            self.sidebar_dragging = false;
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
@@ -5354,8 +5437,9 @@ impl EditorApp {
             egui::Rect::from_min_max(egui::pos2(editor.left(), rect.top()), editor.right_top());
         let file_tree_button = file_tree_toggle_rect(rect, editor_header);
         let terminal_button = terminal_toggle_rect(file_tree_button);
+        let source_control_button = source_control_toggle_rect(terminal_button);
         let agentic_button = agentic_toggle_rect(
-            terminal_button,
+            source_control_button,
             self.sidebar.then_some(editor_header.left()),
         );
         #[cfg(target_os = "macos")]
@@ -5376,7 +5460,7 @@ impl EditorApp {
             agentic_button.right() + 4.0
         };
         #[cfg(not(target_os = "macos"))]
-        let first_tabs_left = terminal_button.right().max(agentic_button.right()) + 4.0;
+        let first_tabs_left = source_control_button.right().max(agentic_button.right()) + 4.0;
         for (pane, pane_rect) in panes
             .iter()
             .copied()
@@ -5414,7 +5498,7 @@ impl EditorApp {
             }
         }
         #[cfg(target_os = "macos")]
-        let sidebar_drag_left = terminal_button.right();
+        let sidebar_drag_left = source_control_button.right();
         #[cfg(not(target_os = "macos"))]
         let sidebar_drag_left = rect.left();
         let sidebar_drag_right = (agentic_button.left() - 3.0).max(sidebar_drag_left);
@@ -5462,12 +5546,17 @@ impl EditorApp {
             ui.ctx().request_repaint();
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
-            self.execute_keybinding(KeybindingCommand::ViewToggleSidebar, None, ui.ctx());
+            self.execute_keybinding(KeybindingCommand::ViewToggleExplorer, None, ui.ctx());
             self.sidebar_dragging = false;
             ui.ctx().request_repaint();
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
             self.execute_keybinding(KeybindingCommand::ViewToggleTerminal, None, ui.ctx());
+        }
+        if self.draw_source_control_toggle(ui, source_control_button) {
+            self.execute_keybinding(KeybindingCommand::ViewToggleSourceControl, None, ui.ctx());
+            self.sidebar_dragging = false;
+            ui.ctx().request_repaint();
         }
         if self.draw_agentic_toggle(ui, agentic_button) {
             self.execute_keybinding(KeybindingCommand::AppToggleAgenticView, None, ui.ctx());
@@ -5910,7 +5999,8 @@ impl EditorApp {
     }
 
     fn draw_file_tree_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
-        let label = if self.sidebar {
+        let active = self.sidebar && self.sidebar_pane == SidebarPane::Files;
+        let label = if active {
             "Hide File Tree"
         } else {
             "Show File Tree"
@@ -5921,7 +6011,7 @@ impl EditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
         });
-        draw_sidebar_toggle_icon(ui, button, &response, self.sidebar);
+        draw_sidebar_toggle_icon(ui, button, &response, active);
         response.clicked()
     }
 
@@ -5947,6 +6037,32 @@ impl EditorApp {
             Icon::Terminal,
             egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
             color,
+        );
+        response.clicked()
+    }
+
+    fn draw_source_control_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
+        let active = self.sidebar && self.sidebar_pane == SidebarPane::SourceControl;
+        let label = if active {
+            "Hide Source Control"
+        } else {
+            "Show Source Control"
+        };
+        let response = ui
+            .interact(button, Id::new("source_control_toggle"), Sense::click())
+            .on_hover_text(label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        icons::paint(
+            ui.painter(),
+            Icon::SourceControl,
+            egui::Rect::from_center_size(button.center(), egui::Vec2::splat(icons::GRID)),
+            if response.hovered() || active {
+                theme::text().primary
+            } else {
+                theme::text().muted
+            },
         );
         response.clicked()
     }
@@ -6254,6 +6370,7 @@ impl EditorApp {
         self.draw_agent_image_lightbox(ctx);
         self.draw_agent_file_picker(ctx);
         self.draw_project_folder_picker(ctx);
+        self.draw_git_discard_dialog(ctx);
         if self.devin_confirm_terminate {
             let title = self
                 .devin_state
@@ -7072,26 +7189,25 @@ fn agentic_project_row(
         .file_name()
         .unwrap_or(root.as_os_str())
         .to_string_lossy();
-    let height = match status {
-        Some(status) if status.pull_request.is_some() => 58.0,
-        Some(_) => 44.0,
-        None => theme::control::ROW + theme::space::TIGHT,
+    let pull_request = status.and_then(|status| status.pull_request.as_ref());
+    let height = if pull_request.is_some() {
+        44.0
+    } else {
+        theme::control::ROW + theme::space::TIGHT
     };
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let hover = status
-        .and_then(|status| status.pull_request.as_ref())
-        .map_or_else(
-            || root.display().to_string(),
-            |pull_request| {
-                format!(
-                    "{}\n{}\n{}",
-                    root.display(),
-                    pull_request.title,
-                    pull_request.url
-                )
-            },
-        );
+    let hover = pull_request.map_or_else(
+        || root.display().to_string(),
+        |pull_request| {
+            format!(
+                "{}\n{}\n{}",
+                root.display(),
+                pull_request.title,
+                pull_request.url
+            )
+        },
+    );
     let response = ui
         .interact(rect, Id::new(("agentic_project", root)), Sense::click())
         .on_hover_text(hover);
@@ -7115,7 +7231,7 @@ fn agentic_project_row(
             theme::state::hover(),
         );
     }
-    let name_y = status.map_or(rect.center().y, |_| rect.top() + 16.0);
+    let name_y = pull_request.map_or(rect.center().y, |_| rect.top() + 13.0);
     icons::paint(
         ui.painter(),
         Icon::Folder,
@@ -7140,23 +7256,14 @@ fn agentic_project_row(
             theme::text().secondary
         },
     );
-    if let Some(status) = status {
+    if let Some(pull_request) = pull_request {
         ui.painter().text(
-            egui::pos2(rect.left() + 31.0, rect.top() + 33.0),
+            egui::pos2(rect.left() + 31.0, rect.top() + 30.0),
             Align2::LEFT_CENTER,
-            &status.branch,
+            pull_request.label(),
             theme::typography::micro(),
-            theme::text().muted,
+            theme::accent(),
         );
-        if let Some(pull_request) = &status.pull_request {
-            ui.painter().text(
-                egui::pos2(rect.left() + 31.0, rect.top() + 48.0),
-                Align2::LEFT_CENTER,
-                pull_request.label(),
-                theme::typography::micro(),
-                theme::accent(),
-            );
-        }
     }
     response.clicked()
 }
@@ -7238,12 +7345,8 @@ fn agent_session_row(
     } else {
         theme::text().secondary
     };
-    let font = if compact {
-        if selected {
-            theme::typography::small_strong()
-        } else {
-            theme::typography::small()
-        }
+    let font = if compact && selected {
+        theme::typography::strong()
     } else {
         theme::typography::body()
     };

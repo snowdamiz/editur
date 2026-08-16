@@ -292,6 +292,9 @@ impl EditorApp {
         let mut conflict = None;
         let mut error = None;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.git_diff.is_some() {
+                continue;
+            }
             match reconcile_buffer(&mut tab.buffer) {
                 Ok(ReconcileOutcome::Unchanged) => {}
                 Ok(ReconcileOutcome::Reloaded) => {
@@ -340,6 +343,7 @@ impl EditorApp {
     }
 
     pub(super) fn refresh_after_agent(&mut self, provider: ProviderId) {
+        self.schedule_git_refresh();
         if provider == self.selected_provider {
             self.git_workspace_status_started = false;
             self.git_workspace_status_rx = None;
@@ -601,12 +605,6 @@ impl EditorApp {
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
-        // On the agentic canvas the header is its own chrome strip; in the
-        // sidebar it stays bare so the frosted material runs edge to edge,
-        // exactly like the file tree.
-        if self.agentic_mode {
-            painter.rect_filled(header, 0.0, theme::surface().chrome);
-        }
         painter.hline(
             header.x_range(),
             header.bottom() - 0.5,
@@ -1258,24 +1256,7 @@ impl EditorApp {
                                 }
                                 match item {
                                     TranscriptItem::User(text) => {
-                                        if !dense_agent {
-                                            ui.label(
-                                                RichText::new("YOU")
-                                                    .size(theme::typography::MICRO_SIZE)
-                                                    .strong()
-                                                    .color(theme::text().muted),
-                                            );
-                                        }
-                                        egui::Frame::new()
-                                            .fill(theme::surface().input)
-                                            .stroke(egui::Stroke::new(
-                                                1.0,
-                                                theme::border::strong_color(),
-                                            ))
-                                            .inner_margin(egui::Margin::same(12))
-                                            .corner_radius(8)
-                                            .show(ui, |ui| {
-                                                ui.set_width(ui.available_width());
+                                        chat_user_bubble(ui, |ui| {
                                                 if !text.is_empty() {
                                                     let job = agent_text_job(
                                                         text,
@@ -1402,11 +1383,7 @@ impl EditorApp {
                                                         ui,
                                                         self.selected_provider,
                                                     ),
-                                                    ContentRole::User => {
-                                                        ui.label(
-                                                            RichText::new("You").small().strong(),
-                                                        );
-                                                    }
+                                                    ContentRole::User => {}
                                                     ContentRole::Thought => {
                                                         ui.label(
                                                             RichText::new("Thinking")

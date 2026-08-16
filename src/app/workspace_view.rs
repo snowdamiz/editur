@@ -6,12 +6,17 @@ impl EditorApp {
         ui.painter()
             .rect_filled(rect, 0.0, theme::state::sidebar_material());
         let settings = sidebar_settings_rect(rect);
-        let tree = rect.with_max_y(settings.top());
+        let content = rect.with_max_y(settings.top());
         #[cfg(target_os = "macos")]
-        let tree = tree.with_min_y((tree.top() + TITLEBAR_HEIGHT).min(tree.bottom()));
+        let content = content.with_min_y((content.top() + TITLEBAR_HEIGHT).min(content.bottom()));
         ui.scope_builder(
-            UiBuilder::new().id_salt("sidebar_tree").max_rect(tree),
-            |ui| self.draw_tree(ui),
+            UiBuilder::new()
+                .id_salt("sidebar_content")
+                .max_rect(content),
+            |ui| match self.sidebar_pane {
+                SidebarPane::Files => self.draw_tree(ui),
+                SidebarPane::SourceControl => self.draw_source_control(ui),
+            },
         );
         let (open_settings, update) = self.draw_settings_row(ui, settings);
         if open_settings {
@@ -925,6 +930,36 @@ impl EditorApp {
             })
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
         let active_pane = !preview && path_override.is_none() && pane == self.active_pane;
+        if let Some(index) = active_tab
+            && let Some(diff) = self.tabs[index].git_diff.clone()
+        {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, theme::surface().input);
+            let id = Id::new(("tab_git_diff", &self.tabs[index].buffer.path));
+            let rendered = cached_agent_diff(ui, id, diff.old.as_deref(), &diff.new);
+            if diff.unsaved_editor_changes {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Unsaved editor changes are not shown.")
+                                .font(theme::typography::small())
+                                .color(theme::text().muted),
+                        );
+                    });
+            }
+            draw_agent_diff_body(
+                ui,
+                id,
+                &diff.repository.join(&diff.path),
+                &rendered,
+                diff.old.as_deref(),
+                &diff.new,
+                &self.highlighter,
+                &self.syntaxes,
+            );
+            return;
+        }
         if let Some(index) = active_tab
             && self.tabs[index].agent_diff.is_some()
         {

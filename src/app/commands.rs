@@ -213,6 +213,9 @@ impl EditorApp {
         {
             return vec![Scope::Find];
         }
+        if self.scm_focused {
+            return vec![Scope::SourceControl];
+        }
         if self.tree_focused {
             return vec![Scope::FilesTree];
         }
@@ -230,6 +233,19 @@ impl EditorApp {
         paste: Option<&str>,
         ctx: &egui::Context,
     ) {
+        if self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| tab.git_diff.is_some())
+            && (command.id().starts_with("editor.")
+                || command.id().starts_with("vim.")
+                || matches!(
+                    command,
+                    KeybindingCommand::ViewToggleMarkdownPreview | KeybindingCommand::SearchFind
+                ))
+        {
+            return;
+        }
         match command {
             KeybindingCommand::AppOpenSettings => {
                 if self.settings_open {
@@ -325,10 +341,53 @@ impl EditorApp {
             KeybindingCommand::FileFocusPreviousPane | KeybindingCommand::FileFocusLeftPane => {
                 self.focus_relative_pane(-1);
             }
-            KeybindingCommand::ViewToggleSidebar => self.sidebar = !self.sidebar,
+            KeybindingCommand::ViewToggleSidebar => {
+                self.sidebar = !self.sidebar;
+                if self.sidebar && self.sidebar_pane == SidebarPane::SourceControl {
+                    self.scm_focused = true;
+                    self.focus_editor = false;
+                    self.open_source_control(ctx);
+                } else if !self.sidebar {
+                    self.tree_focused = false;
+                    self.scm_focused = false;
+                    self.focus_editor = self.active_tab.is_some();
+                }
+            }
+            KeybindingCommand::ViewToggleExplorer => {
+                if self.sidebar && self.sidebar_pane == SidebarPane::Files {
+                    self.sidebar = false;
+                    self.tree_focused = false;
+                } else {
+                    if self.agentic_mode {
+                        self.set_agentic_mode(false, ctx);
+                    }
+                    self.sidebar = true;
+                    self.sidebar_pane = SidebarPane::Files;
+                    self.scm_focused = false;
+                    self.tree_focused = true;
+                }
+            }
+            KeybindingCommand::ViewToggleSourceControl => {
+                if self.sidebar && self.sidebar_pane == SidebarPane::SourceControl {
+                    self.sidebar = false;
+                    self.scm_focused = false;
+                } else {
+                    if self.agentic_mode {
+                        self.set_agentic_mode(false, ctx);
+                    }
+                    self.sidebar = true;
+                    self.sidebar_pane = SidebarPane::SourceControl;
+                    self.tree_focused = false;
+                    self.scm_focused = true;
+                    self.focus_editor = false;
+                    self.open_source_control(ctx);
+                }
+            }
             KeybindingCommand::ViewFocusExplorer => {
                 self.sidebar = true;
+                self.sidebar_pane = SidebarPane::Files;
                 self.focus_editor = false;
+                self.scm_focused = false;
                 self.tree_focused = true;
                 ctx.memory_mut(|memory| memory.surrender_focus(Id::new("editor")));
             }

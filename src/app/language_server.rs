@@ -81,7 +81,9 @@ impl EditorApp {
             .iter()
             .enumerate()
             .filter(|tab| {
-                !tab.1.buffer.large_file_warning && tab.1.buffer.text.len() <= LARGE_FILE_BYTES
+                tab.1.git_diff.is_none()
+                    && !tab.1.buffer.large_file_warning
+                    && tab.1.buffer.text.len() <= LARGE_FILE_BYTES
             })
             .filter_map(|(index, tab)| {
                 let (preset, language_id) = preset_for_path(&tab.buffer.path)?;

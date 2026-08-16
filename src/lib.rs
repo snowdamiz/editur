@@ -7,6 +7,7 @@ pub mod devin;
 mod dialog;
 pub mod editor_surface;
 pub mod file_io;
+pub mod git;
 mod icons;
 mod instance;
 pub mod keybindings;

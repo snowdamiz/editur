@@ -24,7 +24,6 @@ pub(super) enum DevinScope {
 #[derive(Clone, Debug)]
 pub(super) struct PendingDevinMessage {
     text: String,
-    attachment_ids: Vec<String>,
     failed: bool,
     confirmed: bool,
 }
@@ -39,6 +38,8 @@ pub(super) enum DevinLifecycle {
 
 enum DevinUiAction {
     Close,
+    #[cfg(debug_assertions)]
+    SeedPreview,
     Back,
     NewSession,
     Connect,
@@ -54,8 +55,7 @@ enum DevinUiAction {
     LoadMoreEvents,
     Lifecycle(DevinLifecycle),
     ConfirmTerminate,
-    ToggleAttachment(String),
-    ToggleActivity(String),
+    OpenImage(String),
 }
 
 impl EditorApp {
@@ -77,20 +77,26 @@ impl EditorApp {
         ui.painter()
             .rect_filled(rect, 0.0, theme::state::sidebar_material());
         let header = rect.with_max_y((rect.top() + TITLEBAR_HEIGHT).min(rect.bottom()));
-        let body = rect.with_min_y(header.bottom());
+        // The session home mirrors its header with an equally thin footer:
+        // data freshness on the left, the panel-level overflow on the right.
+        let footer = (self.devin_view == DevinView::Sessions && !self.devin_needs_connect_card())
+            .then(|| rect.with_min_y((rect.bottom() - TITLEBAR_HEIGHT).max(header.bottom())));
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), header.bottom()),
+            egui::pos2(
+                rect.right(),
+                footer.map_or(rect.bottom(), |footer| footer.top()),
+            ),
+        );
         let mut action = None;
 
-        // The trailing inset is a hair, not a full step: the close control's
-        // 32 px hit target carries its own dead zone, and the agent header
-        // centers its trailing glyph 17 px from the edge.
-        let header_content = egui::Rect::from_min_max(
-            egui::pos2(header.left() + theme::space::MEDIUM, header.top()),
-            egui::pos2(header.right() - theme::space::HAIR, header.bottom()),
-        );
+        // The Agent header's exact chrome: the title 14 px in from the left,
+        // and 28 px full-height glyph buttons stacked flush against the right
+        // edge, so the two panels wear identical hats.
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("devin_header")
-                .max_rect(header_content)
+                .max_rect(header)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| self.draw_devin_header(ui, &mut action),
         );
@@ -102,7 +108,7 @@ impl EditorApp {
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt(("devin_body", self.devin_view))
-                .max_rect(body.shrink2(egui::vec2(theme::space::LARGE, theme::space::SMALL))),
+                .max_rect(body.shrink2(egui::vec2(theme::space::MEDIUM, theme::space::SMALL))),
             |ui| {
                 ui.set_width(ui.available_width());
                 if self.devin_needs_connect_card() {
@@ -122,6 +128,24 @@ impl EditorApp {
                 }
             },
         );
+        if let Some(footer) = footer {
+            ui.painter().hline(
+                footer.x_range(),
+                footer.top() + 0.5,
+                egui::Stroke::new(1.0, theme::border::hairline_color()),
+            );
+            let footer_content = egui::Rect::from_min_max(
+                egui::pos2(footer.left() + theme::space::MEDIUM, footer.top()),
+                egui::pos2(footer.right() - theme::space::HAIR, footer.bottom()),
+            );
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("devin_footer")
+                    .max_rect(footer_content)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| self.draw_devin_footer(ui, &mut action),
+            );
+        }
 
         if self.devin_view != DevinView::Sessions
             && !devin_text_field_focused(ui.ctx())
@@ -136,39 +160,41 @@ impl EditorApp {
 
     fn draw_devin_header(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
         let connected_surface = !self.devin_needs_connect_card();
+        // The Agent header's metrics verbatim: the title 14 px in, glyph
+        // buttons 28 px wide at full header height, packed with no gaps.
+        let button_size = egui::vec2(28.0, ui.available_height());
+        ui.spacing_mut().item_spacing.x = 0.0;
         let header_title = |text: &str| {
             RichText::new(text)
                 .font(theme::typography::body())
                 .color(theme::text().primary)
         };
+        let back = |ui: &mut egui::Ui, action: &mut Option<DevinUiAction>| {
+            if icons::button_with_id(
+                ui,
+                Some(Id::new("devin_back")),
+                Icon::ChevronLeft,
+                "Back to Devin sessions",
+                theme::text().secondary,
+                button_size,
+            )
+            .clicked()
+            {
+                *action = Some(DevinUiAction::Back);
+            }
+            ui.add_space(theme::space::SNUG);
+        };
         match self.devin_view {
-            DevinView::Sessions => ui.label(header_title("Devin")),
+            DevinView::Sessions => {
+                ui.add_space(14.0);
+                ui.label(header_title("Devin"))
+            }
             DevinView::Create => {
-                if icons::button_sized(
-                    ui,
-                    Icon::ChevronLeft,
-                    "Back to Devin sessions",
-                    theme::text().secondary,
-                    egui::Vec2::splat(theme::control::STANDARD),
-                )
-                .clicked()
-                {
-                    *action = Some(DevinUiAction::Back);
-                }
+                back(ui, action);
                 ui.label(header_title("New session"))
             }
             DevinView::Detail => {
-                if icons::button_sized(
-                    ui,
-                    Icon::ChevronLeft,
-                    "Back to Devin sessions",
-                    theme::text().secondary,
-                    egui::Vec2::splat(theme::control::STANDARD),
-                )
-                .clicked()
-                {
-                    *action = Some(DevinUiAction::Back);
-                }
+                back(ui, action);
                 let title = self
                     .devin_state
                     .detail
@@ -179,10 +205,11 @@ impl EditorApp {
                             .map(|summary| summary.title.as_str())
                     })
                     .unwrap_or("Session");
+                let trailing = if cfg!(debug_assertions) { 88.0 } else { 60.0 };
                 ui.add_sized(
                     [
-                        (ui.available_width() - 80.0).max(48.0),
-                        theme::control::STANDARD,
+                        (ui.available_width() - trailing).max(48.0),
+                        ui.available_height(),
                     ],
                     Label::new(header_title(title)).truncate(),
                 )
@@ -190,53 +217,53 @@ impl EditorApp {
         };
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if close_icon_button(ui)
-                .on_hover_text("Close Devin sidebar")
-                .clicked()
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if icons::button_with_id(
+                ui,
+                Some(Id::new("devin_close")),
+                Icon::Close,
+                "Close Devin sidebar",
+                theme::text().secondary,
+                button_size,
+            )
+            .clicked()
             {
                 *action = Some(DevinUiAction::Close);
             }
+            #[cfg(debug_assertions)]
+            if icons::button_with_id(
+                ui,
+                Some(Id::new("devin_seed_preview")),
+                Icon::Sparkle,
+                "Seed Devin preview data",
+                theme::text().secondary,
+                button_size,
+            )
+            .clicked()
+            {
+                *action = Some(DevinUiAction::SeedPreview);
+            }
             match self.devin_view {
                 DevinView::Sessions if connected_surface => {
-                    let menu = ui.menu_button("⋯", |ui| {
-                        ui.hyperlink_to("Open Devin web app", DEVIN_WEB);
-                        if let Some(source) = self.devin_state.credential_source {
-                            ui.separator();
-                            ui.label(match source {
-                                CredentialSource::Environment => "Using environment credentials",
-                                CredentialSource::Keyring => "Using operating-system credentials",
-                            });
-                            if source == CredentialSource::Keyring
-                                && ui.button("Disconnect…").clicked()
-                            {
-                                *action = Some(DevinUiAction::ConfirmDisconnect);
-                            }
-                        }
-                    });
-                    menu.response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
-                            ui.is_enabled(),
-                            "More Devin actions",
-                        )
-                    });
-                    if icons::button_sized(
+                    if icons::button_with_id(
                         ui,
+                        Some(Id::new("devin_new_session")),
                         Icon::Plus,
                         "New Devin session",
                         theme::text().secondary,
-                        egui::Vec2::splat(theme::control::STANDARD),
+                        button_size,
                     )
                     .clicked()
                     {
                         *action = Some(DevinUiAction::NewSession);
                     }
-                    if icons::button_sized(
+                    if icons::button_with_id(
                         ui,
+                        Some(Id::new("devin_refresh")),
                         Icon::Refresh,
                         "Refresh Devin sessions",
                         theme::text().secondary,
-                        egui::Vec2::splat(theme::control::STANDARD),
+                        button_size,
                     )
                     .clicked()
                     {
@@ -251,13 +278,50 @@ impl EditorApp {
         });
     }
 
+    /// The freshness readout and account overflow, in a strip as thin as the
+    /// header so the panel is book-ended by matching chrome.
+    fn draw_devin_footer(&self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
+        ui.label(
+            RichText::new(devin_freshness(&self.devin_state))
+                .size(theme::typography::MICRO_SIZE)
+                .color(theme::text().muted),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let button = icons::button_with_id(
+                ui,
+                Some(Id::new("devin_overflow_menu")),
+                Icon::Ellipsis,
+                "More Devin actions",
+                theme::text().secondary,
+                egui::vec2(theme::control::STANDARD, theme::control::COMPACT + 2.0),
+            );
+            egui::Popup::menu(&button).show(|ui| {
+                ui.hyperlink_to("Open Devin web app", DEVIN_WEB);
+                if self.devin_state.credential_source == Some(CredentialSource::Keyring) {
+                    ui.separator();
+                    if ui.button("Disconnect…").clicked() {
+                        *action = Some(DevinUiAction::ConfirmDisconnect);
+                    }
+                }
+            });
+        });
+    }
+
     fn draw_devin_lifecycle_menu(&self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
         let summary = self.selected_devin_summary();
         let archived = summary.is_some_and(|summary| summary.archived);
         let url = summary
             .and_then(|summary| summary.url.as_deref())
             .unwrap_or(DEVIN_WEB);
-        let menu = ui.menu_button("⋯", |ui| {
+        let button = icons::button_with_id(
+            ui,
+            Some(Id::new("devin_lifecycle_menu")),
+            Icon::Ellipsis,
+            "Devin session actions",
+            theme::text().secondary,
+            egui::vec2(28.0, ui.available_height()),
+        );
+        egui::Popup::menu(&button).show(|ui| {
             ui.hyperlink_to("Open in Devin web app", url);
             ui.separator();
             ui.add_enabled_ui(!self.devin_state.busy, |ui| {
@@ -280,13 +344,6 @@ impl EditorApp {
                     *action = Some(DevinUiAction::ConfirmTerminate);
                 }
             });
-        });
-        menu.response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                ui.is_enabled(),
-                "Devin session actions",
-            )
         });
     }
 
@@ -311,6 +368,7 @@ impl EditorApp {
                 .font(theme::typography::small_strong())
                 .color(theme::text().secondary)
         };
+        let field_background = theme::mix(theme::surface().input, theme::surface().raised, 0.25);
         const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(10, 8);
         let width = ui.available_width().min(CARD_WIDTH);
         let indent = ((ui.available_width() - width) / 2.0).max(0.0);
@@ -339,6 +397,7 @@ impl EditorApp {
                         .id(Id::new("devin_api_key"))
                         .font(theme::typography::body())
                         .margin(FIELD_MARGIN)
+                        .background_color(field_background)
                         .desired_width(f32::INFINITY)
                         .password(true)
                         .hint_text(devin_field_hint("cog_…")),
@@ -351,6 +410,7 @@ impl EditorApp {
                         .id(Id::new("devin_org_id"))
                         .font(theme::typography::body())
                         .margin(FIELD_MARGIN)
+                        .background_color(field_background)
                         .desired_width(f32::INFINITY)
                         .hint_text(devin_field_hint("Only when your key requires it")),
                 );
@@ -451,40 +511,29 @@ impl EditorApp {
     }
 
     fn draw_devin_sessions(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
-        ui.horizontal(|ui| {
-            let compact = ui.available_width() < 360.0;
-            ui.add(
-                TextEdit::singleline(&mut self.devin_filter)
-                    .id(Id::new("devin_filter"))
-                    .font(theme::typography::body())
-                    .hint_text(devin_field_hint("Filter sessions…"))
-                    .desired_width(
-                        (ui.available_width() - if compact { 82.0 } else { 126.0 }).max(80.0),
-                    ),
-            );
-            if compact {
-                ui.menu_button(devin_scope_label(self.devin_scope), |ui| {
-                    for (scope, label) in devin_scopes() {
-                        if ui
-                            .selectable_label(self.devin_scope == scope, label)
-                            .clicked()
-                        {
-                            self.devin_scope = scope;
-                            self.devin_list_cursor = 0;
-                            self.devin_focus_list = true;
-                        }
-                    }
-                });
-            } else {
-                for (scope, label) in devin_scopes() {
+        // Laid right-to-left so the scope segments always keep their full
+        // width and the filter input absorbs whatever the panel has left.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), theme::control::STANDARD),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                for (scope, label) in devin_scopes().into_iter().rev() {
                     if segment(ui, label, self.devin_scope == scope, None).clicked() {
                         self.devin_scope = scope;
                         self.devin_list_cursor = 0;
                         self.devin_focus_list = true;
                     }
                 }
-            }
-        });
+                ui.add(
+                    TextEdit::singleline(&mut self.devin_filter)
+                        .id(Id::new("devin_filter"))
+                        .font(theme::typography::body())
+                        .hint_text(devin_field_hint("Filter sessions…"))
+                        .margin(egui::Margin::symmetric(10, 7))
+                        .desired_width(ui.available_width()),
+                );
+            },
+        );
         ui.add_space(theme::space::SMALL);
 
         let ids = visible_session_ids(
@@ -498,10 +547,8 @@ impl EditorApp {
         self.devin_list_cursor = self.devin_list_cursor.min(ids.len().saturating_sub(1));
         let mut row_ids = Vec::new();
         let mut focused_row = None;
-        let list_height = (ui.available_height() - 34.0).max(80.0);
         ScrollArea::vertical()
             .id_salt("devin_sessions_scroll")
-            .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if ids.is_empty() {
@@ -599,7 +646,10 @@ impl EditorApp {
                     );
                     let response = ui
                         .push_id(("devin_session", &session.id), |ui| {
-                            selectable_content_row(ui, selected, 50.0, |ui| {
+                            // Content-sized: two text lines plus the frame
+                            // margin, rather than a fixed height that leaves
+                            // dead space under short rows.
+                            selectable_content_row(ui, selected, 0.0, |ui| {
                                 ui.horizontal(|ui| {
                                     let color = devin_status_dot_color(ui, session.category);
                                     let (dot, hover) = ui.allocate_exact_size(
@@ -611,17 +661,30 @@ impl EditorApp {
                                         session.status_detail.as_deref().unwrap_or(&session.status),
                                     );
                                     ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = theme::space::HAIR;
                                         let row_title = RichText::new(title)
                                             .font(theme::typography::strong())
                                             .color(theme::text().primary);
                                         if session.pull_request_count > 0 {
-                                            ui.with_layout(
-                                                Layout::right_to_left(Align::Center),
-                                                |ui| {
-                                                    chip(ui, "PR");
-                                                    ui.add(Label::new(row_title).truncate());
-                                                },
-                                            );
+                                            // The title truncates against a
+                                            // measured reservation, keeping it
+                                            // left-aligned with the chip held
+                                            // inside the row.
+                                            ui.horizontal(|ui| {
+                                                let reserved = chip_width(ui, "PR")
+                                                    + ui.spacing().item_spacing.x;
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(
+                                                        (ui.available_width() - reserved).max(48.0),
+                                                        theme::control::COMPACT,
+                                                    ),
+                                                    Layout::left_to_right(Align::Center),
+                                                    |ui| {
+                                                        ui.add(Label::new(row_title).truncate());
+                                                    },
+                                                );
+                                                chip(ui, "PR");
+                                            });
                                         } else {
                                             ui.add(Label::new(row_title).truncate());
                                         }
@@ -719,12 +782,6 @@ impl EditorApp {
                 ui.memory_mut(|memory| memory.request_focus(Id::new("devin_filter")));
             }
         }
-        ui.add_space(theme::space::TIGHT);
-        ui.label(
-            RichText::new(devin_freshness(&self.devin_state))
-                .size(theme::typography::MICRO_SIZE)
-                .color(theme::text().muted),
-        );
     }
 
     fn draw_devin_create(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
@@ -894,23 +951,32 @@ impl EditorApp {
                 );
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            if let Some(parent) = summary.parent_session_id.as_deref()
-                && ui.small_button("Open parent session").clicked()
-            {
-                *action = Some(DevinUiAction::Select(parent.into()));
-            }
-            if let Some(detail) = self.devin_state.detail.as_ref() {
-                for child in &detail.children {
-                    if ui
-                        .small_button(format!("Child: {} · {}", child.title, child.status))
-                        .clicked()
-                    {
-                        *action = Some(DevinUiAction::Select(child.id.clone()));
+        let has_lineage = summary.parent_session_id.is_some()
+            || self
+                .devin_state
+                .detail
+                .as_ref()
+                .is_some_and(|detail| !detail.children.is_empty());
+        if has_lineage {
+            ui.add_space(theme::space::TIGHT);
+            ui.horizontal_wrapped(|ui| {
+                if let Some(parent) = summary.parent_session_id.as_deref()
+                    && ui.small_button("Open parent session").clicked()
+                {
+                    *action = Some(DevinUiAction::Select(parent.into()));
+                }
+                if let Some(detail) = self.devin_state.detail.as_ref() {
+                    for child in &detail.children {
+                        if ui
+                            .small_button(format!("Child: {} · {}", child.title, child.status))
+                            .clicked()
+                        {
+                            *action = Some(DevinUiAction::Select(child.id.clone()));
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         if let Some(detail) = self.devin_state.detail.as_ref()
             && !detail.pull_requests.is_empty()
         {
@@ -932,50 +998,89 @@ impl EditorApp {
                     );
                     ui.add_space(theme::space::TIGHT);
                     for pull_request in &detail.pull_requests {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.hyperlink_to(
-                                RichText::new("Open ↗").font(theme::typography::small()),
-                                &pull_request.url,
+                        // The title truncates against a measured reservation
+                        // so the status chip and link hold the trailing edge
+                        // without the row centering in leftover panel space.
+                        ui.horizontal(|ui| {
+                            let spacing = ui.spacing().item_spacing.x;
+                            let mut reserved = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    "Open ↗".to_owned(),
+                                    theme::typography::small(),
+                                    theme::text().primary,
+                                )
+                                .size()
+                                .x
+                                + spacing;
+                            if let Some(status) = pull_request.status.as_deref() {
+                                reserved += chip_width(ui, status) + spacing;
+                            }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(
+                                    (ui.available_width() - reserved).max(48.0),
+                                    theme::control::COMPACT,
+                                ),
+                                Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(&pull_request.title)
+                                                .font(theme::typography::strong())
+                                                .color(theme::text().primary),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
                             );
                             if let Some(status) = pull_request.status.as_deref() {
                                 chip(ui, status);
                             }
-                            ui.add(
-                                Label::new(
-                                    RichText::new(&pull_request.title)
-                                        .font(theme::typography::strong())
-                                        .color(theme::text().primary),
-                                )
-                                .truncate(),
+                            ui.hyperlink_to(
+                                RichText::new("Open ↗").font(theme::typography::small()),
+                                &pull_request.url,
                             );
                         });
                     }
                 });
         }
-        ui.separator();
+        // The divider between the session meta and the transcript runs the
+        // full panel width, bleeding through the body inset like the Agent's.
+        ui.add_space(theme::space::SNUG);
+        ui.painter().hline(
+            ui.max_rect().expand(theme::space::MEDIUM).x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
+        );
+        ui.add_space(theme::space::SNUG);
         let terminal = summary.archived
             || matches!(
                 summary.category,
                 StatusCategory::Completed | StatusCategory::Failed
             );
-        let composer_height = if terminal { 56.0 } else { 150.0 };
+        // The Agent composer's proportions: input plus footer. The composer
+        // anchors to the panel bottom, so estimate error becomes slack between
+        // the transcript and the divider, never a gap under the send action.
+        let composer_height = if terminal { 56.0 } else { 104.0 };
         let stream_height = (ui.available_height() - composer_height).max(100.0);
         ScrollArea::vertical()
             .id_salt(("devin_stream", &summary.id))
             .stick_to_bottom(true)
             .max_height(stream_height)
             .auto_shrink([false, false])
-            .show(ui, |ui| self.draw_devin_stream(ui, action));
-        if self.devin_state.messages_cursor.is_some()
-            && ui.small_button("Load earlier messages").clicked()
-        {
-            *action = Some(DevinUiAction::LoadMoreMessages);
-        }
-        if self.devin_state.activity_cursor.is_some()
-            && ui.small_button("Load earlier activity").clicked()
-        {
-            *action = Some(DevinUiAction::LoadMoreEvents);
-        }
+            .show(ui, |ui| {
+                if self.devin_state.messages_cursor.is_some()
+                    && ui.small_button("Load earlier messages").clicked()
+                {
+                    *action = Some(DevinUiAction::LoadMoreMessages);
+                }
+                if self.devin_state.activity_cursor.is_some()
+                    && ui.small_button("Load earlier activity").clicked()
+                {
+                    *action = Some(DevinUiAction::LoadMoreEvents);
+                }
+                self.draw_devin_stream(ui, action);
+            });
         if terminal {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -993,42 +1098,18 @@ impl EditorApp {
             });
             return;
         }
-        if summary.category == StatusCategory::Waiting {
-            devin_callout(
-                ui,
-                "Devin is waiting for your reply",
-                theme::semantic().warning,
-            );
-        }
-        if let Some(detail) = self.devin_state.detail.as_ref()
-            && !detail.attachments.is_empty()
-        {
-            ui.horizontal_wrapped(|ui| {
-                for attachment in &detail.attachments {
-                    let selected = self.devin_attachment_ids.contains(&attachment.id);
-                    if ui
-                        .selectable_label(
-                            selected,
-                            RichText::new(&attachment.name).font(theme::typography::small()),
-                        )
-                        .clicked()
-                    {
-                        *action = Some(DevinUiAction::ToggleAttachment(attachment.id.clone()));
-                    }
-                }
-            });
-        }
         let hint = if summary.category == StatusCategory::Sleeping {
             "Message Devin — sending will wake this session"
         } else {
             "Message Devin"
         };
-        // The Agent composer's anatomy: a hairline over a frameless input,
-        // with the send control as a solid 32 px action on the trailing edge.
+        // The Agent composer's anatomy: a hairline, then the input, with the
+        // leftover height sitting between the prompt and the footer — so the
+        // 32 px send action always holds the panel's bottom edge.
         ui.add_space(theme::space::SNUG);
         let divider = ui.cursor().top();
         ui.painter().hline(
-            ui.max_rect().x_range(),
+            ui.max_rect().expand(theme::space::MEDIUM).x_range(),
             divider,
             egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
@@ -1056,16 +1137,24 @@ impl EditorApp {
             }
             self.devin_focus_detail = false;
         }
-        let can_send = !self.devin_state.busy
-            && (!self.devin_message.trim().is_empty() || !self.devin_attachment_ids.is_empty());
+        let can_send = !self.devin_state.busy && !self.devin_message.trim().is_empty();
         let enter = input.has_focus()
             && ui.input(|input| !input.modifiers.shift && input.key_pressed(Key::Enter));
+        let slack = ui.available_height() - theme::control::STANDARD;
+        if slack > 0.0 {
+            ui.add_space(slack);
+        }
         let mut send = false;
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (fill, color) = agent_send_button_colors(can_send);
-            send = agent_composer_action(ui, Icon::ArrowUp, "Send (Enter)", fill, color, can_send)
-                .clicked();
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), theme::control::STANDARD),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                let (fill, color) = agent_send_button_colors(can_send);
+                send =
+                    agent_composer_action(ui, Icon::ArrowUp, "Send (Enter)", fill, color, can_send)
+                        .clicked();
+            },
+        );
         if (send || enter) && can_send {
             *action = Some(DevinUiAction::SendMessage);
         }
@@ -1106,11 +1195,7 @@ impl EditorApp {
             }
             match stream[index].1 {
                 Kind::Message(message) => {
-                    draw_devin_message(
-                        ui,
-                        &self.devin_state.messages[message],
-                        self.devin_state.detail.as_ref(),
-                    );
+                    self.draw_devin_message(ui, &self.devin_state.messages[message], action);
                     index += 1;
                 }
                 Kind::Activity(_) => {
@@ -1121,30 +1206,27 @@ impl EditorApp {
                     let Kind::Activity(first) = stream[start].1 else {
                         unreachable!()
                     };
-                    let group_id = self.devin_state.activity[first].id.clone();
-                    let expanded = self.devin_expanded_activity_groups.contains(&group_id);
+                    let group_id = self.devin_state.activity[first].id.as_str();
                     let count = index - start;
-                    if ui
-                        .selectable_label(
-                            expanded,
-                            RichText::new(format!(
-                                "{count} remote action{}",
-                                if count == 1 { "" } else { "s" }
-                            ))
-                            .font(theme::typography::small())
-                            .color(theme::text().secondary),
-                        )
-                        .on_hover_text("Remote Devin activity; paths do not open local files")
-                        .clicked()
-                    {
-                        *action = Some(DevinUiAction::ToggleActivity(group_id));
-                    }
-                    if expanded {
+                    // The Agent transcript's dense work anatomy: one disclosure
+                    // row over per-action tool rows, so grouped remote work
+                    // reads exactly like grouped local work.
+                    let open = agent_dense_disclosure_row(
+                        ui,
+                        Id::new(("devin_activity_group", group_id)),
+                        &format!(
+                            "{count} remote action{}",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                        None,
+                        false,
+                        false,
+                    );
+                    if open {
                         for (_, kind) in &stream[start..index] {
                             let Kind::Activity(activity) = kind else {
                                 continue;
                             };
-                            ui.add_space(theme::space::TIGHT);
                             draw_devin_activity(ui, &self.devin_state.activity[*activity]);
                         }
                     }
@@ -1155,8 +1237,7 @@ impl EditorApp {
             if !stream.is_empty() {
                 ui.add_space(theme::space::SMALL);
             }
-            devin_role_label(ui, "YOU", None);
-            devin_user_bubble(ui, |ui| {
+            chat_user_bubble(ui, |ui| {
                 ui.add(
                     Label::new(
                         RichText::new(&pending.text)
@@ -1192,6 +1273,112 @@ impl EditorApp {
         }
     }
 
+    /// One Devin turn, rendered with the Agent transcript's exact anatomy:
+    /// the shared bubble for the human, the shared identity line and markdown
+    /// pipeline for the assistant, and the Agent's image previews for
+    /// attachments whose bytes have arrived.
+    fn draw_devin_message(
+        &self,
+        ui: &mut egui::Ui,
+        message: &DevinMessage,
+        action: &mut Option<DevinUiAction>,
+    ) {
+        if message.role.eq_ignore_ascii_case("user") {
+            chat_user_bubble(ui, |ui| {
+                if !message.text.is_empty() {
+                    let job = agent_text_job(
+                        &message.text,
+                        ui.available_width(),
+                        theme::typography::body(),
+                        theme::text().primary,
+                        None,
+                    );
+                    ui.add(Label::new(job).wrap());
+                }
+                self.draw_devin_message_attachments(ui, message, true, action);
+            });
+        } else {
+            let identity = if message.role.eq_ignore_ascii_case("devin")
+                || message.role.eq_ignore_ascii_case("devin_ai")
+                || message.role.eq_ignore_ascii_case("assistant")
+            {
+                "Devin"
+            } else {
+                message.role.as_str()
+            };
+            chat_identity(ui, identity, None, paint_devin_icon);
+            let width = ui.available_width();
+            let galley = agent_markdown_galley(
+                ui,
+                Id::new(("devin_markdown", message.id.as_str())),
+                &message.text,
+                width,
+                &self.highlighter,
+                &self.syntaxes,
+                false,
+                None,
+            );
+            ui.add(Label::new(galley).wrap());
+            self.draw_devin_message_attachments(ui, message, false, action);
+        }
+    }
+
+    /// Attachments on a turn: images that have bytes render as the Agent's
+    /// previews — square in the prompt bubble, thumbnail elsewhere — and
+    /// everything else as the 48 px tile, which opens its remote link.
+    fn draw_devin_message_attachments(
+        &self,
+        ui: &mut egui::Ui,
+        message: &DevinMessage,
+        in_bubble: bool,
+        action: &mut Option<DevinUiAction>,
+    ) {
+        let Some(detail) = self.devin_state.detail.as_ref() else {
+            return;
+        };
+        if message.attachment_ids.is_empty() {
+            return;
+        }
+        if !message.text.is_empty() {
+            ui.add_space(if in_bubble {
+                theme::space::MEDIUM
+            } else {
+                theme::space::TIGHT
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            for id in &message.attachment_ids {
+                let Some(attachment) = detail
+                    .attachments
+                    .iter()
+                    .find(|attachment| &attachment.id == id)
+                else {
+                    continue;
+                };
+                let bytes = self.devin_state.attachment_previews.get(id);
+                let preview = bytes.and_then(|bytes| {
+                    if in_bubble {
+                        agent_prompt_image_preview(ui, bytes)
+                    } else {
+                        agent_embedded_image_preview(ui, bytes)
+                    }
+                });
+                if let Some(preview) = preview {
+                    if preview.clicked() {
+                        *action = Some(DevinUiAction::OpenImage(id.clone()));
+                    }
+                    continue;
+                }
+                let pill = devin_attachment_pill(ui, attachment);
+                if pill.clicked()
+                    && let Some(url) = attachment.url.as_deref()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+        });
+    }
+
     fn selected_devin_summary(&self) -> Option<&SessionSummary> {
         self.devin_state
             .detail
@@ -1210,6 +1397,20 @@ impl EditorApp {
         let command = match action {
             DevinUiAction::Close => {
                 self.execute_keybinding(KeybindingCommand::AppToggleDevinSidebar, None, ctx);
+                return;
+            }
+            #[cfg(debug_assertions)]
+            DevinUiAction::SeedPreview => {
+                self.devin_controller = None;
+                self.devin_state.seed_preview();
+                self.devin_view = DevinView::Sessions;
+                self.devin_scope = DevinScope::Active;
+                self.devin_filter.clear();
+                self.devin_list_cursor = 0;
+                self.devin_focus_list = true;
+                self.devin_pending_message = None;
+                self.devin_pending_lifecycle = None;
+                ctx.request_repaint();
                 return;
             }
             DevinUiAction::Back => {
@@ -1241,10 +1442,16 @@ impl EditorApp {
             }
             DevinUiAction::LoadMoreSessions => Some(DevinCommand::LoadMoreSessions),
             DevinUiAction::Select(session_id) => {
+                #[cfg(debug_assertions)]
+                if self.devin_state.preview {
+                    self.devin_state.select_preview(session_id);
+                    self.devin_view = DevinView::Detail;
+                    self.devin_focus_detail = true;
+                    return;
+                }
                 let generation = self.devin_state.select(session_id.clone());
                 self.devin_view = DevinView::Detail;
                 self.devin_focus_detail = true;
-                self.devin_attachment_ids.clear();
                 Some(DevinCommand::SelectSession {
                     session_id,
                     generation,
@@ -1262,7 +1469,6 @@ impl EditorApp {
             DevinUiAction::SendMessage => {
                 let pending = PendingDevinMessage {
                     text: self.devin_message.trim().into(),
-                    attachment_ids: self.devin_attachment_ids.iter().cloned().collect(),
                     failed: false,
                     confirmed: false,
                 };
@@ -1271,7 +1477,7 @@ impl EditorApp {
                 self.devin_pending_message = Some(pending.clone());
                 Some(DevinCommand::SendMessage {
                     message: pending.text,
-                    attachment_ids: pending.attachment_ids,
+                    attachment_ids: Vec::new(),
                 })
             }
             DevinUiAction::RetryMessage => {
@@ -1283,7 +1489,7 @@ impl EditorApp {
                 self.devin_state.busy = true;
                 Some(DevinCommand::SendMessage {
                     message: pending.text.clone(),
-                    attachment_ids: pending.attachment_ids.clone(),
+                    attachment_ids: Vec::new(),
                 })
             }
             DevinUiAction::LoadMoreMessages => Some(DevinCommand::LoadMoreMessages),
@@ -1302,15 +1508,10 @@ impl EditorApp {
                 self.devin_confirm_terminate = true;
                 return;
             }
-            DevinUiAction::ToggleAttachment(id) => {
-                if !self.devin_attachment_ids.remove(&id) {
-                    self.devin_attachment_ids.insert(id);
-                }
-                return;
-            }
-            DevinUiAction::ToggleActivity(id) => {
-                if !self.devin_expanded_activity_groups.remove(&id) {
-                    self.devin_expanded_activity_groups.insert(id);
+            DevinUiAction::OpenImage(id) => {
+                if let Some(bytes) = self.devin_state.attachment_previews.get(&id) {
+                    self.agent_image_lightbox =
+                        Some(AgentImageSource::Bytes(std::sync::Arc::clone(bytes)));
                 }
                 return;
             }
@@ -1329,6 +1530,10 @@ impl EditorApp {
     }
 
     pub(super) fn open_devin(&mut self, ctx: &egui::Context) {
+        #[cfg(debug_assertions)]
+        if self.devin_state.preview {
+            return;
+        }
         if self.devin_controller.is_none() {
             let wake = ctx.clone();
             self.devin_controller =
@@ -1379,12 +1584,6 @@ impl EditorApp {
                     select_created = Some(session.id.clone());
                 }
                 DevinEvent::SessionLoaded { detail, .. } => {
-                    self.devin_attachment_ids.retain(|id| {
-                        detail
-                            .attachments
-                            .iter()
-                            .any(|attachment| &attachment.id == id)
-                    });
                     if detail.summary.category == StatusCategory::Waiting {
                         self.devin_focus_detail = true;
                     }
@@ -1495,13 +1694,6 @@ fn devin_scopes() -> [(DevinScope, &'static str); 3] {
         (DevinScope::All, "All"),
         (DevinScope::Archived, "Archived"),
     ]
-}
-
-fn devin_scope_label(scope: DevinScope) -> &'static str {
-    devin_scopes()
-        .into_iter()
-        .find_map(|(candidate, label)| (candidate == scope).then_some(label))
-        .unwrap_or("Active")
 }
 
 fn visible_session_ids<'a>(
@@ -1659,167 +1851,134 @@ fn chronological_timestamp(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
-/// The Agent transcript's section label: micro, semibold, muted, with an
-/// optional relative timestamp trailing it.
-fn devin_role_label(ui: &mut egui::Ui, role: &str, timestamp: Option<&str>) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(role)
-                .size(theme::typography::MICRO_SIZE)
-                .strong()
-                .color(theme::text().muted),
-        );
-        if let Some(timestamp) = timestamp.filter(|timestamp| !timestamp.is_empty()) {
-            ui.label(
-                RichText::new(compact_relative_time(timestamp))
-                    .size(theme::typography::MICRO_SIZE)
-                    .color(theme::text().muted),
-            );
-        }
-    });
-}
-
-/// The Agent's user-message bubble: input fill, strong border, 12 px inset.
-fn devin_user_bubble(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(theme::surface().input)
-        .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
-        .inner_margin(egui::Margin::same(12))
-        .corner_radius(8)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add_contents(ui);
-        });
-}
-
-fn draw_devin_message_attachments(
-    ui: &mut egui::Ui,
-    message: &DevinMessage,
-    detail: Option<&crate::devin::SessionDetail>,
-) {
-    let Some(detail) = detail else { return };
-    if message.attachment_ids.is_empty() {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        for id in &message.attachment_ids {
-            let Some(attachment) = detail
-                .attachments
-                .iter()
-                .find(|attachment| &attachment.id == id)
-            else {
-                continue;
-            };
-            if let Some(url) = attachment.url.as_deref() {
+/// One remote action as the Agent's dense tool row: the summary as the title,
+/// with the path, command, details, and remote link folded into the same
+/// indented body the Agent uses for local tool calls.
+fn draw_devin_activity(ui: &mut egui::Ui, activity: &Activity) {
+    let has_body = activity.details.is_some()
+        || activity.path.is_some()
+        || activity.command.is_some()
+        || activity.url.is_some();
+    agent_dense_tool(
+        ui,
+        Id::new(("devin_activity", activity.id.as_str())),
+        &activity.summary,
+        None,
+        None,
+        None,
+        has_body,
+        |ui| {
+            for line in [activity.path.as_deref(), activity.command.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                ui.label(
+                    RichText::new(line)
+                        .font(theme::typography::code_small())
+                        .color(theme::text().secondary),
+                );
+            }
+            if let Some(details) = activity.details.as_deref() {
+                ui.add(
+                    Label::new(
+                        RichText::new(details)
+                            .font(theme::typography::small())
+                            .color(theme::text().secondary),
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+            }
+            if let Some(url) = activity.url.as_deref() {
                 ui.hyperlink_to(
-                    RichText::new(&attachment.name).font(theme::typography::small()),
+                    RichText::new("Open remote link").font(theme::typography::small()),
                     url,
                 );
-            } else {
-                chip(ui, &attachment.name);
             }
-        }
-    });
+        },
+    );
 }
 
-fn draw_devin_message(
+/// A transcript attachment that is not a previewable image: a compact pill
+/// carrying the file glyph and the full name, so a log or archive reads as
+/// "this file", not as a cryptic extension swatch.
+fn devin_attachment_pill(
     ui: &mut egui::Ui,
-    message: &DevinMessage,
-    detail: Option<&crate::devin::SessionDetail>,
-) {
-    let body = |ui: &mut egui::Ui| {
-        ui.add(
-            Label::new(
-                RichText::new(&message.text)
-                    .font(theme::typography::body())
-                    .color(theme::text().primary),
-            )
-            .selectable(true)
-            .wrap(),
-        );
-        draw_devin_message_attachments(ui, message, detail);
-    };
-    if message.role.eq_ignore_ascii_case("user") {
-        devin_role_label(ui, "YOU", Some(&message.timestamp));
-        devin_user_bubble(ui, body);
-    } else {
-        // Devin's turns read like the Agent's: an identity line over plain
-        // text, not a bubble.
-        let identity = if message.role.eq_ignore_ascii_case("devin")
-            || message.role.eq_ignore_ascii_case("devin_ai")
-            || message.role.eq_ignore_ascii_case("assistant")
-        {
-            "Devin".to_owned()
+    attachment: &crate::devin::Attachment,
+) -> egui::Response {
+    let name = ui.painter().layout_no_wrap(
+        attachment.name.clone(),
+        theme::typography::small(),
+        theme::text().secondary,
+    );
+    let size = egui::vec2(
+        theme::space::SMALL
+            + icons::GRID
+            + theme::space::TIGHT
+            + name.size().x
+            + theme::space::SMALL,
+        theme::control::COMPACT,
+    );
+    let linked = attachment.url.is_some();
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if linked {
+            Sense::click()
         } else {
-            message.role.clone()
-        };
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(identity)
-                    .size(theme::typography::BODY_SIZE)
-                    .strong()
-                    .color(theme::text().primary),
-            );
-            if !message.timestamp.is_empty() {
-                ui.label(
-                    RichText::new(compact_relative_time(&message.timestamp))
-                        .size(theme::typography::MICRO_SIZE)
-                        .color(theme::text().muted),
-                );
-            }
-        });
-        ui.add_space(theme::space::TIGHT);
-        body(ui);
-    }
-}
-
-fn draw_devin_activity(ui: &mut egui::Ui, activity: &Activity) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new("REMOTE")
-                .size(theme::typography::MICRO_SIZE)
-                .strong()
-                .color(theme::text().muted),
-        );
-        ui.label(
-            RichText::new(format!("{} · {}", activity.category, activity.summary))
-                .font(theme::typography::small())
-                .color(theme::text().secondary),
-        );
-        if !activity.timestamp.is_empty() {
-            ui.label(
-                RichText::new(compact_relative_time(&activity.timestamp))
-                    .size(theme::typography::MICRO_SIZE)
-                    .color(theme::text().muted),
-            );
-        }
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            if linked {
+                egui::WidgetType::Link
+            } else {
+                egui::WidgetType::Label
+            },
+            ui.is_enabled(),
+            format!("Attachment: {}", attachment.name),
+        )
     });
-    for detail_line in [activity.path.as_deref(), activity.command.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        ui.label(
-            RichText::new(detail_line)
-                .font(theme::typography::code_small())
-                .color(theme::text().muted),
-        );
-    }
-    if let Some(details) = activity.details.as_deref() {
-        ui.add(
-            Label::new(
-                RichText::new(details)
-                    .font(theme::typography::small())
-                    .color(theme::text().secondary),
-            )
-            .selectable(true)
-            .wrap(),
-        );
-    }
-    if let Some(url) = activity.url.as_deref() {
-        ui.hyperlink_to(
-            RichText::new("Open remote link").font(theme::typography::small()),
-            url,
-        );
+    let fill = if linked && response.hovered() {
+        theme::state::hover()
+    } else {
+        theme::surface().input
+    };
+    ui.painter()
+        .rect_filled(rect, theme::corner(theme::radius::CONTROL), fill);
+    ui.painter().rect_stroke(
+        rect,
+        theme::corner(theme::radius::CONTROL),
+        egui::Stroke::new(1.0, theme::state::selected()),
+        egui::StrokeKind::Inside,
+    );
+    icons::paint(
+        ui.painter(),
+        Icon::File,
+        egui::Rect::from_center_size(
+            egui::pos2(
+                rect.left() + theme::space::SMALL + icons::GRID * 0.5,
+                rect.center().y,
+            ),
+            egui::Vec2::splat(icons::GRID * 0.85),
+        ),
+        theme::text().muted,
+    );
+    let name_y = rect.center().y - name.size().y * 0.5;
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + theme::space::SMALL + icons::GRID + theme::space::TIGHT,
+            name_y,
+        ),
+        name,
+        theme::text().secondary,
+    );
+    if linked {
+        response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Open attachment")
+    } else {
+        response
     }
 }
 
