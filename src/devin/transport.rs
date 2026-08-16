@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, path::Path};
 
 #[cfg(feature = "network")]
 use std::time::Duration;
@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::credentials::Credentials;
 
 pub(super) const ENDPOINT: &str = "https://mcp.devin.ai/mcp";
+const ATTACHMENTS_ENDPOINT: &str = "https://api.devin.ai/v1/attachments";
 pub(super) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -42,6 +43,8 @@ pub(super) struct McpTransport {
     #[cfg(feature = "network")]
     endpoint: String,
     #[cfg(feature = "network")]
+    attachments_endpoint: String,
+    #[cfg(feature = "network")]
     credentials: Credentials,
     #[cfg(feature = "network")]
     session_id: Option<String>,
@@ -70,13 +73,27 @@ pub(super) enum InteractAction<'a> {
 
 impl McpTransport {
     pub(super) fn connect(credentials: Credentials) -> Result<Self, TransportError> {
-        Self::connect_endpoint(credentials, ENDPOINT)
+        Self::connect_endpoints(credentials, ENDPOINT, ATTACHMENTS_ENDPOINT)
     }
 
     pub(super) fn connect_endpoint(
         credentials: Credentials,
         endpoint: &str,
     ) -> Result<Self, TransportError> {
+        let attachments_endpoint = format!(
+            "{}/v1/attachments",
+            endpoint.strip_suffix("/mcp").unwrap_or(endpoint)
+        );
+        Self::connect_endpoints(credentials, endpoint, &attachments_endpoint)
+    }
+
+    fn connect_endpoints(
+        credentials: Credentials,
+        endpoint: &str,
+        attachments_endpoint: &str,
+    ) -> Result<Self, TransportError> {
+        #[cfg(not(feature = "network"))]
+        let _ = attachments_endpoint;
         #[cfg(feature = "network")]
         let agent = ureq::Agent::config_builder()
             .user_agent(format!("editur/{}", env!("CARGO_PKG_VERSION")))
@@ -93,6 +110,8 @@ impl McpTransport {
         let mut transport = Self {
             #[cfg(feature = "network")]
             endpoint: endpoint.into(),
+            #[cfg(feature = "network")]
+            attachments_endpoint: attachments_endpoint.into(),
             #[cfg(feature = "network")]
             credentials,
             #[cfg(feature = "network")]
@@ -145,6 +164,58 @@ impl McpTransport {
             }
         }
         Ok(transport)
+    }
+
+    #[cfg(feature = "network")]
+    pub(super) fn upload_attachment(&mut self, path: &Path) -> Result<String, TransportError> {
+        let form = ureq::unversioned::multipart::Form::new()
+            .file("file", path)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        let authorization = format!("Bearer {}", self.credentials.api_key());
+        let mut request = self
+            .agent
+            .post(&self.attachments_endpoint)
+            .header("Authorization", &authorization)
+            .header("Accept", "application/json");
+        if let Some(org_id) = self.credentials.org_id() {
+            request = request.header("X-Org-Id", org_id);
+        }
+        let mut response = request.send(form).map_err(|_| TransportError::Offline)?;
+        let status = response.status().as_u16();
+        match status {
+            200..=299 => {}
+            401 => return Err(TransportError::Authentication),
+            403 => return Err(TransportError::Forbidden),
+            429 => return Err(TransportError::RateLimited(None)),
+            500..=599 => return Err(TransportError::Offline),
+            _ => return Err(TransportError::Remote(format!("HTTP {status}"))),
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_to_vec()
+            .map_err(|_| TransportError::Offline)?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(TransportError::Oversized);
+        }
+        let url: String = serde_json::from_slice(&bytes)
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        if !url.starts_with("https://")
+            || url
+                .chars()
+                .any(|character| character.is_control() || character == '"')
+        {
+            return Err(TransportError::Protocol(
+                "attachment upload returned an invalid URL".into(),
+            ));
+        }
+        Ok(url)
+    }
+
+    #[cfg(not(feature = "network"))]
+    pub(super) fn upload_attachment(&mut self, _path: &Path) -> Result<String, TransportError> {
+        Err(TransportError::Offline)
     }
 
     pub(super) fn search(&mut self, cursor: Option<&str>) -> Result<Value, TransportError> {

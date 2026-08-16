@@ -34,6 +34,7 @@ pub(crate) enum Icon {
     ArrowUp,
     Download,
     Refresh,
+    Undo,
     History,
     Warning,
     Error,
@@ -42,6 +43,7 @@ pub(crate) enum Icon {
     Sparkle,
     Bolt,
     Ellipsis,
+    ExternalLink,
 }
 
 /// One piece of an icon, in grid coordinates.
@@ -198,6 +200,26 @@ const REFRESH: &[Segment] = &[
     ]),
     Segment::Line(&[(6.2, 10.4), (3.7, 10.4), (3.7, 12.9)]),
 ];
+const UNDO: &[Segment] = &[
+    Segment::Line(&[
+        (3.3, 7.5),
+        (3.5, 9.2),
+        (4.4, 10.8),
+        (5.8, 12.0),
+        (7.5, 12.5),
+        (9.3, 12.2),
+        (10.9, 11.2),
+        (12.0, 9.8),
+        (12.5, 8.0),
+        (12.2, 6.2),
+        (11.2, 4.6),
+        (9.7, 3.5),
+        (8.0, 3.1),
+        (6.2, 3.4),
+        (5.4, 4.0),
+    ]),
+    Segment::Line(&[(3.3, 3.4), (3.3, 7.5), (7.4, 7.5)]),
+];
 const HISTORY: &[Segment] = &[
     Segment::Circle {
         center: (8.0, 8.0),
@@ -302,6 +324,18 @@ const ELLIPSIS: &[Segment] = &[
         radius: 1.1,
     },
 ];
+const EXTERNAL_LINK: &[Segment] = &[
+    // The box stops short of its top-right corner, where the arrow departs.
+    Segment::Line(&[
+        (7.2, 4.4),
+        (4.2, 4.4),
+        (4.2, 11.8),
+        (11.6, 11.8),
+        (11.6, 8.8),
+    ]),
+    Segment::Line(&[(8.8, 7.2), (12.6, 3.4)]),
+    Segment::Line(&[(9.6, 3.4), (12.6, 3.4), (12.6, 6.4)]),
+];
 
 fn segments(icon: Icon) -> &'static [Segment] {
     match icon {
@@ -325,6 +359,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::ArrowUp => ARROW_UP,
         Icon::Download => DOWNLOAD,
         Icon::Refresh => REFRESH,
+        Icon::Undo => UNDO,
         Icon::History => HISTORY,
         Icon::Warning => WARNING,
         Icon::Error => ERROR,
@@ -333,12 +368,13 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Sparkle => SPARKLE,
         Icon::Bolt => BOLT,
         Icon::Ellipsis => ELLIPSIS,
+        Icon::ExternalLink => EXTERNAL_LINK,
     }
 }
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 28] = [
+pub(crate) const ALL: [Icon; 30] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -359,6 +395,7 @@ pub(crate) const ALL: [Icon; 28] = [
     Icon::ArrowUp,
     Icon::Download,
     Icon::Refresh,
+    Icon::Undo,
     Icon::History,
     Icon::Warning,
     Icon::Error,
@@ -367,6 +404,7 @@ pub(crate) const ALL: [Icon; 28] = [
     Icon::Sparkle,
     Icon::Bolt,
     Icon::Ellipsis,
+    Icon::ExternalLink,
 ];
 
 /// Paints `icon` centered inside `rect`, scaled from the 16 px grid so the
@@ -641,5 +679,28 @@ mod tests {
 
         assert_eq!(painted.len(), 4);
         assert!(painted.iter().all(|shape| matches!(shape, Shape::Path(_))));
+    }
+
+    #[test]
+    fn undo_is_one_circular_arrow_without_a_clock_face() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Undo, rect, Color32::WHITE);
+
+        assert_eq!(painted.len(), 2);
+        assert!(painted.iter().all(|shape| matches!(shape, Shape::Path(_))));
+    }
+
+    #[test]
+    fn undo_keeps_a_gap_between_the_arc_and_arrowhead() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Undo, rect, Color32::WHITE);
+        let [Shape::Path(arc), Shape::Path(arrowhead)] = painted.as_slice() else {
+            panic!("undo should be two paths");
+        };
+
+        assert!(
+            arc.points.last().expect("arc end").x - arrowhead.points[0].x > arc.stroke.width,
+            "the loose arc end touches the arrowhead"
+        );
     }
 }

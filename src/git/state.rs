@@ -22,7 +22,7 @@ pub struct GitState {
     pub pending_paths: HashSet<(PathBuf, PathBuf)>,
     pub pending_operation: Option<&'static str>,
     pub last_refresh_error: Option<String>,
-    pub focus_index: usize,
+    pub focus_index: Option<usize>,
     pub focus_commit: bool,
 }
 
@@ -76,15 +76,16 @@ impl GitState {
                 self.pending_paths.clear();
                 self.pending_operation = None;
                 self.last_refresh_error = None;
-                self.focus_index = self.focus_index.min(
-                    snapshot
-                        .repositories
-                        .iter()
-                        .map(|repository| repository.entries.len())
-                        .max()
-                        .unwrap_or_default()
-                        .saturating_sub(1),
-                );
+                let last_index = snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.entries.len())
+                    .max()
+                    .and_then(|len| len.checked_sub(1));
+                self.focus_index = self
+                    .focus_index
+                    .zip(last_index)
+                    .map(|(index, last)| index.min(last));
             }
             GitEvent::RefreshFailed(message) => {
                 self.last_refresh_error = Some(message.clone());
@@ -114,7 +115,7 @@ mod tests {
     use super::{GitAvailability, GitState};
     use crate::git::{
         controller::GitEvent,
-        status::{BranchInfo, GitStatusSnapshot, RepoInfo, RepositoryStatus},
+        status::{BranchInfo, ChangeKind, GitEntry, GitStatusSnapshot, RepoInfo, RepositoryStatus},
     };
 
     fn snapshot(generation: u64, root: &str) -> GitStatusSnapshot {
@@ -157,5 +158,21 @@ mod tests {
         );
         assert!(state.pending_paths.is_empty());
         assert_eq!(state.availability, GitAvailability::Ready);
+    }
+
+    #[test]
+    fn status_does_not_focus_a_change_until_the_user_selects_one() {
+        let mut state = GitState::default();
+        let mut status = snapshot(1, "/repo");
+        status.repositories[0].entries.push(GitEntry {
+            path: "file.rs".into(),
+            orig_path: None,
+            index: None,
+            worktree: Some(ChangeKind::Modified),
+        });
+
+        state.apply(&GitEvent::Status(status));
+
+        assert_eq!(state.focus_index, None);
     }
 }

@@ -253,7 +253,7 @@ pub(super) fn agent_code_galley(
 }
 
 #[expect(clippy::too_many_arguments)]
-pub(super) fn agent_markdown_galley(
+pub(super) fn assistant_markdown_galley(
     ui: &mut egui::Ui,
     id: Id,
     source: &str,

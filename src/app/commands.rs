@@ -17,7 +17,7 @@ impl EditorApp {
             || self.conflict
             || self.save_as.is_some()
             || self.error.is_some()
-            || self.agent_file_picker.is_some()
+            || self.attachment_file_picker.is_some()
             || self.project_folder_picker.is_some()
             || self.devin_confirm_terminate
             || self.devin_confirm_disconnect

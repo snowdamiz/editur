@@ -302,11 +302,11 @@ fn primary_modifiers() -> egui::Modifiers {
     }
 }
 const WINDOW_CORNER_RADIUS: u8 = theme::radius::WINDOW;
-const AGENT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
+const ASSISTANT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_FIND_HEIGHT: f32 = FIND_BAR_HEIGHT;
-const AGENT_COMPOSER_HEIGHT: f32 = 108.0;
-const AGENT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
-const AGENT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
+const ASSISTANT_COMPOSER_HEIGHT: f32 = 108.0;
+const ASSISTANT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
+const ASSISTANT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
 const AGENT_MENU_WIDTH: f32 = 240.0;
 const AGENT_PROVIDER_MENU_WIDTH: f32 = 240.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
@@ -356,7 +356,7 @@ fn agent_at_bottom(offset: f32, max_offset: f32) -> bool {
 }
 
 #[derive(Clone)]
-enum AgentImageSource {
+enum AssistantImageSource {
     Bytes(Arc<[u8]>),
     Path(PathBuf),
 }
@@ -365,7 +365,7 @@ fn draw_agent_content(
     ui: &mut egui::Ui,
     content: &DisplayContent,
     search: Option<(&str, Option<usize>)>,
-) -> Option<AgentImageSource> {
+) -> Option<AssistantImageSource> {
     let mut opened = None;
     match content {
         DisplayContent::Image {
@@ -375,9 +375,10 @@ fn draw_agent_content(
             data,
         } => {
             if let Some(data) = data
-                && agent_embedded_image_preview(ui, data).is_some_and(|preview| preview.clicked())
+                && assistant_embedded_image_preview(ui, data)
+                    .is_some_and(|preview| preview.clicked())
             {
-                opened = Some(AgentImageSource::Bytes(Arc::clone(data)));
+                opened = Some(AssistantImageSource::Bytes(Arc::clone(data)));
             }
             agent_search_label(
                 ui,
@@ -559,21 +560,22 @@ fn agent_path_link(
     .on_hover_text("Open in editor")
 }
 
-const AGENT_IMAGE_PREVIEW_EDGE: u32 = 640;
-const AGENT_IMAGE_LIGHTBOX_EDGE: u32 = 4_096;
-const AGENT_IMAGE_PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const AGENT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(240.0, 180.0);
-const AGENT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0);
+const ASSISTANT_IMAGE_PREVIEW_EDGE: u32 = 640;
+const ASSISTANT_IMAGE_LIGHTBOX_EDGE: u32 = 4_096;
+const ASSISTANT_IMAGE_PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const ASSISTANT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(240.0, 180.0);
+const ASSISTANT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0);
 
 #[derive(Clone)]
-enum AgentImagePreview {
+enum AssistantImagePreview {
     Unavailable,
     Loaded(egui::TextureHandle),
 }
 
-fn agent_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> egui::Response {
+fn assistant_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> egui::Response {
     let source_size = texture.size_vec2();
-    let bounds = AGENT_IMAGE_THUMBNAIL_SIZE.min(egui::vec2(ui.available_width(), f32::INFINITY));
+    let bounds =
+        ASSISTANT_IMAGE_THUMBNAIL_SIZE.min(egui::vec2(ui.available_width(), f32::INFINITY));
     let scale = (bounds.x / source_size.x)
         .min(bounds.y / source_size.y)
         .min(1.0);
@@ -595,7 +597,7 @@ fn agent_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> eg
     response
 }
 
-fn agent_image_cover_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+fn assistant_image_cover_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
     let source_aspect = source_size.x / source_size.y;
     let target_aspect = target_size.x / target_size.y;
     if source_aspect > target_aspect {
@@ -613,37 +615,39 @@ fn agent_image_cover_uv(source_size: egui::Vec2, target_size: egui::Vec2) -> egu
     }
 }
 
-fn agent_embedded_image_texture(
+fn assistant_embedded_image_texture(
     ui: &mut egui::Ui,
     data: &Arc<[u8]>,
 ) -> Option<egui::TextureHandle> {
     let cache_id = Id::new(("agent_embedded_image", data.as_ptr() as usize, data.len()));
-    let cached = ui.data(|state| state.get_temp::<AgentImagePreview>(cache_id));
+    let cached = ui.data(|state| state.get_temp::<AssistantImagePreview>(cache_id));
     let cached = cached.unwrap_or_else(|| {
         let name = format!(
             "agent_embedded_image_{:x}_{}",
             data.as_ptr() as usize,
             data.len()
         );
-        let loaded = load_agent_image_preview_bytes(ui.ctx(), &name, data)
-            .map_or(AgentImagePreview::Unavailable, AgentImagePreview::Loaded);
+        let loaded = load_assistant_image_preview_bytes(ui.ctx(), &name, data).map_or(
+            AssistantImagePreview::Unavailable,
+            AssistantImagePreview::Loaded,
+        );
         ui.data_mut(|state| state.insert_temp(cache_id, loaded.clone()));
         loaded
     });
     match cached {
-        AgentImagePreview::Unavailable => None,
-        AgentImagePreview::Loaded(texture) => Some(texture),
+        AssistantImagePreview::Unavailable => None,
+        AssistantImagePreview::Loaded(texture) => Some(texture),
     }
 }
 
-fn agent_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
-    let texture = agent_embedded_image_texture(ui, data)?;
-    Some(agent_image_thumbnail(ui, &texture))
+fn assistant_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+    let texture = assistant_embedded_image_texture(ui, data)?;
+    Some(assistant_image_thumbnail(ui, &texture))
 }
 
-fn agent_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
-    let texture = agent_embedded_image_texture(ui, data)?;
-    let edge = AGENT_PROMPT_IMAGE_THUMBNAIL_SIZE
+fn assistant_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
+    let texture = assistant_embedded_image_texture(ui, data)?;
+    let edge = ASSISTANT_PROMPT_IMAGE_THUMBNAIL_SIZE
         .x
         .min(ui.available_width());
     let size = egui::Vec2::splat(edge);
@@ -653,7 +657,7 @@ fn agent_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egu
             egui::Image::from_texture((texture.id(), source_size))
                 .fit_to_exact_size(size)
                 .maintain_aspect_ratio(false)
-                .uv(agent_image_cover_uv(source_size, size))
+                .uv(assistant_image_cover_uv(source_size, size))
                 .corner_radius(8)
                 .sense(Sense::click()),
         )
@@ -672,63 +676,65 @@ fn agent_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egu
 /// expand and is cached (including failures) so a frame never re-reads disk.
 fn agent_generated_image_preview(ui: &mut egui::Ui, path: &Path) -> Option<egui::Response> {
     let cache_id = Id::new(("agent_generated_image", path));
-    let cached = ui.data(|data| data.get_temp::<AgentImagePreview>(cache_id));
+    let cached = ui.data(|data| data.get_temp::<AssistantImagePreview>(cache_id));
     let cached = cached.unwrap_or_else(|| {
-        let loaded = load_agent_image_preview(ui.ctx(), path)
-            .map_or(AgentImagePreview::Unavailable, AgentImagePreview::Loaded);
+        let loaded = load_assistant_image_preview(ui.ctx(), path).map_or(
+            AssistantImagePreview::Unavailable,
+            AssistantImagePreview::Loaded,
+        );
         ui.data_mut(|data| data.insert_temp(cache_id, loaded.clone()));
         loaded
     });
     match cached {
-        AgentImagePreview::Unavailable => None,
-        AgentImagePreview::Loaded(texture) => Some(agent_image_thumbnail(ui, &texture)),
+        AssistantImagePreview::Unavailable => None,
+        AssistantImagePreview::Loaded(texture) => Some(assistant_image_thumbnail(ui, &texture)),
     }
 }
 
-fn load_agent_image_preview(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-    load_agent_image_path(ctx, path, AGENT_IMAGE_PREVIEW_EDGE)
+fn load_assistant_image_preview(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    load_assistant_image_path(ctx, path, ASSISTANT_IMAGE_PREVIEW_EDGE)
 }
 
-fn load_agent_image_path(
+fn load_assistant_image_path(
     ctx: &egui::Context,
     path: &Path,
     max_edge: u32,
 ) -> Option<egui::TextureHandle> {
     let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > AGENT_IMAGE_PREVIEW_MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > ASSISTANT_IMAGE_PREVIEW_MAX_BYTES {
         return None;
     }
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
-    decode_agent_image_preview(ctx, path.display().to_string(), reader, max_edge)
+    decode_assistant_image_preview(ctx, path.display().to_string(), reader, max_edge)
 }
 
-fn load_agent_image_preview_bytes(
+fn load_assistant_image_preview_bytes(
     ctx: &egui::Context,
     name: &str,
     bytes: &[u8],
 ) -> Option<egui::TextureHandle> {
-    load_agent_image_bytes(ctx, name, bytes, AGENT_IMAGE_PREVIEW_EDGE)
+    load_assistant_image_bytes(ctx, name, bytes, ASSISTANT_IMAGE_PREVIEW_EDGE)
 }
 
-fn load_agent_image_bytes(
+fn load_assistant_image_bytes(
     ctx: &egui::Context,
     name: &str,
     bytes: &[u8],
     max_edge: u32,
 ) -> Option<egui::TextureHandle> {
-    if bytes.is_empty() || bytes.len() as u64 > AGENT_IMAGE_PREVIEW_MAX_BYTES {
+    if bytes.is_empty() || bytes.len() as u64 > ASSISTANT_IMAGE_PREVIEW_MAX_BYTES {
         return None;
     }
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
-    decode_agent_image_preview(ctx, name.to_owned(), reader, max_edge)
+    decode_assistant_image_preview(ctx, name.to_owned(), reader, max_edge)
 }
 
-fn decode_agent_image_preview<R: BufRead + Seek>(
+fn decode_assistant_image_preview<R: BufRead + Seek>(
     ctx: &egui::Context,
     name: String,
     mut reader: image::ImageReader<R>,
@@ -1026,6 +1032,27 @@ fn chat_user_bubble(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui))
             ui.set_width(ui.available_width());
             add_contents(ui);
         });
+}
+
+fn chat_user_message(
+    ui: &mut egui::Ui,
+    text: &str,
+    search: Option<(&str, Option<usize>)>,
+    add_attachments: impl FnOnce(&mut egui::Ui),
+) {
+    chat_user_bubble(ui, |ui| {
+        if !text.is_empty() {
+            let job = agent_text_job(
+                text,
+                ui.available_width(),
+                theme::typography::body(),
+                theme::text().primary,
+                search,
+            );
+            ui.add(Label::new(job).wrap());
+        }
+        add_attachments(ui);
+    });
 }
 
 fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
@@ -1540,7 +1567,7 @@ fn agent_collapsing_header(
     });
 }
 
-fn agent_dense_disclosure_row(
+fn assistant_dense_disclosure_row(
     ui: &mut egui::Ui,
     id: Id,
     label: &str,
@@ -1888,7 +1915,7 @@ fn dense_agent_work_clusters(
 }
 
 #[expect(clippy::too_many_arguments)]
-fn agent_dense_tool(
+fn assistant_dense_tool(
     ui: &mut egui::Ui,
     id: Id,
     title: &str,
@@ -2403,17 +2430,73 @@ fn macos_titlebar_controls(
     selected
 }
 
-fn agent_composer_height(text_height: f32, row_height: f32, sidebar_height: f32) -> f32 {
+fn assistant_composer_height(text_height: f32, row_height: f32, sidebar_height: f32) -> f32 {
     let max_height =
-        AGENT_COMPOSER_MAX_HEIGHT.min((sidebar_height * 0.45).max(AGENT_COMPOSER_HEIGHT));
-    (AGENT_COMPOSER_HEIGHT + (text_height - row_height * 3.0).max(0.0)).min(max_height)
+        ASSISTANT_COMPOSER_MAX_HEIGHT.min((sidebar_height * 0.45).max(ASSISTANT_COMPOSER_HEIGHT));
+    (ASSISTANT_COMPOSER_HEIGHT + (text_height - row_height * 3.0).max(0.0)).min(max_height)
+}
+
+fn draw_assistant_sidebar_surface(ui: &mut egui::Ui, rect: egui::Rect) {
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Body, theme::typography::title());
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Small, theme::typography::small());
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Button, theme::typography::body());
+    ui.painter()
+        .rect_filled(rect, 0.0, theme::state::sidebar_material());
+}
+
+fn assistant_sidebar_header(rect: egui::Rect) -> egui::Rect {
+    rect.with_max_y((rect.top() + ASSISTANT_HEADER_HEIGHT).min(rect.bottom()))
+}
+
+fn paint_assistant_header_divider(painter: &egui::Painter, header: egui::Rect) {
+    painter.hline(
+        header.x_range(),
+        header.bottom() - 0.5,
+        egui::Stroke::new(1.0, theme::border::hairline_color()),
+    );
+}
+
+fn measure_assistant_composer_height(
+    ui: &mut egui::Ui,
+    prompt: &str,
+    prompt_width: f32,
+    sidebar_height: f32,
+    has_attachments: bool,
+) -> f32 {
+    let font_id = theme::typography::body();
+    let (text_height, row_height) = ui.fonts_mut(|fonts| {
+        (
+            fonts
+                .layout(
+                    prompt.to_owned(),
+                    font_id.clone(),
+                    Color32::WHITE,
+                    prompt_width.max(24.0),
+                )
+                .size()
+                .y,
+            fonts.row_height(&font_id),
+        )
+    });
+    assistant_composer_height(text_height, row_height, sidebar_height)
+        + if has_attachments {
+            ASSISTANT_ATTACHMENT_ROW_HEIGHT
+        } else {
+            0.0
+        }
 }
 
 fn split_agent_sidebar(
     rect: egui::Rect,
     composer_height: f32,
 ) -> (egui::Rect, egui::Rect, egui::Rect) {
-    let header = rect.with_max_y((rect.top() + AGENT_HEADER_HEIGHT).min(rect.bottom()));
+    let header = assistant_sidebar_header(rect);
     let composer = rect.with_min_y(
         (rect.bottom() - composer_height)
             .max(header.bottom())
@@ -2425,7 +2508,7 @@ fn split_agent_sidebar(
 
 fn agent_toggle_rect(header: egui::Rect) -> egui::Rect {
     #[cfg(target_os = "macos")]
-    let controls_right = header.right();
+    let controls_right = header.right() - 3.0;
     #[cfg(not(target_os = "macos"))]
     let controls_right = header.right() - 3.0 * 46.0;
     egui::Rect::from_center_size(
@@ -2521,7 +2604,7 @@ fn agent_new_session_rect(header: egui::Rect) -> egui::Rect {
 
 /// Inset the composer so the prompt and footer share one rhythm: equal sides,
 /// a little extra air under the toolbar so the selects don't sit on the edge.
-fn agent_composer_content(composer: egui::Rect) -> egui::Rect {
+fn assistant_composer_content(composer: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(
             composer.left() + theme::space::MEDIUM,
@@ -3210,9 +3293,16 @@ struct AgenticDiff {
     text: String,
 }
 
-struct AgentComposerAttachment {
+struct AssistantComposerAttachment {
     file: PromptAttachment,
     thumbnail: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum AttachmentTarget {
+    #[default]
+    Agent,
+    Devin,
 }
 
 enum SettingsAction {
@@ -3353,7 +3443,7 @@ enum FilePickerOutcome {
     OpenDirectory(PathBuf),
 }
 
-struct AgentFilePicker {
+struct WorkspaceFilePicker {
     purpose: FilePickerPurpose,
     directory: PathBuf,
     entries: Vec<TreeEntry>,
@@ -3376,7 +3466,7 @@ struct AgentFilePicker {
     history_forward: Vec<PathBuf>,
 }
 
-impl AgentFilePicker {
+impl WorkspaceFilePicker {
     fn open(directory: PathBuf) -> Result<Self, String> {
         let entries = read_directory(&directory)?;
         Ok(Self::with_entries(directory, entries))
@@ -3508,7 +3598,334 @@ impl AgentFilePicker {
     }
 }
 
-fn load_agent_thumbnail(
+fn stage_composer_files(
+    ctx: &egui::Context,
+    attachments: &mut Vec<AssistantComposerAttachment>,
+    paths: impl IntoIterator<Item = PathBuf>,
+    allow_directories: bool,
+) -> Option<String> {
+    let mut first_error = None;
+    for path in paths {
+        if attachments.len() >= MAX_PROMPT_ATTACHMENTS {
+            return Some(format!("attach at most {MAX_PROMPT_ATTACHMENTS} items"));
+        }
+        let attachment = match PromptAttachment::from_path(path) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if attachment.is_directory() && !allow_directories {
+            first_error.get_or_insert_with(|| "Only files can be attached here".into());
+            continue;
+        }
+        if attachments
+            .iter()
+            .any(|attached| attached.file.path() == attachment.path())
+        {
+            continue;
+        }
+        let total = attachments
+            .iter()
+            .map(|attached| attached.file.byte_len())
+            .sum::<u64>()
+            .saturating_add(attachment.byte_len());
+        if total > MAX_PROMPT_ATTACHMENT_TOTAL_BYTES {
+            return Some(format!(
+                "attached files must total no more than {} MiB",
+                MAX_PROMPT_ATTACHMENT_TOTAL_BYTES / 1024 / 1024
+            ));
+        }
+        let thumbnail = load_assistant_thumbnail(ctx, &attachment);
+        attachments.push(AssistantComposerAttachment {
+            file: attachment,
+            thumbnail,
+        });
+    }
+    first_error
+}
+
+struct AssistantComposer<'a> {
+    panel: egui::Rect,
+    prompt_id: Id,
+    attach_id: Id,
+    scroll_id: Id,
+    hint: &'a str,
+    attach_tooltip: &'a str,
+    drop_hint: &'a str,
+    enabled: bool,
+    send_enabled: bool,
+    active: bool,
+    allow_directories: bool,
+    handle_drop: bool,
+    mouse_wheel: bool,
+    focus: bool,
+    radius: f32,
+}
+
+struct AssistantComposerOutput {
+    input_changed: bool,
+    submit: bool,
+    send: bool,
+    cancel: bool,
+    open_file_picker: bool,
+    input_rect: egui::Rect,
+    controls_rect: egui::Rect,
+    error: Option<String>,
+}
+
+impl AssistantComposer<'_> {
+    fn stage_drop(
+        ui: &egui::Ui,
+        panel: egui::Rect,
+        enabled: bool,
+        attachments: &mut Vec<AssistantComposerAttachment>,
+        drop_hovered: &mut bool,
+        allow_directories: bool,
+    ) -> Option<String> {
+        let (hovered_files, dropped_files, pointer) = ui.input(|input| {
+            (
+                !input.raw.hovered_files.is_empty(),
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+                input.pointer.hover_pos(),
+            )
+        });
+        // External file drags do not always carry a pointer event on macOS.
+        let pointer_over_composer = pointer.is_none_or(|pointer| panel.contains(pointer));
+        if hovered_files {
+            *drop_hovered = enabled && pointer_over_composer;
+        }
+        if dropped_files.is_empty() {
+            if !hovered_files {
+                *drop_hovered = false;
+            }
+            return None;
+        }
+        let dropped_over_composer = enabled && (pointer_over_composer || *drop_hovered);
+        *drop_hovered = false;
+        dropped_over_composer
+            .then(|| stage_composer_files(ui.ctx(), attachments, dropped_files, allow_directories))
+            .flatten()
+    }
+
+    fn show(
+        self,
+        ui: &mut egui::Ui,
+        prompt: &mut String,
+        attachments: &mut Vec<AssistantComposerAttachment>,
+        drop_hovered: &mut bool,
+    ) -> AssistantComposerOutput {
+        let error = self
+            .handle_drop
+            .then(|| {
+                Self::stage_drop(
+                    ui,
+                    self.panel,
+                    self.enabled,
+                    attachments,
+                    drop_hovered,
+                    self.allow_directories,
+                )
+            })
+            .flatten();
+        let content = assistant_composer_content(self.panel);
+        let attachment_height = if attachments.is_empty() {
+            0.0
+        } else {
+            ASSISTANT_ATTACHMENT_ROW_HEIGHT
+        };
+        if attachment_height > 0.0 {
+            let attachments_rect = egui::Rect::from_min_max(
+                content.left_top(),
+                egui::pos2(content.right(), content.top() + attachment_height),
+            );
+            let mut remove = None;
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt(self.scroll_id.with("attachments"))
+                    .max_rect(attachments_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ScrollArea::horizontal()
+                        .id_salt(self.scroll_id.with("attachment_scroll"))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (index, attachment) in attachments.iter().enumerate() {
+                                    if assistant_attachment_tile(ui, attachment).clicked() {
+                                        remove = Some(index);
+                                    }
+                                }
+                            });
+                        });
+                },
+            );
+            if let Some(index) = remove {
+                attachments.remove(index);
+                ui.ctx().request_repaint();
+            }
+        }
+        let footer = egui::Rect::from_min_max(
+            egui::pos2(
+                content.left() - (theme::control::STANDARD - icons::GRID) * 0.5,
+                content.bottom() - theme::control::STANDARD,
+            ),
+            content.right_bottom(),
+        );
+        let input_rect = egui::Rect::from_min_max(
+            egui::pos2(content.left(), content.top() + attachment_height),
+            egui::pos2(content.right(), footer.top() - theme::space::SMALL),
+        );
+        let mut input_changed = false;
+        let mut submit = false;
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(self.scroll_id.with("region"))
+                .max_rect(input_rect)
+                .layout(Layout::top_down(Align::LEFT)),
+            |ui| {
+                ScrollArea::vertical()
+                    .id_salt(self.scroll_id)
+                    .max_height(input_rect.height())
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, false])
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        mouse_wheel: self.mouse_wheel,
+                        ..Default::default()
+                    })
+                    .content_margin(0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let input = ui.add_enabled(
+                            self.enabled,
+                            TextEdit::multiline(prompt)
+                                .id(self.prompt_id)
+                                .font(theme::typography::body())
+                                .hint_text(
+                                    RichText::new(self.hint)
+                                        .size(theme::typography::BODY_SIZE)
+                                        .color(theme::text().secondary),
+                                )
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .return_key(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::SHIFT,
+                                    Key::Enter,
+                                ))
+                                .frame(egui::Frame::NONE),
+                        );
+                        if self.focus {
+                            input.request_focus();
+                        }
+                        input_changed = input.changed();
+                        submit = input.has_focus()
+                            && ui.input(|input| {
+                                !input.modifiers.shift && input.key_pressed(Key::Enter)
+                            });
+                    });
+            },
+        );
+        let controls_footer = footer.with_max_x(
+            (footer.right() - theme::control::STANDARD - theme::space::SMALL).max(footer.left()),
+        );
+        let mut open_file_picker = false;
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(self.scroll_id.with("footer"))
+                .max_rect(controls_footer.translate(egui::vec2(0.0, theme::space::SMALL)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                open_file_picker = ui
+                    .add_enabled_ui(self.enabled, |ui| {
+                        icons::button_with_id(
+                            ui,
+                            Some(self.attach_id),
+                            Icon::Plus,
+                            self.attach_tooltip,
+                            theme::text().secondary,
+                            egui::Vec2::splat(theme::control::STANDARD),
+                        )
+                    })
+                    .inner
+                    .clicked();
+            },
+        );
+        let controls_rect = controls_footer
+            .translate(egui::vec2(0.0, theme::space::SMALL))
+            .with_min_x(controls_footer.left() + theme::control::STANDARD + theme::space::SMALL);
+        let mut send = false;
+        let mut cancel = false;
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(self.scroll_id.with("action"))
+                .max_rect(footer)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                if self.active {
+                    cancel = assistant_composer_action(
+                        ui,
+                        Icon::Stop,
+                        "Stop",
+                        theme::state::selected(),
+                        theme::text().primary,
+                        true,
+                    )
+                    .clicked();
+                } else {
+                    let (fill, color) = assistant_send_button_colors(self.send_enabled);
+                    send = assistant_composer_action(
+                        ui,
+                        Icon::ArrowUp,
+                        "Send (Enter)",
+                        fill,
+                        color,
+                        self.send_enabled,
+                    )
+                    .clicked();
+                }
+            },
+        );
+        if *drop_hovered {
+            ui.painter().rect_filled(
+                self.panel,
+                self.radius,
+                theme::surface().raised.gamma_multiply(0.93),
+            );
+            ui.painter().rect_stroke(
+                self.panel.shrink(1.0),
+                self.radius,
+                egui::Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                self.panel.center(),
+                Align2::CENTER_CENTER,
+                self.drop_hint,
+                theme::typography::body(),
+                theme::text().primary,
+            );
+        }
+        AssistantComposerOutput {
+            input_changed,
+            submit,
+            send,
+            cancel,
+            open_file_picker,
+            input_rect,
+            controls_rect,
+            error,
+        }
+    }
+}
+
+fn load_assistant_thumbnail(
     ctx: &egui::Context,
     attachment: &PromptAttachment,
 ) -> Option<egui::TextureHandle> {
@@ -3536,9 +3953,9 @@ fn load_agent_thumbnail(
     ))
 }
 
-fn agent_attachment_tile(
+fn assistant_attachment_tile(
     ui: &mut egui::Ui,
-    attachment: &AgentComposerAttachment,
+    attachment: &AssistantComposerAttachment,
 ) -> egui::Response {
     let size = egui::vec2(48.0, 48.0);
     let response = if let Some(thumbnail) = &attachment.thumbnail {
@@ -3595,7 +4012,7 @@ fn agent_attachment_tile(
     response.on_hover_text(format!("Remove {}", attachment.file.path().display()))
 }
 
-fn agent_file_picker_row(
+fn workspace_file_picker_row(
     ui: &mut egui::Ui,
     entry: &TreeEntry,
     selected: bool,
@@ -3659,7 +4076,7 @@ fn agent_file_picker_row(
 }
 
 /// A rail shortcut: the Places and Recent rows share this one look.
-fn agent_file_picker_location_row(
+fn workspace_file_picker_location_row(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,
@@ -3965,6 +4382,8 @@ pub struct EditorApp {
     devin_create_prompt: String,
     devin_creating: bool,
     devin_message: String,
+    devin_attachments: Vec<AssistantComposerAttachment>,
+    devin_drop_hovered: bool,
     devin_pending_message: Option<PendingDevinMessage>,
     devin_pending_lifecycle: Option<DevinLifecycle>,
     devin_confirm_terminate: bool,
@@ -3975,8 +4394,8 @@ pub struct EditorApp {
     agent_follow_transcript: bool,
     agent_prompt_history_index: Option<usize>,
     agent_prompt_history_draft: String,
-    agent_attachments: Vec<AgentComposerAttachment>,
-    agent_image_lightbox: Option<AgentImageSource>,
+    agent_attachments: Vec<AssistantComposerAttachment>,
+    assistant_image_lightbox: Option<AssistantImageSource>,
     agent_mentions: Option<Vec<AgentMentionEntry>>,
     agent_mention_matches: Vec<AgentMentionEntry>,
     agent_mention_selected: usize,
@@ -3991,8 +4410,9 @@ pub struct EditorApp {
     /// were culled spacers); the culling tests key off this.
     agent_transcript_rendered: usize,
     agent_drop_hovered: bool,
-    agent_file_picker: Option<AgentFilePicker>,
-    project_folder_picker: Option<AgentFilePicker>,
+    attachment_file_picker: Option<WorkspaceFilePicker>,
+    attachment_picker_target: AttachmentTarget,
+    project_folder_picker: Option<WorkspaceFilePicker>,
     agent_run_everything: Option<bool>,
     selected_provider: ProviderId,
     available_providers: Vec<ProviderId>,
@@ -4157,6 +4577,8 @@ impl EditorApp {
             devin_create_prompt: String::new(),
             devin_creating: false,
             devin_message: String::new(),
+            devin_attachments: Vec::new(),
+            devin_drop_hovered: false,
             devin_pending_message: None,
             devin_pending_lifecycle: None,
             devin_confirm_terminate: false,
@@ -4168,7 +4590,7 @@ impl EditorApp {
             agent_prompt_history_index: None,
             agent_prompt_history_draft: String::new(),
             agent_attachments: Vec::new(),
-            agent_image_lightbox: None,
+            assistant_image_lightbox: None,
             agent_mentions: None,
             agent_mention_matches: Vec::new(),
             agent_mention_selected: 0,
@@ -4177,7 +4599,8 @@ impl EditorApp {
             agent_transcript_heights_key: (0, 0, false, false, 0),
             agent_transcript_rendered: 0,
             agent_drop_hovered: false,
-            agent_file_picker: None,
+            attachment_file_picker: None,
+            attachment_picker_target: AttachmentTarget::Agent,
             project_folder_picker: None,
             agent_run_everything: None,
             selected_provider: ProviderId::Cursor,
@@ -4968,8 +5391,7 @@ impl EditorApp {
 
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 0.0, theme::state::sidebar_material());
+        draw_assistant_sidebar_surface(ui, rect);
         let settings = sidebar_settings_rect(rect);
         let content = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 14.0, rect.top() + TITLEBAR_HEIGHT + 14.0),
@@ -6164,7 +6586,7 @@ impl EditorApp {
         self.agentic_mode = enabled;
         self.agent_menu = None;
         self.agent_menu_popup = None;
-        self.agent_file_picker = None;
+        self.attachment_file_picker = None;
         if !enabled {
             self.agent_find.open = false;
             self.agent_find.focus = false;
@@ -6246,22 +6668,22 @@ impl EditorApp {
         self.window_action.take()
     }
 
-    fn draw_agent_image_lightbox(&mut self, ctx: &egui::Context) {
-        let Some(source) = self.agent_image_lightbox.clone() else {
+    fn draw_assistant_image_lightbox(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.assistant_image_lightbox.clone() else {
             return;
         };
         let cache_id = match &source {
-            AgentImageSource::Bytes(data) => Id::new((
+            AssistantImageSource::Bytes(data) => Id::new((
                 "agent_image_lightbox_bytes",
                 data.as_ptr() as usize,
                 data.len(),
             )),
-            AgentImageSource::Path(path) => Id::new(("agent_image_lightbox_path", path)),
+            AssistantImageSource::Path(path) => Id::new(("agent_image_lightbox_path", path)),
         };
-        let cached = ctx.data(|data| data.get_temp::<AgentImagePreview>(cache_id));
+        let cached = ctx.data(|data| data.get_temp::<AssistantImagePreview>(cache_id));
         let preview = cached.unwrap_or_else(|| {
             let loaded = match &source {
-                AgentImageSource::Bytes(data) => load_agent_image_bytes(
+                AssistantImageSource::Bytes(data) => load_assistant_image_bytes(
                     ctx,
                     &format!(
                         "agent_image_lightbox_{:x}_{}",
@@ -6269,18 +6691,21 @@ impl EditorApp {
                         data.len()
                     ),
                     data,
-                    AGENT_IMAGE_LIGHTBOX_EDGE,
+                    ASSISTANT_IMAGE_LIGHTBOX_EDGE,
                 ),
-                AgentImageSource::Path(path) => {
-                    load_agent_image_path(ctx, path, AGENT_IMAGE_LIGHTBOX_EDGE)
+                AssistantImageSource::Path(path) => {
+                    load_assistant_image_path(ctx, path, ASSISTANT_IMAGE_LIGHTBOX_EDGE)
                 }
             };
-            let preview = loaded.map_or(AgentImagePreview::Unavailable, AgentImagePreview::Loaded);
+            let preview = loaded.map_or(
+                AssistantImagePreview::Unavailable,
+                AssistantImagePreview::Loaded,
+            );
             ctx.data_mut(|data| data.insert_temp(cache_id, preview.clone()));
             preview
         });
-        let AgentImagePreview::Loaded(texture) = preview else {
-            self.agent_image_lightbox = None;
+        let AssistantImagePreview::Loaded(texture) = preview else {
+            self.assistant_image_lightbox = None;
             return;
         };
 
@@ -6295,7 +6720,7 @@ impl EditorApp {
             .stroke(theme::border::strong())
             .corner_radius(theme::corner(theme::radius::DIALOG))
             .shadow(theme::shadow::dialog());
-        let modal = egui::Modal::new(Id::new("agent_image_lightbox"))
+        let modal = egui::Modal::new(Id::new("assistant_image_lightbox"))
             .backdrop_color(theme::state::scrim())
             .frame(frame)
             .show(ctx, |ui| {
@@ -6362,13 +6787,13 @@ impl EditorApp {
             });
         close |= modal.backdrop_response.clicked();
         if close {
-            self.agent_image_lightbox = None;
+            self.assistant_image_lightbox = None;
         }
     }
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
-        self.draw_agent_image_lightbox(ctx);
-        self.draw_agent_file_picker(ctx);
+        self.draw_assistant_image_lightbox(ctx);
+        self.draw_attachment_file_picker(ctx);
         self.draw_project_folder_picker(ctx);
         self.draw_git_discard_dialog(ctx);
         if self.devin_confirm_terminate {
@@ -6790,7 +7215,7 @@ fn agent_config_selector_button(
     response.on_hover_text(format!("{tooltip}\n{label}"))
 }
 
-fn agent_send_button_colors(ready: bool) -> (Color32, Color32) {
+fn assistant_send_button_colors(ready: bool) -> (Color32, Color32) {
     if ready {
         (theme::accent(), theme::text().on_accent)
     } else {
@@ -6805,7 +7230,7 @@ fn agentic_composer_fill() -> Color32 {
 
 /// Send and stop: one solid 32 px control, filled by state rather than drawn
 /// as a bare glyph, because it is the panel's primary action.
-fn agent_composer_action(
+fn assistant_composer_action(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,

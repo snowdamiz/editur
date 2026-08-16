@@ -934,7 +934,7 @@ impl EditorApp {
             && let Some(diff) = self.tabs[index].git_diff.clone()
         {
             ui.painter()
-                .rect_filled(ui.max_rect(), 0.0, theme::surface().input);
+                .rect_filled(ui.max_rect(), 0.0, editor_background());
             let id = Id::new(("tab_git_diff", &self.tabs[index].buffer.path));
             let rendered = cached_agent_diff(ui, id, diff.old.as_deref(), &diff.new);
             if diff.unsaved_editor_changes {
@@ -1395,20 +1395,26 @@ impl EditorApp {
         }
     }
 
-    pub(super) fn draw_agent_file_picker(&mut self, ctx: &egui::Context) {
-        if self.agent_file_picker.is_none() {
+    pub(super) fn draw_attachment_file_picker(&mut self, ctx: &egui::Context) {
+        if self.attachment_file_picker.is_none() {
             return;
         }
         let project_root = self.tree.root.clone();
-        let attached_count = self.agent_attachments.len();
-        let Some(picker) = self.agent_file_picker.as_mut() else {
+        let attached_count = match self.attachment_picker_target {
+            AttachmentTarget::Agent => self.agent_attachments.len(),
+            AttachmentTarget::Devin => self.devin_attachments.len(),
+        };
+        let Some(picker) = self.attachment_file_picker.as_mut() else {
             return;
         };
         match Self::file_picker_dialog(ctx, picker, Some(&project_root), attached_count) {
-            Some(FilePickerOutcome::Dismissed) => self.agent_file_picker = None,
+            Some(FilePickerOutcome::Dismissed) => self.attachment_file_picker = None,
             Some(FilePickerOutcome::AttachFiles(paths)) => {
-                self.agent_file_picker = None;
-                self.attach_agent_files(ctx, paths);
+                self.attachment_file_picker = None;
+                match self.attachment_picker_target {
+                    AttachmentTarget::Agent => self.attach_agent_files(ctx, paths),
+                    AttachmentTarget::Devin => self.attach_devin_files(ctx, paths),
+                }
                 ctx.request_repaint();
             }
             Some(FilePickerOutcome::OpenDirectory(_)) | None => {}
@@ -1439,7 +1445,7 @@ impl EditorApp {
     /// native dialog stalls. Returns what the user resolved this frame.
     pub(super) fn file_picker_dialog(
         ctx: &egui::Context,
-        picker: &mut AgentFilePicker,
+        picker: &mut WorkspaceFilePicker,
         project_root: Option<&Path>,
         attached_count: usize,
     ) -> Option<FilePickerOutcome> {
@@ -1536,7 +1542,7 @@ impl EditorApp {
         let remaining = MAX_PROMPT_ATTACHMENTS
             .saturating_sub(attached_count.saturating_add(picker.selected.len()));
         let (title, window_id) = match purpose {
-            FilePickerPurpose::AttachFiles => ("Add context", "agent_file_picker"),
+            FilePickerPurpose::AttachFiles => ("Add context", "attachment_file_picker"),
             FilePickerPurpose::OpenProject => ("Open project", "project_folder_picker"),
         };
         let frame = egui::Frame::new()
@@ -1779,7 +1785,7 @@ impl EditorApp {
                         );
                         ui.add_space(theme::space::TIGHT);
                         for (index, (icon, label, path)) in places.iter().enumerate() {
-                            if agent_file_picker_location_row(
+                            if workspace_file_picker_location_row(
                                 ui,
                                 *icon,
                                 label,
@@ -1805,7 +1811,7 @@ impl EditorApp {
                                     || path.display().to_string(),
                                     |name| name.to_string_lossy().into_owned(),
                                 );
-                                if agent_file_picker_location_row(
+                                if workspace_file_picker_location_row(
                                     ui,
                                     Icon::History,
                                     &name,
@@ -1867,7 +1873,7 @@ impl EditorApp {
                                     let selected = picker.selected.contains(&entry.path);
                                     let highlighted = picker.cursor == Some(index);
                                     let response =
-                                        agent_file_picker_row(ui, entry, selected, highlighted);
+                                        workspace_file_picker_row(ui, entry, selected, highlighted);
                                     if highlighted && cursor_moved {
                                         response.scroll_to_me(None);
                                     }

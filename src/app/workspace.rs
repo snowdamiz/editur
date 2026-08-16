@@ -242,7 +242,7 @@ impl EditorApp {
         let start = directories::UserDirs::new()
             .map(|directories| directories.home_dir().to_path_buf())
             .unwrap_or_else(|| self.tree.root.clone());
-        match AgentFilePicker::open_directories(start) {
+        match WorkspaceFilePicker::open_directories(start) {
             Ok(mut picker) => {
                 picker.recent = self
                     .recent_projects

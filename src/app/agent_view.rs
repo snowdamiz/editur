@@ -3,10 +3,7 @@ use super::*;
 impl EditorApp {
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        // The same frosted material as the file tree, so the window reads as
-        // one glass rail on each side of the document.
-        ui.painter()
-            .rect_filled(rect, 0.0, theme::state::sidebar_material());
+        draw_assistant_sidebar_surface(ui, rect);
         self.draw_agent(ui, rect);
     }
 
@@ -187,7 +184,7 @@ impl EditorApp {
         self.agent_prompt_history_draft.clear();
         self.agent_follow_transcript = true;
         self.agent_find.dirty = true;
-        self.agent_file_picker = None;
+        self.attachment_file_picker = None;
         self.agent_run_everything = None;
         self.start_provider(target, ctx);
     }
@@ -235,7 +232,7 @@ impl EditorApp {
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
                 self.agent_attachments.clear();
-                self.agent_file_picker = None;
+                self.attachment_file_picker = None;
             }
             if selected && matches!(event, AgentEvent::UserMessage(_)) {
                 self.agent_attachments.clear();
@@ -445,58 +442,44 @@ impl EditorApp {
         ctx: &egui::Context,
         paths: impl IntoIterator<Item = PathBuf>,
     ) {
-        for path in paths {
-            if self.agent_attachments.len() >= MAX_PROMPT_ATTACHMENTS {
-                self.show_error(format!("attach at most {MAX_PROMPT_ATTACHMENTS} items"));
-                break;
-            }
-            let attachment = match PromptAttachment::from_path(path) {
-                Ok(attachment) => attachment,
-                Err(error) => {
-                    self.show_error(error);
-                    continue;
-                }
-            };
-            if self
-                .agent_attachments
-                .iter()
-                .any(|attached| attached.file.path() == attachment.path())
-            {
-                continue;
-            }
-            let total = self
-                .agent_attachments
-                .iter()
-                .map(|attached| attached.file.byte_len())
-                .sum::<u64>()
-                .saturating_add(attachment.byte_len());
-            if total > MAX_PROMPT_ATTACHMENT_TOTAL_BYTES {
-                self.show_error(format!(
-                    "attached files must total no more than {} MiB",
-                    MAX_PROMPT_ATTACHMENT_TOTAL_BYTES / 1024 / 1024
-                ));
-                break;
-            }
-            let thumbnail = load_agent_thumbnail(ctx, &attachment);
-            self.agent_attachments.push(AgentComposerAttachment {
-                file: attachment,
-                thumbnail,
-            });
+        if let Some(error) = stage_composer_files(ctx, &mut self.agent_attachments, paths, true) {
+            self.show_error(error);
+        }
+    }
+
+    pub(super) fn attach_devin_files(
+        &mut self,
+        ctx: &egui::Context,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) {
+        if let Some(error) = stage_composer_files(ctx, &mut self.devin_attachments, paths, false) {
+            self.show_error(error);
         }
     }
 
     pub(super) fn open_agent_file_picker(&mut self) {
+        self.open_attachment_file_picker(AttachmentTarget::Agent);
+    }
+
+    pub(super) fn open_devin_file_picker(&mut self) {
+        self.open_attachment_file_picker(AttachmentTarget::Devin);
+    }
+
+    fn open_attachment_file_picker(&mut self, target: AttachmentTarget) {
         let directory = self.tree.root.clone();
         let picker = self
             .tree
             .children
             .get(&directory)
             .cloned()
-            .map(|entries| AgentFilePicker::with_entries(directory.clone(), entries))
+            .map(|entries| WorkspaceFilePicker::with_entries(directory.clone(), entries))
             .map(Ok)
-            .unwrap_or_else(|| AgentFilePicker::open(directory));
+            .unwrap_or_else(|| WorkspaceFilePicker::open(directory));
         match picker {
-            Ok(picker) => self.agent_file_picker = Some(picker),
+            Ok(picker) => {
+                self.attachment_file_picker = Some(picker);
+                self.attachment_picker_target = target;
+            }
             Err(error) => self.show_error(error),
         }
     }
@@ -545,16 +528,6 @@ impl EditorApp {
     }
 
     pub(super) fn draw_agent(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        ui.style_mut()
-            .text_styles
-            .insert(egui::TextStyle::Body, theme::typography::title());
-        ui.style_mut()
-            .text_styles
-            .insert(egui::TextStyle::Small, theme::typography::small());
-        ui.style_mut()
-            .text_styles
-            .insert(egui::TextStyle::Button, theme::typography::body());
-        let font_id = egui::TextStyle::Body.resolve(ui.style());
         // The exact width the prompt is laid out at later, so the measured
         // text height matches what the composer actually shows.
         let prompt_width = if self.agentic_mode {
@@ -563,27 +536,13 @@ impl EditorApp {
         } else {
             rect.width() - 2.0 * theme::space::MEDIUM
         };
-        let (text_height, row_height) = ui.fonts_mut(|fonts| {
-            let row_height = fonts.row_height(&font_id);
-            let text_height = fonts
-                .layout(
-                    self.agent.prompt.clone(),
-                    font_id,
-                    Color32::WHITE,
-                    prompt_width.max(24.0),
-                )
-                .size()
-                .y;
-            (text_height, row_height)
-        });
-        let attachment_height = if self.agent_attachments.is_empty() {
-            0.0
-        } else {
-            AGENT_ATTACHMENT_ROW_HEIGHT
-        };
-        let composer_height = (agent_composer_height(text_height, row_height, rect.height())
-            + attachment_height)
-            .min(AGENT_COMPOSER_MAX_HEIGHT + attachment_height);
+        let composer_height = measure_assistant_composer_height(
+            ui,
+            &self.agent.prompt,
+            prompt_width,
+            rect.height(),
+            !self.agent_attachments.is_empty(),
+        );
         let composer_height = if self.agentic_mode {
             composer_height + AGENTIC_COMPOSER_TOP_MARGIN + AGENTIC_COMPOSER_BOTTOM_MARGIN
         } else {
@@ -605,11 +564,7 @@ impl EditorApp {
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
         let painter = ui.painter().clone();
-        painter.hline(
-            header.x_range(),
-            header.bottom() - 0.5,
-            egui::Stroke::new(1.0, theme::border::hairline_color()),
-        );
+        paint_assistant_header_divider(&painter, header);
         let project_title = self
             .tree
             .root
@@ -696,7 +651,7 @@ impl EditorApp {
             self.agent_sidebar = false;
             self.agent_sidebar_dragging = false;
             self.agent_menu = None;
-            self.agent_file_picker = None;
+            self.attachment_file_picker = None;
             ui.ctx().request_repaint();
         }
         if !self.agentic_mode && self.agent.session_ready {
@@ -741,7 +696,7 @@ impl EditorApp {
         let mut interaction_responses = Vec::new();
         let mut open_path_request: Option<(PathBuf, Option<u32>)> = None;
         let mut open_diff_request: Option<PathBuf> = None;
-        let mut open_image_request: Option<AgentImageSource> = None;
+        let mut open_image_request: Option<AssistantImageSource> = None;
         let transcript_padding = if self.agentic_mode {
             ((transcript.width() - AGENTIC_CONTENT_WIDTH) * 0.5).max(28.0)
         } else {
@@ -1236,7 +1191,7 @@ impl EditorApp {
                                         .flatten(),
                                 ));
                                 if let Some(cluster) = dense_cluster {
-                                    dense_work_open = agent_dense_disclosure_row(
+                                    dense_work_open = assistant_dense_disclosure_row(
                                         ui,
                                         Id::new(("dense_agent_work", item_index, cluster.active)),
                                         &cluster.label,
@@ -1256,30 +1211,20 @@ impl EditorApp {
                                 }
                                 match item {
                                     TranscriptItem::User(text) => {
-                                        chat_user_bubble(ui, |ui| {
-                                                if !text.is_empty() {
-                                                    let job = agent_text_job(
-                                                        text,
-                                                        ui.available_width(),
-                                                        theme::typography::body(),
-                                                        theme::text().primary,
-                                                        item_search,
-                                                    );
-                                                    ui.add(Label::new(job).wrap());
-                                                }
+                                        chat_user_message(ui, text, item_search, |ui| {
                                                 if !user_prompt_images[item_index].is_empty() {
                                                     if !text.is_empty() {
                                                         ui.add_space(theme::space::MEDIUM);
                                                     }
                                                     ui.horizontal_wrapped(|ui| {
                                                         for data in &user_prompt_images[item_index] {
-                                                            if agent_prompt_image_preview(ui, data)
+                                                            if assistant_prompt_image_preview(ui, data)
                                                                 .is_some_and(|preview| {
                                                                     preview.clicked()
                                                                 })
                                                             {
                                                                 open_image_request = Some(
-                                                                    AgentImageSource::Bytes(
+                                                                    AssistantImageSource::Bytes(
                                                                         Arc::clone(data),
                                                                     ),
                                                                 );
@@ -1294,7 +1239,7 @@ impl EditorApp {
                                             draw_provider_identity(ui, self.selected_provider);
                                         }
                                         let width = ui.available_width();
-                                        let galley = agent_markdown_galley(
+                                        let galley = assistant_markdown_galley(
                                             ui,
                                             Id::new(("agent_markdown", item_index, dense_agent)),
                                             text,
@@ -1316,7 +1261,7 @@ impl EditorApp {
                                                 );
                                             };
                                         if dense_agent {
-                                            agent_dense_tool(
+                                            assistant_dense_tool(
                                                 ui,
                                                 Id::new(("dense_agent_thought", item_index)),
                                                 "Thought",
@@ -1355,7 +1300,7 @@ impl EditorApp {
                                         } else if dense_agent
                                             && matches!(role, ContentRole::Thought)
                                         {
-                                            agent_dense_tool(
+                                            assistant_dense_tool(
                                                 ui,
                                                 Id::new(("dense_agent_content", item_index)),
                                                 "Thought",
@@ -1416,7 +1361,7 @@ impl EditorApp {
                                                 }
                                             };
                                         if dense_agent {
-                                            agent_dense_tool(
+                                            assistant_dense_tool(
                                                 ui,
                                                 Id::new(("dense_agent_plan", item_index)),
                                                 "Plan",
@@ -1665,7 +1610,7 @@ impl EditorApp {
                                                                         && preview.clicked()
                                                                     {
                                                                         open_image_request = Some(
-                                                                            AgentImageSource::Path(
+                                                                            AssistantImageSource::Path(
                                                                             file_path.clone(),
                                                                             ),
                                                                         );
@@ -1732,7 +1677,7 @@ impl EditorApp {
                                                 }
                                             };
                                         if dense_agent {
-                                                agent_dense_tool(
+                                                assistant_dense_tool(
                                                     ui,
                                                     Id::new(("dense_agent_tool", item_index)),
                                                 title,
@@ -2264,10 +2209,6 @@ impl EditorApp {
             option.id.eq_ignore_ascii_case("mode") || option.name.eq_ignore_ascii_case("mode")
         });
 
-        let mut send = false;
-        let mut cancel = false;
-        let mut open_file_picker = false;
-        let mut submit_shortcut = false;
         let mut prompt_changed = false;
         let mut history_navigated = false;
         let mut mention_attach = None;
@@ -2325,226 +2266,127 @@ impl EditorApp {
             );
             composer
         };
-        let composer_content = agent_composer_content(composer_panel);
-        let (hovered_files, dropped_files, pointer) = ui.input(|input| {
-            (
-                !input.raw.hovered_files.is_empty(),
-                input
-                    .raw
-                    .dropped_files
-                    .iter()
-                    .filter_map(|file| file.path.clone())
-                    .collect::<Vec<_>>(),
-                input.pointer.hover_pos(),
-            )
-        });
-        let pointer_over_composer = pointer.is_some_and(|pointer| composer_panel.contains(pointer));
-        if hovered_files {
-            self.agent_drop_hovered = composer_enabled && pointer_over_composer;
-        }
-        if !dropped_files.is_empty() {
-            let dropped_over_composer =
-                composer_enabled && (pointer_over_composer || self.agent_drop_hovered);
-            self.agent_drop_hovered = false;
-            if dropped_over_composer {
-                self.attach_agent_files(ui.ctx(), dropped_files);
-                ui.ctx().request_repaint();
+        let prompt_id = Id::new("agent_prompt");
+        let mention_open = matches!(open_menu, Some(AgentMenu::Mentions(_)))
+            && !self.agent_mention_matches.is_empty();
+        if mention_open && ui.memory(|memory| memory.has_focus(prompt_id)) {
+            let (up, down, tab) = ui.input(|input| {
+                (
+                    input.modifiers == egui::Modifiers::NONE && input.key_pressed(Key::ArrowUp),
+                    input.modifiers == egui::Modifiers::NONE && input.key_pressed(Key::ArrowDown),
+                    input.modifiers == egui::Modifiers::NONE && input.key_pressed(Key::Tab),
+                )
+            });
+            if up {
+                self.agent_mention_selected = self.agent_mention_selected.saturating_sub(1);
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
+                });
+            } else if down {
+                self.agent_mention_selected =
+                    (self.agent_mention_selected + 1).min(self.agent_mention_matches.len() - 1);
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
+                });
             }
-        } else if !hovered_files {
-            self.agent_drop_hovered = false;
-        }
-        let attachment_height = if self.agent_attachments.is_empty() {
-            0.0
-        } else {
-            AGENT_ATTACHMENT_ROW_HEIGHT
-        };
-        if attachment_height > 0.0 {
-            let attachments = egui::Rect::from_min_max(
-                egui::pos2(composer_content.left(), composer_content.top()),
-                egui::pos2(
-                    composer_content.right(),
-                    composer_content.top() + attachment_height,
-                ),
-            );
-            let mut remove = None;
-            ui.scope_builder(
-                UiBuilder::new()
-                    .id_salt("agent_attachments")
-                    .max_rect(attachments)
-                    .layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ScrollArea::horizontal()
-                        .id_salt("agent_attachment_scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                for (index, attachment) in self.agent_attachments.iter().enumerate()
-                                {
-                                    if agent_attachment_tile(ui, attachment).clicked() {
-                                        remove = Some(index);
-                                    }
-                                }
-                            });
-                        });
-                },
-            );
-            if let Some(index) = remove {
-                self.agent_attachments.remove(index);
-                ui.ctx().request_repaint();
+            if tab {
+                mention_attach = self
+                    .agent_mention_matches
+                    .get(self.agent_mention_selected)
+                    .map(|entry| entry.path.clone());
+                remove_agent_mention(&mut self.agent.prompt);
+                open_menu = None;
+                prompt_changed = true;
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, Key::Tab);
+                });
             }
         }
-        // The footer starts half an icon's dead zone to the left of the
-        // content, so the attach glyph — not its invisible hit target — lines
-        // up with the prompt text above it.
-        let footer = egui::Rect::from_min_max(
-            egui::pos2(
-                composer_content.left() - (theme::control::STANDARD - icons::GRID) * 0.5,
-                composer_content.bottom() - theme::control::STANDARD,
-            ),
-            composer_content.right_bottom(),
-        );
-        let input_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                composer_content.left(),
-                composer_content.top() + attachment_height,
-            ),
-            egui::pos2(composer_content.right(), footer.top() - theme::space::SMALL),
-        );
-        ui.scope_builder(
-            UiBuilder::new()
-                .id_salt("agent_composer_region")
-                .max_rect(input_rect)
-                .layout(Layout::top_down(Align::LEFT)),
-            |ui| {
-                ScrollArea::vertical()
-                    .id_salt("agent_prompt_scroll")
-                    .max_height(input_rect.height())
-                    .min_scrolled_height(0.0)
-                    .auto_shrink([false, false])
-                    .scroll_source(egui::scroll_area::ScrollSource {
-                        mouse_wheel: !menu_owns_wheel,
-                        ..Default::default()
-                    })
-                    .content_margin(0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let prompt_id = Id::new("agent_prompt");
-                        let mention_open = matches!(open_menu, Some(AgentMenu::Mentions(_)))
-                            && !self.agent_mention_matches.is_empty();
-                        if mention_open && ui.memory(|memory| memory.has_focus(prompt_id)) {
-                            let (up, down, tab) = ui.input(|input| {
-                                (
-                                    input.modifiers == egui::Modifiers::NONE
-                                        && input.key_pressed(Key::ArrowUp),
-                                    input.modifiers == egui::Modifiers::NONE
-                                        && input.key_pressed(Key::ArrowDown),
-                                    input.modifiers == egui::Modifiers::NONE
-                                        && input.key_pressed(Key::Tab),
-                                )
-                            });
-                            if up {
-                                self.agent_mention_selected =
-                                    self.agent_mention_selected.saturating_sub(1);
-                                ui.input_mut(|input| {
-                                    input.consume_key(egui::Modifiers::NONE, Key::ArrowUp);
-                                });
-                            } else if down {
-                                self.agent_mention_selected = (self.agent_mention_selected + 1)
-                                    .min(self.agent_mention_matches.len() - 1);
-                                ui.input_mut(|input| {
-                                    input.consume_key(egui::Modifiers::NONE, Key::ArrowDown);
-                                });
-                            }
-                            if tab {
-                                mention_attach = self
-                                    .agent_mention_matches
-                                    .get(self.agent_mention_selected)
-                                    .map(|entry| entry.path.clone());
-                                remove_agent_mention(&mut self.agent.prompt);
-                                open_menu = None;
-                                prompt_changed = true;
-                                ui.input_mut(|input| {
-                                    input.consume_key(egui::Modifiers::NONE, Key::Tab);
-                                });
-                            }
-                        }
-                        let cursor_at_start = egui::TextEdit::load_state(ui.ctx(), prompt_id)
-                            .and_then(|state| state.cursor.char_range())
-                            .is_some_and(|range| {
-                                range.primary.index == egui::text::CharIndex(0)
-                                    && range.secondary.index == egui::text::CharIndex(0)
-                            });
-                        let history_key = (!mention_open
-                            && ui.memory(|memory| memory.has_focus(prompt_id))
-                            && cursor_at_start)
-                            .then(|| {
-                                ui.input(|input| {
-                                    if input.modifiers == egui::Modifiers::NONE
-                                        && input.key_pressed(Key::ArrowUp)
-                                    {
-                                        Some((Key::ArrowUp, true))
-                                    } else if input.modifiers == egui::Modifiers::NONE
-                                        && input.key_pressed(Key::ArrowDown)
-                                    {
-                                        Some((Key::ArrowDown, false))
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .flatten();
-                        if let Some((key, older)) = history_key
-                            && self.navigate_agent_prompt_history(older)
-                        {
-                            history_navigated = true;
-                            ui.memory_mut(|memory| {
-                                memory.move_focus(egui::FocusDirection::None);
-                            });
-                            ui.input_mut(|input| {
-                                input.consume_key(egui::Modifiers::NONE, key);
-                            });
-                        }
-                        let input = ui.add_enabled(
-                            composer_enabled,
-                            TextEdit::multiline(&mut self.agent.prompt)
-                                .id(prompt_id)
-                                .hint_text(
-                                    RichText::new(&composer_hint)
-                                        .size(theme::typography::BODY_SIZE)
-                                        .color(theme::text().secondary),
-                                )
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .return_key(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::SHIFT,
-                                    Key::Enter,
-                                ))
-                                .frame(egui::Frame::NONE),
-                        );
-                        if history_navigated
-                            && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), prompt_id)
-                        {
-                            state
-                                .cursor
-                                .set_char_range(Some(egui::text::CCursorRange::one(
-                                    egui::text::CCursor::new(0),
-                                )));
-                            egui::TextEdit::store_state(ui.ctx(), prompt_id, state);
-                        }
-                        let input_changed = input.changed();
-                        if input_changed {
-                            self.agent_prompt_history_index = None;
-                            self.agent_prompt_history_draft.clear();
-                        }
-                        prompt_changed |= history_navigated || input_changed;
-                        submit_shortcut = input.has_focus()
-                            && ui.input(|input| {
-                                !input.modifiers.shift && input.key_pressed(Key::Enter)
-                            });
-                    });
+        let cursor_at_start = egui::TextEdit::load_state(ui.ctx(), prompt_id)
+            .and_then(|state| state.cursor.char_range())
+            .is_some_and(|range| {
+                range.primary.index == egui::text::CharIndex(0)
+                    && range.secondary.index == egui::text::CharIndex(0)
+            });
+        let history_key = (!mention_open
+            && ui.memory(|memory| memory.has_focus(prompt_id))
+            && cursor_at_start)
+            .then(|| {
+                ui.input(|input| {
+                    if input.modifiers == egui::Modifiers::NONE && input.key_pressed(Key::ArrowUp) {
+                        Some((Key::ArrowUp, true))
+                    } else if input.modifiers == egui::Modifiers::NONE
+                        && input.key_pressed(Key::ArrowDown)
+                    {
+                        Some((Key::ArrowDown, false))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .flatten();
+        if let Some((key, older)) = history_key
+            && self.navigate_agent_prompt_history(older)
+        {
+            history_navigated = true;
+            ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, key);
+            });
+        }
+        let ready = self.agent.session_ready
+            && (!self.agent.prompt.trim().is_empty() || !self.agent_attachments.is_empty());
+        let output = (AssistantComposer {
+            panel: composer_panel,
+            prompt_id,
+            attach_id: Id::new("agent_attach"),
+            scroll_id: Id::new("agent_prompt_scroll"),
+            hint: &composer_hint,
+            attach_tooltip: "Attach files (or type @ for files and folders)",
+            drop_hint: "Drop files or folders to attach",
+            enabled: composer_enabled,
+            send_enabled: ready,
+            active: self.agent.active,
+            allow_directories: true,
+            handle_drop: true,
+            mouse_wheel: !menu_owns_wheel,
+            focus: false,
+            radius: if self.agentic_mode {
+                f32::from(AGENTIC_COMPOSER_RADIUS)
+            } else {
+                0.0
             },
+        })
+        .show(
+            ui,
+            &mut self.agent.prompt,
+            &mut self.agent_attachments,
+            &mut self.agent_drop_hovered,
         );
+        let send = output.send;
+        let cancel = output.cancel;
+        let open_file_picker = output.open_file_picker;
+        let submit_shortcut = output.submit;
+        let input_rect = output.input_rect;
+        let controls_footer = output.controls_rect;
+        if let Some(error) = output.error {
+            self.show_error(error);
+        }
+        if history_navigated
+            && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), prompt_id)
+        {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(0),
+                )));
+            egui::TextEdit::store_state(ui.ctx(), prompt_id, state);
+        }
+        if output.input_changed {
+            self.agent_prompt_history_index = None;
+            self.agent_prompt_history_draft.clear();
+        }
+        prompt_changed |= history_navigated || output.input_changed;
         if history_navigated {
             ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
         }
@@ -2589,29 +2431,13 @@ impl EditorApp {
         } else if prompt_changed && matches!(open_menu, Some(AgentMenu::Commands(_))) {
             open_menu = None;
         }
-        let controls_footer = footer.with_max_x(
-            (footer.right() - theme::control::STANDARD - theme::space::SMALL).max(footer.left()),
-        );
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agent_composer_footer")
-                .max_rect(controls_footer.translate(egui::vec2(0.0, theme::space::SMALL)))
+                .max_rect(controls_footer)
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing.x = theme::space::SMALL;
-                let attach = ui
-                    .add_enabled_ui(composer_enabled, |ui| {
-                        icons::button_with_id(
-                            ui,
-                            Some(Id::new("agent_attach")),
-                            Icon::Plus,
-                            "Attach files (or type @ for files and folders)",
-                            theme::text().secondary,
-                            egui::Vec2::splat(theme::control::STANDARD),
-                        )
-                    })
-                    .inner;
-                open_file_picker = attach.clicked();
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     if self.agent.allow_run_everything {
                         let run_everything = self
@@ -2758,64 +2584,6 @@ impl EditorApp {
                 });
             },
         );
-        ui.scope_builder(
-            UiBuilder::new()
-                .id_salt("agent_composer_action")
-                .max_rect(footer)
-                .layout(Layout::right_to_left(Align::Center)),
-            |ui| {
-                if self.agent.active {
-                    cancel = agent_composer_action(
-                        ui,
-                        Icon::Stop,
-                        "Stop",
-                        theme::state::selected(),
-                        theme::text().primary,
-                        true,
-                    )
-                    .clicked();
-                } else {
-                    let ready = self.agent.session_ready
-                        && (!self.agent.prompt.trim().is_empty()
-                            || !self.agent_attachments.is_empty());
-                    let (fill, color) = agent_send_button_colors(ready);
-                    send = agent_composer_action(
-                        ui,
-                        Icon::ArrowUp,
-                        "Send (Enter)",
-                        fill,
-                        color,
-                        ready,
-                    )
-                    .clicked();
-                }
-            },
-        );
-        if self.agent_drop_hovered {
-            let radius = if self.agentic_mode {
-                AGENTIC_COMPOSER_RADIUS
-            } else {
-                0
-            };
-            ui.painter().rect_filled(
-                composer_panel,
-                radius,
-                theme::surface().raised.gamma_multiply(0.93),
-            );
-            ui.painter().rect_stroke(
-                composer_panel.shrink(1.0),
-                radius,
-                egui::Stroke::new(1.5, theme::accent()),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                composer_panel.center(),
-                Align2::CENTER_CENTER,
-                "Drop files or folders to attach",
-                theme::typography::body(),
-                theme::text().primary,
-            );
-        }
 
         let mut menu_popup = None;
         if let (Some(menu), Some(anchor)) = (open_menu.as_ref(), menu_anchor) {
@@ -3377,7 +3145,7 @@ impl EditorApp {
             }
         }
         if let Some(source) = open_image_request {
-            self.agent_image_lightbox = Some(source);
+            self.assistant_image_lightbox = Some(source);
         }
         if let Some((path, line)) = open_path_request {
             self.open_agent_path(path, line);

@@ -314,18 +314,20 @@ impl EditorApp {
                                 .color(theme::text().muted),
                         );
                     }
-                    if icons::button_with_id(
-                        ui,
-                        Some(Id::new("source_control_refresh")),
-                        Icon::Refresh,
-                        "Refresh",
-                        theme::text().secondary,
-                        egui::Vec2::splat(theme::control::COMPACT),
-                    )
-                    .clicked()
-                    {
-                        action = Some(SourceControlAction::Refresh);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icons::button_with_id(
+                            ui,
+                            Some(Id::new("source_control_refresh")),
+                            Icon::Refresh,
+                            "Refresh",
+                            theme::text().secondary,
+                            egui::Vec2::splat(theme::control::COMPACT),
+                        )
+                        .clicked()
+                        {
+                            action = Some(SourceControlAction::Refresh);
+                        }
+                    });
                 });
             });
 
@@ -372,7 +374,7 @@ impl EditorApp {
             .inner_margin(egui::Margin::symmetric(theme::space::MEDIUM as i8, 0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let (response, commit_clicked) = egui::Frame::new()
+                let commit_frame = egui::Frame::new()
                     .fill(theme::surface().input)
                     .corner_radius(theme::corner(theme::radius::CONTROL))
                     .inner_margin(egui::Margin::symmetric(6, 4))
@@ -386,7 +388,9 @@ impl EditorApp {
                                 - egui::vec2(theme::control::COMPACT, theme::control::COMPACT),
                             egui::Vec2::splat(theme::control::COMPACT),
                         );
-                        let text_rect = rect.with_max_x(commit_rect.left() - theme::space::TIGHT);
+                        let text_rect = rect
+                            .with_max_x(commit_rect.left() - theme::space::TIGHT)
+                            .shrink(theme::space::HAIR);
                         let response = ui.put(
                             text_rect,
                             TextEdit::multiline(&mut self.git_state.commit_message)
@@ -431,8 +435,14 @@ impl EditorApp {
                             theme::accent(),
                         );
                         (response, commit.clicked())
-                    })
-                    .inner;
+                    });
+                ui.painter().rect_stroke(
+                    commit_frame.response.rect,
+                    theme::corner(theme::radius::CONTROL),
+                    theme::border::hairline(),
+                    egui::StrokeKind::Inside,
+                );
+                let (response, commit_clicked) = commit_frame.inner;
                 if std::mem::take(&mut self.git_state.focus_commit) {
                     response.request_focus();
                 }
@@ -444,6 +454,7 @@ impl EditorApp {
                     action = Some(SourceControlAction::Commit(repository.root.clone()));
                 }
             });
+        ui.add_space(theme::space::SMALL);
 
         let keyboard = self.source_control_keyboard(ui.ctx(), &repository);
         if keyboard.is_some() {
@@ -511,12 +522,12 @@ impl EditorApp {
                                     group,
                                     &entry,
                                     row_index,
-                                    self.git_state.focus_index == row_index,
+                                    self.git_state.focus_index == Some(row_index),
                                     self.git_state
                                         .pending_paths
                                         .contains(&(repository.root.clone(), entry.path.clone())),
                                 ) {
-                                    self.git_state.focus_index = row_index;
+                                    self.git_state.focus_index = Some(row_index);
                                     self.scm_focused = true;
                                     action = Some(found);
                                 }
@@ -576,11 +587,19 @@ impl EditorApp {
             return None;
         }
         if down {
-            self.git_state.focus_index = (self.git_state.focus_index + 1).min(rows.len() - 1);
+            self.git_state.focus_index = Some(
+                self.git_state
+                    .focus_index
+                    .map_or(0, |index| index.saturating_add(1).min(rows.len() - 1)),
+            );
         } else if up {
-            self.git_state.focus_index = self.git_state.focus_index.saturating_sub(1);
+            self.git_state.focus_index = Some(
+                self.git_state
+                    .focus_index
+                    .map_or(0, |index| index.saturating_sub(1)),
+            );
         }
-        let (group, entry) = &rows[self.git_state.focus_index.min(rows.len() - 1)];
+        let (group, entry) = &rows[self.git_state.focus_index?.min(rows.len() - 1)];
         if enter {
             return Some(if *group == SourceGroup::Merge {
                 SourceControlAction::Open(repository.root.join(&entry.path))
@@ -620,7 +639,7 @@ impl EditorApp {
             }
             SourceControlAction::SelectRepository(root) => {
                 self.git_state.selected_repository = Some(root);
-                self.git_state.focus_index = 0;
+                self.git_state.focus_index = None;
                 self.git_state.focus_commit = true;
             }
             SourceControlAction::Stage(repository, paths) => {
@@ -865,6 +884,19 @@ fn source_group_header(
     pending: bool,
 ) -> Option<SourceControlAction> {
     let mut action = None;
+    let header_rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(
+            ui.available_width(),
+            theme::control::COMPACT + theme::space::TIGHT,
+        ),
+    );
+    let hovered = ui.rect_contains_pointer(header_rect);
+    ui.interact(
+        header_rect,
+        Id::new(("source_control_group_header", repository, group as u8)),
+        Sense::hover(),
+    );
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(theme::space::MEDIUM as i8, 2))
         .show(ui, |ui| {
@@ -911,14 +943,16 @@ fn source_group_header(
                                         paths(),
                                     ));
                                 }
-                                if icons::button_sized(
-                                    ui,
-                                    Icon::History,
-                                    "Discard all changes…",
-                                    theme::semantic().danger,
-                                    egui::Vec2::splat(theme::control::COMPACT),
-                                )
-                                .clicked()
+                                if hovered
+                                    && icons::button_with_id(
+                                        ui,
+                                        Some(Id::new(("source_control_discard_all", repository))),
+                                        Icon::Undo,
+                                        "Discard all changes…",
+                                        theme::semantic().danger,
+                                        egui::Vec2::splat(theme::control::COMPACT),
+                                    )
+                                    .clicked()
                                 {
                                     action = Some(SourceControlAction::Discard(
                                         repository.to_path_buf(),
@@ -1049,7 +1083,7 @@ fn source_control_row(
             ],
             SourceGroup::Changes => [
                 Some((Icon::File, "Open file", 0)),
-                Some((Icon::History, "Discard…", 3)),
+                Some((Icon::Undo, "Discard…", 3)),
                 Some((Icon::Plus, "Stage", 1)),
             ],
         };

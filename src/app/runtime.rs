@@ -78,7 +78,7 @@ struct ProjectChooserShell {
     window: Option<Window>,
     renderer: Option<Renderer>,
     egui: Option<egui_winit::State>,
-    picker: Option<AgentFilePicker>,
+    picker: Option<WorkspaceFilePicker>,
     selected: Option<PathBuf>,
     error: Option<String>,
     fatal: Option<String>,
@@ -292,7 +292,7 @@ impl ProjectChooserShell {
                 .map(|directories| directories.home_dir().to_path_buf())
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("/"));
-            match AgentFilePicker::open_directories(start) {
+            match WorkspaceFilePicker::open_directories(start) {
                 Ok(picker) => self.picker = Some(picker),
                 Err(error) => self.error = Some(error),
             }

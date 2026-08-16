@@ -13,11 +13,10 @@ use std::{
 use super::{
     credentials::Credentials,
     normalize,
-    state::{
-        Attachment, ConnectionState, DevinError, DevinEvent, RepositoryState, StatusCategory,
-    },
+    state::{Attachment, ConnectionState, DevinError, DevinEvent, RepositoryState, StatusCategory},
     transport::{ENDPOINT, InteractAction, McpTransport, TransportError},
 };
+use crate::agent::controller::{MAX_PROMPT_ATTACHMENTS, PromptAttachment};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
@@ -25,7 +24,6 @@ const ACTIVE_POLL: Duration = Duration::from_secs(4);
 const LIST_POLL: Duration = Duration::from_secs(20);
 const TERMINAL_POLL: Duration = Duration::from_secs(30);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const MAX_ATTACHMENT_REFERENCES: usize = 16;
 const MAX_PREVIEW_FETCHES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,7 +43,7 @@ pub enum DevinCommand {
     },
     SendMessage {
         message: String,
-        attachment_ids: Vec<String>,
+        attachments: Vec<PromptAttachment>,
     },
     RefreshSelected,
     Sleep,
@@ -235,15 +233,16 @@ impl Worker {
             }
             DevinCommand::SendMessage {
                 message,
-                attachment_ids,
+                attachments,
             } => {
-                if (message.trim().is_empty() && attachment_ids.is_empty())
+                if (message.trim().is_empty() && attachments.is_empty())
                     || message.len() > MAX_MESSAGE_BYTES
-                    || attachment_ids.len() > MAX_ATTACHMENT_REFERENCES
+                    || attachments.len() > MAX_PROMPT_ATTACHMENTS
+                    || attachments.iter().any(PromptAttachment::is_directory)
                 {
                     self.local_error("The Devin message or attachment list is invalid");
                 } else {
-                    self.run_request(|worker| worker.send_message(message.trim(), &attachment_ids));
+                    self.run_request(|worker| worker.send_message(message.trim(), &attachments));
                 }
             }
             DevinCommand::RefreshSelected => self.run_request(Self::refresh_selected),
@@ -441,8 +440,7 @@ impl Worker {
             .attachments
             .iter()
             .filter_map(|attachment| {
-                image_attachment_url(attachment)
-                    .map(|url| (attachment.id.clone(), url.to_owned()))
+                image_attachment_url(attachment).map(|url| (attachment.id.clone(), url.to_owned()))
             })
             .collect::<Vec<_>>();
         self.emit(DevinEvent::SessionLoaded {
@@ -552,8 +550,16 @@ impl Worker {
     fn send_message(
         &mut self,
         message: &str,
-        attachment_ids: &[String],
+        attachments: &[PromptAttachment],
     ) -> Result<(), TransportError> {
+        let mut urls = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            urls.push(
+                self.ensure_connected()?
+                    .upload_attachment(attachment.path())?,
+            );
+        }
+        let message = message_with_attachment_urls(message, &urls);
         let selected = self
             .selected
             .clone()
@@ -561,8 +567,8 @@ impl Worker {
         let result = self.ensure_connected()?.interact(
             &selected.id,
             InteractAction::SendMessage {
-                message,
-                attachment_ids,
+                message: &message,
+                attachment_ids: &[],
             },
         )?;
         normalize::tool_payload(result).map_err(TransportError::Protocol)?;
@@ -723,12 +729,15 @@ fn image_attachment_url(attachment: &Attachment) -> Option<&str> {
         .media_type
         .as_deref()
         .is_some_and(|media_type| media_type.to_ascii_lowercase().starts_with("image/"));
-    let by_extension = attachment.name.rsplit_once('.').is_some_and(|(_, extension)| {
-        matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-        )
-    });
+    let by_extension = attachment
+        .name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        });
     (by_media_type || by_extension).then_some(url)
 }
 
@@ -818,6 +827,19 @@ fn workspace_boundary_message(branch: Option<&str>, dirty: bool, ahead: u64) -> 
     "Devin works from the remote repository. Local uncommitted or unpushed changes are not visible to it.".into()
 }
 
+fn message_with_attachment_urls(message: &str, urls: &[String]) -> String {
+    let mut message = message.trim().to_owned();
+    for url in urls {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str("ATTACHMENT:\"");
+        message.push_str(url);
+        message.push('"');
+    }
+    message
+}
+
 fn git_text(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -839,7 +861,7 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
             mpsc,
         },
@@ -848,6 +870,24 @@ mod tests {
     };
 
     use serde_json::{Value, json};
+
+    type FakeMcpServer = (
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    );
+
+    #[test]
+    fn uploaded_attachments_are_added_to_the_message_as_devin_references() {
+        assert_eq!(
+            super::message_with_attachment_urls(
+                "Use this image",
+                &["https://storage.example/reference.png".into()],
+            ),
+            "Use this image\n\nATTACHMENT:\"https://storage.example/reference.png\""
+        );
+    }
 
     #[test]
     fn polling_pauses_while_hidden_and_backoff_delays_the_next_request() {
@@ -946,7 +986,7 @@ mod tests {
 
     #[test]
     fn fake_mcp_drives_the_complete_interactive_session_flow() {
-        let (endpoint, stop, server) = fake_mcp_server();
+        let (endpoint, _requests, stop, server) = fake_mcp_server();
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let mut worker =
             super::Worker::new(std::env::temp_dir(), endpoint, event_tx, Arc::new(|| {}));
@@ -988,10 +1028,60 @@ mod tests {
         );
     }
 
-    fn fake_mcp_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    #[cfg(feature = "network")]
+    #[test]
+    fn sending_a_local_image_uploads_and_references_it_in_the_devin_message() {
+        let (endpoint, requests, stop, server) = fake_mcp_server();
+        let (event_tx, _event_rx) = mpsc::sync_channel(64);
+        let mut worker =
+            super::Worker::new(std::env::temp_dir(), endpoint, event_tx, Arc::new(|| {}));
+        let credentials = super::super::credentials::Credentials::new(
+            "cog_test-only".into(),
+            None,
+            super::super::credentials::CredentialSource::Environment,
+        )
+        .unwrap();
+        worker.connect(credentials).unwrap();
+        worker.selected = Some(super::SelectedSession {
+            id: "session-1".into(),
+            generation: 1,
+            messages_cursor: None,
+            events_cursor: None,
+            category: super::super::state::StatusCategory::Active,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("reference.png");
+        std::fs::write(&image, b"image").unwrap();
+
+        worker
+            .send_message(
+                "Use this image",
+                &[crate::agent::controller::PromptAttachment::from_path(image).unwrap()],
+            )
+            .unwrap();
+
+        let sent = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.split("\r\n\r\n").nth(1))
+            .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+            .find(|request| request["params"]["arguments"]["action"] == "send_message")
+            .unwrap();
+        assert_eq!(
+            sent["params"]["arguments"]["message"],
+            "Use this image\n\nATTACHMENT:\"https://storage.example/reference.png\""
+        );
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    fn fake_mcp_server() -> FakeMcpServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server = thread::spawn(move || {
@@ -1002,7 +1092,7 @@ mod tests {
                         // mode on macOS; the request reader expects blocking
                         // reads, so WouldBlock would panic it under load.
                         stream.set_nonblocking(false).unwrap();
-                        serve_mcp_request(&mut stream);
+                        serve_mcp_request(&mut stream, &server_requests);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -1011,19 +1101,28 @@ mod tests {
                 }
             }
         });
-        (endpoint, stop, server)
+        (endpoint, requests, stop, server)
     }
 
-    fn serve_mcp_request(stream: &mut TcpStream) {
+    fn serve_mcp_request(stream: &mut TcpStream, requests: &Mutex<Vec<String>>) {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let request = read_http_request(stream);
+        requests.lock().unwrap().push(request.clone());
         assert!(
             request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer cog_test-only")
         );
+        if request.starts_with("POST /v1/attachments ") {
+            write_http(
+                stream,
+                200,
+                Some("\"https://storage.example/reference.png\""),
+            );
+            return;
+        }
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
         let request: Value = serde_json::from_str(body).unwrap();
         if request.get("id").is_none() {

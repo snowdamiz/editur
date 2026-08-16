@@ -8,31 +8,31 @@ use crate::{
 #[cfg(unix)]
 use super::picker_breadcrumb_segments;
 use super::{
-    AGENT_COMPOSER_HEIGHT, AGENT_MENU_ROW_HEIGHT, AgentFilePicker, AgenticDiff, CompletionPopup,
-    DevinView, DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId,
-    PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection,
-    TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
-    TITLEBAR_PAINT_KEY, TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS,
-    agent_at_bottom, agent_collapsing_header, agent_composer_content, agent_composer_height,
-    agent_dense_disclosure_row, agent_dense_tool, agent_diff_cache_count, agent_diff_preview,
-    agent_empty_state_rect, agent_markdown_galley, agent_mention_matches, agent_mention_query,
-    agent_menu_rect, agent_new_session_rect, agent_search_matches, agent_selector_button,
-    agent_send_button_colors, agent_toggle_rect, build_agent_diff, cached_agent_diff, child_path,
-    collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
-    diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
-    draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
-    draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
-    editor_watermark_color, file_result_job, file_tree_toggle_rect, find_highlighted_job,
-    install_repaint_wake, launch_in_current_process, load_agent_image_preview_bytes,
-    match_bracket_pair, match_spans, model_display_name, next_find_match, pane_header_and_content,
-    plain_text_job, presentation_job, project_chooser_ui, provider_selector_visible,
-    repaint_deadline, repaint_delay_after_texture_update, resize_divider_stroke,
-    run_everything_state, search_group_header, search_needs_polling,
-    search_selection_after_navigation, settings_ui_scale_slider, should_show_project_chooser,
-    skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_diff,
-    split_agentic_workspace, split_bottom_panel, split_pane_content, split_workspace,
-    split_workspace_with_devin, stable_tab_drop_zone, tab_width, terminal_toggle_rect,
-    unique_copy_path,
+    AGENT_MENU_ROW_HEIGHT, ASSISTANT_COMPOSER_HEIGHT, AgenticDiff, CompletionPopup, DevinView,
+    DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId, PaneLayout,
+    PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection, TAB_CLOSE,
+    TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
+    TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, WorkspaceFilePicker,
+    agent_at_bottom, agent_collapsing_header, agent_diff_cache_count, agent_diff_preview,
+    agent_empty_state_rect, agent_mention_matches, agent_mention_query, agent_menu_rect,
+    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_toggle_rect,
+    assistant_composer_content, assistant_composer_height, assistant_dense_disclosure_row,
+    assistant_dense_tool, assistant_markdown_galley, assistant_send_button_colors,
+    build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions, completion_word_range,
+    copy_tree_entry, defer_resize, diagnostic_highlighted_job,
+    disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
+    draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
+    draw_tab_drag_ghost, editor_background, editor_column_content, editor_watermark_color,
+    file_result_job, file_tree_toggle_rect, find_highlighted_job, install_repaint_wake,
+    launch_in_current_process, load_assistant_image_preview_bytes, match_bracket_pair, match_spans,
+    model_display_name, next_find_match, pane_header_and_content, plain_text_job, presentation_job,
+    project_chooser_ui, provider_selector_visible, repaint_deadline,
+    repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
+    search_group_header, search_needs_polling, search_selection_after_navigation,
+    settings_ui_scale_slider, should_show_project_chooser, skip_transition_render,
+    slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
+    split_bottom_panel, split_pane_content, split_workspace, split_workspace_with_devin,
+    stable_tab_drop_zone, tab_width, terminal_toggle_rect, unique_copy_path,
 };
 
 fn click_response(
@@ -1886,7 +1886,7 @@ fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
 }
 
 #[test]
-fn devin_detail_lists_pull_requests_in_a_compact_card() {
+fn devin_detail_folds_status_and_pull_request_into_the_header() {
     fn text_rect(shape: &Shape, matches: &dyn Fn(&str) -> bool) -> Option<Rect> {
         match shape {
             Shape::Text(text) if matches(text.galley.text()) => {
@@ -1907,7 +1907,11 @@ fn devin_detail_lists_pull_requests_in_a_compact_card() {
         id: "waiting".into(),
         title: "Waiting task".into(),
         status: "blocked".into(),
+        status_detail: Some("Waiting for your recovery-code decision".into()),
         category: StatusCategory::Waiting,
+        origin: Some("slack".into()),
+        repository: Some("openai/editur".into()),
+        created_at: Some("2026-08-15T20:00:00Z".into()),
         ..Default::default()
     };
     app.devin_sidebar = true;
@@ -1931,46 +1935,97 @@ fn devin_detail_lists_pull_requests_in_a_compact_card() {
                 url: "https://example.com/pr/1".into(),
                 status: Some("Ready for review".into()),
             }],
+            children: vec![crate::devin::ChildSession {
+                id: "child".into(),
+                title: "Run cross-platform auth tests".into(),
+                status: "working".into(),
+            }],
+            usage: Some(crate::devin::Usage {
+                acus: Some(3.72),
+                limit: Some(10.0),
+            }),
             ..Default::default()
         },
     });
     let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
+    let panel_left = window.right() - app.devin_sidebar_width;
     let context = theme::test_context();
-    let output = context.run_ui(
-        RawInput {
-            screen_rect: Some(window),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(window),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let output = draw(Vec::new());
 
-    let heading = output
-        .shapes
-        .iter()
-        .find_map(|shape| text_rect(&shape.shape, &|text| text == "PULL REQUESTS"))
-        .expect("pull request heading");
+    // Nothing paints between the header and the transcript: no status
+    // caption, no provenance or usage, no badge, and no pull-request row.
+    for junk in [
+        "PULL REQUESTS",
+        "openai/editur",
+        "ACUs",
+        "Child:",
+        "Needs you",
+        "Ready for review",
+        "Open ↗",
+        "Add passkey",
+    ] {
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| text_rect(&shape.shape, &|text| text.contains(junk)).is_some()),
+            "{junk} should no longer paint below the header"
+        );
+    }
+    // Header order: back chevron, status dot, title, open icon button.
     let title = output
         .shapes
         .iter()
-        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Add passkey")))
-        .expect("pull request title");
+        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Waiting task")))
+        .expect("session title");
     assert!(
-        title.top() - heading.bottom() <= theme::space::WIDE,
-        "the row sits under its heading instead of centering in leftover space: \
-         heading {heading:?}, title {title:?}"
+        title.top() < TITLEBAR_HEIGHT && title.left() > panel_left,
+        "the session title lives in the header: {title:?}"
     );
-    let panel_left = window.right() - app.devin_sidebar_width;
+    let open = context
+        .read_response(Id::new("devin_pr_open"))
+        .expect("open pull request icon button")
+        .rect;
     assert!(
-        title.left() <= panel_left + 64.0,
-        "the pull request title reads from the left: {title:?}"
+        open.center().y < TITLEBAR_HEIGHT,
+        "the open button lives in the header: {open:?}"
     );
-    let link = output
+    assert!(
+        open.left() >= title.right() && open.left() - title.right() <= theme::space::SMALL,
+        "the open button packs against the title: title {title:?}, open {open:?}"
+    );
+    // With the strip gone, the transcript starts right under the header.
+    let empty = output
         .shapes
         .iter()
-        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Open")))
-        .expect("open link");
-    assert!(link.right() <= window.right() - theme::space::MEDIUM + 1.0);
-    assert!((link.center().y - title.center().y).abs() <= theme::space::SMALL);
+        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("No conversation")))
+        .expect("empty transcript note");
+    assert!(
+        empty.top() <= TITLEBAR_HEIGHT + theme::space::MEDIUM + theme::space::SMALL,
+        "the transcript leads the panel body: {empty:?}"
+    );
+
+    // Lineage navigation survives inside the session menu.
+    let _ = click_response(&context, &mut draw, Id::new("devin_lifecycle_menu"));
+    let menu = draw(Vec::new());
+    assert!(
+        menu.shapes
+            .iter()
+            .any(|shape| text_rect(&shape.shape, &|text| text
+                .starts_with("Child: Run cross-platform"))
+            .is_some()),
+        "child sessions move into the session menu"
+    );
 }
 
 #[test]
@@ -2223,8 +2278,9 @@ fn devin_stream_reads_like_the_agent_transcript() {
             .is_none(),
         "turn labels carry no relative timestamps, matching the Agent"
     );
-    // Both structural dividers — meta-to-transcript and transcript-to-composer
-    // — bleed through the body inset to run the full panel width.
+    // With no pull requests there is no strip above the transcript, so the
+    // only structural divider is transcript-to-composer, bleeding through the
+    // body inset to run the full panel width.
     let panel_left = 1000.0 - app.devin_sidebar_width;
     fn full_width_rules(shape: &Shape, left: f32, right: f32, below: f32, rules: &mut Vec<f32>) {
         match shape {
@@ -2255,8 +2311,8 @@ fn devin_stream_reads_like_the_agent_transcript() {
         );
     }
     assert!(
-        rules.len() >= 2,
-        "the meta and composer dividers span the full panel width, found {rules:?}"
+        rules.len() == 1,
+        "exactly the composer divider spans the full panel width, found {rules:?}"
     );
 }
 
@@ -2313,7 +2369,7 @@ fn devin_header_wears_the_agent_chrome() {
             |root| app.ui(root),
         )
     };
-    let _ = draw(&mut app);
+    let detail = draw(&mut app);
     let panel_left = screen.right() - app.devin_sidebar_width;
 
     // Detail view: 28 px full-height glyph buttons flush against the panel
@@ -2331,6 +2387,52 @@ fn devin_header_wears_the_agent_chrome() {
         .rect;
     assert_eq!(back.left(), panel_left);
     assert_eq!(back.width(), 28.0);
+    let session_title = detail
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Waiting task")))
+        .expect("session title");
+    assert!(
+        session_title.top() < TITLEBAR_HEIGHT,
+        "the session title lives in the header: {session_title:?}"
+    );
+    // The status dot sits between the back chevron and the title, and the
+    // title packs against it instead of centering in leftover header width.
+    fn find_dot(shape: &Shape, matches: &dyn Fn(Pos2) -> bool) -> Option<Pos2> {
+        match shape {
+            Shape::Circle(circle)
+                if circle.fill != Color32::TRANSPARENT && matches(circle.center) =>
+            {
+                Some(circle.center)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| find_dot(shape, matches)),
+            _ => None,
+        }
+    }
+    let dot = detail
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            find_dot(&shape.shape, &|center| {
+                center.y < TITLEBAR_HEIGHT
+                    && center.x > back.right()
+                    && center.x < session_title.left()
+            })
+        })
+        .expect("status dot between the back chevron and the title");
+    assert!(
+        (dot.y - back.center().y).abs() <= 1.0,
+        "the dot centers in the header: {dot:?}"
+    );
+    assert!(
+        session_title.left() - back.right() <= 28.0,
+        "the title packs against the chevron and dot instead of centering: \
+         back {back:?}, title {session_title:?}"
+    );
+    assert!(
+        context.read_response(Id::new("devin_pr_open")).is_none(),
+        "no open button appears without a pull request"
+    );
     let lifecycle = context
         .read_response(Id::new("devin_lifecycle_menu"))
         .expect("lifecycle menu")
@@ -2386,6 +2488,86 @@ fn devin_header_wears_the_agent_chrome() {
             .rect;
         assert_eq!(plus.right(), close.left());
     }
+}
+
+#[test]
+fn devin_header_button_hover_brightens_the_icon_without_adding_a_surface() {
+    fn paints_button_surface(shape: &Shape, button: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.rect == button && rect.fill != Color32::TRANSPARENT,
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| paints_button_surface(shape, button)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let summary = crate::devin::SessionSummary {
+        id: "session-with-pr".into(),
+        title: "Session with pull request".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    let generation = app.devin_state.select(summary.id.clone());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            pull_requests: vec![crate::devin::PullRequest {
+                id: "pr".into(),
+                title: "Pull request".into(),
+                url: "https://example.com/pr/1".into(),
+                status: None,
+            }],
+            ..Default::default()
+        },
+    });
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let context = theme::test_context();
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let button = context
+        .read_response(Id::new("devin_pr_open"))
+        .expect("open pull request button")
+        .rect;
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            events: vec![Event::PointerMoved(button.center())],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| paints_button_surface(&shape.shape, button))
+    );
+    assert!(crate::icons::probe::bounds(&output.shapes, button, theme::text().primary).is_some());
 }
 
 #[test]
@@ -2529,15 +2711,26 @@ fn devin_attachments_render_like_the_agent_composer_and_prompt() {
         .iter()
         .find_map(|shape| text_rect(&shape.shape, &|text| text.contains("Message Devin")))
         .expect("composer hint");
-    // The composer offers no attachment pickers: session files belong to the
-    // turns that carried them, and this client cannot stage uploads, so the
-    // strip below the transcript holds only the prompt and the send action.
+    let attach = context
+        .read_response(Id::new("devin_attach"))
+        .expect("composer attach button")
+        .rect;
+    let panel_left = screen.right() - app.devin_sidebar_width;
+    assert!(
+        (attach.center().x - (panel_left + theme::space::MEDIUM + crate::icons::GRID * 0.5)).abs()
+            <= 1.0,
+        "the shared composer must not inherit Devin's body inset: {attach:?}"
+    );
+    assert!(
+        (attach.bottom() - (screen.bottom() - 3.0)).abs() <= 1.0,
+        "the shared composer must keep its normal bottom padding: {attach:?}"
+    );
+    // This fixture has transcript attachments but no newly staged composer files.
     assert!(
         !images
             .iter()
-            .any(|rect| (rect.width() - 48.0).abs() <= 1.0
-                && (rect.height() - 48.0).abs() <= 1.0),
-        "no 48 px attachment tiles render anywhere; the composer stages nothing"
+            .any(|rect| (rect.width() - 48.0).abs() <= 1.0 && (rect.height() - 48.0).abs() <= 1.0),
+        "no staged composer tile should render for transcript-only attachments"
     );
     assert!(
         output
@@ -2661,6 +2854,81 @@ fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
             .shapes
             .iter()
             .any(|shape| has_text(&shape.shape, "remote action"))
+    );
+}
+
+#[test]
+fn devin_composer_grows_with_multiline_messages() {
+    fn horizontal_line_y(shape: &Shape, min_width: f32) -> Option<f32> {
+        match shape {
+            Shape::LineSegment { points, .. }
+                if (points[0].y - points[1].y).abs() <= 0.5
+                    && (points[1].x - points[0].x).abs() >= min_width =>
+            {
+                Some(points[0].y)
+            }
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .filter_map(|shape| horizontal_line_y(shape, min_width))
+                .max_by(f32::total_cmp),
+            _ => None,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "active".into(),
+        title: "Active task".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_message = (1..=8)
+        .map(|line| format!("Message line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let generation = app.devin_state.select(summary.id.clone());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            ..Default::default()
+        },
+    });
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let divider = output
+        .shapes
+        .iter()
+        .filter_map(|shape| horizontal_line_y(&shape.shape, app.devin_sidebar_width - 2.0))
+        .max_by(f32::total_cmp)
+        .expect("composer divider");
+
+    assert!(
+        screen.bottom() - divider > 150.0,
+        "multiline composer stayed fixed-height: divider at {divider}"
     );
 }
 
@@ -2972,7 +3240,7 @@ fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() 
         true,
         app.agent_sidebar_width,
     );
-    let (_, transcript, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    let (_, transcript, _) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
     assert!((auth.center().x - transcript.center().x).abs() <= 1.0);
 }
 
@@ -3028,7 +3296,7 @@ fn disconnected_acp_provider_uses_centered_connect_state() {
         true,
         app.agent_sidebar_width,
     );
-    let (_, transcript, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    let (_, transcript, _) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
     assert!((state.center().x - transcript.center().x).abs() <= 1.0);
 }
 
@@ -3690,7 +3958,7 @@ fn agent_opens_on_the_right_without_replacing_the_explorer() {
 fn open_agent_toggle_belongs_to_the_agent_header() {
     let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
     let (_, _, sidebar) = split_workspace(window, true, 248.0, true, 360.0);
-    let (header, _, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    let (header, _, _) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
     let toggle = agent_toggle_rect(header);
     let new_session = agent_new_session_rect(header);
 
@@ -4154,7 +4422,7 @@ fn dense_work_summary_is_one_bold_inline_hover_target() {
                 ..RawInput::default()
             },
             |ui| {
-                agent_dense_disclosure_row(
+                assistant_dense_disclosure_row(
                     ui,
                     Id::new("dense_summary_style"),
                     "Edited app.rs",
@@ -4764,8 +5032,8 @@ fn agentic_toggle_hover_brightens_text_without_a_background() {
 
 #[test]
 fn disabled_send_button_is_neutral_instead_of_blue_with_a_gray_arrow() {
-    let (ready_fill, ready_icon) = agent_send_button_colors(true);
-    let (disabled_fill, disabled_icon) = agent_send_button_colors(false);
+    let (ready_fill, ready_icon) = assistant_send_button_colors(true);
+    let (disabled_fill, disabled_icon) = assistant_send_button_colors(false);
 
     assert_eq!(ready_fill, theme::accent());
     assert_eq!(ready_icon, theme::text().on_accent);
@@ -5325,7 +5593,7 @@ fn in_file_find_bar_uses_only_the_bottom_of_its_pane() {
 #[test]
 fn agent_layout_keeps_the_composer_inside_the_sidebar() {
     let sidebar = Rect::from_min_size(pos2(640.0, 34.0), Vec2::new(360.0, 641.0));
-    let (header, transcript, composer) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    let (header, transcript, composer) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
 
     assert_eq!(header.left(), sidebar.left());
     assert_eq!(header.height(), TITLEBAR_HEIGHT);
@@ -5506,7 +5774,7 @@ fn unchanged_agent_markdown_and_diffs_reuse_their_frame_work() {
     let draw = |new_text: &str| {
         let mut cached = None;
         let _ = context.run_ui(RawInput::default(), |ui| {
-            let markdown = agent_markdown_galley(
+            let markdown = assistant_markdown_galley(
                 ui,
                 Id::new("cached_markdown"),
                 "**fast**",
@@ -5596,7 +5864,7 @@ fn ui_scale_change_rebuilds_cached_agent_text() {
         let mut cached = None;
         let _ = context.run_ui(RawInput::default(), |ui| {
             cached = Some((
-                agent_markdown_galley(
+                assistant_markdown_galley(
                     ui,
                     Id::new("scaled_agent_markdown"),
                     "**cached agent text**",
@@ -5635,7 +5903,7 @@ fn agent_markdown_syntax_highlights_fenced_code() {
     let syntaxes = SyntaxManager::built_in().unwrap();
     let highlighter = Highlighter::new().unwrap();
     let _ = theme::test_context().run_ui(RawInput::default(), |ui| {
-        galley = Some(agent_markdown_galley(
+        galley = Some(assistant_markdown_galley(
             ui,
             Id::new("highlighted_markdown"),
             "```rust\nfn main() { let value = \"ok\"; }\n```",
@@ -5868,7 +6136,7 @@ fn subagent_cards_are_distinct_and_collapse_their_prompt() {
 #[test]
 fn dense_subagent_rows_show_their_status() {
     let output = theme::test_context().run_ui(RawInput::default(), |ui| {
-        agent_dense_tool(
+        assistant_dense_tool(
             ui,
             Id::new("dense_subagent_status"),
             "Subagent: Review changes",
@@ -5898,7 +6166,7 @@ fn dense_subagent_rows_show_their_status() {
 #[test]
 fn dense_failed_tool_rows_show_a_red_error_icon() {
     let output = theme::test_context().run_ui(RawInput::default(), |ui| {
-        agent_dense_tool(
+        assistant_dense_tool(
             ui,
             Id::new("dense_failed_status"),
             "Run cargo test",
@@ -6951,7 +7219,7 @@ fn sidebar_empty_state_is_centered_in_the_available_transcript() {
         true,
         app.agent_sidebar_width,
     );
-    let (_, transcript, _) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
+    let (_, transcript, _) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(screen),
@@ -8151,9 +8419,9 @@ fn agent_permission_and_metadata_labels_explain_what_they_show() {
 
 #[test]
 fn agent_composer_grows_with_wrapped_text_and_stops_at_its_cap() {
-    assert_eq!(agent_composer_height(28.0, 14.0, 700.0), 108.0);
-    assert_eq!(agent_composer_height(84.0, 14.0, 700.0), 150.0);
-    assert_eq!(agent_composer_height(1_400.0, 14.0, 700.0), 240.0);
+    assert_eq!(assistant_composer_height(28.0, 14.0, 700.0), 108.0);
+    assert_eq!(assistant_composer_height(84.0, 14.0, 700.0), 150.0);
+    assert_eq!(assistant_composer_height(1_400.0, 14.0, 700.0), 240.0);
 }
 
 #[test]
@@ -8172,11 +8440,9 @@ fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
     app.agent.session_ready = true;
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
-    let pointer = pos2(800.0, 650.0);
     let _ = context.run_ui(
         RawInput {
             screen_rect: Some(screen),
-            events: vec![Event::PointerMoved(pointer)],
             hovered_files: vec![HoveredFile {
                 path: Some(image.clone()),
                 ..HoveredFile::default()
@@ -8188,7 +8454,6 @@ fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(screen),
-            events: vec![Event::PointerMoved(pointer)],
             dropped_files: vec![DroppedFile {
                 path: Some(image),
                 ..DroppedFile::default()
@@ -8248,7 +8513,7 @@ fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
 fn embedded_session_image_bytes_decode_to_a_thumbnail() {
     let context = theme::test_context();
 
-    let preview = load_agent_image_preview_bytes(
+    let preview = load_assistant_image_preview_bytes(
         &context,
         "detected-session-image",
         include_bytes!("../../assets/icons/editur.png"),
@@ -8259,8 +8524,8 @@ fn embedded_session_image_bytes_decode_to_a_thumbnail() {
 
 #[test]
 fn prompt_image_square_uses_a_center_crop() {
-    let landscape = super::agent_image_cover_uv(Vec2::new(200.0, 100.0), Vec2::splat(72.0));
-    let portrait = super::agent_image_cover_uv(Vec2::new(100.0, 200.0), Vec2::splat(72.0));
+    let landscape = super::assistant_image_cover_uv(Vec2::new(200.0, 100.0), Vec2::splat(72.0));
+    let portrait = super::assistant_image_cover_uv(Vec2::new(100.0, 200.0), Vec2::splat(72.0));
 
     assert_eq!(
         landscape,
@@ -8461,7 +8726,7 @@ fn user_prompt_image_is_a_square_inside_the_prompt_and_opens_a_lightbox() {
             modifiers: Modifiers::NONE,
         }]);
     }
-    assert!(app.agent_image_lightbox.is_none());
+    assert!(app.assistant_image_lightbox.is_none());
 }
 
 #[test]
@@ -8564,7 +8829,113 @@ fn agent_originated_image_starts_collapsed() {
             modifiers: Modifiers::NONE,
         }]);
     }
-    assert!(app.agent_image_lightbox.is_some());
+    assert!(app.assistant_image_lightbox.is_some());
+}
+
+#[test]
+fn dropping_an_image_over_the_devin_composer_stages_it_for_send() {
+    let temp = tempfile::tempdir().unwrap();
+    let image = temp.path().join("reference.png");
+    fs::write(&image, include_bytes!("../../assets/icons/editur.png")).unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "active".into(),
+        title: "Active task".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let generation = app.devin_state.select(summary.id.clone());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            ..Default::default()
+        },
+    });
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            hovered_files: vec![HoveredFile {
+                path: Some(image.clone()),
+                ..HoveredFile::default()
+            }],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            dropped_files: vec![DroppedFile {
+                path: Some(image),
+                ..DroppedFile::default()
+            }],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    fn contains_thumbnail(shape: &Shape) -> bool {
+        let small_square = |bounds: Rect| {
+            bounds.left() > 560.0
+                && bounds.top() > 520.0
+                && (40.0..=56.0).contains(&bounds.width())
+                && (40.0..=56.0).contains(&bounds.height())
+        };
+        match shape {
+            Shape::Rect(rect) if rect.brush.is_some() => small_square(rect.rect),
+            Shape::Mesh(mesh) if !mesh.vertices.is_empty() => {
+                small_square(mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                    bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                }))
+            }
+            Shape::Vec(shapes) => shapes.iter().any(contains_thumbnail),
+            _ => false,
+        }
+    }
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_thumbnail(&shape.shape)),
+        "the dropped image should render in the Devin composer"
+    );
+    context.memory_mut(|memory| memory.request_focus(Id::new("devin_prompt")));
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: Some(Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    assert!(
+        app.devin_pending_message.is_some() && app.devin_attachments.is_empty(),
+        "an attachment-only Devin message should enter the send path"
+    );
 }
 
 #[test]
@@ -8623,7 +8994,7 @@ fn custom_file_picker_loads_one_directory_at_a_time_and_preserves_selection() {
     fs::write(&root_file, "root").unwrap();
     fs::write(&nested_file, "nested").unwrap();
 
-    let mut picker = AgentFilePicker::open(root.clone()).unwrap();
+    let mut picker = WorkspaceFilePicker::open(root.clone()).unwrap();
     assert_eq!(
         picker
             .entries
@@ -8646,7 +9017,7 @@ fn custom_file_picker_filters_the_current_folder_case_insensitively() {
     fs::create_dir(root.join("docs")).unwrap();
     fs::write(root.join("Reference.PNG"), "image").unwrap();
     fs::write(root.join("notes.txt"), "notes").unwrap();
-    let mut picker = AgentFilePicker::open(root).unwrap();
+    let mut picker = WorkspaceFilePicker::open(root).unwrap();
 
     picker.query = "png".into();
 
@@ -8694,7 +9065,7 @@ fn custom_file_picker_renders_project_files_without_a_native_dialog() {
 
     assert!(
         context
-            .read_response(Id::new("agent_file_picker"))
+            .read_response(Id::new("attachment_file_picker"))
             .is_some()
     );
     assert!(
@@ -8740,7 +9111,7 @@ fn custom_file_picker_stays_fixed_while_the_pointer_moves() {
         let _ = context.run_ui(input, |root| app.ui(root));
         positions.push(
             context
-                .read_response(Id::new("agent_file_picker"))
+                .read_response(Id::new("attachment_file_picker"))
                 .unwrap()
                 .rect,
         );
@@ -8768,7 +9139,7 @@ fn the_project_folder_picker_lists_only_directories() {
     fs::create_dir(root.join("crates")).unwrap();
     fs::write(root.join("notes.txt"), "notes").unwrap();
 
-    let picker = AgentFilePicker::open_directories(root).unwrap();
+    let picker = WorkspaceFilePicker::open_directories(root).unwrap();
 
     assert_eq!(
         picker
@@ -8786,9 +9157,9 @@ fn hidden_entries_stay_out_of_the_picker_until_the_toggle() {
     let root = temp.path().canonicalize().unwrap();
     fs::create_dir(root.join(".config")).unwrap();
     fs::create_dir(root.join("src")).unwrap();
-    let mut picker = AgentFilePicker::open_directories(root).unwrap();
+    let mut picker = WorkspaceFilePicker::open_directories(root).unwrap();
 
-    let names = |picker: &AgentFilePicker| {
+    let names = |picker: &WorkspaceFilePicker| {
         picker
             .visible_entries()
             .iter()
@@ -8810,7 +9181,7 @@ fn the_picker_walks_its_own_history_with_back_and_forward() {
     let root = temp.path().canonicalize().unwrap();
     let child = root.join("child");
     fs::create_dir(&child).unwrap();
-    let mut picker = AgentFilePicker::open_directories(root.clone()).unwrap();
+    let mut picker = WorkspaceFilePicker::open_directories(root.clone()).unwrap();
     assert!(!picker.can_go_back() && !picker.can_go_forward());
 
     picker.navigate(child.clone()).unwrap();
@@ -8833,7 +9204,7 @@ fn navigating_somewhere_new_after_going_back_drops_the_forward_trail() {
     let second = root.join("second");
     fs::create_dir(&first).unwrap();
     fs::create_dir(&second).unwrap();
-    let mut picker = AgentFilePicker::open_directories(root).unwrap();
+    let mut picker = WorkspaceFilePicker::open_directories(root).unwrap();
 
     picker.navigate(first).unwrap();
     picker.go_back();
@@ -8849,7 +9220,7 @@ fn reloading_reads_the_directory_again_without_touching_history_or_the_query() {
     let root = temp.path().canonicalize().unwrap();
     let child = root.join("child");
     fs::create_dir(&child).unwrap();
-    let mut picker = AgentFilePicker::open_directories(root.clone()).unwrap();
+    let mut picker = WorkspaceFilePicker::open_directories(root.clone()).unwrap();
     picker.navigate(child.clone()).unwrap();
     picker.query = "late".into();
     fs::create_dir(child.join("latecomer")).unwrap();
@@ -8866,7 +9237,7 @@ fn reloading_reads_the_directory_again_without_touching_history_or_the_query() {
 fn navigating_to_the_current_directory_does_not_stack_history() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
-    let mut picker = AgentFilePicker::open_directories(root.clone()).unwrap();
+    let mut picker = WorkspaceFilePicker::open_directories(root.clone()).unwrap();
 
     picker.navigate(root).unwrap();
 
@@ -8919,7 +9290,7 @@ fn arrow_keys_walk_the_list_and_enter_descends_into_the_highlighted_folder() {
     })
     .unwrap();
     app.project_folder_picker =
-        Some(AgentFilePicker::open_directories(destination_root.clone()).unwrap());
+        Some(WorkspaceFilePicker::open_directories(destination_root.clone()).unwrap());
     let context = theme::test_context();
     let mut press = |key| {
         let _ = context.run_ui(
@@ -8966,7 +9337,7 @@ fn command_brackets_walk_the_picker_history_and_the_toolbar_offers_the_buttons()
     })
     .unwrap();
     app.project_folder_picker =
-        Some(AgentFilePicker::open_directories(destination_root.clone()).unwrap());
+        Some(WorkspaceFilePicker::open_directories(destination_root.clone()).unwrap());
     let context = theme::test_context();
     fn press(context: &egui::Context, app: &mut EditorApp, key: Key, modifiers: Modifiers) {
         let _ = context.run_ui(
@@ -9123,7 +9494,7 @@ fn opening_a_folder_from_the_picker_switches_the_project() {
     })
     .unwrap();
     app.project_folder_picker =
-        Some(AgentFilePicker::open_directories(destination_root.clone()).unwrap());
+        Some(WorkspaceFilePicker::open_directories(destination_root.clone()).unwrap());
 
     let _ = theme::test_context().run_ui(
         RawInput {
@@ -9526,8 +9897,8 @@ fn agentic_transcript_scrolls_from_the_side_gutters() {
 #[test]
 fn agent_menu_hugs_its_selector_without_wasted_bottom_space() {
     let sidebar = Rect::from_min_size(pos2(640.0, 34.0), Vec2::new(360.0, 641.0));
-    let (_, transcript, composer) = split_agent_sidebar(sidebar, AGENT_COMPOSER_HEIGHT);
-    let content = agent_composer_content(composer);
+    let (_, transcript, composer) = split_agent_sidebar(sidebar, ASSISTANT_COMPOSER_HEIGHT);
+    let content = assistant_composer_content(composer);
     let selector = Rect::from_min_size(
         pos2(content.left(), content.bottom() - 30.0),
         Vec2::new(76.0, 30.0),
@@ -11860,6 +12231,50 @@ fn git_diff_tabs_are_read_only_keyed_by_area_and_refresh_in_place() {
 }
 
 #[test]
+fn git_diff_uses_the_normal_editor_background() {
+    fn has_editor_background(shape: &Shape) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.fill == editor_background(),
+            Shape::Vec(shapes) => shapes.iter().any(has_editor_background),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.open_git_diff(crate::git::controller::GitEvent::Diff {
+        repository: root,
+        path: "file.rs".into(),
+        area: crate::git::controller::DiffArea::Worktree,
+        old: Some("old\n".into()),
+        new: "new\n".into(),
+        generation: 1,
+    });
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0))),
+            ..RawInput::default()
+        },
+        |ui| app.draw_editor(ui, PaneId(0), true, None, false),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_editor_background(&shape.shape)),
+        "version-control diffs should use the normal editor material"
+    );
+}
+
+#[test]
 fn source_control_composer_and_rows_fit_the_minimum_sidebar_width() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -11898,17 +12313,20 @@ fn source_control_composer_and_rows_fit_the_minimum_sidebar_width() {
         ));
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 700.0));
     let context = theme::test_context();
-    let _ = context.run_ui(
-        RawInput {
-            screen_rect: Some(screen),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
-
     let sidebar = split_workspace(screen, true, app.sidebar_width, false, 0.0)
         .0
         .expect("sidebar");
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(&mut app, Vec::new());
     let composer = context
         .read_response(Id::new("git_commit_message"))
         .expect("commit composer");
@@ -11922,16 +12340,41 @@ fn source_control_composer_and_rows_fit_the_minimum_sidebar_width() {
     let row = context
         .read_response(Id::new(("source_control_row", &root, &entry, 2_u8)))
         .expect("source control row");
+    let changes_header = context
+        .read_response(Id::new(("source_control_group_header", &root, 2_u8)))
+        .expect("changes header");
     assert!(sidebar.contains_rect(composer.rect));
     assert!(composer.rect.right() <= commit.rect.left());
-    assert!((composer.rect.bottom() - commit.rect.bottom()).abs() <= 1.0);
+    assert!((commit.rect.bottom() - composer.rect.bottom() - theme::space::HAIR).abs() <= 1.0);
     assert_eq!(commit.rect.size(), Vec2::splat(theme::control::COMPACT));
+    assert!(
+        (refresh.rect.right() - (sidebar.right() - theme::space::MEDIUM)).abs() <= 1.0,
+        "refresh should sit against the sidebar's trailing inset: {refresh:?}"
+    );
     assert!(composer.rect.top() - refresh.rect.bottom() <= theme::space::SMALL);
+    assert!(changes_header.rect.top() - composer.rect.bottom() >= theme::space::MEDIUM);
+    assert!(
+        context
+            .read_response(Id::new(("source_control_discard_all", &root)))
+            .is_none(),
+        "discard all should stay hidden outside the changes header"
+    );
     assert_eq!(row.rect.height(), theme::control::COMPACT);
     assert!(
         context
             .read_response(Id::new("source_control_toggle"))
             .is_some()
+    );
+
+    let _ = draw(
+        &mut app,
+        vec![Event::PointerMoved(changes_header.rect.center())],
+    );
+    assert!(
+        context
+            .read_response(Id::new(("source_control_discard_all", &root)))
+            .is_some(),
+        "discard all should appear while hovering the changes header"
     );
 }
 
@@ -11999,7 +12442,7 @@ fn clean_source_control_only_shows_no_changes_near_the_composer() {
             .shapes
             .iter()
             .all(|shape| text_top(&shape.shape, "Last commit: abc1234 Base").is_none())
-            && no_changes_top - composer_bottom <= theme::space::WIDE,
+            && no_changes_top - composer_bottom <= theme::space::WIDE + theme::space::HAIR,
         "clean state included extra text or sat too far below the composer"
     );
 }
@@ -12049,7 +12492,6 @@ fn source_control_row_hover_stays_painted_over_its_action_buttons() {
                 }],
             },
         ));
-    app.git_state.focus_index = usize::MAX;
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 700.0));
     let mut draw = |events| {
