@@ -4,7 +4,7 @@ use egui::{
     epaint::text::{Galley, LayoutJob},
     text::{ByteIndex, CCursor, CCursorRange, LayoutSection},
 };
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use crate::{keybindings::Command, renderer::mark_retained, theme};
 
@@ -84,7 +84,8 @@ pub(crate) struct EditorShowOptions<'a> {
     pub request_focus: bool,
     pub scroll_to_character: Option<usize>,
     pub id: Id,
-    pub line_markers: &'a [(usize, Color32)],
+    pub line_markers: &'a HashMap<usize, crate::lsp::DiagnosticSeverity>,
+    pub line_markers_stale: bool,
     pub text_input: TextInputMode,
     pub native_keybindings: bool,
     pub block_caret: bool,
@@ -374,7 +375,8 @@ impl EditorSurface {
                 request_focus,
                 scroll_to_character,
                 id: Id::new("editor"),
-                line_markers: &[],
+                line_markers: &HashMap::new(),
+                line_markers_stale: false,
                 text_input: TextInputMode::Standard,
                 native_keybindings: true,
                 block_caret: false,
@@ -396,6 +398,7 @@ impl EditorSurface {
             scroll_to_character,
             id: editor_id,
             line_markers,
+            line_markers_stale,
             text_input,
             native_keybindings,
             block_caret,
@@ -585,7 +588,14 @@ impl EditorSurface {
             ui.ctx()
                 .request_repaint_after(Duration::from_secs_f64(until_next));
         }
-        self.paint(ui, rect, content, focused, block_caret, line_markers);
+        self.paint(
+            ui,
+            rect,
+            content,
+            focused,
+            block_caret,
+            (line_markers, line_markers_stale),
+        );
         if focused {
             self.update_ime(ui, rect, content);
         }
@@ -790,8 +800,9 @@ impl EditorSurface {
         content: Rect,
         focused: bool,
         block_caret: bool,
-        line_markers: &[(usize, Color32)],
+        line_markers: (&HashMap<usize, crate::lsp::DiagnosticSeverity>, bool),
     ) {
+        let (line_markers, line_markers_stale) = line_markers;
         let painter = ui.painter_at(rect);
         let text_painter = painter.with_clip_rect(content);
         let horizontal_geometry = u64::from(content.left().to_bits())
@@ -896,14 +907,21 @@ impl EditorSurface {
                     },
                 );
             }
-            if let Some((_, color)) = line_markers.iter().find(|(line, _)| *line == index) {
+            if !line_markers.is_empty()
+                && let Some(severity) = line_markers.get(&index)
+            {
+                let color = diagnostic_marker_color(*severity);
                 painter.rect_filled(
                     Rect::from_min_size(
                         egui::pos2(content.left() - 3.0, y + (line_height - 6.0) * 0.5),
                         egui::vec2(3.0, 6.0),
                     ),
                     theme::corner(2),
-                    *color,
+                    if line_markers_stale {
+                        color.gamma_multiply(0.55)
+                    } else {
+                        color
+                    },
                 );
             }
             let mut galley = Arc::clone(base_galley);
@@ -1272,6 +1290,16 @@ struct LineSpec {
 }
 
 /// Leading whitespace in characters, with a tab counted as one tab stop.
+fn diagnostic_marker_color(severity: crate::lsp::DiagnosticSeverity) -> Color32 {
+    match severity {
+        crate::lsp::DiagnosticSeverity::Error => theme::semantic().danger,
+        crate::lsp::DiagnosticSeverity::Warning => theme::semantic().warning,
+        crate::lsp::DiagnosticSeverity::Information | crate::lsp::DiagnosticSeverity::Hint => {
+            theme::semantic().info
+        }
+    }
+}
+
 fn indent_of(text: &str) -> usize {
     text.chars()
         .take_while(|character| *character == ' ' || *character == '\t')
@@ -1490,6 +1518,7 @@ mod tests {
         Rect, TextFormat, TouchPhase, Vec2, pos2, text::LayoutJob,
     };
     use std::{
+        collections::HashMap,
         ops::Range,
         time::{Duration, Instant},
     };
@@ -2108,7 +2137,8 @@ mod tests {
                             request_focus: true,
                             scroll_to_character: None,
                             id: Id::new("editor"),
-                            line_markers: &[],
+                            line_markers: &HashMap::new(),
+                            line_markers_stale: false,
                             text_input: super::TextInputMode::Standard,
                             native_keybindings: true,
                             block_caret: false,
@@ -2143,6 +2173,7 @@ mod tests {
             400.0,
         );
         let danger = theme::semantic().danger;
+        let line_markers = HashMap::from([(0, crate::lsp::DiagnosticSeverity::Error)]);
         let character_len = text.chars().count();
         let mut shapes = Vec::new();
         for _ in 0..2 {
@@ -2165,7 +2196,8 @@ mod tests {
                             request_focus: false,
                             scroll_to_character: None,
                             id: Id::new("editor"),
-                            line_markers: &[(0, danger)],
+                            line_markers: &line_markers,
+                            line_markers_stale: false,
                             text_input: super::TextInputMode::Standard,
                             native_keybindings: true,
                             block_caret: false,

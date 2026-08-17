@@ -65,14 +65,19 @@ pub fn reconcile_buffer(buffer: &mut Buffer) -> Result<ReconcileOutcome, String>
     }) {
         return Ok(ReconcileOutcome::Unchanged);
     }
-    let fingerprint = disk_fingerprint(&buffer.path)?;
+    let path = buffer.path.clone();
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let fingerprint = fingerprint_from(&metadata, &bytes);
     if buffer.fingerprint.as_ref() == Some(&fingerprint) {
         return Ok(ReconcileOutcome::Unchanged);
     }
     if buffer.dirty {
         return Ok(ReconcileOutcome::Conflict);
     }
-    *buffer = load_buffer(&buffer.path)?;
+    *buffer = Buffer::from_bytes(path, bytes, fingerprint)?;
     Ok(ReconcileOutcome::Reloaded)
 }
 

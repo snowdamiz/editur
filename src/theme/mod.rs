@@ -80,7 +80,7 @@ pub(crate) fn apply_to(style: &mut Style) {
     visuals.dark_mode = color::palette().dark;
     visuals.weak_text_color = Some(text.muted);
     visuals.selection.bg_fill = editor::selection();
-    visuals.selection.stroke = Stroke::new(stroke::DIVIDER, text.primary);
+    visuals.selection.stroke = Stroke::new(0.0, text.primary);
     visuals.hyperlink_color = accent();
     visuals.faint_bg_color = state::hover();
     visuals.extreme_bg_color = surface.input;
@@ -219,6 +219,10 @@ mod tests {
         assert_eq!(style.visuals.window_fill, surface().raised);
         assert_eq!(style.visuals.text_edit_bg_color, Some(surface().input));
         assert_eq!(style.visuals.selection.bg_fill, editor::selection());
+        assert_eq!(
+            style.visuals.selection.stroke.width, 0.0,
+            "focused text inputs must not gain an outline"
+        );
         assert_eq!(
             style.visuals.selection.stroke.color,
             text().primary,

@@ -658,9 +658,8 @@ impl EditorApp {
                         paths
                             .iter()
                             .filter(|path| {
-                                snapshot.entries.iter().any(|entry| {
-                                    &entry.path == *path
-                                        && entry.worktree == Some(ChangeKind::Untracked)
+                                snapshot.entry(path).is_some_and(|entry| {
+                                    entry.worktree == Some(ChangeKind::Untracked)
                                 })
                             })
                             .count()

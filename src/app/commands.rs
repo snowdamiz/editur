@@ -125,7 +125,9 @@ impl EditorApp {
             if matches!(
                 event,
                 egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
-            ) && !scopes.contains(&Scope::Terminal)
+            ) && !ctx.text_edit_focused()
+                && !scopes.contains(&Scope::Terminal)
+                && !scopes.contains(&Scope::Devin)
             {
                 consumed.insert(index);
             }
@@ -172,15 +174,6 @@ impl EditorApp {
     }
 
     pub(super) fn active_keybinding_scopes(&self, ctx: &egui::Context) -> Vec<Scope> {
-        if self.settings_open {
-            return vec![Scope::Settings];
-        }
-        if self.terminal.focused(ctx) {
-            return vec![Scope::Terminal];
-        }
-        if ctx.memory(|memory| memory.has_focus(Id::new("agent_prompt"))) {
-            return vec![Scope::Agent];
-        }
         if ctx.memory(|memory| {
             [
                 "devin_api_key",
@@ -194,6 +187,15 @@ impl EditorApp {
             .any(|id| memory.has_focus(Id::new(id)))
         }) {
             return vec![Scope::Devin];
+        }
+        if self.settings_open {
+            return vec![Scope::Settings];
+        }
+        if self.terminal.focused(ctx) {
+            return vec![Scope::Terminal];
+        }
+        if ctx.memory(|memory| memory.has_focus(Id::new("agent_prompt"))) {
+            return vec![Scope::Agent];
         }
         if self.agent_find.open
             && ctx.memory(|memory| memory.has_focus(Id::new("agent_find_query")))
@@ -212,6 +214,9 @@ impl EditorApp {
             })
         {
             return vec![Scope::Find];
+        }
+        if ctx.text_edit_focused() {
+            return Vec::new();
         }
         if self.scm_focused {
             return vec![Scope::SourceControl];

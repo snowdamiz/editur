@@ -2396,7 +2396,8 @@ impl EditorApp {
         if let Some(query) = mention_query
             && (prompt_changed || matches!(open_menu, Some(AgentMenu::Mentions(_))))
         {
-            if self.agent_mentions.is_none() {
+            let mentions_changed = self.agent_mentions.is_none();
+            if mentions_changed {
                 // ponytail: one path-only scan on the first @; move it to the existing search
                 // worker only if very large workspaces make this measurable.
                 self.agent_mentions = Some(collect_agent_mentions(&self.tree.root));
@@ -2405,9 +2406,11 @@ impl EditorApp {
                 &open_menu,
                 Some(AgentMenu::Mentions(current)) if current == query
             );
-            self.agent_mention_matches =
-                agent_mention_matches(self.agent_mentions.as_deref().unwrap_or_default(), query);
-            if query_changed {
+            if query_changed || mentions_changed {
+                self.agent_mention_matches = agent_mention_matches(
+                    self.agent_mentions.as_deref().unwrap_or_default(),
+                    query,
+                );
                 self.agent_mention_selected = 0;
                 self.agent_menu_scroll_y = 0.0;
             } else {

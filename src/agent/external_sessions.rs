@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{BufRead as _, BufReader, Read as _},
     path::{Path, PathBuf},
@@ -135,19 +135,19 @@ impl ExternalSession {
             "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n\n\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
         );
         let available = MAX_HANDOFF_BYTES.saturating_sub(fixed.len());
-        let mut history = Vec::new();
+        let mut history = VecDeque::new();
         let mut bytes = 0_usize;
         self.visit_transcript(&mut |message| {
             let Some(message) = handoff_message(message) else {
                 return Ok(());
             };
             bytes = bytes.saturating_add(message.len() + usize::from(!history.is_empty()) * 2);
-            history.push(message);
+            history.push_back(message);
             while bytes > available && history.len() > 1 {
-                bytes = bytes.saturating_sub(history.remove(0).len() + 2);
+                bytes = bytes.saturating_sub(history.pop_front().unwrap().len() + 2);
             }
             if bytes > available {
-                let message = &mut history[0];
+                let message = history.front_mut().unwrap();
                 let mut start = message.len().saturating_sub(available);
                 while !message.is_char_boundary(start) {
                     start += 1;
@@ -157,7 +157,7 @@ impl ExternalSession {
             }
             Ok(())
         })?;
-        let history = history.join("\n\n");
+        let history = history.make_contiguous().join("\n\n");
         Ok(format!(
             "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n{history}\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
         ))
@@ -742,16 +742,23 @@ fn cursor_diff(
 
 struct CursorContentCache<'a> {
     connection: &'a Connection,
+    values: HashMap<String, Option<Arc<str>>>,
 }
 
 impl<'a> CursorContentCache<'a> {
     fn new(connection: &'a Connection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            values: HashMap::new(),
+        }
     }
 
     fn get(&mut self, id: &str) -> Option<Arc<str>> {
         if !valid_cursor_content_id(id) {
             return None;
+        }
+        if let Some(value) = self.values.get(id) {
+            return value.clone();
         }
         let value = self
             .connection
@@ -760,11 +767,11 @@ impl<'a> CursorContentCache<'a> {
                 [id],
                 |row| row.get::<_, String>(0),
             )
-            .ok()?;
-        if value.len() > MAX_EXTERNAL_DIFF_BYTES {
-            return None;
-        }
-        Some(value.into())
+            .ok()
+            .filter(|value| value.len() <= MAX_EXTERNAL_DIFF_BYTES)
+            .map(Arc::from);
+        self.values.insert(id.to_owned(), value.clone());
+        value
     }
 }
 
@@ -1453,7 +1460,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ExternalMessage, ExternalSession, MAX_HANDOFF_BYTES, TranscriptFormat,
+        CursorContentCache, ExternalMessage, ExternalSession, MAX_HANDOFF_BYTES, TranscriptFormat,
         claude_project_directory, claude_transcript, codex_transcript, cursor_database_transcript,
         cursor_project_directory, discover_claude, discover_codex, discover_cursor,
         external_tool_kind,
@@ -1765,6 +1772,25 @@ mod tests {
                     && tool.diffs[0].old_text.as_deref() == Some("fn before() {}\n")
                     && tool.diffs[0].new_text.as_ref() == "fn after() {}\n"
         ));
+    }
+
+    #[test]
+    fn cursor_content_cache_reuses_a_loaded_revision() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE cursorDiskKV (key TEXT UNIQUE, value BLOB);")
+            .unwrap();
+        let id = format!("composer.content.{}", "a".repeat(64));
+        connection
+            .execute("INSERT INTO cursorDiskKV VALUES (?1, ?2)", (&id, "cached"))
+            .unwrap();
+        let mut cache = CursorContentCache::new(&connection);
+
+        assert_eq!(cache.get(&id).as_deref(), Some("cached"));
+        connection
+            .execute("DELETE FROM cursorDiskKV WHERE key = ?1", [&id])
+            .unwrap();
+        assert_eq!(cache.get(&id).as_deref(), Some("cached"));
     }
 
     #[test]

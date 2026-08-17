@@ -1,0 +1,13 @@
+{
+  "items": [
+    {
+      "event_id": "event-fixture",
+      "source": "devin",
+      "message": "Sanitized message",
+      "created_at": 1786885200
+    }
+  ],
+  "end_cursor": "message-cursor-fixture",
+  "has_next_page": true,
+  "total": 1
+}

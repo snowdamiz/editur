@@ -34,6 +34,7 @@ use super::{
     split_bottom_panel, split_pane_content, split_workspace, split_workspace_with_devin,
     stable_tab_drop_zone, tab_width, terminal_toggle_rect, unique_copy_path,
 };
+use std::collections::HashMap;
 
 fn click_response(
     context: &egui::Context,
@@ -705,6 +706,101 @@ fn appearance_settings_offer_the_dense_agent_toggle() {
             .iter()
             .any(|shape| contains_text(&shape.shape, "Dense Agent"))
     );
+}
+
+#[test]
+fn devin_settings_offer_connection_fields() {
+    fn contains_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+    fn has_accent_fill(shape: &Shape, target: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.rect == target && rect.fill == theme::accent(),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_accent_fill(shape, target)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.settings_open = true;
+    app.settings_section = SettingsSection::Devin;
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1_200.0, 800.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_text(&shape.shape, "API key"))
+    );
+    assert!(context.read_response(Id::new("devin_api_key")).is_some());
+    assert!(context.read_response(Id::new("devin_org_id")).is_some());
+    let connect = context
+        .read_response(Id::new("settings_devin_connect"))
+        .expect("connect button")
+        .rect;
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_accent_fill(&shape.shape, connect))
+    );
+}
+
+#[test]
+fn devin_settings_offer_disconnect_for_stored_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.settings_open = true;
+    app.settings_section = SettingsSection::Devin;
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Keyring,
+    )));
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    let context = theme::test_context();
+    let window = Rect::from_min_size(Default::default(), Vec2::new(1_200.0, 800.0));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(window),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(Vec::new());
+    assert!(context.read_response(Id::new("devin_api_key")).is_none());
+    click_response(&context, &mut draw, Id::new("settings_devin_disconnect"));
+
+    assert!(app.devin_confirm_disconnect);
 }
 
 #[test]
@@ -1542,6 +1638,7 @@ fn devin_sidebar_command_hides_but_does_not_reset_the_local_agent() {
     .unwrap();
     app.agent_sidebar = true;
     app.agent.prompt = "local draft".into();
+    app.devin_state.seed_preview();
 
     app.execute_keybinding(
         crate::keybindings::Command::AppToggleDevinSidebar,
@@ -1663,6 +1760,52 @@ fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
     );
 }
 
+#[test]
+fn devin_login_fields_accept_normal_clipboard_paste() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    let context = theme::test_context();
+    let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1100.0, 760.0));
+    let paste = |value: &str| RawInput {
+        screen_rect: Some(window),
+        events: vec![
+            Event::Paste(value.into()),
+            Event::Key {
+                key: Key::V,
+                physical_key: Some(Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers {
+                    command: true,
+                    ..Modifiers::NONE
+                },
+            },
+        ],
+        ..RawInput::default()
+    };
+
+    context.memory_mut(|memory| memory.request_focus(Id::new("devin_api_key")));
+    let _ = context.run_ui(paste("cog_test-only"), |root| app.ui(root));
+    assert_eq!(app.devin_api_key, "cog_test-only");
+
+    context.memory_mut(|memory| memory.request_focus(Id::new("devin_org_id")));
+    let _ = context.run_ui(paste("org-test"), |root| app.ui(root));
+    assert_eq!(app.devin_org_id, "org-test");
+
+    app.settings_open = true;
+    app.settings_section = SettingsSection::Devin;
+    app.devin_api_key.clear();
+    context.memory_mut(|memory| memory.request_focus(Id::new("devin_api_key")));
+    let _ = context.run_ui(paste("cog_settings"), |root| app.ui(root));
+    assert_eq!(app.devin_api_key, "cog_settings");
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn devin_preview_button_seeds_a_complete_connected_account() {
@@ -1759,6 +1902,8 @@ fn devin_home_groups_waiting_sessions_first_at_minimum_width() {
             },
         ],
         next_cursor: None,
+        total: Some(2),
+        has_next: false,
         append: false,
     });
     let output = theme::test_context().run_ui(
@@ -1822,6 +1967,8 @@ fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
             ..Default::default()
         }],
         next_cursor: None,
+        total: Some(1),
+        has_next: false,
         append: false,
     });
     let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
@@ -1862,7 +2009,7 @@ fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
         "menus are icon buttons, not a text glyph the font cannot render"
     );
     let inner_right = window.right() - theme::space::MEDIUM + 1.0;
-    for label in ["Active", "All", "Archived", "PR"] {
+    for label in ["Active sessions", "PR"] {
         let rect = output
             .shapes
             .iter()
@@ -1873,20 +2020,69 @@ fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
             "{label} paints to {rect:?}, past the panel inset {inner_right}"
         );
     }
+    for hidden_option in ["All sessions", "Archived sessions"] {
+        assert!(
+            output
+                .shapes
+                .iter()
+                .all(|shape| text_rect(&shape.shape, &|text| text == hidden_option).is_none()),
+            "closed status select should not paint the {hidden_option:?} option"
+        );
+    }
     let title = output
         .shapes
         .iter()
         .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Add passkey")))
         .expect("session title");
+    let subtitle = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Needs you")))
+        .expect("session metadata");
+    let pr = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, &|text| text == "PR"))
+        .expect("pull request badge");
+    fn pill_around(shape: &Shape, label: Rect) -> Option<(Rect, u8)> {
+        match shape {
+            Shape::Rect(rect)
+                if rect.rect.contains_rect(label)
+                    && rect.fill == theme::state::selected()
+                    && rect.rect.height() <= theme::control::COMPACT =>
+            {
+                Some((rect.rect, rect.corner_radius.nw))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| pill_around(shape, label)),
+            _ => None,
+        }
+    }
+    let (pill, radius) = output
+        .shapes
+        .iter()
+        .find_map(|shape| pill_around(&shape.shape, pr))
+        .expect("pull request pill");
     assert!(
         title.left() <= panel_left + 64.0,
         "the session title reads from the left edge of its row: {title:?}"
     );
     assert!(title.right() <= inner_right);
+    assert!(pill.right() >= inner_right - theme::space::MEDIUM);
+    let content_center = Rect::from_min_max(title.left_top(), subtitle.right_bottom())
+        .center()
+        .y;
+    assert!(
+        (pill.center().y - content_center).abs() <= 1.0,
+        "the PR pill centers on both text lines: pill {pill:?}, title {title:?}, metadata {subtitle:?}"
+    );
+    assert!(
+        radius as f32 >= pill.height() * 0.5 - 1.0,
+        "the PR badge is pill shaped: {pill:?}, radius {radius}"
+    );
 }
 
 #[test]
-fn devin_detail_folds_status_and_pull_request_into_the_header() {
+fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
     fn text_rect(shape: &Shape, matches: &dyn Fn(&str) -> bool) -> Option<Rect> {
         match shape {
             Shape::Text(text) if matches(text.galley.text()) => {
@@ -1906,12 +2102,20 @@ fn devin_detail_folds_status_and_pull_request_into_the_header() {
     let summary = crate::devin::SessionSummary {
         id: "waiting".into(),
         title: "Waiting task".into(),
-        status: "blocked".into(),
-        status_detail: Some("Waiting for your recovery-code decision".into()),
+        status: "running".into(),
+        status_detail: Some("waiting_for_user".into()),
         category: StatusCategory::Waiting,
         origin: Some("slack".into()),
         repository: Some("openai/editur".into()),
         created_at: Some("2026-08-15T20:00:00Z".into()),
+        updated_at: Some("2026-08-15T21:00:00Z".into()),
+        tags: vec!["auth".into(), "frontend".into()],
+        devin_mode: Some("fast".into()),
+        playbook_id: Some("playbook-passkeys".into()),
+        automation_id: Some("automation-nightly".into()),
+        session_category: Some("feature_development".into()),
+        subcategory: Some("Authentication".into()),
+        structured_output: Some(serde_json::json!({"result":"ready"})),
         ..Default::default()
     };
     app.devin_sidebar = true;
@@ -1929,11 +2133,26 @@ fn devin_detail_folds_status_and_pull_request_into_the_header() {
         generation,
         detail: crate::devin::SessionDetail {
             summary,
-            pull_requests: vec![crate::devin::PullRequest {
-                id: "pr".into(),
-                title: "Add passkey sign-in and recovery-code flows".into(),
-                url: "https://example.com/pr/1".into(),
-                status: Some("Ready for review".into()),
+            pull_requests: vec![
+                crate::devin::PullRequest {
+                    id: "pr".into(),
+                    title: "Add passkey sign-in and recovery-code flows".into(),
+                    url: "https://example.com/pr/1".into(),
+                    status: Some("Ready for review".into()),
+                },
+                crate::devin::PullRequest {
+                    id: "pr-2".into(),
+                    title: "Add recovery telemetry".into(),
+                    url: "https://example.com/pr/2".into(),
+                    status: Some("Draft".into()),
+                },
+            ],
+            attachments: vec![crate::devin::Attachment {
+                id: "unattached".into(),
+                name: "verification.log".into(),
+                media_type: Some("text/plain".into()),
+                size: Some(2048),
+                url: Some("https://example.com/verification.log".into()),
             }],
             children: vec![crate::devin::ChildSession {
                 id: "child".into(),
@@ -1944,87 +2163,317 @@ fn devin_detail_folds_status_and_pull_request_into_the_header() {
                 acus: Some(3.72),
                 limit: Some(10.0),
             }),
-            ..Default::default()
         },
     });
     let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
     let panel_left = window.right() - app.devin_sidebar_width;
     let context = theme::test_context();
-    let mut draw = |events| {
+    {
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: Some(window),
+                    events,
+                    ..RawInput::default()
+                },
+                |root| app.ui(root),
+            )
+        };
+        let output = draw(Vec::new());
+
+        for expected in ["verification.log", "\"result\": \"ready\""] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(
+                        |shape| text_rect(&shape.shape, &|text| text.contains(expected)).is_some()
+                    ),
+                "session detail should render {expected}"
+            );
+        }
+        for hidden_until_requested in [
+            "waiting_for_user",
+            "Needs you",
+            "openai/editur",
+            "3.72 / 10 ACUs",
+            "Mode fast",
+            "Playbook playbook-passkeys",
+            "auth",
+            "feature_development",
+            "Created ",
+            "Updated ",
+            "Comma-separated tags",
+            "Search remote activity",
+            "Child: Run cross-platform",
+            "PULL REQUESTS",
+            "Add passkey sign-in",
+            "Add recovery telemetry",
+            "Ready for review",
+        ] {
+            assert!(
+                !output
+                    .shapes
+                    .iter()
+                    .any(|shape| text_rect(&shape.shape, &|text| text
+                        .contains(hidden_until_requested))
+                    .is_some()),
+                "session detail should not lead with {hidden_until_requested}"
+            );
+        }
+        assert!(
+            !output.shapes.iter().any(|shape| {
+                text_rect(&shape.shape, &|text| text.contains("Session tools")).is_some()
+            }),
+            "power-user session tools stay out of the conversation"
+        );
+        // Header order: back chevron, status dot, title, open icon button.
+        let title = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Waiting task")))
+            .expect("session title");
+        assert!(
+            title.top() < TITLEBAR_HEIGHT && title.left() > panel_left,
+            "the session title lives in the header: {title:?}"
+        );
+        let open = context
+            .read_response(Id::new("devin_pr_open"))
+            .expect("open pull request icon button")
+            .rect;
+        assert!(
+            open.center().y < TITLEBAR_HEIGHT,
+            "the open button lives in the header: {open:?}"
+        );
+        assert!(
+            open.left() >= title.right() && open.left() - title.right() <= theme::space::SMALL,
+            "the open button packs against the title: title {title:?}, open {open:?}"
+        );
+        // Lineage navigation survives inside the session menu.
+        let _ = click_response(&context, &mut draw, Id::new("devin_lifecycle_menu"));
+        let menu = draw(Vec::new());
+        assert!(
+            menu.shapes
+                .iter()
+                .any(|shape| text_rect(&shape.shape, &|text| text
+                    .starts_with("Child: Run cross-platform"))
+                .is_some()),
+            "child sessions move into the session menu"
+        );
+        for tool in ["Edit labels", "Find work history"] {
+            assert!(
+                menu.shapes
+                    .iter()
+                    .any(|shape| text_rect(&shape.shape, &|text| text.contains(tool)).is_some()),
+                "{tool} remains reachable from the session menu"
+            );
+        }
+    }
+
+    let generation = app.devin_state.select("archived".into());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: "archived".into(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary: crate::devin::SessionSummary {
+                id: "archived".into(),
+                title: "Archived task".into(),
+                status: "suspended".into(),
+                status_detail: Some("user_request".into()),
+                category: StatusCategory::Completed,
+                archived: true,
+                origin: Some("webapp".into()),
+                devin_mode: Some("normal".into()),
+                session_category: Some("other".into()),
+                subcategory: Some("Other".into()),
+                ..Default::default()
+            },
+            usage: Some(crate::devin::Usage {
+                acus: Some(0.0),
+                limit: None,
+            }),
+            ..Default::default()
+        },
+    });
+    let archived = context.run_ui(
+        RawInput {
+            screen_rect: Some(window),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    for noise in [
+        "Archived · suspended",
+        "Mode normal",
+        "other · Other",
+        "0 ACUs",
+        "STRUCTURED OUTPUT",
+    ] {
+        assert!(
+            !archived
+                .shapes
+                .iter()
+                .any(|shape| text_rect(&shape.shape, &|text| text.contains(noise)).is_some()),
+            "archived detail should omit {noise}"
+        );
+    }
+}
+
+#[test]
+fn suspended_devin_detail_keeps_the_composer_inside_the_sidebar() {
+    fn contains_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_sidebar_width = 400.0;
+    app.devin_view = DevinView::Detail;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let generation = app.devin_state.select("suspended".into());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: "suspended".into(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary: crate::devin::SessionSummary {
+                id: "suspended".into(),
+                title: "Suspended task".into(),
+                status: "suspended".into(),
+                status_detail: Some("out_of_quota".into()),
+                category: StatusCategory::Suspended,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    });
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 520.0));
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let prompt = context
+        .read_response(Id::new("devin_prompt"))
+        .expect("Devin composer")
+        .rect;
+
+    assert!(
+        prompt.bottom() <= screen.bottom(),
+        "composer must stay inside the window: {prompt:?}"
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_text(&shape.shape, "Message Devin")),
+        "the composer input must remain visible"
+    );
+    assert!(
+        !output.shapes.iter().any(|shape| contains_text(
+            &shape.shape,
+            "This session is suspended; review the reason before resuming."
+        )),
+        "the header status already explains that the session is suspended"
+    );
+}
+
+#[test]
+fn every_devin_resource_and_advanced_session_view_has_a_focused_sidebar_route() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_sidebar_width = 440.0;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp| {
         context.run_ui(
             RawInput {
-                screen_rect: Some(window),
-                events,
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1100.0, 820.0),
+                )),
                 ..RawInput::default()
             },
             |root| app.ui(root),
         )
     };
-    let output = draw(Vec::new());
 
-    // Nothing paints between the header and the transcript: no status
-    // caption, no provenance or usage, no badge, and no pull-request row.
-    for junk in [
-        "PULL REQUESTS",
-        "openai/editur",
-        "ACUs",
-        "Child:",
-        "Needs you",
-        "Ready for review",
-        "Open ↗",
-        "Add passkey",
+    for (section, expected) in [
+        (crate::devin::DevinSection::Review, "Trigger review"),
+        (
+            crate::devin::DevinSection::Repositories,
+            "Search repositories",
+        ),
+        (
+            crate::devin::DevinSection::Knowledge,
+            "Search notes or folders",
+        ),
+        (crate::devin::DevinSection::Playbooks, "Playbook title"),
+        (crate::devin::DevinSection::Automations, "SCHEDULES"),
+        (crate::devin::DevinSection::Environment, "BLUEPRINTS"),
+        (crate::devin::DevinSection::Integrations, "All integrations"),
     ] {
+        app.devin_view = DevinView::Section(section);
+        let output = draw(&mut app);
         assert!(
-            !output
+            output
                 .shapes
                 .iter()
-                .any(|shape| text_rect(&shape.shape, &|text| text.contains(junk)).is_some()),
-            "{junk} should no longer paint below the header"
+                .any(|shape| has_text(&shape.shape, expected)),
+            "{section:?} should expose {expected}"
         );
     }
-    // Header order: back chevron, status dot, title, open icon button.
-    let title = output
-        .shapes
-        .iter()
-        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("Waiting task")))
-        .expect("session title");
+
+    app.devin_view = DevinView::Filters;
     assert!(
-        title.top() < TITLEBAR_HEIGHT && title.left() > panel_left,
-        "the session title lives in the header: {title:?}"
-    );
-    let open = context
-        .read_response(Id::new("devin_pr_open"))
-        .expect("open pull request icon button")
-        .rect;
-    assert!(
-        open.center().y < TITLEBAR_HEIGHT,
-        "the open button lives in the header: {open:?}"
-    );
-    assert!(
-        open.left() >= title.right() && open.left() - title.right() <= theme::space::SMALL,
-        "the open button packs against the title: title {title:?}, open {open:?}"
-    );
-    // With the strip gone, the transcript starts right under the header.
-    let empty = output
-        .shapes
-        .iter()
-        .find_map(|shape| text_rect(&shape.shape, &|text| text.starts_with("No conversation")))
-        .expect("empty transcript note");
-    assert!(
-        empty.top() <= TITLEBAR_HEIGHT + theme::space::MEDIUM + theme::space::SMALL,
-        "the transcript leads the panel body: {empty:?}"
+        draw(&mut app)
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Apply filters"))
     );
 
-    // Lineage navigation survives inside the session menu.
-    let _ = click_response(&context, &mut draw, Id::new("devin_lifecycle_menu"));
-    let menu = draw(Vec::new());
+    app.devin_view = DevinView::Create;
+    app.devin_advanced.open = true;
     assert!(
-        menu.shapes
+        draw(&mut app)
+            .shapes
             .iter()
-            .any(|shape| text_rect(&shape.shape, &|text| text
-                .starts_with("Child: Run cross-platform"))
-            .is_some()),
-        "child sessions move into the session menu"
+            .any(|shape| has_text(&shape.shape, "Structured output JSON Schema"))
     );
 }
 
@@ -2090,7 +2539,7 @@ fn devin_stream_reads_like_the_agent_transcript() {
             },
         ],
         next_cursor: None,
-        replace: true,
+        update: crate::devin::PageUpdate::Initial,
     });
     app.devin_state.apply(DevinEvent::ActivityLoaded {
         session_id: "waiting".into(),
@@ -2112,7 +2561,7 @@ fn devin_stream_reads_like_the_agent_transcript() {
             },
         ],
         next_cursor: None,
-        replace: true,
+        update: crate::devin::PageUpdate::Initial,
     });
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
@@ -2425,6 +2874,10 @@ fn devin_header_wears_the_agent_chrome() {
         "the dot centers in the header: {dot:?}"
     );
     assert!(
+        (session_title.center().y - back.center().y).abs() <= 1.0,
+        "the back arrow, status, and title share one centerline: back {back:?}, title {session_title:?}"
+    );
+    assert!(
         session_title.left() - back.right() <= 28.0,
         "the title packs against the chevron and dot instead of centering: \
          back {back:?}, title {session_title:?}"
@@ -2459,6 +2912,10 @@ fn devin_header_wears_the_agent_chrome() {
         .find_map(|shape| text_rect(&shape.shape, &|text| text == "Devin"))
         .expect("panel title");
     assert!(title.top() < TITLEBAR_HEIGHT);
+    assert!(
+        (title.center().y - close.center().y).abs() <= 1.0,
+        "the home title shares the header controls' centerline: title {title:?}, close {close:?}"
+    );
     assert!(
         (title.left() - (panel_left + 14.0)).abs() <= 1.0,
         "the title leads 14 px in like the Agent's: {title:?}"
@@ -2679,7 +3136,7 @@ fn devin_attachments_render_like_the_agent_composer_and_prompt() {
             },
         ],
         next_cursor: None,
-        replace: true,
+        update: crate::devin::PageUpdate::Initial,
     });
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
@@ -2825,10 +3282,19 @@ fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
             summary: "Ran tests".into(),
             ..Default::default()
         }],
-        next_cursor: None,
-        replace: true,
+        next_cursor: Some("next".into()),
+        update: crate::devin::PageUpdate::Initial,
     });
     let context = theme::test_context();
+    for id in [
+        Id::new(("devin_activity_group", "remote")),
+        Id::new(("devin_activity", "remote")),
+    ] {
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(&context, id, false);
+        state.set_open(true);
+        state.store(&context);
+    }
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(
@@ -2854,6 +3320,31 @@ fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
             .shapes
             .iter()
             .any(|shape| has_text(&shape.shape, "remote action"))
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Loading details…"))
+    );
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Fetch details")),
+        "detail loading is not exposed as a manual button"
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Load more actions (1 shown)"))
+    );
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Load earlier activity"))
     );
 }
 
@@ -13808,6 +14299,7 @@ fn the_pane_header_states_what_is_wrong_in_the_color_of_the_problem() {
                 diagnostic(crate::lsp::DiagnosticSeverity::Error),
                 diagnostic(crate::lsp::DiagnosticSeverity::Warning),
             ],
+            line_markers: HashMap::new(),
         },
     );
     let context = theme::test_context();
@@ -14239,6 +14731,71 @@ fn normalized_paste_runs_once_and_an_empty_profile_can_disable_it() {
     let _ = context.run_ui(paste(), |root| app.ui(root));
 
     assert_eq!(app.tabs[0].buffer.text, "Xbase");
+}
+
+#[test]
+fn native_text_edits_own_standard_editing_shortcuts_without_registered_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.tree_focused = false;
+    let context = theme::test_context();
+    let id = Id::new("unregistered_native_text_edit");
+    let mut value = String::new();
+    let _ = context.run_ui(RawInput::default(), |ui| {
+        ui.add(egui::TextEdit::singleline(&mut value).id(id))
+            .request_focus();
+    });
+
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::Paste("hello".into())],
+            ..RawInput::default()
+        },
+        |ui| {
+            app.shortcuts(&context);
+            ui.add(egui::TextEdit::singleline(&mut value).id(id));
+        },
+    );
+
+    assert_eq!(value, "hello");
+
+    let command = Modifiers {
+        command: true,
+        ..Modifiers::NONE
+    };
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::Key {
+                key: Key::A,
+                physical_key: Some(Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: command,
+            }],
+            ..RawInput::default()
+        },
+        |ui| {
+            app.shortcuts(&context);
+            ui.add(egui::TextEdit::singleline(&mut value).id(id));
+        },
+    );
+    let _ = context.run_ui(
+        RawInput {
+            events: vec![Event::Cut],
+            ..RawInput::default()
+        },
+        |ui| {
+            app.shortcuts(&context);
+            ui.add(egui::TextEdit::singleline(&mut value).id(id));
+        },
+    );
+
+    assert!(value.is_empty());
 }
 
 #[test]

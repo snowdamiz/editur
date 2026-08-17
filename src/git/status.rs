@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeKind {
@@ -50,6 +50,15 @@ pub struct RepositoryStatus {
     pub root: PathBuf,
     pub info: RepoInfo,
     pub entries: Vec<GitEntry>,
+}
+
+impl RepositoryStatus {
+    pub fn entry(&self, path: &Path) -> Option<&GitEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.path.as_path().cmp(path))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,7 +247,9 @@ fn text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchInfo, ChangeKind, GitEntry, ParsedStatus, parse_status};
+    use super::{
+        BranchInfo, ChangeKind, GitEntry, ParsedStatus, RepoInfo, RepositoryStatus, parse_status,
+    };
 
     #[test]
     fn parses_named_branch_and_modified_worktree_entry() {
@@ -354,5 +365,38 @@ mod tests {
                 worktree: Some(ChangeKind::Modified),
             }]
         );
+    }
+
+    #[test]
+    fn repository_entry_finds_sorted_paths_and_reports_missing_paths() {
+        let repository = RepositoryStatus {
+            root: ".".into(),
+            info: RepoInfo {
+                branch: BranchInfo::Detached {
+                    oid: "0123456".into(),
+                },
+                last_commit_subject: None,
+            },
+            entries: vec![
+                GitEntry {
+                    path: "a.rs".into(),
+                    orig_path: None,
+                    index: None,
+                    worktree: Some(ChangeKind::Modified),
+                },
+                GitEntry {
+                    path: "z.rs".into(),
+                    orig_path: None,
+                    index: None,
+                    worktree: Some(ChangeKind::Untracked),
+                },
+            ],
+        };
+
+        assert_eq!(
+            repository.entry(std::path::Path::new("z.rs")),
+            repository.entries.get(1)
+        );
+        assert_eq!(repository.entry(std::path::Path::new("missing.rs")), None);
     }
 }

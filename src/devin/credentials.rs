@@ -114,6 +114,10 @@ impl Credentials {
     pub(crate) const fn source(&self) -> CredentialSource {
         self.source
     }
+
+    pub(crate) fn with_org_id(&self, org_id: String) -> Result<Self, String> {
+        Self::new(self.api_key.clone(), Some(org_id), self.source)
+    }
 }
 
 #[derive(Deserialize, Serialize)]

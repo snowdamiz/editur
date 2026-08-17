@@ -3836,12 +3836,12 @@ fn tool_display_title<'a>(
     raw_input: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
     let trimmed = title.map(str::trim).filter(|title| !title.is_empty());
-    let input = raw_input.and_then(parse_tool_input);
     if let Some(title) = trimmed
         && !tool_title_needs_humanizing(title)
     {
         return std::borrow::Cow::Borrowed(title);
     }
+    let input = raw_input.and_then(parse_tool_input);
     if let Some(humanized) = humanize_machine_tool_title(trimmed, kind, paths, input.as_ref()) {
         return std::borrow::Cow::Owned(humanized);
     }

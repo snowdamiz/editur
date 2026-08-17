@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const html = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.html"),
-  "utf8",
-);
+const dist = join(dirname(fileURLToPath(import.meta.url)), "..", "dist");
+const html = readFileSync(join(dist, "index.html"), "utf8");
 
 test("ships the verified macOS install command", () => {
   assert.match(
@@ -39,6 +38,21 @@ test("logo and og image URLs keep the /editur base segment", () => {
 test("the header is the only place the mark appears", () => {
   const logos = html.match(/src="[^"]*editur-icon[^"]*"/g) ?? [];
   assert.equal(logos.length, 1);
+});
+
+test("does not ship byte-identical PNG assets twice", () => {
+  const hashes = readdirSync(dist, { recursive: true })
+    .filter((path) => path.endsWith(".png"))
+    .map((path) =>
+      createHash("sha256").update(readFileSync(join(dist, path))).digest("hex"),
+    );
+  assert.equal(new Set(hashes).size, hashes.length);
+});
+
+test("ships only the used WOFF2 font faces", () => {
+  const fonts = readdirSync(join(dist, "_astro")).filter((path) => path.includes("woff"));
+  assert.ok(fonts.every((path) => path.endsWith(".woff2")), fonts);
+  assert.ok(!fonts.some((path) => path.includes("serif-latin-400-normal")), fonts);
 });
 
 test("install commands truncate instead of scrolling sideways", () => {

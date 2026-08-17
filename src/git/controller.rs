@@ -314,9 +314,7 @@ impl Worker {
         let mut untracked = Vec::new();
         for path in paths {
             let entry = snapshot
-                .entries
-                .iter()
-                .find(|entry| &entry.path == path)
+                .entry(path)
                 .ok_or_else(|| format!("{} is no longer changed", path.display()))?;
             if entry.worktree == Some(ChangeKind::Untracked) {
                 let target = repository.join(path);

@@ -1,9 +1,29 @@
 @import "tailwindcss";
 @import "@fontsource-variable/instrument-sans/wght.css";
-@import "@fontsource/instrument-serif/latin-400.css";
-@import "@fontsource/instrument-serif/latin-400-italic.css";
-@import "@fontsource/jetbrains-mono/latin-400.css";
-@import "@fontsource/jetbrains-mono/latin-500.css";
+
+@font-face {
+  font-family: "Instrument Serif";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/instrument-serif/files/instrument-serif-latin-400-italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url("@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff2") format("woff2");
+}
 
 @theme {
   --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;

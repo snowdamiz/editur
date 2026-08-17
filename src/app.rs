@@ -27,7 +27,10 @@ mod workspace_view;
 
 use agent_diff::*;
 use agent_text::*;
-use devin_view::{DevinLifecycle, DevinScope, DevinView, PendingDevinMessage};
+use devin_view::{
+    DevinAdvancedDraft, DevinLifecycle, DevinResourceDraft, DevinScope, DevinView,
+    PendingDevinMessage,
+};
 use layout::*;
 use settings_ui::*;
 use window_state::*;
@@ -74,8 +77,9 @@ use crate::{
     },
     data_dir,
     devin::{
-        ConnectionState as DevinConnectionState, CredentialSource, DevinCommand, DevinController,
-        DevinEvent, DevinState, RepositoryState, StatusCategory,
+        ConnectionState as DevinConnectionState, CreateSessionRequest, CredentialSource,
+        CrudAction, DevinCommand, DevinController, DevinEvent, DevinSection, DevinState, LoadState,
+        RepositoryState, ResourceMutation, SecretInput, SessionFilters, StatusCategory,
     },
     dialog::{Dialog, Outcome, Severity},
     editor_surface::{
@@ -1924,7 +1928,7 @@ fn assistant_dense_tool(
     search: Option<(&str, Option<usize>)>,
     has_body: bool,
     add_body: impl FnOnce(&mut egui::Ui),
-) {
+) -> bool {
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     if has_body && search.is_some() {
@@ -1940,6 +1944,7 @@ fn assistant_dense_tool(
             Sense::hover()
         },
     );
+    let toggled_open = response.clicked() && !state.is_open();
     if response.clicked() {
         state.toggle(ui);
         ui.ctx().request_discard("dense tool disclosure changed");
@@ -2088,6 +2093,7 @@ fn assistant_dense_tool(
                 add_body(ui);
             });
     }
+    toggled_open
 }
 
 /// Measured with the active tab's face so a tab does not resize when it is
@@ -2771,16 +2777,21 @@ fn agent_mention_matches(entries: &[AgentMentionEntry], query: &str) -> Vec<Agen
             Some((score, entry.relative.len(), entry))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
+    let by_score = |left: &(usize, usize, &AgentMentionEntry),
+                    right: &(usize, usize, &AgentMentionEntry)| {
         (left.0, left.1, left.2.relative.as_str()).cmp(&(
             right.0,
             right.1,
             right.2.relative.as_str(),
         ))
-    });
+    };
+    if matches.len() > 10 {
+        matches.select_nth_unstable_by(10, by_score);
+        matches.truncate(10);
+    }
+    matches.sort_by(by_score);
     matches
         .into_iter()
-        .take(10)
         .map(|(_, _, entry)| entry.clone())
         .collect()
 }
@@ -3307,6 +3318,9 @@ enum AttachmentTarget {
 
 enum SettingsAction {
     Back,
+    OpenDevin,
+    ConnectDevin,
+    DisconnectDevin,
     Enabled(bool),
     Mode(PresetId, ServerMode),
     Apply(PresetId, String, String),
@@ -3317,6 +3331,7 @@ enum SettingsAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsSection {
     Appearance,
+    Devin,
     Keybindings,
     LanguageServers,
 }
@@ -3383,6 +3398,7 @@ struct LspDiagnosticsState {
     stale: bool,
     generation: u64,
     diagnostics: Vec<crate::lsp::Diagnostic>,
+    line_markers: HashMap<usize, crate::lsp::DiagnosticSeverity>,
 }
 
 struct LspCaret {
@@ -4374,6 +4390,14 @@ pub struct EditorApp {
     devin_view: DevinView,
     devin_scope: DevinScope,
     devin_filter: String,
+    devin_server_filters: SessionFilters,
+    devin_filter_tags: String,
+    devin_resource_query: String,
+    devin_resource_filter: String,
+    devin_advanced: DevinAdvancedDraft,
+    devin_resource_draft: DevinResourceDraft,
+    devin_tags: String,
+    devin_activity_query: String,
     devin_list_cursor: usize,
     devin_focus_list: bool,
     devin_focus_create: bool,
@@ -4388,6 +4412,8 @@ pub struct EditorApp {
     devin_pending_lifecycle: Option<DevinLifecycle>,
     devin_confirm_terminate: bool,
     devin_confirm_disconnect: bool,
+    devin_confirm_mutation: Option<ResourceMutation>,
+    devin_confirm_org: Option<String>,
     agent_menu: Option<AgentMenu>,
     agent_menu_popup: Option<egui::Rect>,
     agent_menu_scroll_y: f32,
@@ -4569,6 +4595,14 @@ impl EditorApp {
             devin_view: DevinView::default(),
             devin_scope: DevinScope::default(),
             devin_filter: String::new(),
+            devin_server_filters: SessionFilters::default(),
+            devin_filter_tags: String::new(),
+            devin_resource_query: String::new(),
+            devin_resource_filter: String::new(),
+            devin_advanced: DevinAdvancedDraft::default(),
+            devin_resource_draft: DevinResourceDraft::default(),
+            devin_tags: String::new(),
+            devin_activity_query: String::new(),
             devin_list_cursor: 0,
             devin_focus_list: false,
             devin_focus_create: false,
@@ -4583,6 +4617,8 @@ impl EditorApp {
             devin_pending_lifecycle: None,
             devin_confirm_terminate: false,
             devin_confirm_disconnect: false,
+            devin_confirm_mutation: None,
+            devin_confirm_org: None,
             agent_menu: None,
             agent_menu_popup: None,
             agent_menu_scroll_y: 0.0,
@@ -6834,6 +6870,85 @@ impl EditorApp {
                 _ => {}
             }
         }
+        if let Some(org_id) = self.devin_confirm_org.clone() {
+            let outcome = Dialog::new("devin_org_switch_dialog", "Switch Devin organization")
+                .body("Switch organizations? Remote sessions and resource caches will be cleared. Unsent local drafts and staged files stay in Editur.")
+                .primary("Switch organization")
+                .show(ctx);
+            match outcome {
+                Outcome::Primary => {
+                    self.devin_confirm_org = None;
+                    self.send_devin(DevinCommand::SelectOrganization(org_id));
+                }
+                Outcome::Cancel | Outcome::Dismissed => self.devin_confirm_org = None,
+                _ => {}
+            }
+        }
+        if let Some(mutation) = self.devin_confirm_mutation.clone() {
+            let destructive = matches!(
+                mutation,
+                ResourceMutation::RemoveRepositoryIndex { .. }
+                    | ResourceMutation::RemoveRepositoryBranch { .. }
+                    | ResourceMutation::Knowledge {
+                        action: CrudAction::Delete,
+                        ..
+                    }
+                    | ResourceMutation::DismissKnowledgeSuggestion { .. }
+                    | ResourceMutation::Playbook {
+                        action: CrudAction::Delete,
+                        ..
+                    }
+                    | ResourceMutation::Schedule {
+                        action: CrudAction::Delete,
+                        ..
+                    }
+                    | ResourceMutation::Automation {
+                        action: CrudAction::Delete,
+                        ..
+                    }
+                    | ResourceMutation::Blueprint {
+                        action: CrudAction::Delete,
+                        ..
+                    }
+                    | ResourceMutation::DeleteBlueprintFile { .. }
+                    | ResourceMutation::CancelBuild { .. }
+                    | ResourceMutation::DeleteSecret { .. }
+            );
+            let (title, body, button) = match &mutation {
+                ResourceMutation::TriggerReview { .. } => (
+                    "Trigger Devin Review",
+                    "Start a remote review? This can incur Devin usage.",
+                    "Trigger review",
+                ),
+                ResourceMutation::TriggerBuild => (
+                    "Trigger snapshot build",
+                    "Start a remote snapshot build using the current blueprints?",
+                    "Trigger build",
+                ),
+                _ => (
+                    "Confirm Devin change",
+                    "Apply this remote organization change? Deleted resources may not be recoverable.",
+                    "Apply change",
+                ),
+            };
+            let dialog = Dialog::new("devin_resource_confirmation", title).body(body);
+            let outcome = if destructive {
+                dialog
+                    .severity(Severity::Danger)
+                    .destructive(button)
+                    .show(ctx)
+            } else {
+                dialog.primary(button).show(ctx)
+            };
+            match outcome {
+                Outcome::Primary | Outcome::Destructive => {
+                    self.devin_confirm_mutation = None;
+                    self.send_devin(DevinCommand::MutateResource(mutation));
+                }
+                Outcome::Cancel | Outcome::Dismissed => self.devin_confirm_mutation = None,
+                _ => {}
+            }
+        }
         if self.tree_prompt.is_some() {
             let action = self.tree_prompt.as_ref().map(|prompt| prompt.action);
             let title = match action {
@@ -7043,17 +7158,18 @@ impl EditorApp {
 }
 
 fn completion_word_range(text: &str, cursor: usize) -> std::ops::Range<usize> {
-    let characters = text.chars().collect::<Vec<_>>();
-    let cursor = cursor.min(characters.len());
-    let mut start = cursor;
-    while start > 0 && (characters[start - 1].is_alphanumeric() || characters[start - 1] == '_') {
-        start -= 1;
-    }
-    let mut end = cursor;
-    while end < characters.len() && (characters[end].is_alphanumeric() || characters[end] == '_') {
-        end += 1;
-    }
-    start..end
+    let (cursor, byte_cursor) = text.char_indices().nth(cursor).map_or_else(
+        || (text.chars().count(), text.len()),
+        |(byte, _)| (cursor, byte),
+    );
+    let is_word = |character: &char| character.is_alphanumeric() || *character == '_';
+    let before = text[..byte_cursor]
+        .chars()
+        .rev()
+        .take_while(is_word)
+        .count();
+    let after = text[byte_cursor..].chars().take_while(is_word).count();
+    cursor - before..cursor + after
 }
 
 fn completion_kind_label(kind: Option<i32>) -> Option<&'static str> {

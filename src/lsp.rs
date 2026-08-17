@@ -111,36 +111,29 @@ struct RpcError {
 fn decode_message(body: &[u8]) -> Result<WireMessage, String> {
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid LSP JSON: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "LSP message is not an object".to_owned())?;
+    let Value::Object(mut object) = value else {
+        return Err("LSP message is not an object".to_owned());
+    };
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err("LSP message is not JSON-RPC 2.0".into());
     }
-    if let Some(method) = object.get("method").and_then(Value::as_str) {
+    if let Some(Value::String(method)) = object.remove("method") {
         if method.len() > 1_024 {
             return Err("LSP method exceeds 1 KiB".into());
         }
         if object.contains_key("result") || object.contains_key("error") {
             return Err("LSP method message contains a response payload".into());
         }
-        let params = object.get("params").cloned().unwrap_or(Value::Null);
+        let params = object.remove("params").unwrap_or(Value::Null);
         if !params.is_null() && !params.is_object() && !params.is_array() {
             return Err("LSP params must be an object or array".into());
         }
-        return match object.get("id") {
-            None | Some(Value::Null) => Ok(WireMessage::Notification {
-                method: method.to_owned(),
-                params,
-            }),
-            Some(id) if id.is_number() => Ok(WireMessage::Request {
-                id: id.clone(),
-                method: method.to_owned(),
-                params,
-            }),
+        return match object.remove("id") {
+            None | Some(Value::Null) => Ok(WireMessage::Notification { method, params }),
+            Some(id) if id.is_number() => Ok(WireMessage::Request { id, method, params }),
             Some(Value::String(id)) if id.len() <= 1_024 => Ok(WireMessage::Request {
-                id: Value::String(id.clone()),
-                method: method.to_owned(),
+                id: Value::String(id),
+                method,
                 params,
             }),
             Some(Value::String(_)) => Err("LSP request ID exceeds 1 KiB".into()),
@@ -148,17 +141,17 @@ fn decode_message(body: &[u8]) -> Result<WireMessage, String> {
         };
     }
     let id = object
-        .get("id")
-        .and_then(Value::as_u64)
+        .remove("id")
+        .and_then(|id| id.as_u64())
         .ok_or_else(|| "invalid LSP response ID".to_owned())?;
-    match (object.get("result"), object.get("error")) {
+    match (object.remove("result"), object.remove("error")) {
         (Some(result), None) => Ok(WireMessage::Response {
             id,
-            result: Ok(result.clone()),
+            result: Ok(result),
         }),
         (None, Some(error)) => Ok(WireMessage::Response {
             id,
-            result: Err(serde_json::from_value(error.clone())
+            result: Err(serde_json::from_value(error)
                 .map_err(|error| format!("invalid LSP error response: {error}"))?),
         }),
         _ => Err("LSP response must contain exactly one result or error".into()),

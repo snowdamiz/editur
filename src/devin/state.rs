@@ -1,4 +1,7 @@
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{BTreeSet, HashSet},
+    time::Instant,
+};
 
 use super::credentials::CredentialSource;
 
@@ -14,18 +17,302 @@ pub enum ConnectionState {
     Failed,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DevinCapabilities {
+    tools: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DevinOrganization {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionFilters {
+    pub origin: String,
+    pub repository: String,
+    pub tags: Vec<String>,
+    pub playbook_id: String,
+    pub schedule_id: String,
+    pub user_id: String,
+    pub parent_session_id: String,
+    pub category: String,
+    pub status: String,
+    pub created_after: String,
+    pub created_before: String,
+    pub updated_after: String,
+    pub updated_before: String,
+}
+
+impl SessionFilters {
+    pub fn is_empty(&self) -> bool {
+        self.origin.is_empty()
+            && self.repository.is_empty()
+            && self.tags.is_empty()
+            && self.playbook_id.is_empty()
+            && self.schedule_id.is_empty()
+            && self.user_id.is_empty()
+            && self.parent_session_id.is_empty()
+            && self.category.is_empty()
+            && self.status.is_empty()
+            && self.created_after.is_empty()
+            && self.created_before.is_empty()
+            && self.updated_after.is_empty()
+            && self.updated_before.is_empty()
+    }
+}
+
+impl DevinCapabilities {
+    pub(crate) fn new(tools: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            tools: tools.into_iter().collect(),
+        }
+    }
+
+    pub fn has(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StatusCategory {
     Active,
     Waiting,
+    WaitingApproval,
     Sleeping,
+    Suspended,
     Completed,
     Failed,
     #[default]
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DevinSection {
+    Review,
+    Repositories,
+    Knowledge,
+    Playbooks,
+    Automations,
+    Environment,
+    Integrations,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevinResourceKind {
+    Repositories,
+    Documents,
+    Knowledge,
+    KnowledgeFolders,
+    KnowledgeSuggestions,
+    Playbooks,
+    Schedules,
+    Automations,
+    AutomationCatalog,
+    Integrations,
+    Reviews,
+    Blueprints,
+    BlueprintFiles,
+    Builds,
+    Secrets,
+    Insights,
+}
+
+impl DevinSection {
+    pub const ALL: [Self; 7] = [
+        Self::Review,
+        Self::Repositories,
+        Self::Knowledge,
+        Self::Playbooks,
+        Self::Automations,
+        Self::Environment,
+        Self::Integrations,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Review => "Review",
+            Self::Repositories => "Repositories",
+            Self::Knowledge => "Knowledge",
+            Self::Playbooks => "Playbooks",
+            Self::Automations => "Automations",
+            Self::Environment => "Environment",
+            Self::Integrations => "Integrations",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoadState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded,
+    Stale,
+    Forbidden,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResourceState<T> {
+    pub status: LoadState,
+    pub items: Vec<T>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DevinRepository {
+    pub id: String,
+    pub name: String,
+    pub indexed: bool,
+    pub indexing_status: Option<String>,
+    pub branches: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WikiDocument {
+    pub repository: String,
+    pub title: String,
+    pub content: String,
+    pub citations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KnowledgeNote {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub folder: Option<String>,
+    pub repositories: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KnowledgeFolder {
+    pub id: String,
+    pub name: String,
+    pub note_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KnowledgeSuggestion {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Playbook {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub automation_macro: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Schedule {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub cadence: String,
+    pub enabled: bool,
+    pub configuration: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Automation {
+    pub id: String,
+    pub title: String,
+    pub enabled: bool,
+    pub summary: String,
+    pub configuration: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AutomationCatalog {
+    pub schemas: serde_json::Value,
+    pub templates: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Integration {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub installed: bool,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Review {
+    pub pull_request_url: String,
+    pub status: String,
+    pub result_url: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Blueprint {
+    pub id: String,
+    pub name: String,
+    pub repository: Option<String>,
+    pub contents_url: Option<String>,
+    pub contents: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlueprintFile {
+    pub id: String,
+    pub name: String,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SnapshotBuild {
+    pub id: String,
+    pub status: String,
+    pub created_at: Option<String>,
+    pub logs_url: Option<String>,
+    pub pinned: bool,
+    pub configuration: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SecretMetadata {
+    pub id: String,
+    pub name: String,
+    pub scope: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionInsight {
+    pub session_id: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub message_count: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct DevinResources {
+    pub repositories: ResourceState<DevinRepository>,
+    pub documents: ResourceState<WikiDocument>,
+    pub knowledge: ResourceState<KnowledgeNote>,
+    pub knowledge_folders: ResourceState<KnowledgeFolder>,
+    pub knowledge_suggestions: ResourceState<KnowledgeSuggestion>,
+    pub playbooks: ResourceState<Playbook>,
+    pub schedules: ResourceState<Schedule>,
+    pub automations: ResourceState<Automation>,
+    pub automation_catalog: ResourceState<AutomationCatalog>,
+    pub integrations: ResourceState<Integration>,
+    pub reviews: ResourceState<Review>,
+    pub blueprints: ResourceState<Blueprint>,
+    pub blueprint_files: ResourceState<BlueprintFile>,
+    pub builds: ResourceState<SnapshotBuild>,
+    pub secrets: ResourceState<SecretMetadata>,
+    pub insights: ResourceState<SessionInsight>,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
@@ -42,15 +329,56 @@ pub struct SessionSummary {
     pub url: Option<String>,
     pub pull_request_count: usize,
     pub tags: Vec<String>,
+    pub org_id: Option<String>,
+    pub user_id: Option<String>,
+    pub service_user_id: Option<String>,
+    pub automation_id: Option<String>,
+    pub devin_mode: Option<String>,
+    pub playbook_id: Option<String>,
+    pub session_category: Option<String>,
+    pub subcategory: Option<String>,
+    pub structured_output: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+impl std::fmt::Debug for SessionSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionSummary")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("prompt", &self.prompt.as_ref().map(|_| "[REDACTED]"))
+            .field("status", &self.status)
+            .field("status_detail", &self.status_detail)
+            .field("category", &self.category)
+            .field("archived", &self.archived)
+            .field(
+                "structured_output",
+                &self.structured_output.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct DevinMessage {
     pub id: String,
     pub timestamp: String,
     pub role: String,
     pub text: String,
     pub attachment_ids: Vec<String>,
+}
+
+impl std::fmt::Debug for DevinMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DevinMessage")
+            .field("id", &self.id)
+            .field("timestamp", &self.timestamp)
+            .field("role", &self.role)
+            .field("text", &"[REDACTED]")
+            .field("attachment_ids", &self.attachment_ids)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -68,13 +396,26 @@ pub struct Activity {
     pub child_session_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct Attachment {
     pub id: String,
     pub name: String,
     pub media_type: Option<String>,
     pub size: Option<u64>,
     pub url: Option<String>,
+}
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Attachment")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("media_type", &self.media_type)
+            .field("size", &self.size)
+            .field("url", &self.url.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -124,14 +465,61 @@ pub enum RepositoryState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DevinEvent {
     ConnectionChanged(ConnectionState),
+    CapabilitiesChanged(DevinCapabilities),
     CredentialsChanged(Option<CredentialSource>),
+    OrganizationsDiscovered(Vec<DevinOrganization>),
+    OrganizationSelected(String),
+    OrganizationSwitching,
     RepositoryResolved(RepositoryState),
+    FiltersChanged(SessionFilters),
     WorkspaceBoundary(String),
+    ResourceLoading(DevinSection),
+    ResourceForbidden(DevinSection),
+    ResourceFailed {
+        section: DevinSection,
+        error: DevinError,
+    },
+    ResourceKindLoading(DevinResourceKind),
+    ResourceKindForbidden(DevinResourceKind),
+    ResourceKindFailed {
+        kind: DevinResourceKind,
+        error: DevinError,
+    },
+    RepositoriesLoaded(Vec<DevinRepository>),
+    DocumentsLoaded(Vec<WikiDocument>),
+    KnowledgeLoaded(Vec<KnowledgeNote>),
+    KnowledgeDetailLoaded(KnowledgeNote),
+    KnowledgeFoldersLoaded(Vec<KnowledgeFolder>),
+    KnowledgeSuggestionsLoaded(Vec<KnowledgeSuggestion>),
+    KnowledgeSuggestionDetailLoaded(KnowledgeSuggestion),
+    PlaybooksLoaded(Vec<Playbook>),
+    PlaybookDetailLoaded(Playbook),
+    SchedulesLoaded(Vec<Schedule>),
+    ScheduleDetailLoaded(Schedule),
+    AutomationsLoaded(Vec<Automation>),
+    AutomationDetailLoaded(Automation),
+    AutomationCatalogLoaded(AutomationCatalog),
+    IntegrationsLoaded(Vec<Integration>),
+    ReviewsLoaded(Vec<Review>),
+    BlueprintsLoaded(Vec<Blueprint>),
+    BlueprintLoaded(Blueprint),
+    BlueprintFilesLoaded(Vec<BlueprintFile>),
+    BuildLogLoaded {
+        build_id: String,
+        logs_url: String,
+    },
+    BuildsLoaded(Vec<SnapshotBuild>),
+    BuildDetailLoaded(SnapshotBuild),
+    SecretsLoaded(Vec<SecretMetadata>),
+    InsightsLoaded(Vec<SessionInsight>),
     SessionsLoaded {
         sessions: Vec<SessionSummary>,
         next_cursor: Option<String>,
+        total: Option<usize>,
+        has_next: bool,
         append: bool,
     },
+    BatchCreated(Vec<String>),
     SessionCreated(SessionSummary),
     SessionLoaded {
         session_id: String,
@@ -143,14 +531,20 @@ pub enum DevinEvent {
         generation: u64,
         messages: Vec<DevinMessage>,
         next_cursor: Option<String>,
-        replace: bool,
+        update: PageUpdate,
     },
     ActivityLoaded {
         session_id: String,
         generation: u64,
         activity: Vec<Activity>,
         next_cursor: Option<String>,
-        replace: bool,
+        update: PageUpdate,
+    },
+    ActivityDetailsLoaded {
+        session_id: String,
+        generation: u64,
+        event_id: String,
+        details: String,
     },
     AttachmentFetched {
         session_id: String,
@@ -161,17 +555,33 @@ pub enum DevinEvent {
     OperationFinished {
         session_id: Option<String>,
     },
+    PermissionDenied(DevinError),
     Failed(DevinError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageUpdate {
+    Initial,
+    History,
+    Refresh,
 }
 
 #[derive(Default)]
 pub struct DevinState {
     pub connection: ConnectionState,
+    pub capabilities: DevinCapabilities,
     pub credential_source: Option<CredentialSource>,
+    pub organizations: Vec<DevinOrganization>,
+    pub selected_org_id: Option<String>,
     pub repository: RepositoryState,
+    pub filters: SessionFilters,
     pub workspace_boundary: Option<String>,
+    pub resources: DevinResources,
     pub sessions: Vec<SessionSummary>,
     pub sessions_cursor: Option<String>,
+    pub sessions_total: Option<usize>,
+    pub sessions_has_next: bool,
+    pub last_created_batch: Vec<String>,
     pub last_sessions_refresh: Option<Instant>,
     pub selected_session: Option<String>,
     pub selected_generation: u64,
@@ -288,7 +698,7 @@ impl DevinState {
                 },
             ],
             next_cursor: None,
-            replace: true,
+            update: PageUpdate::Initial,
         });
         self.apply(DevinEvent::AttachmentFetched {
             session_id: session_id.clone(),
@@ -334,7 +744,7 @@ impl DevinState {
                 },
             ],
             next_cursor: None,
-            replace: true,
+            update: PageUpdate::Initial,
         });
         true
     }
@@ -368,21 +778,164 @@ impl DevinState {
     pub fn apply(&mut self, event: DevinEvent) {
         match event {
             DevinEvent::ConnectionChanged(connection) => self.connection = connection,
+            DevinEvent::CapabilitiesChanged(capabilities) => self.capabilities = capabilities,
             DevinEvent::CredentialsChanged(source) => {
                 self.credential_source = source;
                 if source.is_none() {
+                    self.capabilities = DevinCapabilities::default();
+                    self.organizations.clear();
+                    self.selected_org_id = None;
                     self.sessions.clear();
+                    self.filters = SessionFilters::default();
                     self.sessions_cursor = None;
+                    self.sessions_total = None;
+                    self.sessions_has_next = false;
+                    self.last_created_batch.clear();
                     self.last_sessions_refresh = None;
                     self.clear_selection();
                     self.error = None;
+                    self.resources = DevinResources::default();
                 }
             }
+            DevinEvent::OrganizationsDiscovered(organizations) => {
+                self.organizations = organizations;
+                self.connection = ConnectionState::AuthenticationRequired;
+                self.busy = false;
+            }
+            DevinEvent::OrganizationSelected(org_id) => {
+                self.selected_org_id = Some(org_id);
+            }
+            DevinEvent::OrganizationSwitching => {
+                self.sessions.clear();
+                self.filters = SessionFilters::default();
+                self.sessions_cursor = None;
+                self.sessions_total = None;
+                self.sessions_has_next = false;
+                self.last_created_batch.clear();
+                self.last_sessions_refresh = None;
+                self.clear_selection();
+                self.resources = DevinResources::default();
+                self.error = None;
+            }
             DevinEvent::RepositoryResolved(repository) => self.repository = repository,
+            DevinEvent::FiltersChanged(filters) => self.filters = filters,
             DevinEvent::WorkspaceBoundary(message) => self.workspace_boundary = Some(message),
+            DevinEvent::ResourceLoading(section) => {
+                *resource_state_mut(&mut self.resources, section).0 = LoadState::Loading;
+            }
+            DevinEvent::ResourceForbidden(section) => {
+                let (status, error) = resource_state_mut(&mut self.resources, section);
+                *status = LoadState::Forbidden;
+                *error =
+                    Some("This credential does not have permission for this Devin feature".into());
+                self.busy = false;
+            }
+            DevinEvent::ResourceFailed { section, error } => {
+                let (status, message) = resource_state_mut(&mut self.resources, section);
+                *status = LoadState::Failed;
+                *message = Some(error.message);
+                self.busy = false;
+            }
+            DevinEvent::ResourceKindLoading(kind) => {
+                *resource_kind_state_mut(&mut self.resources, kind).0 = LoadState::Loading;
+            }
+            DevinEvent::ResourceKindForbidden(kind) => {
+                let (status, error) = resource_kind_state_mut(&mut self.resources, kind);
+                *status = LoadState::Forbidden;
+                *error =
+                    Some("This credential does not have permission for this Devin feature".into());
+            }
+            DevinEvent::ResourceKindFailed { kind, error } => {
+                let stale = resource_kind_has_items(&self.resources, kind);
+                let (status, message) = resource_kind_state_mut(&mut self.resources, kind);
+                *status = if stale {
+                    LoadState::Stale
+                } else {
+                    LoadState::Failed
+                };
+                *message = Some(error.message);
+            }
+            DevinEvent::RepositoriesLoaded(items) => {
+                loaded(&mut self.resources.repositories, items)
+            }
+            DevinEvent::DocumentsLoaded(items) => loaded(&mut self.resources.documents, items),
+            DevinEvent::KnowledgeLoaded(items) => loaded(&mut self.resources.knowledge, items),
+            DevinEvent::KnowledgeDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.knowledge, item, |item| item.id.as_str())
+            }
+            DevinEvent::KnowledgeFoldersLoaded(items) => {
+                loaded(&mut self.resources.knowledge_folders, items)
+            }
+            DevinEvent::KnowledgeSuggestionsLoaded(items) => {
+                loaded(&mut self.resources.knowledge_suggestions, items)
+            }
+            DevinEvent::KnowledgeSuggestionDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.knowledge_suggestions, item, |item| {
+                    item.id.as_str()
+                })
+            }
+            DevinEvent::PlaybooksLoaded(items) => loaded(&mut self.resources.playbooks, items),
+            DevinEvent::PlaybookDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.playbooks, item, |item| item.id.as_str())
+            }
+            DevinEvent::SchedulesLoaded(items) => loaded(&mut self.resources.schedules, items),
+            DevinEvent::ScheduleDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.schedules, item, |item| item.id.as_str())
+            }
+            DevinEvent::AutomationsLoaded(items) => loaded(&mut self.resources.automations, items),
+            DevinEvent::AutomationDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.automations, item, |item| {
+                    item.id.as_str()
+                })
+            }
+            DevinEvent::AutomationCatalogLoaded(catalog) => {
+                loaded(&mut self.resources.automation_catalog, vec![catalog])
+            }
+            DevinEvent::IntegrationsLoaded(items) => {
+                loaded(&mut self.resources.integrations, items)
+            }
+            DevinEvent::ReviewsLoaded(items) => loaded(&mut self.resources.reviews, items),
+            DevinEvent::BlueprintsLoaded(items) => loaded(&mut self.resources.blueprints, items),
+            DevinEvent::BlueprintLoaded(blueprint) => {
+                if let Some(current) = self
+                    .resources
+                    .blueprints
+                    .items
+                    .iter_mut()
+                    .find(|current| current.id == blueprint.id)
+                {
+                    *current = blueprint;
+                } else {
+                    self.resources.blueprints.items.push(blueprint);
+                }
+                self.resources.blueprints.status = LoadState::Loaded;
+                self.resources.blueprints.error = None;
+            }
+            DevinEvent::BlueprintFilesLoaded(items) => {
+                loaded(&mut self.resources.blueprint_files, items)
+            }
+            DevinEvent::BuildsLoaded(items) => loaded(&mut self.resources.builds, items),
+            DevinEvent::BuildDetailLoaded(item) => {
+                upsert_loaded(&mut self.resources.builds, item, |item| item.id.as_str())
+            }
+            DevinEvent::BuildLogLoaded { build_id, logs_url } => {
+                if let Some(build) = self
+                    .resources
+                    .builds
+                    .items
+                    .iter_mut()
+                    .find(|build| build.id == build_id)
+                {
+                    build.logs_url = Some(logs_url);
+                }
+            }
+            DevinEvent::SecretsLoaded(items) => loaded(&mut self.resources.secrets, items),
+            DevinEvent::InsightsLoaded(items) => loaded(&mut self.resources.insights, items),
             DevinEvent::SessionsLoaded {
                 sessions,
                 next_cursor,
+                total,
+                has_next,
                 append,
             } => {
                 if append {
@@ -391,6 +944,10 @@ impl DevinState {
                     self.sessions = sessions;
                 }
                 self.sessions_cursor = next_cursor;
+                if total.is_some() || !append {
+                    self.sessions_total = total;
+                }
+                self.sessions_has_next = has_next;
                 self.last_sessions_refresh = Some(Instant::now());
                 self.error = None;
             }
@@ -407,11 +964,23 @@ impl DevinState {
                 self.busy = false;
                 self.error = None;
             }
+            DevinEvent::BatchCreated(session_ids) => {
+                self.last_created_batch = session_ids;
+                self.busy = false;
+                self.error = None;
+            }
             DevinEvent::SessionLoaded {
                 session_id,
                 generation,
                 detail,
             } if self.is_current(&session_id, generation) => {
+                if let Some(summary) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|summary| summary.id == session_id)
+                {
+                    *summary = detail.summary.clone();
+                }
                 self.detail = Some(detail);
                 self.error = None;
                 self.busy = false;
@@ -421,15 +990,17 @@ impl DevinState {
                 generation,
                 messages,
                 next_cursor,
-                replace,
+                update,
             } if self.is_current(&session_id, generation) => {
-                if replace {
+                if update == PageUpdate::Initial {
                     self.messages.clear();
                 }
                 append_unique(&mut self.messages, messages, |message| message.id.as_str());
                 self.messages
                     .sort_by(|left, right| chronological(&left.timestamp, &right.timestamp));
-                self.messages_cursor = next_cursor;
+                if update != PageUpdate::Refresh {
+                    self.messages_cursor = next_cursor;
+                }
                 self.error = None;
                 self.busy = false;
             }
@@ -438,15 +1009,33 @@ impl DevinState {
                 generation,
                 activity,
                 next_cursor,
-                replace,
+                update,
             } if self.is_current(&session_id, generation) => {
-                if replace {
+                if update == PageUpdate::Initial {
                     self.activity.clear();
                 }
                 append_unique(&mut self.activity, activity, |event| event.id.as_str());
                 self.activity
                     .sort_by(|left, right| chronological(&left.timestamp, &right.timestamp));
-                self.activity_cursor = next_cursor;
+                if update != PageUpdate::Refresh {
+                    self.activity_cursor = next_cursor;
+                }
+                self.error = None;
+                self.busy = false;
+            }
+            DevinEvent::ActivityDetailsLoaded {
+                session_id,
+                generation,
+                event_id,
+                details,
+            } if self.is_current(&session_id, generation) => {
+                if let Some(activity) = self
+                    .activity
+                    .iter_mut()
+                    .find(|activity| activity.id == event_id)
+                {
+                    activity.details = Some(details);
+                }
                 self.error = None;
                 self.busy = false;
             }
@@ -466,6 +1055,10 @@ impl DevinState {
                     self.busy = false;
                     self.error = None;
                 }
+            }
+            DevinEvent::PermissionDenied(error) => {
+                self.error = Some(error);
+                self.busy = false;
             }
             DevinEvent::Failed(error) => {
                 self.connection = if error.retry_after_seconds.is_some() {
@@ -488,6 +1081,145 @@ impl DevinState {
     fn is_current(&self, session_id: &str, generation: u64) -> bool {
         self.selected_session.as_deref() == Some(session_id)
             && self.selected_generation == generation
+    }
+}
+
+fn loaded<T>(state: &mut ResourceState<T>, items: Vec<T>) {
+    state.status = LoadState::Loaded;
+    state.items = items;
+    state.error = None;
+}
+
+fn upsert_loaded<T>(state: &mut ResourceState<T>, item: T, id: impl Fn(&T) -> &str) {
+    if let Some(index) = state
+        .items
+        .iter()
+        .position(|existing| id(existing) == id(&item))
+    {
+        state.items[index] = item;
+    } else {
+        state.items.push(item);
+    }
+    state.status = LoadState::Loaded;
+    state.error = None;
+}
+
+fn resource_state_mut(
+    resources: &mut DevinResources,
+    section: DevinSection,
+) -> (&mut LoadState, &mut Option<String>) {
+    match section {
+        DevinSection::Review => (&mut resources.reviews.status, &mut resources.reviews.error),
+        DevinSection::Repositories => (
+            &mut resources.repositories.status,
+            &mut resources.repositories.error,
+        ),
+        DevinSection::Knowledge => (
+            &mut resources.knowledge.status,
+            &mut resources.knowledge.error,
+        ),
+        DevinSection::Playbooks => (
+            &mut resources.playbooks.status,
+            &mut resources.playbooks.error,
+        ),
+        DevinSection::Automations => (
+            &mut resources.automations.status,
+            &mut resources.automations.error,
+        ),
+        DevinSection::Environment => (
+            &mut resources.blueprints.status,
+            &mut resources.blueprints.error,
+        ),
+        DevinSection::Integrations => (
+            &mut resources.integrations.status,
+            &mut resources.integrations.error,
+        ),
+    }
+}
+
+fn resource_kind_state_mut(
+    resources: &mut DevinResources,
+    kind: DevinResourceKind,
+) -> (&mut LoadState, &mut Option<String>) {
+    match kind {
+        DevinResourceKind::Repositories => (
+            &mut resources.repositories.status,
+            &mut resources.repositories.error,
+        ),
+        DevinResourceKind::Documents => (
+            &mut resources.documents.status,
+            &mut resources.documents.error,
+        ),
+        DevinResourceKind::Knowledge => (
+            &mut resources.knowledge.status,
+            &mut resources.knowledge.error,
+        ),
+        DevinResourceKind::KnowledgeFolders => (
+            &mut resources.knowledge_folders.status,
+            &mut resources.knowledge_folders.error,
+        ),
+        DevinResourceKind::KnowledgeSuggestions => (
+            &mut resources.knowledge_suggestions.status,
+            &mut resources.knowledge_suggestions.error,
+        ),
+        DevinResourceKind::Playbooks => (
+            &mut resources.playbooks.status,
+            &mut resources.playbooks.error,
+        ),
+        DevinResourceKind::Schedules => (
+            &mut resources.schedules.status,
+            &mut resources.schedules.error,
+        ),
+        DevinResourceKind::Automations => (
+            &mut resources.automations.status,
+            &mut resources.automations.error,
+        ),
+        DevinResourceKind::AutomationCatalog => (
+            &mut resources.automation_catalog.status,
+            &mut resources.automation_catalog.error,
+        ),
+        DevinResourceKind::Integrations => (
+            &mut resources.integrations.status,
+            &mut resources.integrations.error,
+        ),
+        DevinResourceKind::Reviews => (&mut resources.reviews.status, &mut resources.reviews.error),
+        DevinResourceKind::Blueprints => (
+            &mut resources.blueprints.status,
+            &mut resources.blueprints.error,
+        ),
+        DevinResourceKind::BlueprintFiles => (
+            &mut resources.blueprint_files.status,
+            &mut resources.blueprint_files.error,
+        ),
+        DevinResourceKind::Builds => (&mut resources.builds.status, &mut resources.builds.error),
+        DevinResourceKind::Secrets => (&mut resources.secrets.status, &mut resources.secrets.error),
+        DevinResourceKind::Insights => (
+            &mut resources.insights.status,
+            &mut resources.insights.error,
+        ),
+    }
+}
+
+fn resource_kind_has_items(resources: &DevinResources, kind: DevinResourceKind) -> bool {
+    match kind {
+        DevinResourceKind::Repositories => !resources.repositories.items.is_empty(),
+        DevinResourceKind::Documents => !resources.documents.items.is_empty(),
+        DevinResourceKind::Knowledge => !resources.knowledge.items.is_empty(),
+        DevinResourceKind::KnowledgeFolders => !resources.knowledge_folders.items.is_empty(),
+        DevinResourceKind::KnowledgeSuggestions => {
+            !resources.knowledge_suggestions.items.is_empty()
+        }
+        DevinResourceKind::Playbooks => !resources.playbooks.items.is_empty(),
+        DevinResourceKind::Schedules => !resources.schedules.items.is_empty(),
+        DevinResourceKind::Automations => !resources.automations.items.is_empty(),
+        DevinResourceKind::AutomationCatalog => !resources.automation_catalog.items.is_empty(),
+        DevinResourceKind::Integrations => !resources.integrations.items.is_empty(),
+        DevinResourceKind::Reviews => !resources.reviews.items.is_empty(),
+        DevinResourceKind::Blueprints => !resources.blueprints.items.is_empty(),
+        DevinResourceKind::BlueprintFiles => !resources.blueprint_files.items.is_empty(),
+        DevinResourceKind::Builds => !resources.builds.items.is_empty(),
+        DevinResourceKind::Secrets => !resources.secrets.items.is_empty(),
+        DevinResourceKind::Insights => !resources.insights.items.is_empty(),
     }
 }
 

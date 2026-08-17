@@ -1024,26 +1024,8 @@ impl EditorApp {
             .lsp_diagnostics
             .get(&self.tabs[index].buffer.path)
             .filter(|diagnostics| diagnostics.revision == self.tabs[index].buffer.revision);
-        let line_markers = diagnostics
-            .map(|state| {
-                state
-                    .diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.range.is_empty())
-                    .map(|diagnostic| {
-                        let color = diagnostic_color(diagnostic.severity);
-                        (
-                            diagnostic.line as usize,
-                            if state.stale {
-                                color.gamma_multiply(0.55)
-                            } else {
-                                color
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let empty_line_markers = HashMap::new();
+        let line_markers = diagnostics.map_or(&empty_line_markers, |state| &state.line_markers);
         let FileTab {
             buffer,
             editor_surface,
@@ -1168,7 +1150,8 @@ impl EditorApp {
                 request_focus: active_pane && self.focus_editor,
                 scroll_to_character: scroll_character,
                 id: editor_id,
-                line_markers: &line_markers,
+                line_markers,
+                line_markers_stale: diagnostics.is_some_and(|state| state.stale),
                 text_input,
                 native_keybindings: false,
                 block_caret: vim_enabled && !vim.text_input_enabled(),

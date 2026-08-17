@@ -373,6 +373,14 @@ impl EditorApp {
                             .iter()
                             .any(|tab| tab.buffer.path == path && tab.buffer.revision == revision)
                         {
+                            let mut line_markers = HashMap::new();
+                            for diagnostic in &diagnostics {
+                                if diagnostic.range.is_empty() {
+                                    line_markers
+                                        .entry(diagnostic.line as usize)
+                                        .or_insert(diagnostic.severity);
+                                }
+                            }
                             self.lsp_generation = self.lsp_generation.wrapping_add(1);
                             self.lsp_diagnostics.insert(
                                 path,
@@ -381,6 +389,7 @@ impl EditorApp {
                                     stale: false,
                                     generation: self.lsp_generation,
                                     diagnostics,
+                                    line_markers,
                                 },
                             );
                         }

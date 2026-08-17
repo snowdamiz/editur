@@ -1,7 +1,5 @@
 ---
 import "../styles/global.css";
-import icon from "../assets/editur-icon.png";
-import og from "../assets/og.png";
 import { withBase } from "../lib/paths";
 
 interface Props {
@@ -17,8 +15,8 @@ const description =
   "Editur is a focused native macOS editor built directly on Metal, with no runtime graphics fallback.";
 
 const canonical = new URL(withBase("/"), Astro.site).href;
-const ogImage = new URL(og.src, Astro.site).href;
-const favicon = icon.src;
+const ogImage = new URL(withBase("/og.png"), Astro.site).href;
+const favicon = withBase("/editur-icon.png");
 ---
 
 <!doctype html>

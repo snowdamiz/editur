@@ -329,16 +329,21 @@ pub(super) fn draw_agent_changed_files(
     changed_paths: &HashMap<PathBuf, FileChange>,
     search: Option<(&str, Option<usize>)>,
 ) -> Option<PathBuf> {
-    let mut rows = changed_paths.iter().collect::<Vec<_>>();
-    rows.sort_by_key(|(path, _)| *path);
-    let can_toggle = rows.len() > 5;
+    let row_count = changed_paths.len();
+    let can_toggle = row_count > 5;
     let toggle_id = Id::new("agent_changed_files_toggle");
     let expanded = search.is_some()
         || ui.data(|data| {
             data.get_temp::<bool>(toggle_id.with("expanded"))
                 .unwrap_or(false)
         });
-    let visible_rows = if expanded { rows.len() } else { 5 };
+    let mut rows = changed_paths.iter().collect::<Vec<_>>();
+    if !expanded && rows.len() > 5 {
+        rows.select_nth_unstable_by_key(5, |(path, _)| *path);
+        rows.truncate(5);
+    }
+    rows.sort_by_key(|(path, _)| *path);
+    let visible_rows = rows.len();
     let mut clicked = None;
     egui::Frame::new()
         .fill(theme::surface().raised)
@@ -352,8 +357,8 @@ pub(super) fn draw_agent_changed_files(
                 ui.label(
                     RichText::new(format!(
                         "{} file{} changed",
-                        rows.len(),
-                        if rows.len() == 1 { "" } else { "s" }
+                        row_count,
+                        if row_count == 1 { "" } else { "s" }
                     ))
                     .size(theme::typography::SMALL_SIZE)
                     .strong()

@@ -176,6 +176,26 @@ impl EditorApp {
                         self.settings_section = SettingsSection::LanguageServers;
                         self.settings_search.clear();
                     }
+                    ui.add_space(20.0);
+                    ui.label(
+                        RichText::new("INTEGRATIONS")
+                            .size(theme::typography::MICRO_SIZE)
+                            .strong()
+                            .color(theme::text().muted),
+                    );
+                    ui.add_space(8.0);
+                    if settings_navigation_row(
+                        ui,
+                        "settings_devin",
+                        "Devin",
+                        self.settings_section == SettingsSection::Devin,
+                    )
+                    .clicked()
+                    {
+                        self.settings_section = SettingsSection::Devin;
+                        self.settings_search.clear();
+                        actions.push(SettingsAction::OpenDevin);
+                    }
                 });
             },
         );
@@ -201,6 +221,11 @@ impl EditorApp {
                                 }
                                 if self.settings_section == SettingsSection::Appearance {
                                     self.draw_appearance_settings(ui);
+                                    ui.add_space(34.0);
+                                    return;
+                                }
+                                if self.settings_section == SettingsSection::Devin {
+                                    self.draw_devin_settings(ui, &mut actions);
                                     ui.add_space(34.0);
                                     return;
                                 }
@@ -295,6 +320,70 @@ impl EditorApp {
         if self.lsp_sync_needed {
             root.ctx().request_repaint_after(Duration::from_millis(50));
         }
+    }
+
+    fn draw_devin_settings(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        settings_page_header(
+            ui,
+            "Devin",
+            "Connect once to use Devin sessions from Editur.",
+        );
+        settings_section_label(ui, "Connection");
+        settings_card(ui, |ui| {
+            if let Some(source) = self.devin_state.credential_source {
+                let status = match self.devin_state.connection {
+                    DevinConnectionState::Connecting => "Connecting",
+                    DevinConnectionState::Connected => "Connected",
+                    DevinConnectionState::AuthenticationRequired => "Sign-in required",
+                    DevinConnectionState::Offline => "Offline",
+                    DevinConnectionState::RateLimited => "Rate limited",
+                    DevinConnectionState::Failed => "Connection failed",
+                    DevinConnectionState::Disconnected => "Disconnected",
+                };
+                settings_row(ui, "Status", status, |ui| {
+                    if source == CredentialSource::Keyring
+                        && settings_danger_button(ui, "settings_devin_disconnect", "Disconnect")
+                            .clicked()
+                    {
+                        actions.push(SettingsAction::DisconnectDevin);
+                    }
+                });
+                if source == CredentialSource::Environment {
+                    ui.separator();
+                    settings_row(ui, "Credentials", "Managed by DEVIN_API_KEY", |_| {});
+                }
+                return;
+            }
+
+            ui.add_space(theme::space::SMALL);
+            ui.label(RichText::new("API key").color(theme::text().secondary));
+            ui.add(
+                TextEdit::singleline(&mut self.devin_api_key)
+                    .id(Id::new("devin_api_key"))
+                    .password(true)
+                    .hint_text("cog_…")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(theme::space::MEDIUM);
+            ui.label(RichText::new("Organization ID").color(theme::text().secondary));
+            ui.add(
+                TextEdit::singleline(&mut self.devin_org_id)
+                    .id(Id::new("devin_org_id"))
+                    .hint_text("Only when your key requires it")
+                    .desired_width(f32::INFINITY),
+            );
+            if let Some(error) = self.devin_state.error.as_ref() {
+                ui.add_space(theme::space::MEDIUM);
+                ui.colored_label(theme::ink(theme::semantic().danger), &error.message);
+            }
+            ui.add_space(theme::space::LARGE);
+            ui.add_enabled_ui(self.devin_api_key.trim().starts_with("cog_"), |ui| {
+                if settings_primary_button(ui, "settings_devin_connect", "Connect").clicked() {
+                    actions.push(SettingsAction::ConnectDevin);
+                }
+            });
+            ui.add_space(theme::space::SMALL);
+        });
     }
 
     pub(super) fn draw_appearance_settings(&mut self, ui: &mut egui::Ui) {
@@ -1588,7 +1677,25 @@ impl EditorApp {
 
     pub(super) fn apply_settings_action(&mut self, action: SettingsAction, ctx: &egui::Context) {
         match action {
-            SettingsAction::Back => self.settings_open = false,
+            SettingsAction::Back => {
+                self.settings_open = false;
+                if !self.devin_sidebar {
+                    self.send_devin(DevinCommand::SetVisible(false));
+                }
+            }
+            SettingsAction::OpenDevin => {
+                self.ensure_devin_controller(ctx);
+                self.send_devin(DevinCommand::SetVisible(true));
+            }
+            SettingsAction::ConnectDevin => {
+                self.ensure_devin_controller(ctx);
+                self.send_devin(DevinCommand::SaveCredentials {
+                    api_key: self.devin_api_key.clone(),
+                    org_id: (!self.devin_org_id.trim().is_empty())
+                        .then(|| self.devin_org_id.trim().to_owned()),
+                });
+            }
+            SettingsAction::DisconnectDevin => self.devin_confirm_disconnect = true,
             SettingsAction::Enabled(enabled) => {
                 let old = self.settings.clone();
                 self.settings.language_servers.enabled = enabled;
