@@ -1165,6 +1165,7 @@ dependencies = [
  "objc",
  "portable-pty",
  "pulldown-cmark",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -296,6 +296,8 @@ pub enum Event {
     Capabilities {
         history: bool,
         allow_run_everything: bool,
+        steering: bool,
+        goal_actions: Vec<String>,
     },
     SessionReady {
         current_mode: Option<String>,
@@ -336,6 +338,7 @@ pub enum Event {
         size: u64,
         cost: Option<String>,
     },
+    GoalUpdated(Option<GoalState>),
     TurnFinished {
         cancelled: bool,
     },
@@ -344,6 +347,23 @@ pub enum Event {
         error: String,
         diagnostics: String,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalState {
+    pub objective: String,
+    pub status: String,
+    #[serde(default)]
+    pub iterations: Option<u64>,
+    #[serde(default)]
+    pub last_reason: Option<String>,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
+    #[serde(default)]
+    pub time_used_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -416,6 +436,10 @@ pub struct ToolDetail {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ToolOutput {
     Text(String),
+    Log {
+        label: String,
+        text: String,
+    },
     Content(DisplayContent),
     Diff {
         path: PathBuf,
@@ -434,6 +458,9 @@ pub enum ToolOutput {
         subagent_type: String,
         model: Option<String>,
         agent_id: Option<String>,
+        agents: Vec<SubagentInfo>,
+        path: Option<String>,
+        activity: Option<String>,
         duration_ms: Option<u64>,
     },
     GeneratedImage {
@@ -441,6 +468,13 @@ pub enum ToolOutput {
         file_path: Option<PathBuf>,
         reference_image_paths: Vec<PathBuf>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentInfo {
+    pub id: String,
+    pub status: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +506,10 @@ pub enum InteractionKind {
         questions: Vec<Question>,
     },
     Plan(PlanProposal),
+    Url {
+        title: String,
+        url: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -480,6 +518,19 @@ pub struct Question {
     pub prompt: String,
     pub options: Vec<QuestionOption>,
     pub allow_multiple: bool,
+    pub required: bool,
+    pub secret: bool,
+    pub default_values: Vec<String>,
+    pub value_kind: QuestionValueKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum QuestionValueKind {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    StringArray,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -516,6 +567,8 @@ pub enum InteractionResponse {
     Skipped,
     PlanAccepted,
     PlanRejected,
+    Accepted,
+    Declined,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +585,7 @@ pub enum Command {
         value: ConfigValue,
     },
     SetRunEverything(bool),
+    ControlGoal(GoalAction),
     Prompt(String),
     PromptWithAttachments {
         text: String,
@@ -553,6 +607,14 @@ pub enum Command {
     TerminalAuthFinished(Result<(), String>),
     #[doc(hidden)]
     ResumeTurn,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GoalAction {
+    Set(String),
+    Pause,
+    Resume,
+    Clear,
 }
 
 pub struct AgentController {
@@ -732,6 +794,35 @@ struct EventSender {
     event_tx: SyncSender<Event>,
     wake: Arc<dyn Fn() + Send + Sync>,
     active_session: Option<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+struct SessionNotificationGate(Arc<Mutex<Option<String>>>);
+
+impl SessionNotificationGate {
+    fn accepts(&self, session_id: &SessionId) -> bool {
+        self.0
+            .lock()
+            .map(|active| {
+                active
+                    .as_deref()
+                    .is_none_or(|active| active == session_id.0.as_ref())
+            })
+            .unwrap_or(false)
+    }
+
+    fn activate(&self, session_id: &SessionId) -> Option<String> {
+        self.0
+            .lock()
+            .map(|mut active| active.replace(session_id.0.to_string()))
+            .unwrap_or_default()
+    }
+
+    fn restore(&self, session_id: Option<String>) {
+        if let Ok(mut active) = self.0.lock() {
+            *active = session_id;
+        }
+    }
 }
 
 fn run_thread(
@@ -1040,10 +1131,15 @@ fn protect_managed_process(
 }
 
 fn client_capabilities(provider: ProviderId) -> ClientCapabilities {
-    let mut capabilities =
-        ClientCapabilities::new().session(ClientSessionCapabilities::new().config_options(
+    let mut capabilities = ClientCapabilities::new()
+        .session(ClientSessionCapabilities::new().config_options(
             SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new()),
-        ));
+        ))
+        .elicitation(
+            ElicitationCapabilities::new()
+                .form(ElicitationFormCapabilities::new())
+                .url(ElicitationUrlCapabilities::new()),
+        );
     if provider == ProviderId::Cursor {
         capabilities = capabilities.meta(serde_json::Map::from_iter([(
             "parameterizedModelPicker".into(),
@@ -1051,9 +1147,45 @@ fn client_capabilities(provider: ProviderId) -> ClientCapabilities {
         )]));
     }
     if provider == ProviderId::Claude {
-        capabilities = capabilities.auth(AuthCapabilities::new().terminal(true));
+        capabilities = capabilities
+            .auth(AuthCapabilities::new().terminal(true))
+            .meta(serde_json::Map::from_iter([
+                ("subagent-transcript".into(), serde_json::Value::Bool(true)),
+                ("terminal_output".into(), serde_json::Value::Bool(true)),
+            ]));
     }
     capabilities
+}
+
+fn session_extension_capabilities(
+    provider: ProviderId,
+    meta: Option<&Meta>,
+) -> (bool, Vec<String>) {
+    if provider == ProviderId::Cursor {
+        return (false, Vec::new());
+    }
+    let steering = meta
+        .and_then(|meta| meta.get("steering"))
+        .and_then(|value| value.get("supported"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let goal_actions = meta
+        .and_then(|meta| meta.get("goal"))
+        .filter(|goal| {
+            goal.get("controlMethod")
+                .and_then(serde_json::Value::as_str)
+                == Some("_session/goal")
+        })
+        .and_then(|goal| goal.get("actions"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|action| matches!(*action, "set" | "pause" | "resume" | "clear"))
+        .take(4)
+        .map(str::to_owned)
+        .collect();
+    (steering, goal_actions)
 }
 
 async fn run_connection(
@@ -1080,18 +1212,23 @@ async fn run_connection(
     let auto_approve_permissions = Arc::new(AtomicBool::new(false));
     let permissions = Arc::new(Mutex::new(HashMap::new()));
     let interactions = Arc::new(Mutex::new(HashMap::new()));
+    let elicitations = Arc::new(Mutex::new(HashMap::new()));
     let next_permission = Arc::new(AtomicU64::new(1));
     let mut hidden_sessions = HiddenSessions::load(session_startup.history);
     let mut editur_sessions = EditurSessions::load(session_startup.editur_sessions);
     let preferred_session = session_startup.preferred_session;
+    let session_notifications = SessionNotificationGate::default();
     agent_client_protocol::Client
         .builder()
         .name("editur")
         .on_receive_notification(
             {
                 let events = events.clone();
+                let session_notifications = session_notifications.clone();
                 async move |notification: SessionNotification, _connection| {
-                    normalize_update(notification.update, &events);
+                    if session_notifications.accepts(&notification.session_id) {
+                        normalize_update(notification.update, &events);
+                    }
                     Ok(())
                 }
             },
@@ -1212,6 +1349,43 @@ async fn run_connection(
         .on_receive_request(
             {
                 let events = events.clone();
+                let elicitations = Arc::clone(&elicitations);
+                let next_request = Arc::clone(&next_permission);
+                async move |request: CreateElicitationRequest,
+                            responder,
+                            connection: ConnectionTo<Agent>| {
+                    let request_id = next_request.fetch_add(1, Ordering::Relaxed);
+                    let (request, kind) = match parse_elicitation(request_id, request) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            send_event(&events, Event::Error(error));
+                            responder.respond(CreateElicitationResponse::new(
+                                ElicitationAction::Cancel,
+                            ))?;
+                            return Ok(());
+                        }
+                    };
+                    let (response_tx, response_rx) = async_channel::bounded(1);
+                    elicitations
+                        .lock()
+                        .expect("elicitation lock poisoned")
+                        .insert(request_id, PendingElicitation { kind, response_tx });
+                    send_event(&events, Event::InteractionRequested(request));
+                    connection.spawn(async move {
+                        let action = response_rx
+                            .recv()
+                            .await
+                            .unwrap_or(ElicitationAction::Cancel);
+                        responder.respond(CreateElicitationResponse::new(action))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let events = events.clone();
                 let interactions = Arc::clone(&interactions);
                 let next_request = Arc::clone(&next_permission);
                 async move |request: CursorRequest, responder, connection: ConnectionTo<Agent>| {
@@ -1255,6 +1429,7 @@ async fn run_connection(
             let auto_approve_permissions = Arc::clone(&auto_approve_permissions);
             let permissions = Arc::clone(&permissions);
             let interactions = Arc::clone(&interactions);
+            let elicitations = Arc::clone(&elicitations);
             let shutdown = Arc::clone(&shutdown);
             async move {
                 let client_capabilities = client_capabilities(provider);
@@ -1285,6 +1460,23 @@ async fn run_connection(
                         .session_capabilities
                         .list
                         .is_some();
+                let supports_close = initialized
+                    .agent_capabilities
+                    .session_capabilities
+                    .close
+                    .is_some();
+                let supports_resume = initialized
+                    .agent_capabilities
+                    .session_capabilities
+                    .resume
+                    .is_some();
+                let supports_additional_directories = initialized
+                    .agent_capabilities
+                    .session_capabilities
+                    .additional_directories
+                    .is_some();
+                let (supports_steering, goal_actions) =
+                    session_extension_capabilities(provider, initialized.meta.as_ref());
                 let discovered_external = external_sessions::discover(provider, &project_root)
                     .unwrap_or_else(|error| {
                         if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
@@ -1297,6 +1489,8 @@ async fn run_connection(
                     Event::Capabilities {
                         history: supports_history || !discovered_external.is_empty(),
                         allow_run_everything: extensions == ProviderExtensions::Cursor,
+                        steering: supports_steering,
+                        goal_actions: goal_actions.clone(),
                     },
                 );
                 let (mut session_id, native_sessions) = match start_session(
@@ -1307,6 +1501,8 @@ async fn run_connection(
                     &hidden_sessions.ids,
                     &mut editur_sessions,
                     preferred_session.as_deref(),
+                    &session_notifications,
+                    supports_close,
                 )
                 .await
                 {
@@ -1333,6 +1529,7 @@ async fn run_connection(
                         &hidden_sessions.ids,
                     );
                 let mut pending_external = None;
+                let mut additional_directories = Vec::new();
                 if has_external_sessions {
                     send_event(&events, Event::SessionsUpdated(sessions.clone()));
                 }
@@ -1439,10 +1636,13 @@ async fn run_connection(
                                 &hidden_sessions.ids,
                                 &mut editur_sessions,
                                 preferred_session.as_deref(),
+                                &session_notifications,
+                                supports_close,
                             )
                             .await
                             {
                                 Ok((session, listed)) => {
+                                    additional_directories.clear();
                                     let loaded_id = session.0.to_string();
                                     session_id = Some(session);
                                     let discovered = external_sessions::discover(
@@ -1501,10 +1701,13 @@ async fn run_connection(
                                     &project_root,
                                     &events,
                                     &mut editur_sessions,
+                                    &session_notifications,
+                                    supports_close,
                                 )
                                 .await
                                 {
                                     Ok(session) => {
+                                        additional_directories.clear();
                                         pending_external = None;
                                         let choice = untitled_session(&session);
                                         sessions.retain(|candidate| candidate.id != choice.id);
@@ -1632,8 +1835,18 @@ async fn run_connection(
                                 continue;
                             };
                             pending_external = None;
-                            match load_session(&connection, &project_root, session, &events).await {
+                            match load_session(
+                                &connection,
+                                &project_root,
+                                session,
+                                &events,
+                                &session_notifications,
+                                supports_close,
+                            )
+                            .await
+                            {
                                 Ok(loaded) => {
+                                    additional_directories.clear();
                                     session_id = Some(loaded);
                                     enrich_native_session(&id, &external_sessions, &events);
                                 }
@@ -1724,7 +1937,27 @@ async fn run_connection(
                                 auto_approve_permissions.store(enabled, Ordering::Release);
                             }
                         }
+                        Command::ControlGoal(action) => {
+                            send_goal_control(
+                                &connection,
+                                &events,
+                                session_id.clone(),
+                                action,
+                                &goal_actions,
+                            )?;
+                        }
                         Command::Prompt(text) => {
+                            if active.load(Ordering::Acquire) && supports_steering {
+                                send_steering(
+                                    &connection,
+                                    &events,
+                                    session_id.clone(),
+                                    text,
+                                    Vec::new(),
+                                    attachment_support,
+                                )?;
+                                continue;
+                            }
                             turn_resume.attempts.store(0, Ordering::Release);
                             let visible_text = text.clone();
                             let (prompt_session, text, imported) =
@@ -1735,6 +1968,8 @@ async fn run_connection(
                                         &events,
                                         &mut editur_sessions,
                                         &mut sessions,
+                                        &session_notifications,
+                                        supports_close,
                                         &external,
                                         &text,
                                     )
@@ -1754,6 +1989,9 @@ async fn run_connection(
                                     (session_id.clone(), text, false)
                                 };
                             session_id = prompt_session.clone();
+                            if imported {
+                                additional_directories.clear();
+                            }
                             send_prompt(
                                 &connection,
                                 &events,
@@ -1767,6 +2005,35 @@ async fn run_connection(
                             )?;
                         }
                         Command::PromptWithAttachments { text, attachments } => {
+                            if active.load(Ordering::Acquire) && supports_steering {
+                                if supports_additional_directories
+                                    && attachments.iter().any(|attachment| {
+                                        attachment.is_directory()
+                                            && attachment.path() != project_root
+                                            && !additional_directories
+                                                .iter()
+                                                .any(|path| path == attachment.path())
+                                    })
+                                {
+                                    send_event(
+                                        &events,
+                                        Event::Error(
+                                            "stop the active turn before adding a new workspace folder"
+                                                .into(),
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                send_steering(
+                                    &connection,
+                                    &events,
+                                    session_id.clone(),
+                                    text,
+                                    attachments,
+                                    attachment_support,
+                                )?;
+                                continue;
+                            }
                             turn_resume.attempts.store(0, Ordering::Release);
                             let visible_text = text.clone();
                             let (prompt_session, text, imported) =
@@ -1777,6 +2044,8 @@ async fn run_connection(
                                         &events,
                                         &mut editur_sessions,
                                         &mut sessions,
+                                        &session_notifications,
+                                        supports_close,
                                         &external,
                                         &text,
                                     )
@@ -1794,8 +2063,95 @@ async fn run_connection(
                                     }
                                 } else {
                                     (session_id.clone(), text, false)
-                                };
+                            };
                             session_id = prompt_session.clone();
+                            if imported {
+                                additional_directories.clear();
+                            }
+                            let requested_directories = attachments
+                                .iter()
+                                .filter(|attachment| {
+                                    attachment.is_directory()
+                                        && attachment.path() != project_root
+                                        && !additional_directories
+                                            .iter()
+                                            .any(|path| path == attachment.path())
+                                })
+                                .map(|attachment| attachment.path().to_path_buf())
+                                .collect::<Vec<_>>();
+                            if supports_additional_directories
+                                && !requested_directories.is_empty()
+                            {
+                                if !supports_resume {
+                                    send_event(
+                                        &events,
+                                        Event::Error(
+                                            "agent cannot add workspace folders to this session"
+                                                .into(),
+                                        ),
+                                    );
+                                    send_event(
+                                        &events,
+                                        Event::TurnFinished { cancelled: false },
+                                    );
+                                    continue;
+                                }
+                                let Some(prompt_session) = prompt_session.clone() else {
+                                    send_event(
+                                        &events,
+                                        Event::Error("no active session".into()),
+                                    );
+                                    send_event(
+                                        &events,
+                                        Event::TurnFinished { cancelled: false },
+                                    );
+                                    continue;
+                                };
+                                let mut resumed_directories = additional_directories.clone();
+                                resumed_directories.extend(requested_directories);
+                                match connection
+                                    .send_request(
+                                        ResumeSessionRequest::new(prompt_session, &project_root)
+                                            .additional_directories(resumed_directories.clone()),
+                                    )
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(response) => {
+                                        additional_directories = resumed_directories;
+                                        let (current_mode, modes, config_options) =
+                                            session_controls(
+                                                response.modes.as_ref(),
+                                                response.config_options.as_deref(),
+                                            );
+                                        if current_mode.is_some() || !config_options.is_empty() {
+                                            send_event(
+                                                &events,
+                                                Event::SessionLoaded {
+                                                    current_mode,
+                                                    modes,
+                                                    config_options,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        send_event(
+                                            &events,
+                                            Event::Error(acp_error(
+                                                provider,
+                                                "cannot add workspace folders",
+                                                &error,
+                                            )),
+                                        );
+                                        send_event(
+                                            &events,
+                                            Event::TurnFinished { cancelled: false },
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             send_prompt(
                                 &connection,
                                 &events,
@@ -1831,7 +2187,14 @@ async fn run_connection(
                             request_id,
                             response,
                         } => {
-                            respond_interaction(request_id, response, &interactions, &events);
+                            if !respond_elicitation(
+                                request_id,
+                                response.clone(),
+                                &elicitations,
+                                &events,
+                            ) {
+                                respond_interaction(request_id, response, &interactions, &events);
+                            }
                         }
                         Command::Cancel => {
                             if let Some(session) = session_id.clone()
@@ -1857,6 +2220,16 @@ async fn run_connection(
                                         serde_json::json!({"outcome": {"outcome": "cancelled"}}),
                                     );
                                 }
+                                for elicitation in elicitations
+                                    .lock()
+                                    .expect("elicitation lock poisoned")
+                                    .drain()
+                                    .map(|(_, pending)| pending)
+                                {
+                                    let _ = elicitation
+                                        .response_tx
+                                        .try_send(ElicitationAction::Cancel);
+                                }
                                 connection.send_notification(CancelNotification::new(session))?;
                             }
                         }
@@ -1869,6 +2242,10 @@ async fn run_connection(
                             interactions
                                 .lock()
                                 .expect("interaction lock poisoned")
+                                .clear();
+                            elicitations
+                                .lock()
+                                .expect("elicitation lock poisoned")
                                 .clear();
                             return Ok(());
                         }
@@ -1900,10 +2277,13 @@ async fn run_connection(
                                 &hidden_sessions.ids,
                                 &mut editur_sessions,
                                 preferred_session.as_deref(),
+                                &session_notifications,
+                                supports_close,
                             )
                             .await
                             {
                                 Ok((session, listed)) => {
+                                    additional_directories.clear();
                                     let loaded_id = session.0.to_string();
                                     session_id = Some(session);
                                     let discovered = external_sessions::discover(
@@ -1973,6 +2353,138 @@ fn is_retriable_transport_error(error: &agent_client_protocol::Error) -> bool {
     text.contains("RetriableError")
         || text.contains("http/2 stream closed")
         || text.contains("stream closed with error code CANCEL")
+}
+
+fn send_steering(
+    connection: &ConnectionTo<Agent>,
+    events: &EventSender,
+    session: Option<SessionId>,
+    text: String,
+    attachments: Vec<PromptAttachment>,
+    attachment_support: AttachmentSupport,
+) -> agent_client_protocol::Result<()> {
+    let Some(session) = session else {
+        send_event(events, Event::Error("no active session".into()));
+        return Ok(());
+    };
+    if text.trim().is_empty() && attachments.is_empty() {
+        send_event(
+            events,
+            Event::Error("steering prompt cannot be empty".into()),
+        );
+        return Ok(());
+    }
+    let (content, displays) = match prompt_content(&text, &attachments, attachment_support) {
+        Ok(content) => content,
+        Err(error) => {
+            send_event(events, Event::Error(error));
+            return Ok(());
+        }
+    };
+    let events = events.clone();
+    connection
+        .send_request(SessionExtensionRequest {
+            method: "_session/steering",
+            params: serde_json::json!({
+                "sessionId": session.0,
+                "prompt": content,
+            }),
+        })
+        .on_receiving_result(async move |result| {
+            match result {
+                Ok(response)
+                    if matches!(
+                        response.get("outcome").and_then(serde_json::Value::as_str),
+                        Some("injected" | "startedNewTurn")
+                    ) =>
+                {
+                    send_event(&events, Event::UserMessage(text));
+                    for content in displays {
+                        send_event(
+                            &events,
+                            Event::ContentReceived {
+                                role: ContentRole::User,
+                                content,
+                            },
+                        );
+                    }
+                }
+                Ok(_) => send_event(
+                    &events,
+                    Event::Error("agent could not apply steering".into()),
+                ),
+                Err(error) => send_event(
+                    &events,
+                    Event::Error(acp_error(
+                        events.provider,
+                        "cannot steer active turn",
+                        &error,
+                    )),
+                ),
+            }
+            Ok(())
+        })
+}
+
+fn send_goal_control(
+    connection: &ConnectionTo<Agent>,
+    events: &EventSender,
+    session: Option<SessionId>,
+    action: GoalAction,
+    supported_actions: &[String],
+) -> agent_client_protocol::Result<()> {
+    let Some(session) = session else {
+        send_event(events, Event::Error("no active session".into()));
+        return Ok(());
+    };
+    let (action_name, objective) = match action {
+        GoalAction::Set(objective) if !objective.trim().is_empty() => {
+            ("set", Some(objective.trim().to_owned()))
+        }
+        GoalAction::Set(_) => {
+            send_event(
+                events,
+                Event::Error("goal objective cannot be empty".into()),
+            );
+            return Ok(());
+        }
+        GoalAction::Pause => ("pause", None),
+        GoalAction::Resume => ("resume", None),
+        GoalAction::Clear => ("clear", None),
+    };
+    if !supported_actions.iter().any(|action| action == action_name) {
+        send_event(
+            events,
+            Event::Error(format!("agent does not support goal action {action_name}")),
+        );
+        return Ok(());
+    }
+    let mut params = serde_json::json!({
+        "sessionId": session.0,
+        "action": action_name,
+    });
+    if let Some(objective) = objective {
+        params["objective"] = objective.into();
+    }
+    let events = events.clone();
+    connection
+        .send_request(SessionExtensionRequest {
+            method: "_session/goal",
+            params,
+        })
+        .on_receiving_result(async move |result| {
+            if let Err(error) = result {
+                send_event(
+                    &events,
+                    Event::Error(acp_error(
+                        events.provider,
+                        "cannot update session goal",
+                        &error,
+                    )),
+                );
+            }
+            Ok(())
+        })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -2383,16 +2895,22 @@ fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
             .to_owned(),
         model: input_string(&["model"]).map(str::to_owned),
         agent_id,
+        agents: Vec::new(),
+        path: None,
+        activity: None,
         duration_ms,
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn handoff_external_session(
     connection: &ConnectionTo<Agent>,
     project_root: &Path,
     events: &EventSender,
     editur_sessions: &mut EditurSessions,
     sessions: &mut Vec<SessionChoice>,
+    session_notifications: &SessionNotificationGate,
+    supports_close: bool,
     external: &ExternalSession,
     next_message: &str,
 ) -> Result<(SessionId, String), String> {
@@ -2403,7 +2921,11 @@ async fn handoff_external_session(
         .await
         .map_err(|error| acp_error(events.provider, "cannot continue imported session", &error))?;
     let session_id = response.session_id;
-    editur_sessions.remember(session_id.0.as_ref())?;
+    let previous = session_notifications.activate(&session_id);
+    close_replaced_session(connection, previous, &session_id, supports_close, events).await;
+    if let Err(error) = editur_sessions.remember(session_id.0.as_ref()) {
+        send_event(events, Event::Error(error));
+    }
     let (current_mode, modes, config_options) =
         session_controls(response.modes.as_ref(), response.config_options.as_deref());
     sessions.retain(|session| session.id != external.choice_id());
@@ -2439,12 +2961,16 @@ async fn new_session(
     project_root: &std::path::Path,
     events: &EventSender,
     editur_sessions: &mut EditurSessions,
+    session_notifications: &SessionNotificationGate,
+    supports_close: bool,
 ) -> agent_client_protocol::Result<SessionId> {
     let response = connection
         .send_request(NewSessionRequest::new(project_root))
         .block_task()
         .await?;
     let session_id = response.session_id;
+    let previous = session_notifications.activate(&session_id);
+    close_replaced_session(connection, previous, &session_id, supports_close, events).await;
     if let Err(error) = editur_sessions.remember(session_id.0.as_ref()) {
         send_event(events, Event::Error(error));
     }
@@ -2466,6 +2992,7 @@ async fn new_session(
     Ok(session_id)
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn start_session(
     connection: &ConnectionTo<Agent>,
     project_root: &std::path::Path,
@@ -2474,6 +3001,8 @@ async fn start_session(
     hidden_sessions: &HashSet<String>,
     editur_sessions: &mut EditurSessions,
     preferred_session: Option<&str>,
+    session_notifications: &SessionNotificationGate,
+    supports_close: bool,
 ) -> agent_client_protocol::Result<(SessionId, Vec<SessionChoice>)> {
     let sessions = if supports_history {
         list_sessions(
@@ -2491,11 +3020,27 @@ async fn start_session(
     if let Some(session) = preferred_session
         .and_then(|id| sessions.iter().find(|session| session.id == id))
         .or_else(|| sessions.first())
-        && let Ok(session_id) = load_session(connection, project_root, session, events).await
+        && let Ok(session_id) = load_session(
+            connection,
+            project_root,
+            session,
+            events,
+            session_notifications,
+            supports_close,
+        )
+        .await
     {
         return Ok((session_id, sessions));
     }
-    let session_id = new_session(connection, project_root, events, editur_sessions).await?;
+    let session_id = new_session(
+        connection,
+        project_root,
+        events,
+        editur_sessions,
+        session_notifications,
+        supports_close,
+    )
+    .await?;
     let mut sessions = sessions;
     sessions.insert(0, untitled_session(&session_id));
     send_event(events, Event::SessionsUpdated(sessions.clone()));
@@ -2529,23 +3074,41 @@ async fn list_sessions(
     hidden_sessions: &HashSet<String>,
     editur_sessions: &EditurSessions,
 ) -> agent_client_protocol::Result<Vec<SessionChoice>> {
-    let response = connection
-        .send_request(ListSessionsRequest::new().cwd(project_root))
-        .block_task()
-        .await?;
-    let mut sessions = response
-        .sessions
-        .into_iter()
-        .filter(|session| {
-            session.cwd == project_root && !hidden_sessions.contains(session.session_id.0.as_ref())
-        })
-        .map(|session| SessionChoice {
-            id: session.session_id.0.to_string(),
-            title: session.title,
-            updated_at: session.updated_at,
-            started_in_editur: editur_sessions.contains(session.session_id.0.as_ref()),
-        })
-        .collect::<Vec<_>>();
+    let mut sessions = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    while sessions.len() < MAX_CHOICES {
+        let response = connection
+            .send_request(
+                ListSessionsRequest::new()
+                    .cwd(project_root)
+                    .cursor(cursor.clone()),
+            )
+            .block_task()
+            .await?;
+        sessions.extend(
+            response
+                .sessions
+                .into_iter()
+                .filter(|session| {
+                    session.cwd == project_root
+                        && !hidden_sessions.contains(session.session_id.0.as_ref())
+                })
+                .map(|session| SessionChoice {
+                    id: session.session_id.0.to_string(),
+                    title: session.title,
+                    updated_at: session.updated_at,
+                    started_in_editur: editur_sessions.contains(session.session_id.0.as_ref()),
+                }),
+        );
+        let Some(next_cursor) = response.next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(MAX_CHOICES);
     send_event(events, Event::SessionsUpdated(sessions.clone()));
@@ -2777,6 +3340,8 @@ async fn load_session(
     project_root: &std::path::Path,
     session: &SessionChoice,
     events: &EventSender,
+    session_notifications: &SessionNotificationGate,
+    supports_close: bool,
 ) -> agent_client_protocol::Result<SessionId> {
     send_event(
         events,
@@ -2785,10 +3350,19 @@ async fn load_session(
         },
     );
     let session_id = SessionId::new(session.id.clone());
-    let response = connection
+    let previous = session_notifications.activate(&session_id);
+    let response = match connection
         .send_request(LoadSessionRequest::new(session_id.clone(), project_root))
         .block_task()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            session_notifications.restore(previous);
+            return Err(error);
+        }
+    };
+    close_replaced_session(connection, previous, &session_id, supports_close, events).await;
     let (current_mode, modes, config_options) =
         session_controls(response.modes.as_ref(), response.config_options.as_deref());
     send_event(
@@ -2805,6 +3379,35 @@ async fn load_session(
     );
     send_event(events, Event::ConnectionChanged(ConnectionState::Ready));
     Ok(session_id)
+}
+
+async fn close_replaced_session(
+    connection: &ConnectionTo<Agent>,
+    previous: Option<String>,
+    current: &SessionId,
+    supports_close: bool,
+    events: &EventSender,
+) {
+    let Some(previous) = previous.filter(|previous| previous != current.0.as_ref()) else {
+        return;
+    };
+    if !supports_close {
+        return;
+    }
+    if let Err(error) = connection
+        .send_request(CloseSessionRequest::new(previous))
+        .block_task()
+        .await
+    {
+        send_event(
+            events,
+            Event::Error(acp_error(
+                events.provider,
+                "cannot close previous session",
+                &error,
+            )),
+        );
+    }
 }
 
 fn session_controls(
@@ -2875,6 +3478,47 @@ impl agent_client_protocol::JsonRpcRequest for CursorRequest {
     type Response = serde_json::Value;
 }
 
+#[derive(Clone, Debug)]
+struct SessionExtensionRequest {
+    method: &'static str,
+    params: serde_json::Value,
+}
+
+impl agent_client_protocol::JsonRpcMessage for SessionExtensionRequest {
+    fn matches_method(method: &str) -> bool {
+        matches!(method, "_session/steering" | "_session/goal")
+    }
+
+    fn method(&self) -> &str {
+        self.method
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> Result<agent_client_protocol::UntypedMessage, agent_client_protocol::Error> {
+        agent_client_protocol::UntypedMessage::new(self.method, &self.params)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        let method = match method {
+            "_session/steering" => "_session/steering",
+            "_session/goal" => "_session/goal",
+            _ => return Err(agent_client_protocol::Error::method_not_found()),
+        };
+        Ok(Self {
+            method,
+            params: serde_json::to_value(params)?,
+        })
+    }
+}
+
+impl agent_client_protocol::JsonRpcRequest for SessionExtensionRequest {
+    type Response = serde_json::Value;
+}
+
 struct PendingInteraction {
     kind: PendingInteractionKind,
     response_tx: async_channel::Sender<serde_json::Value>,
@@ -2883,6 +3527,19 @@ struct PendingInteraction {
 enum PendingInteractionKind {
     Questions(HashMap<String, (HashSet<String>, bool)>),
     Plan,
+}
+
+struct PendingElicitation {
+    kind: PendingElicitationKind,
+    response_tx: async_channel::Sender<ElicitationAction>,
+}
+
+enum PendingElicitationKind {
+    Form {
+        fields: HashMap<String, ElicitationPropertySchema>,
+        required: HashSet<String>,
+    },
+    Url,
 }
 
 #[derive(Deserialize)]
@@ -2990,6 +3647,10 @@ fn parse_cursor_interaction(
                         })
                         .collect(),
                     allow_multiple: question.allow_multiple,
+                    required: true,
+                    secret: false,
+                    default_values: Vec::new(),
+                    value_kind: QuestionValueKind::String,
                 });
             }
             Ok((
@@ -3052,6 +3713,507 @@ fn parse_cursor_interaction(
         }
         _ => Err("unsupported Cursor interaction".into()),
     }
+}
+
+fn parse_elicitation(
+    request_id: u64,
+    request: CreateElicitationRequest,
+) -> Result<(InteractionRequest, PendingElicitationKind), String> {
+    let tool_call_id = match request.mode.scope() {
+        ElicitationScope::Session(scope) => scope
+            .tool_call_id
+            .as_ref()
+            .map_or_else(|| "elicitation".into(), |id| id.0.to_string()),
+        ElicitationScope::Request(_) => "elicitation".into(),
+        _ => "elicitation".into(),
+    };
+    let form = match request.mode {
+        ElicitationMode::Form(form) => form,
+        ElicitationMode::Url(url) => {
+            return Ok((
+                InteractionRequest {
+                    request_id,
+                    tool_call_id,
+                    kind: InteractionKind::Url {
+                        title: request.message,
+                        url: url.url,
+                    },
+                },
+                PendingElicitationKind::Url,
+            ));
+        }
+        _ => return Err("unsupported ACP elicitation mode".into()),
+    };
+    if form.requested_schema.properties.is_empty()
+        || form.requested_schema.properties.len() > MAX_CHOICES
+    {
+        return Err(format!(
+            "agent supplied {} elicitation fields; expected 1..={MAX_CHOICES}",
+            form.requested_schema.properties.len()
+        ));
+    }
+    let required = form
+        .requested_schema
+        .required
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if required
+        .iter()
+        .any(|field| !form.requested_schema.properties.contains_key(field))
+    {
+        return Err("agent marked an unknown elicitation field as required".into());
+    }
+    let mut fields = HashMap::new();
+    let mut questions = Vec::with_capacity(form.requested_schema.properties.len());
+    for (id, field) in form.requested_schema.properties {
+        let (title, description, options, allow_multiple, secret, default_values, value_kind) =
+            match &field {
+                ElicitationPropertySchema::String(schema) => {
+                    if let Some(pattern) = &schema.pattern
+                        && (pattern.len() > MAX_DETAIL_BYTES || regex::Regex::new(pattern).is_err())
+                    {
+                        return Err(format!(
+                            "agent supplied an invalid pattern for elicitation field {id}"
+                        ));
+                    }
+                    let options = schema
+                        .one_of
+                        .as_ref()
+                        .map(|options| {
+                            options
+                                .iter()
+                                .map(|option| QuestionOption {
+                                    id: option.value.clone(),
+                                    label: option.title.clone(),
+                                })
+                                .collect()
+                        })
+                        .or_else(|| {
+                            schema.enum_values.as_ref().map(|options| {
+                                options
+                                    .iter()
+                                    .map(|option| QuestionOption {
+                                        id: option.clone(),
+                                        label: option.clone(),
+                                    })
+                                    .collect()
+                            })
+                        })
+                        .unwrap_or_default();
+                    (
+                        schema.title.as_deref(),
+                        schema.description.as_deref(),
+                        options,
+                        false,
+                        elicitation_secret(schema.meta.as_ref()),
+                        schema.default.iter().cloned().collect(),
+                        QuestionValueKind::String,
+                    )
+                }
+                ElicitationPropertySchema::Number(schema) => (
+                    schema.title.as_deref(),
+                    schema.description.as_deref(),
+                    Vec::new(),
+                    false,
+                    false,
+                    schema
+                        .default
+                        .map(|value| value.to_string())
+                        .into_iter()
+                        .collect(),
+                    QuestionValueKind::Number,
+                ),
+                ElicitationPropertySchema::Integer(schema) => (
+                    schema.title.as_deref(),
+                    schema.description.as_deref(),
+                    Vec::new(),
+                    false,
+                    false,
+                    schema
+                        .default
+                        .map(|value| value.to_string())
+                        .into_iter()
+                        .collect(),
+                    QuestionValueKind::Integer,
+                ),
+                ElicitationPropertySchema::Boolean(schema) => (
+                    schema.title.as_deref(),
+                    schema.description.as_deref(),
+                    vec![
+                        QuestionOption {
+                            id: "true".into(),
+                            label: "Yes".into(),
+                        },
+                        QuestionOption {
+                            id: "false".into(),
+                            label: "No".into(),
+                        },
+                    ],
+                    false,
+                    false,
+                    schema
+                        .default
+                        .map(|value| value.to_string())
+                        .into_iter()
+                        .collect(),
+                    QuestionValueKind::Boolean,
+                ),
+                ElicitationPropertySchema::Array(schema) => {
+                    let options = match &schema.items {
+                        MultiSelectItems::String(items) => items
+                            .values
+                            .iter()
+                            .map(|value| QuestionOption {
+                                id: value.clone(),
+                                label: value.clone(),
+                            })
+                            .collect(),
+                        MultiSelectItems::Titled(items) => items
+                            .options
+                            .iter()
+                            .map(|option| QuestionOption {
+                                id: option.value.clone(),
+                                label: option.title.clone(),
+                            })
+                            .collect(),
+                        MultiSelectItems::Other(_) => {
+                            return Err("unsupported ACP elicitation array item type".into());
+                        }
+                        _ => return Err("unsupported ACP elicitation array item type".into()),
+                    };
+                    (
+                        schema.title.as_deref(),
+                        schema.description.as_deref(),
+                        options,
+                        true,
+                        false,
+                        schema.default.clone().unwrap_or_default(),
+                        QuestionValueKind::StringArray,
+                    )
+                }
+                ElicitationPropertySchema::Other(_) => {
+                    return Err("unsupported ACP elicitation field type".into());
+                }
+                _ => return Err("unsupported ACP elicitation field type".into()),
+            };
+        if options.len() > MAX_CHOICES {
+            return Err(format!(
+                "agent supplied {} choices for elicitation field {id}; expected at most {MAX_CHOICES}",
+                options.len()
+            ));
+        }
+        let prompt = match (title, description) {
+            (Some(title), Some(description)) => format!("{title}\n{description}"),
+            (Some(title), None) => title.to_owned(),
+            (None, Some(description)) => format!("{id}\n{description}"),
+            (None, None) => id.clone(),
+        };
+        questions.push(Question {
+            id: id.clone(),
+            prompt,
+            options,
+            allow_multiple,
+            required: required.contains(&id),
+            secret,
+            default_values,
+            value_kind,
+        });
+        fields.insert(id, field);
+    }
+    Ok((
+        InteractionRequest {
+            request_id,
+            tool_call_id,
+            kind: InteractionKind::Questions {
+                title: request.message,
+                questions,
+            },
+        },
+        PendingElicitationKind::Form { fields, required },
+    ))
+}
+
+fn elicitation_secret(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
+    meta.and_then(|meta| meta.get("codex"))
+        .and_then(|codex| codex.get("isSecret"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn respond_elicitation(
+    request_id: u64,
+    response: InteractionResponse,
+    elicitations: &Mutex<HashMap<u64, PendingElicitation>>,
+    events: &EventSender,
+) -> bool {
+    let mut elicitations = elicitations.lock().expect("elicitation lock poisoned");
+    let Some(pending) = elicitations.get(&request_id) else {
+        return false;
+    };
+    let action = match (&pending.kind, response) {
+        (
+            PendingElicitationKind::Form { fields, required },
+            InteractionResponse::Answers(answers),
+        ) => {
+            if answers.len() > MAX_CHOICES
+                || answers.iter().any(|answer| {
+                    answer.question_id.len() > MAX_DETAIL_BYTES
+                        || answer.selected_option_ids.len() > MAX_CHOICES
+                        || answer
+                            .selected_option_ids
+                            .iter()
+                            .any(|value| value.len() > MAX_DETAIL_BYTES)
+                })
+            {
+                send_event(
+                    events,
+                    Event::Error("elicitation answer is too large".into()),
+                );
+                return true;
+            }
+            let mut content = std::collections::BTreeMap::new();
+            let mut seen = HashSet::new();
+            for answer in answers {
+                let Some(field) = fields.get(&answer.question_id) else {
+                    send_event(events, Event::Error("unknown elicitation answer".into()));
+                    return true;
+                };
+                if !seen.insert(answer.question_id.clone()) {
+                    send_event(events, Event::Error("duplicate elicitation answer".into()));
+                    return true;
+                }
+                if answer.selected_option_ids.is_empty() {
+                    continue;
+                }
+                let value = match elicitation_value(field, &answer.selected_option_ids) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        send_event(events, Event::Error(error));
+                        return true;
+                    }
+                };
+                content.insert(answer.question_id, value);
+            }
+            if required.iter().any(|field| !content.contains_key(field)) {
+                send_event(
+                    events,
+                    Event::Error("not every required field was answered".into()),
+                );
+                return true;
+            }
+            ElicitationAction::Accept(ElicitationAcceptAction::new().content(content))
+        }
+        (PendingElicitationKind::Form { .. }, InteractionResponse::Skipped) => {
+            ElicitationAction::Decline
+        }
+        (PendingElicitationKind::Url, InteractionResponse::Accepted) => {
+            ElicitationAction::Accept(ElicitationAcceptAction::new())
+        }
+        (PendingElicitationKind::Url, InteractionResponse::Declined) => ElicitationAction::Decline,
+        _ => {
+            send_event(
+                events,
+                Event::Error("response does not match elicitation".into()),
+            );
+            return true;
+        }
+    };
+    let pending = elicitations
+        .remove(&request_id)
+        .expect("pending elicitation disappeared");
+    let _ = pending.response_tx.try_send(action);
+    true
+}
+
+fn elicitation_value(
+    field: &ElicitationPropertySchema,
+    values: &[String],
+) -> Result<ElicitationContentValue, String> {
+    match field {
+        ElicitationPropertySchema::String(schema) => {
+            let [value] = values else {
+                return Err("string elicitation fields require one value".into());
+            };
+            if schema
+                .min_length
+                .is_some_and(|minimum| value.chars().count() < minimum as usize)
+                || schema
+                    .max_length
+                    .is_some_and(|maximum| value.chars().count() > maximum as usize)
+                || schema
+                    .enum_values
+                    .as_ref()
+                    .is_some_and(|options| !options.contains(value))
+                || schema
+                    .one_of
+                    .as_ref()
+                    .is_some_and(|options| !options.iter().any(|option| option.value == *value))
+                || schema.pattern.as_ref().is_some_and(|pattern| {
+                    !regex::Regex::new(pattern).is_ok_and(|re| re.is_match(value))
+                })
+                || schema
+                    .format
+                    .is_some_and(|format| !valid_string_format(value, format))
+            {
+                return Err("invalid string elicitation value".into());
+            }
+            Ok(ElicitationContentValue::String(value.clone()))
+        }
+        ElicitationPropertySchema::Number(schema) => {
+            let [value] = values else {
+                return Err("number elicitation fields require one value".into());
+            };
+            let value = value
+                .parse::<f64>()
+                .map_err(|_| "invalid number elicitation value".to_owned())?;
+            if !value.is_finite()
+                || schema.minimum.is_some_and(|minimum| value < minimum)
+                || schema.maximum.is_some_and(|maximum| value > maximum)
+            {
+                return Err("number elicitation value is out of range".into());
+            }
+            Ok(ElicitationContentValue::Number(value))
+        }
+        ElicitationPropertySchema::Integer(schema) => {
+            let [value] = values else {
+                return Err("integer elicitation fields require one value".into());
+            };
+            let value = value
+                .parse::<i64>()
+                .map_err(|_| "invalid integer elicitation value".to_owned())?;
+            if schema.minimum.is_some_and(|minimum| value < minimum)
+                || schema.maximum.is_some_and(|maximum| value > maximum)
+            {
+                return Err("integer elicitation value is out of range".into());
+            }
+            Ok(ElicitationContentValue::Integer(value))
+        }
+        ElicitationPropertySchema::Boolean(_) => match values {
+            [value] if value == "true" => Ok(ElicitationContentValue::Boolean(true)),
+            [value] if value == "false" => Ok(ElicitationContentValue::Boolean(false)),
+            _ => Err("invalid boolean elicitation value".into()),
+        },
+        ElicitationPropertySchema::Array(schema) => {
+            let allowed = match &schema.items {
+                MultiSelectItems::String(items) => items.values.iter().collect::<HashSet<_>>(),
+                MultiSelectItems::Titled(items) => {
+                    items.options.iter().map(|option| &option.value).collect()
+                }
+                MultiSelectItems::Other(_) => return Err("unsupported elicitation array".into()),
+                _ => return Err("unsupported elicitation array".into()),
+            };
+            if values.iter().collect::<HashSet<_>>().len() != values.len()
+                || values.iter().any(|value| !allowed.contains(value))
+                || schema
+                    .min_items
+                    .is_some_and(|minimum| values.len() < minimum as usize)
+                || schema
+                    .max_items
+                    .is_some_and(|maximum| values.len() > maximum as usize)
+            {
+                return Err("invalid multi-select elicitation value".into());
+            }
+            Ok(ElicitationContentValue::StringArray(values.to_vec()))
+        }
+        ElicitationPropertySchema::Other(_) => Err("unsupported elicitation field".into()),
+        _ => Err("unsupported elicitation field".into()),
+    }
+}
+
+fn valid_string_format(value: &str, format: StringFormat) -> bool {
+    match format {
+        StringFormat::Email => value.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && !value.chars().any(char::is_whitespace)
+        }),
+        StringFormat::Uri => value.split_once(':').is_some_and(|(scheme, rest)| {
+            !rest.is_empty()
+                && scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+                && !value.chars().any(char::is_whitespace)
+        }),
+        StringFormat::Date => valid_date(value),
+        StringFormat::DateTime => valid_date_time(value),
+        _ => false,
+    }
+}
+
+fn valid_date(value: &str) -> bool {
+    let Some((year, month, day)) = value
+        .split_once('-')
+        .and_then(|(year, rest)| rest.split_once('-').map(|(month, day)| (year, month, day)))
+    else {
+        return false;
+    };
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    if value.len() != 10 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days).contains(&day)
+}
+
+fn valid_date_time(value: &str) -> bool {
+    let Some((date, time)) = value.split_once(['T', 't']) else {
+        return false;
+    };
+    let (clock, offset) = if let Some(clock) = time.strip_suffix(['Z', 'z']) {
+        (clock, None)
+    } else if time.len() >= 6 {
+        let start = time.len() - 6;
+        if !matches!(time.as_bytes()[start], b'+' | b'-') {
+            return false;
+        }
+        (&time[..start], Some(&time.as_bytes()[start..]))
+    } else {
+        return false;
+    };
+    let mut parts = clock.split(':');
+    let (Some(hour), Some(minute), Some(second), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (second, fraction) = second
+        .split_once('.')
+        .map_or((second, None), |(second, fraction)| {
+            (second, Some(fraction))
+        });
+    let valid_clock = hour.len() == 2
+        && minute.len() == 2
+        && second.len() == 2
+        && hour.parse::<u8>().is_ok_and(|hour| hour <= 23)
+        && minute.parse::<u8>().is_ok_and(|minute| minute <= 59)
+        && second.parse::<u8>().is_ok_and(|second| second <= 60)
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.chars().all(|character| character.is_ascii_digit())
+        });
+    let valid_offset = offset.is_none_or(|offset| {
+        offset.len() == 6
+            && offset[3] == b':'
+            && offset[1..3].iter().all(u8::is_ascii_digit)
+            && offset[4..].iter().all(u8::is_ascii_digit)
+            && (offset[1] - b'0') * 10 + offset[2] - b'0' <= 23
+            && (offset[4] - b'0') * 10 + offset[5] - b'0' <= 59
+    });
+    valid_date(date) && valid_clock && valid_offset
 }
 
 fn respond_interaction(
@@ -3166,13 +4328,13 @@ fn decide_permission(
 fn normalize_update(update: SessionUpdate, events: &EventSender) {
     match update {
         SessionUpdate::UserMessageChunk(chunk) => {
-            normalize_content(ContentRole::User, chunk.content, events)
+            normalize_content_chunk(ContentRole::User, chunk, events)
         }
         SessionUpdate::AgentMessageChunk(chunk) => {
-            normalize_content(ContentRole::Assistant, chunk.content, events)
+            normalize_content_chunk(ContentRole::Assistant, chunk, events)
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
-            normalize_content(ContentRole::Thought, chunk.content, events)
+            normalize_content_chunk(ContentRole::Thought, chunk, events)
         }
         SessionUpdate::Plan(plan) => send_event(
             events,
@@ -3198,16 +4360,17 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                 tool.meta.as_ref(),
                 true,
             );
-            send_event(
+            send_tool_activity(
                 events,
-                Event::ToolCallUpdated(ToolActivity {
+                tool.meta.as_ref(),
+                ToolActivity {
                     id: bounded_detail(tool.tool_call_id.0.to_string()),
                     title: Some(bounded_detail(tool.title)),
                     status: Some(format!("{:?}", tool.status)),
                     kind,
                     paths: tool_paths(&tool.locations, &tool.content),
                     detail,
-                }),
+                },
             );
         }
         SessionUpdate::ToolCallUpdate(update) => {
@@ -3215,9 +4378,10 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
             let fields = update.fields;
             let content = fields.content.as_deref().unwrap_or_default();
             let locations = fields.locations.as_deref().unwrap_or_default();
-            send_event(
+            send_tool_activity(
                 events,
-                Event::ToolCallUpdated(ToolActivity {
+                meta.as_ref(),
+                ToolActivity {
                     id: bounded_detail(update.tool_call_id.0.to_string()),
                     title: fields.title.map(bounded_detail),
                     status: fields.status.map(|status| format!("{status:?}")),
@@ -3232,7 +4396,7 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                         meta.as_ref(),
                         false,
                     ),
-                }),
+                },
             );
         }
         SessionUpdate::UsageUpdate(usage) => send_event(
@@ -3274,6 +4438,20 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
         SessionUpdate::SessionInfoUpdate(update) => {
             if let Some(title) = update.title.as_opt_ref() {
                 send_event(events, Event::SessionTitleUpdated(title.cloned()));
+            }
+            if let Some(goal) = update.meta.as_ref().and_then(|meta| meta.get("goal")) {
+                if goal.is_null() {
+                    send_event(events, Event::GoalUpdated(None));
+                } else if let Ok(goal) = serde_json::from_value::<GoalState>(goal.clone()) {
+                    send_event(
+                        events,
+                        Event::GoalUpdated(Some(GoalState {
+                            objective: bounded_detail(goal.objective),
+                            status: bounded_detail(goal.status),
+                            ..goal
+                        })),
+                    );
+                }
             }
         }
         _ => {}
@@ -3394,6 +4572,9 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
                         subagent_type: bounded_detail(update.subagent_type.into()),
                         model: update.model.map(bounded_detail),
                         agent_id: update.agent_id.map(bounded_detail),
+                        agents: Vec::new(),
+                        path: None,
+                        activity: None,
                         duration_ms: update.duration_ms,
                     }],
                     output: None,
@@ -3438,6 +4619,22 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
     }
 }
 
+fn normalize_content_chunk(role: ContentRole, chunk: ContentChunk, events: &EventSender) {
+    let Some(parent) = claude_parent_tool_use_id(events.provider, chunk.meta.as_ref()) else {
+        normalize_content(role, chunk.content, events);
+        return;
+    };
+    let Some(content) = normalize_display_content(chunk.content) else {
+        return;
+    };
+    let text = match content {
+        NormalizedContent::Text(text) => text,
+        NormalizedContent::Display(content) => display_content_summary(&content),
+    };
+    let _ = role;
+    send_event(events, subagent_log_update(parent, text));
+}
+
 fn normalize_content(role: ContentRole, content: ContentBlock, events: &EventSender) {
     match normalize_display_content(content) {
         Some(NormalizedContent::Text(text)) => {
@@ -3452,6 +4649,32 @@ fn normalize_content(role: ContentRole, content: ContentBlock, events: &EventSen
             send_event(events, Event::ContentReceived { role, content });
         }
         None => {}
+    }
+}
+
+fn display_content_summary(content: &DisplayContent) -> String {
+    match content {
+        DisplayContent::Image {
+            mime_type,
+            uri,
+            encoded_bytes,
+            ..
+        } => format!(
+            "Image · {mime_type} · {encoded_bytes} encoded bytes{}",
+            uri.as_deref()
+                .map_or(String::new(), |uri| format!(" · {uri}"))
+        ),
+        DisplayContent::Audio {
+            mime_type,
+            encoded_bytes,
+        } => format!("Audio · {mime_type} · {encoded_bytes} encoded bytes"),
+        DisplayContent::ResourceLink {
+            name, title, uri, ..
+        } => format!("{} · {uri}", title.as_deref().unwrap_or(name)),
+        DisplayContent::TextResource { uri, text, .. } => format!("{uri}\n{text}"),
+        DisplayContent::BlobResource {
+            uri, encoded_bytes, ..
+        } => format!("{uri} · {encoded_bytes} encoded bytes"),
     }
 }
 
@@ -3635,6 +4858,122 @@ fn normalized_tool_kind(
     }
 }
 
+fn send_tool_activity(events: &EventSender, meta: Option<&Meta>, tool: ToolActivity) {
+    if let Some(parent) = claude_parent_tool_use_id(events.provider, meta) {
+        let summary = nested_tool_summary(&tool, meta);
+        send_event(events, subagent_log_update(parent, summary));
+    } else {
+        send_event(events, Event::ToolCallUpdated(tool));
+    }
+}
+
+fn claude_parent_tool_use_id(provider: ProviderId, meta: Option<&Meta>) -> Option<String> {
+    (provider == ProviderId::Claude)
+        .then_some(meta?)?
+        .get("claudeCode")?
+        .get("parentToolUseId")?
+        .as_str()
+        .map(|id| bounded_detail(id.to_owned()))
+}
+
+fn subagent_log_update(parent: String, text: String) -> Event {
+    Event::ToolCallUpdated(ToolActivity {
+        id: parent,
+        title: None,
+        status: None,
+        kind: None,
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Log {
+                label: "Subagent transcript".into(),
+                text: bounded_detail(text),
+            }],
+            output: None,
+        }),
+    })
+}
+
+fn nested_tool_summary(tool: &ToolActivity, meta: Option<&Meta>) -> String {
+    let fallback = meta
+        .and_then(|meta| meta.get("claudeCode"))
+        .and_then(|claude| claude.get("toolName"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Tool");
+    let mut text = format!(
+        "\nTool · {}",
+        tool.title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .unwrap_or(fallback)
+    );
+    if let Some(status) = &tool.status {
+        let _ = write!(text, " · {status}");
+    }
+    for path in &tool.paths {
+        let _ = write!(text, "\n{}", path.path.display());
+    }
+    if let Some(detail) = &tool.detail {
+        if let Some(input) = &detail.input {
+            let _ = write!(text, "\n{input}");
+        }
+        for content in &detail.content {
+            match content {
+                ToolOutput::Text(value) => {
+                    let _ = write!(text, "\n{value}");
+                }
+                ToolOutput::Log { label, text: value } => {
+                    let _ = write!(text, "\n{label}\n{value}");
+                }
+                ToolOutput::Content(content) => {
+                    let _ = write!(text, "\n{}", display_content_summary(content));
+                }
+                ToolOutput::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => {
+                    let _ = write!(
+                        text,
+                        "\nDiff {}\n{}\n{}",
+                        path.display(),
+                        old_text.as_deref().unwrap_or_default(),
+                        new_text
+                    );
+                }
+                ToolOutput::Terminal(id) => {
+                    let _ = write!(text, "\nTerminal {id}");
+                }
+                ToolOutput::Todo {
+                    id,
+                    content,
+                    status,
+                } => {
+                    let _ = write!(text, "\n{status} · {content} · {id}");
+                }
+                ToolOutput::Task { description, .. } => {
+                    let _ = write!(text, "\nSubagent · {description}");
+                }
+                ToolOutput::GeneratedImage {
+                    description,
+                    file_path,
+                    ..
+                } => {
+                    let _ = write!(text, "\n{description}");
+                    if let Some(path) = file_path {
+                        let _ = write!(text, "\n{}", path.display());
+                    }
+                }
+            }
+        }
+        if let Some(output) = &detail.output {
+            let _ = write!(text, "\n{output}");
+        }
+    }
+    text.push('\n');
+    text
+}
+
 fn normalized_tool_detail(
     provider: ProviderId,
     title: &str,
@@ -3645,7 +4984,9 @@ fn normalized_tool_detail(
     initial: bool,
 ) -> Option<ToolDetail> {
     let mut detail = tool_detail(input, content, output);
-    if initial && let Some(task) = normalized_subagent_task(provider, title, input, meta) {
+    if (initial || input.is_some())
+        && let Some(task) = normalized_subagent_task(provider, title, input, meta)
+    {
         let detail = detail.get_or_insert_with(|| ToolDetail {
             input: None,
             content: Vec::new(),
@@ -3658,7 +4999,66 @@ fn normalized_tool_detail(
         }
         detail.content.insert(0, task);
     }
+    let logs = tool_logs(provider, meta);
+    if !logs.is_empty() {
+        detail
+            .get_or_insert_with(|| ToolDetail {
+                input: None,
+                content: Vec::new(),
+                output: None,
+            })
+            .content
+            .extend(logs);
+    }
     detail
+}
+
+fn tool_logs(provider: ProviderId, meta: Option<&Meta>) -> Vec<ToolOutput> {
+    if provider == ProviderId::Cursor {
+        return Vec::new();
+    }
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    [
+        ("terminal_output", "Terminal output"),
+        ("terminal_output_delta", "Terminal output"),
+        ("mcp_output_delta", "MCP progress"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let text = meta
+            .get(key)?
+            .as_object()?
+            .get("data")?
+            .as_str()?
+            .to_owned();
+        (!text.is_empty()).then(|| ToolOutput::Log {
+            label: label.to_owned(),
+            text,
+        })
+    })
+    .chain(claude_non_execution_log(provider, meta))
+    .collect()
+}
+
+fn claude_non_execution_log(provider: ProviderId, meta: &Meta) -> Option<ToolOutput> {
+    if provider != ProviderId::Claude {
+        return None;
+    }
+    let claude = meta.get("claudeCode")?.as_object()?;
+    let kind = claude.get("nonExecutionKind")?.as_str()?;
+    let text = claude
+        .get("userFeedback")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || kind.to_owned(),
+            |feedback| format!("{kind} · {feedback}"),
+        );
+    Some(ToolOutput::Log {
+        label: "Not executed".into(),
+        text,
+    })
 }
 
 fn provider_meta_is_subagent(provider: ProviderId, meta: Option<&Meta>) -> bool {
@@ -3705,33 +5105,85 @@ fn normalized_subagent_task(
                 .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
         })
     };
-    let (description, subagent_type, agent_id) = match provider {
+    let (description, subagent_type, agent_id, agents, path, activity) = match provider {
         ProviderId::Codex => {
             let codex = meta?.get("codex")?.as_object()?;
+            let collaboration = codex
+                .get("collaboration")
+                .and_then(serde_json::Value::as_object);
+            let subagent = codex.get("subagent").and_then(serde_json::Value::as_object);
             let subagent_type = input_string(&["subagent_type", "subagentType"])
                 .or_else(|| {
-                    codex
-                        .get("collaboration")
-                        .and_then(serde_json::Value::as_object)
+                    collaboration
                         .and_then(|collaboration| collaboration.get("tool"))
                         .and_then(serde_json::Value::as_str)
                 })
                 .unwrap_or("subagent")
                 .to_owned();
-            let agent_id = codex
-                .get("subagent")
-                .and_then(serde_json::Value::as_object)
+            let subagent_id = subagent
                 .and_then(|subagent| subagent.get("threadId"))
-                .and_then(serde_json::Value::as_str)
+                .and_then(serde_json::Value::as_str);
+            let receiver_ids = input
+                .and_then(|input| input.get("receiverThreadIds"))
+                .and_then(serde_json::Value::as_array)
                 .or_else(|| {
-                    input
-                        .and_then(|input| input.get("receiverThreadIds"))
+                    collaboration
+                        .and_then(|collaboration| collaboration.get("receiverThreadIds"))
                         .and_then(serde_json::Value::as_array)
-                        .and_then(|ids| ids.first())
+                });
+            let states = input
+                .and_then(|input| input.get("agentsStates"))
+                .and_then(serde_json::Value::as_object);
+            let mut agents = receiver_ids
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .take(MAX_CHOICES)
+                .filter_map(|id| {
+                    let state = states.and_then(|states| states.get(id))?.as_object();
+                    let status = state
+                        .and_then(|state| state.get("status"))
                         .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let message = state
+                        .and_then(|state| state.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    Some(SubagentInfo {
+                        id: id.to_owned(),
+                        status,
+                        message,
+                    })
                 })
+                .collect::<Vec<_>>();
+            if agents.is_empty()
+                && let Some(id) = subagent_id
+            {
+                agents.push(SubagentInfo {
+                    id: id.to_owned(),
+                    status: None,
+                    message: None,
+                });
+            }
+            let agent_id = agents.first().map(|agent| agent.id.clone());
+            let path = subagent
+                .and_then(|subagent| subagent.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| input_string(&["agentPath"]))
                 .map(str::to_owned);
-            (title.to_owned(), subagent_type, agent_id)
+            let activity = subagent
+                .and_then(|subagent| subagent.get("activity"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| input_string(&["activityKind"]))
+                .map(str::to_owned);
+            (
+                title.to_owned(),
+                subagent_type,
+                agent_id,
+                agents,
+                path,
+                activity,
+            )
         }
         ProviderId::Claude => {
             let claude = meta?.get("claudeCode")?.as_object()?;
@@ -3743,6 +5195,9 @@ fn normalized_subagent_task(
                 input_string(&["description"]).unwrap_or(title).to_owned(),
                 subagent_type,
                 input_string(&["agent_id", "agentId"]).map(str::to_owned),
+                Vec::new(),
+                None,
+                None,
             )
         }
         ProviderId::Cursor => return None,
@@ -3753,6 +5208,9 @@ fn normalized_subagent_task(
         subagent_type,
         model,
         agent_id,
+        agents,
+        path,
+        activity,
         duration_ms: None,
     })
 }
@@ -4069,6 +5527,148 @@ mod tests {
             capabilities.meta.as_ref().unwrap()["parameterizedModelPicker"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn claude_opts_into_nested_transcripts_and_terminal_output() {
+        let capabilities = client_capabilities(ProviderId::Claude);
+        let meta = capabilities.meta.as_ref().unwrap();
+
+        assert_eq!(meta["subagent-transcript"], serde_json::json!(true));
+        assert_eq!(meta["terminal_output"], serde_json::json!(true));
+        assert!(capabilities.auth.terminal);
+    }
+
+    #[test]
+    fn claude_uses_provider_neutral_steering_and_goal_extensions() {
+        let meta = serde_json::Map::from_iter([
+            ("steering".into(), serde_json::json!({"supported": true})),
+            (
+                "goal".into(),
+                serde_json::json!({
+                    "version": 1,
+                    "controlMethod": "_session/goal",
+                    "actions": ["set", "pause", "resume", "clear"]
+                }),
+            ),
+        ]);
+
+        assert_eq!(
+            session_extension_capabilities(ProviderId::Claude, Some(&meta)),
+            (
+                true,
+                vec![
+                    "set".into(),
+                    "pause".into(),
+                    "resume".into(),
+                    "clear".into()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn claude_subagent_text_is_attached_to_its_launch_card() {
+        let event = one_provider_event(
+            ProviderId::Claude,
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("Found the bug"))).meta(
+                    serde_json::Map::from_iter([(
+                        "claudeCode".into(),
+                        serde_json::json!({"parentToolUseId": "agent-1"}),
+                    )]),
+                ),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                id,
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if id == "agent-1" && matches!(
+                content.as_slice(),
+                [ToolOutput::Log { label, text }]
+                    if label == "Subagent transcript" && text == "Found the bug"
+            )
+        ));
+    }
+
+    #[test]
+    fn claude_subagent_tools_and_terminal_output_stay_in_the_nested_transcript() {
+        let event = one_provider_event(
+            ProviderId::Claude,
+            SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new(
+                    "bash-1",
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                )
+                .meta(serde_json::Map::from_iter([
+                    (
+                        "claudeCode".into(),
+                        serde_json::json!({
+                            "toolName": "Bash",
+                            "parentToolUseId": "agent-1"
+                        }),
+                    ),
+                    (
+                        "terminal_output".into(),
+                        serde_json::json!({
+                            "terminal_id": "bash-1",
+                            "data": "tests passed\n"
+                        }),
+                    ),
+                ])),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                id,
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if id == "agent-1" && matches!(
+                content.as_slice(),
+                [ToolOutput::Log { label, text }]
+                    if label == "Subagent transcript" && text.contains("Bash")
+                        && text.contains("tests passed")
+            )
+        ));
+    }
+
+    #[test]
+    fn claude_tool_denials_preserve_the_reason_and_feedback() {
+        let event = one_provider_event(
+            ProviderId::Claude,
+            SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new(
+                    "bash-1",
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
+                )
+                .meta(serde_json::Map::from_iter([(
+                    "claudeCode".into(),
+                    serde_json::json!({
+                        "toolName": "Bash",
+                        "nonExecutionKind": "user-rejected",
+                        "userFeedback": "Do not publish yet"
+                    }),
+                )])),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if matches!(
+                content.as_slice(),
+                [ToolOutput::Log { label, text }]
+                    if label == "Not executed" && text == "user-rejected · Do not publish yet"
+            )
+        ));
     }
 
     #[test]
@@ -4577,7 +6177,17 @@ mod tests {
                     .status(ToolCallStatus::InProgress)
                     .raw_input(serde_json::json!({
                         "prompt": "Find the current weather in Paris.",
-                        "receiverThreadIds": ["thread-paris"],
+                        "receiverThreadIds": ["thread-paris", "thread-lyon"],
+                        "agentsStates": {
+                            "thread-paris": {
+                                "status": "running",
+                                "message": "Checking weather"
+                            },
+                            "thread-lyon": {
+                                "status": "completed",
+                                "message": null
+                            }
+                        },
                         "model": "gpt-5",
                     }))
                     .meta(serde_json::Map::from_iter([(
@@ -4586,7 +6196,7 @@ mod tests {
                             "collaboration": {
                                 "tool": "spawnAgent",
                                 "senderThreadId": "thread-main",
-                                "receiverThreadIds": ["thread-paris"],
+                                "receiverThreadIds": ["thread-paris", "thread-lyon"],
                             }
                         }),
                     )])),
@@ -4606,11 +6216,28 @@ mod tests {
                     subagent_type,
                     model: Some(model),
                     agent_id: Some(agent_id),
+                    agents,
                     ..
                 }] if prompt == "Find the current weather in Paris."
                     && subagent_type == "spawnAgent"
                     && model == "gpt-5"
                     && agent_id == "thread-paris"
+                    && matches!(agents.as_slice(), [
+                        SubagentInfo {
+                            id: paris,
+                            status: Some(running),
+                            message: Some(message),
+                        },
+                        SubagentInfo {
+                            id: lyon,
+                            status: Some(completed),
+                            message: None,
+                        },
+                    ] if paris == "thread-paris"
+                        && running == "running"
+                        && message == "Checking weather"
+                        && lyon == "thread-lyon"
+                        && completed == "completed")
             )
         ));
     }
@@ -4872,6 +6499,197 @@ mod tests {
             response_rx.try_recv().unwrap()["outcome"]["outcome"],
             "accepted"
         );
+    }
+
+    #[test]
+    fn acp_elicitation_forms_preserve_field_types_and_user_values() {
+        let schema = ElicitationSchema::new()
+            .property(
+                "token",
+                StringPropertySchema::new()
+                    .title("API token")
+                    .meta(serde_json::Map::from_iter([(
+                        "codex".into(),
+                        serde_json::json!({"isSecret": true}),
+                    )])),
+                true,
+            )
+            .property(
+                "environment",
+                StringPropertySchema::new()
+                    .enum_values(vec!["dev".into(), "prod".into()])
+                    .default_value("dev"),
+                true,
+            )
+            .integer("retries", 0, 5, false)
+            .boolean("confirm", true)
+            .property(
+                "scopes",
+                MultiSelectPropertySchema::new(vec!["read".into(), "write".into()]),
+                false,
+            );
+        let (request, kind) = parse_elicitation(
+            11,
+            CreateElicitationRequest::new(
+                ElicitationFormMode::new(ElicitationSessionScope::new("fake-session"), schema),
+                "Configure access",
+            ),
+        )
+        .unwrap();
+        let InteractionKind::Questions { title, questions } = request.kind else {
+            panic!("expected form questions")
+        };
+        assert_eq!(title, "Configure access");
+        assert!(questions.iter().any(|question| {
+            question.id == "token"
+                && question.required
+                && question.secret
+                && question.options.is_empty()
+                && question.value_kind == QuestionValueKind::String
+        }));
+        assert!(questions.iter().any(|question| {
+            question.id == "environment"
+                && question.default_values == ["dev"]
+                && question.options.len() == 2
+        }));
+        assert!(questions.iter().any(|question| {
+            question.id == "scopes"
+                && question.allow_multiple
+                && question.value_kind == QuestionValueKind::StringArray
+        }));
+
+        let (response_tx, response_rx) = async_channel::bounded(1);
+        let pending = Mutex::new(HashMap::from([(
+            11,
+            PendingElicitation { kind, response_tx },
+        )]));
+        let (event_tx, _) = mpsc::sync_channel(4);
+        respond_elicitation(
+            11,
+            InteractionResponse::Answers(vec![
+                QuestionAnswer {
+                    question_id: "token".into(),
+                    selected_option_ids: vec!["secret-value".into()],
+                },
+                QuestionAnswer {
+                    question_id: "environment".into(),
+                    selected_option_ids: vec!["prod".into()],
+                },
+                QuestionAnswer {
+                    question_id: "retries".into(),
+                    selected_option_ids: vec!["3".into()],
+                },
+                QuestionAnswer {
+                    question_id: "confirm".into(),
+                    selected_option_ids: vec!["true".into()],
+                },
+            ]),
+            &pending,
+            &EventSender {
+                provider: ProviderId::Codex,
+                event_tx,
+                wake: Arc::new(|| {}),
+                active_session: None,
+            },
+        );
+        let ElicitationAction::Accept(response) = response_rx.try_recv().unwrap() else {
+            panic!("expected accepted elicitation")
+        };
+        let content = response.content.unwrap();
+        assert_eq!(
+            content["token"],
+            ElicitationContentValue::String("secret-value".into())
+        );
+        assert_eq!(content["retries"], ElicitationContentValue::Integer(3));
+        assert_eq!(content["confirm"], ElicitationContentValue::Boolean(true));
+        assert!(!content.contains_key("scopes"));
+    }
+
+    #[test]
+    fn oversized_elicitation_answers_stay_pending() {
+        let (_, kind) = parse_elicitation(
+            12,
+            CreateElicitationRequest::new(
+                ElicitationFormMode::new(
+                    ElicitationSessionScope::new("fake-session"),
+                    ElicitationSchema::new().property("token", StringPropertySchema::new(), true),
+                ),
+                "Configure access",
+            ),
+        )
+        .unwrap();
+        let (response_tx, response_rx) = async_channel::bounded(1);
+        let pending = Mutex::new(HashMap::from([(
+            12,
+            PendingElicitation { kind, response_tx },
+        )]));
+        let (event_tx, event_rx) = mpsc::sync_channel(4);
+
+        assert!(respond_elicitation(
+            12,
+            InteractionResponse::Answers(vec![QuestionAnswer {
+                question_id: "token".into(),
+                selected_option_ids: vec!["x".repeat(MAX_DETAIL_BYTES + 1)],
+            }]),
+            &pending,
+            &EventSender {
+                provider: ProviderId::Codex,
+                event_tx,
+                wake: Arc::new(|| {}),
+                active_session: None,
+            },
+        ));
+        assert!(response_rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().contains_key(&12));
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+    }
+
+    #[test]
+    fn elicitation_strings_enforce_patterns_and_formats() {
+        let email = ElicitationPropertySchema::from(
+            StringPropertySchema::email().pattern(r"^[a-z]+@example\.com$"),
+        );
+        assert!(elicitation_value(&email, &["hello@example.com".into()]).is_ok());
+        assert!(elicitation_value(&email, &["hello@elsewhere.test".into()]).is_err());
+
+        let date_time = ElicitationPropertySchema::from(StringPropertySchema::date_time());
+        assert!(elicitation_value(&date_time, &["2024-02-29T23:59:60Z".into()]).is_ok());
+        assert!(elicitation_value(&date_time, &["2023-02-29T24:00:00Z".into()]).is_err());
+        assert!(elicitation_value(&date_time, &["2024-01-01T00:00:é1234".into()]).is_err());
+    }
+
+    #[test]
+    fn codex_goal_metadata_becomes_visible_state() {
+        let event = one_event(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().meta(serde_json::Map::from_iter([(
+                "goal".into(),
+                serde_json::json!({
+                    "objective": "Ship the editor",
+                    "status": "active",
+                    "iterations": 3,
+                    "lastReason": "waiting for CI",
+                    "tokenBudget": 5000,
+                    "tokensUsed": 120,
+                    "timeUsedSeconds": 9,
+                    "controlMethod": "_session/goal"
+                }),
+            )])),
+        ));
+
+        assert!(matches!(
+            event,
+            Event::GoalUpdated(Some(GoalState {
+                objective,
+                status,
+                iterations: Some(3),
+                last_reason: Some(last_reason),
+                token_budget: Some(5000),
+                tokens_used: Some(120),
+                time_used_seconds: Some(9),
+            })) if objective == "Ship the editor"
+                && status == "active"
+                && last_reason == "waiting for CI"
+        ));
     }
 
     #[test]

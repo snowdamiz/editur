@@ -1,10 +1,45 @@
 use editur::agent::{
     controller::{
-        ConnectionState, ContentRole, DisplayContent, Event, PermissionChoice, PermissionRequest,
-        PlanItem, SessionTranscriptMessage, ToolActivity, ToolDetail, ToolOutput,
+        ConnectionState, ContentRole, DisplayContent, Event, InteractionKind, InteractionRequest,
+        PermissionChoice, PermissionRequest, PlanItem, Question, QuestionValueKind,
+        SessionTranscriptMessage, ToolActivity, ToolDetail, ToolOutput,
     },
     state::{AgentState, FileChange, TranscriptItem},
 };
+
+#[test]
+fn answered_secret_interactions_discard_bounded_defaults() {
+    let mut state = AgentState::default();
+    state.apply(Event::InteractionRequested(InteractionRequest {
+        request_id: 7,
+        tool_call_id: "login".into(),
+        kind: InteractionKind::Questions {
+            title: "Credentials".into(),
+            questions: vec![Question {
+                id: "token".into(),
+                prompt: "Token".into(),
+                options: Vec::new(),
+                allow_multiple: false,
+                required: true,
+                secret: true,
+                default_values: vec!["secret".into(); 256],
+                value_kind: QuestionValueKind::String,
+            }],
+        },
+    }));
+
+    let TranscriptItem::Interaction(card) = state.transcript.front().unwrap() else {
+        panic!("interaction should be visible");
+    };
+    assert_eq!(card.selections["token"].len(), 128);
+
+    assert!(state.answer_interaction(7));
+    let TranscriptItem::Interaction(card) = state.transcript.front().unwrap() else {
+        panic!("interaction should remain visible");
+    };
+    assert!(card.answered);
+    assert!(!card.selections.contains_key("token"));
+}
 
 #[test]
 fn plans_are_replaced_only_within_the_current_user_turn() {
@@ -511,6 +546,9 @@ fn subagent_result_updates_keep_the_launch_metadata() {
                 subagent_type: "Explore".into(),
                 model: None,
                 agent_id: None,
+                agents: Vec::new(),
+                path: None,
+                activity: None,
                 duration_ms: None,
             }],
             output: None,

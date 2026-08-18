@@ -60,9 +60,9 @@ use crate::{
     agent::{
         controller::{
             AgentController, AuthKind, Command as AgentCommand, ConfigChoice, ConfigValue,
-            ConnectionState, ContentRole, DisplayContent, Event as AgentEvent, InteractionKind,
-            InteractionResponse, MAX_PROMPT_ATTACHMENT_TOTAL_BYTES, MAX_PROMPT_ATTACHMENTS,
-            PromptAttachment, QuestionAnswer, SessionChoice, ToolOutput,
+            ConnectionState, ContentRole, DisplayContent, Event as AgentEvent, GoalAction,
+            InteractionKind, InteractionResponse, MAX_PROMPT_ATTACHMENT_TOTAL_BYTES,
+            MAX_PROMPT_ATTACHMENTS, PromptAttachment, QuestionAnswer, SessionChoice, ToolOutput,
         },
         provider::{
             ProviderDescriptor, ProviderIcon, ProviderId, catalog as provider_catalog,
@@ -2892,6 +2892,9 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                         ToolOutput::Text(content) => {
                             let _ = writeln!(text, "{content}");
                         }
+                        ToolOutput::Log { label, text: log } => {
+                            let _ = writeln!(text, "{label}\n{log}");
+                        }
                         ToolOutput::Content(content) => {
                             append_display_search_text(&mut text, content)
                         }
@@ -2920,12 +2923,33 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                             prompt,
                             subagent_type,
                             model,
+                            agent_id,
+                            agents,
+                            path,
+                            activity,
                             duration_ms,
-                            ..
                         } => {
                             let _ = writeln!(text, "{description}\n{prompt}\n{subagent_type}");
                             if let Some(model) = model {
                                 let _ = writeln!(text, "{model}");
+                            }
+                            if let Some(agent_id) = agent_id {
+                                let _ = writeln!(text, "{agent_id}");
+                            }
+                            for agent in agents {
+                                let _ = writeln!(
+                                    text,
+                                    "{} {} {}",
+                                    agent.status.as_deref().unwrap_or_default(),
+                                    agent.id,
+                                    agent.message.as_deref().unwrap_or_default()
+                                );
+                            }
+                            if let Some(path) = path {
+                                let _ = writeln!(text, "{path}");
+                            }
+                            if let Some(activity) = activity {
+                                let _ = writeln!(text, "{activity}");
                             }
                             if let Some(duration_ms) = duration_ms {
                                 let _ = writeln!(text, "{}", agent_task_duration(*duration_ms));
@@ -2979,6 +3003,9 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                 for phase in &plan.phases {
                     let _ = writeln!(text, "{}", phase.name);
                 }
+            }
+            InteractionKind::Url { title, url } => {
+                let _ = writeln!(text, "{title}\n{url}");
             }
         },
     }
@@ -3684,6 +3711,7 @@ struct AssistantComposer<'a> {
     enabled: bool,
     send_enabled: bool,
     active: bool,
+    allow_active_send: bool,
     allow_directories: bool,
     handle_drop: bool,
     mouse_wheel: bool,
@@ -3905,6 +3933,18 @@ impl AssistantComposer<'_> {
                         true,
                     )
                     .clicked();
+                    if self.allow_active_send {
+                        let (fill, color) = assistant_send_button_colors(self.send_enabled);
+                        send = assistant_composer_action(
+                            ui,
+                            Icon::ArrowUp,
+                            "Steer active turn (Enter)",
+                            fill,
+                            color,
+                            self.send_enabled,
+                        )
+                        .clicked();
+                    }
                 } else {
                     let (fill, color) = assistant_send_button_colors(self.send_enabled);
                     send = assistant_composer_action(

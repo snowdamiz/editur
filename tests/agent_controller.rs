@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use editur::agent::controller::{
-    AgentController, AuthKind, Command, ConfigValue, ConnectionState, Event, InteractionResponse,
-    PromptAttachment, QuestionAnswer,
+    AgentController, AuthKind, Command, ConfigValue, ConnectionState, Event, GoalAction,
+    InteractionKind, InteractionResponse, PromptAttachment, QuestionAnswer,
 };
 use editur::agent::provider::ProviderId;
 use editur::agent::state::{AgentState, TranscriptItem};
@@ -35,7 +35,10 @@ fn acp_output_is_paged_without_losing_history() {
         Vec::new(),
     );
     receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::SessionReady { .. })
+        matches!(
+            event,
+            Event::SessionReady { .. } | Event::SessionLoaded { .. }
+        )
     });
 
     controller
@@ -155,6 +158,154 @@ fn audio_and_text_files_use_their_advertised_acp_content_blocks() {
     assert!(events.iter().any(
         |event| matches!(event, Event::AssistantDelta(text) if text == "audio:audio/mpeg,text:text/plain")
     ));
+}
+
+#[test]
+fn codex_folder_attachments_activate_additional_directories() {
+    let project = tempfile::tempdir().unwrap();
+    let additional = tempfile::tempdir().unwrap();
+    let marker = project.path().join("additional-directories");
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--additional-directories".into(),
+            marker.to_string_lossy().into_owned(),
+        ],
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::SessionReady { .. } | Event::SessionLoaded { .. }
+        )
+    });
+
+    controller
+        .send(Command::PromptWithAttachments {
+            text: "folder".into(),
+            attachments: vec![PromptAttachment::from_path(additional.path()).unwrap()],
+        })
+        .unwrap();
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        additional.path().canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[test]
+fn codex_acp_form_elicitation_round_trips_typed_answers() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+
+    controller
+        .send(Command::Prompt("elicitation".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::InteractionRequested(_))
+    });
+    let request = events
+        .into_iter()
+        .find_map(|event| match event {
+            Event::InteractionRequested(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(
+        &request.kind,
+        InteractionKind::Questions { title, questions }
+            if title == "Configure" && questions.len() == 2
+    ));
+    controller
+        .send(Command::RespondInteraction {
+            request_id: request.request_id,
+            response: InteractionResponse::Answers(vec![
+                QuestionAnswer {
+                    question_id: "name".into(),
+                    selected_option_ids: vec!["Ada".into()],
+                },
+                QuestionAnswer {
+                    question_id: "confirm".into(),
+                    selected_option_ids: vec!["true".into()],
+                },
+            ]),
+        })
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "Ada:true"))
+    );
+}
+
+#[test]
+fn codex_extensions_expose_goals_and_steer_an_active_turn() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--codex-extensions".into()],
+    );
+    let ready = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    assert!(ready.iter().any(|event| matches!(
+        event,
+        Event::Capabilities { steering: true, goal_actions, .. }
+            if goal_actions == &["set", "pause", "resume", "clear"]
+    )));
+
+    controller
+        .send(Command::ControlGoal(GoalAction::Set(
+            "Ship the editor".into(),
+        )))
+        .unwrap();
+    let goal = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::GoalUpdated(_))
+    });
+    assert!(goal.iter().any(|event| matches!(
+        event,
+        Event::GoalUpdated(Some(goal))
+            if goal.objective == "Ship the editor" && goal.status == "active"
+    )));
+
+    controller.send(Command::Prompt("wait".into())).unwrap();
+    receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::UserMessage(text) if text == "wait"),
+    );
+    controller.send(Command::Prompt("redirect".into())).unwrap();
+    let steered = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::UserMessage(text) if text == "redirect"),
+    );
+    assert!(steered.iter().any(|event| matches!(
+        event,
+        Event::AssistantDelta(text) if text == "steered:redirect"
+    )));
+
+    controller.send(Command::Cancel).unwrap();
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
 }
 
 #[test]
@@ -359,7 +510,7 @@ fn history_and_cursor_only_controls_are_capability_events() {
         });
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Capabilities { history, allow_run_everything }
+            Event::Capabilities { history, allow_run_everything, .. }
                 if (*history, *allow_run_everything) == (expected_history, expected_allow_all)
         )));
     }
@@ -392,8 +543,10 @@ fn pinned_codex_fixture_drives_history_and_standard_session_controls() {
         event,
         Event::Capabilities {
             history: true,
-            allow_run_everything: false
-        }
+            allow_run_everything: false,
+            steering: true,
+            goal_actions,
+        } if goal_actions == &["set", "pause", "resume", "clear"]
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -438,8 +591,10 @@ fn pinned_claude_fixture_drives_shared_history_attachments_and_session_controls(
         event,
         Event::Capabilities {
             history: true,
-            allow_run_everything: false
-        }
+            allow_run_everything: false,
+            steering: true,
+            goal_actions,
+        } if goal_actions == &["set", "clear"]
     )));
     assert!(ready.iter().any(|event| matches!(
         event,
@@ -555,6 +710,105 @@ fn session_history_distinguishes_provider_sessions_from_editur_sessions() {
             ("older-session", false),
         ])
     );
+}
+
+#[test]
+fn switching_sessions_closes_the_previous_session_and_ignores_its_late_updates() {
+    let project = tempfile::tempdir().unwrap();
+    let close_marker = project.path().join("closed-session");
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--session-lifecycle".into(),
+            close_marker.to_string_lossy().into_owned(),
+        ],
+    );
+    receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
+
+    controller
+        .send(Command::LoadSession("older-session".into()))
+        .unwrap();
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::AssistantDelta(text) if text == "settled current reply"),
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(close_marker).unwrap(),
+        "newest-session"
+    );
+    assert!(!events.iter().any(
+        |event| matches!(event, Event::AssistantDelta(text) if text == "stale previous reply")
+    ));
+}
+
+#[test]
+fn codex_history_follows_session_list_cursors() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--paged-sessions".into()],
+    );
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::SessionsUpdated(sessions)
+            if sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>()
+                == ["newest-session", "older-session"]
+    )));
+}
+
+#[test]
+fn codex_terminal_and_mcp_progress_stream_into_the_tool_card() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("codex-progress".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    let mut state = AgentState::default();
+    for event in events {
+        state.apply(event);
+    }
+
+    assert!(matches!(
+        state.transcript.back(),
+        Some(TranscriptItem::Tool(tool)) if tool.detail.as_ref().is_some_and(|detail| {
+            detail.content.iter().any(|content| matches!(
+                content,
+                editur::agent::controller::ToolOutput::Log { label, text }
+                    if label == "Terminal output" && text == "compiling\n"
+            )) && detail.content.iter().any(|content| matches!(
+                content,
+                editur::agent::controller::ToolOutput::Log { label, text }
+                    if label == "MCP progress" && text == "checking service"
+            ))
+        })
+    ));
 }
 
 #[test]

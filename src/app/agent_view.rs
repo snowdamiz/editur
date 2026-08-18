@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 
 impl EditorApp {
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -412,11 +413,12 @@ impl EditorApp {
         };
         let prompt = self.agent.prompt.trim().to_owned();
         if (prompt.is_empty() && self.agent_attachments.is_empty())
-            || self.agent.active
+            || (self.agent.active && !self.agent.steering)
             || !self.agent.session_ready
         {
             return;
         }
+        let was_active = self.agent.active;
         self.agent.active = true;
         match controller.send(AgentCommand::PromptWithAttachments {
             text: prompt,
@@ -431,7 +433,7 @@ impl EditorApp {
                 self.agent_prompt_history_draft.clear();
             }
             Err(error) => {
-                self.agent.active = false;
+                self.agent.active = was_active;
                 self.show_error(error);
             }
         }
@@ -1475,6 +1477,22 @@ impl EditorApp {
                                                                     );
                                                                 }
                                                             }
+                                                            ToolOutput::Log { label, text } => {
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    label,
+                                                                    theme::typography::small(),
+                                                                    theme::text().muted,
+                                                                    item_search,
+                                                                );
+                                                                agent_search_label(
+                                                                    ui,
+                                                                    text,
+                                                                    theme::typography::body(),
+                                                                    theme::text().primary,
+                                                                    item_search,
+                                                                );
+                                                            }
                                                             ToolOutput::Content(content) => {
                                                                 if let Some(source) = draw_agent_content(
                                                                     ui,
@@ -1543,7 +1561,10 @@ impl EditorApp {
                                                                 prompt,
                                                                 subagent_type,
                                                                 model,
-                                                                agent_id: _,
+                                                                agent_id,
+                                                                agents,
+                                                                path,
+                                                                activity,
                                                                 duration_ms,
                                                             } => {
                                                                 agent_search_label(
@@ -1556,6 +1577,8 @@ impl EditorApp {
                                                                 let metadata = [
                                                                     Some(subagent_type.clone()),
                                                                     model.clone(),
+                                                                    activity.clone(),
+                                                                    path.clone(),
                                                                     duration_ms.map(
                                                                         agent_task_duration,
                                                                     ),
@@ -1571,6 +1594,40 @@ impl EditorApp {
                                                                     theme::text().muted,
                                                                     item_search,
                                                                 );
+                                                                if agents.is_empty() {
+                                                                    if let Some(agent_id) = agent_id {
+                                                                        agent_search_label(
+                                                                            ui,
+                                                                            &format!("Agent {agent_id}"),
+                                                                            theme::typography::small(),
+                                                                            theme::text().muted,
+                                                                            item_search,
+                                                                        );
+                                                                    }
+                                                                } else {
+                                                                    for agent in agents {
+                                                                        let state = agent
+                                                                            .status
+                                                                            .as_deref()
+                                                                            .unwrap_or("unknown");
+                                                                        agent_search_label(
+                                                                            ui,
+                                                                            &format!("{state} · {}", agent.id),
+                                                                            theme::typography::small(),
+                                                                            theme::text().muted,
+                                                                            item_search,
+                                                                        );
+                                                                        if let Some(message) = &agent.message {
+                                                                            agent_search_label(
+                                                                                ui,
+                                                                                message,
+                                                                                theme::typography::body(),
+                                                                                theme::text().primary,
+                                                                                item_search,
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                }
                                                                 egui::CollapsingHeader::new(
                                                                     "Prompt",
                                                                 )
@@ -1909,15 +1966,35 @@ impl EditorApp {
                                                                     }
                                                                 }
                                                             }
+                                                            if question.options.is_empty() {
+                                                                if selected.is_empty() {
+                                                                    selected.push(String::new());
+                                                                }
+                                                                let value = &mut selected[0];
+                                                                ui.add_enabled(
+                                                                    !card.answered,
+                                                                    egui::TextEdit::singleline(value)
+                                                                        .password(question.secret)
+                                                                        .hint_text(match question.value_kind {
+                                                                            crate::agent::controller::QuestionValueKind::Number => "Number",
+                                                                            crate::agent::controller::QuestionValueKind::Integer => "Whole number",
+                                                                            _ if question.secret => "Secret",
+                                                                            _ => "Answer",
+                                                                        }),
+                                                                );
+                                                            }
                                                         }
                                                         if !card.answered {
                                                             ui.horizontal(|ui| {
                                                                 let complete = questions.iter().all(
                                                                     |question| {
+                                                                        if !question.required {
+                                                                            return true;
+                                                                        }
                                                                         card.selections
                                                                             .get(&question.id)
                                                                             .is_some_and(|answer| {
-                                                                                !answer.is_empty()
+                                                                                answer.iter().any(|value| !value.is_empty())
                                                                             })
                                                                     },
                                                                 );
@@ -2020,6 +2097,39 @@ impl EditorApp {
                                                                     interaction_responses.push((
                                                                         card.request.request_id,
                                                                         InteractionResponse::PlanRejected,
+                                                                    ));
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                    InteractionKind::Url { title, url } => {
+                                                        ui.label(
+                                                            RichText::new(title)
+                                                                .strong()
+                                                                .color(theme::text().primary),
+                                                        );
+                                                        ui.add(
+                                                            egui::Hyperlink::from_label_and_url(
+                                                                "Open authentication page",
+                                                                url,
+                                                            )
+                                                            .open_in_new_tab(true),
+                                                        );
+                                                        if !card.answered {
+                                                            ui.horizontal(|ui| {
+                                                                if ui.button("Open").clicked() {
+                                                                    ui.ctx().open_url(
+                                                                        egui::OpenUrl::new_tab(url),
+                                                                    );
+                                                                    interaction_responses.push((
+                                                                        card.request.request_id,
+                                                                        InteractionResponse::Accepted,
+                                                                    ));
+                                                                }
+                                                                if ui.button("Cancel").clicked() {
+                                                                    interaction_responses.push((
+                                                                        card.request.request_id,
+                                                                        InteractionResponse::Declined,
                                                                     ));
                                                                 }
                                                             });
@@ -2202,6 +2312,7 @@ impl EditorApp {
         let mut mode_change = None;
         let mut config_changes = Vec::new();
         let mut run_everything_change = None;
+        let mut goal_action = None;
         let mut provider_change = None;
         let mut session_load = None;
         let mut session_remove = None;
@@ -2212,7 +2323,8 @@ impl EditorApp {
         let mut prompt_changed = false;
         let mut history_navigated = false;
         let mut mention_attach = None;
-        let composer_enabled = self.agent.session_ready && !self.agent.active;
+        let composer_enabled =
+            self.agent.session_ready && (!self.agent.active || self.agent.steering);
         let composer_hint = if self.agent.session_ready {
             format!(
                 "Ask {} Agent…",
@@ -2347,6 +2459,7 @@ impl EditorApp {
             enabled: composer_enabled,
             send_enabled: ready,
             active: self.agent.active,
+            allow_active_send: self.agent.steering,
             allow_directories: true,
             handle_drop: true,
             mouse_wheel: !menu_owns_wheel,
@@ -2441,6 +2554,57 @@ impl EditorApp {
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing.x = theme::space::SMALL;
+                if let Some(goal) = &self.agent.goal {
+                    let mut goal_detail = goal.objective.clone();
+                    if let Some(iterations) = goal.iterations {
+                        let _ = write!(goal_detail, "\nIterations: {iterations}");
+                    }
+                    if let Some(reason) = &goal.last_reason {
+                        let _ = write!(goal_detail, "\nLast update: {reason}");
+                    }
+                    ui.label(
+                        RichText::new(format!("Goal: {}", goal.status))
+                            .size(theme::typography::MICRO_SIZE)
+                            .weak(),
+                    )
+                    .on_hover_text(goal_detail);
+                    if goal.status == "active"
+                        && self
+                            .agent
+                            .goal_actions
+                            .iter()
+                            .any(|action| action == "pause")
+                        && ui.small_button("Pause").clicked()
+                    {
+                        goal_action = Some(GoalAction::Pause);
+                    } else if matches!(goal.status.as_str(), "paused" | "blocked" | "limited")
+                        && self
+                            .agent
+                            .goal_actions
+                            .iter()
+                            .any(|action| action == "resume")
+                        && ui.small_button("Resume").clicked()
+                    {
+                        goal_action = Some(GoalAction::Resume);
+                    }
+                    if self
+                        .agent
+                        .goal_actions
+                        .iter()
+                        .any(|action| action == "clear")
+                        && ui.small_button("Clear").clicked()
+                    {
+                        goal_action = Some(GoalAction::Clear);
+                    }
+                } else if self.agent.goal_actions.iter().any(|action| action == "set")
+                    && ui
+                        .small_button("Goal")
+                        .on_hover_text("Set a persistent session goal")
+                        .clicked()
+                {
+                    self.agent.prompt = "/goal ".into();
+                    ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
+                }
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     if self.agent.allow_run_everything {
                         let run_everything = self
@@ -3181,6 +3345,9 @@ impl EditorApp {
             }
             for (id, value) in config_changes {
                 let _ = controller.send(AgentCommand::SetConfig { id, value });
+            }
+            if let Some(action) = goal_action {
+                let _ = controller.send(AgentCommand::ControlGoal(action));
             }
             if cancel {
                 let _ = controller.send(AgentCommand::Cancel);

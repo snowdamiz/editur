@@ -1646,6 +1646,7 @@ impl EditorApp {
             enabled: composer_enabled,
             send_enabled: can_send,
             active: false,
+            allow_active_send: false,
             allow_directories: false,
             handle_drop: false,
             mouse_wheel: true,

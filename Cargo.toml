@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 build = "build.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=2.0.0", features = ["unstable_auth_methods"] }
+agent-client-protocol = { version = "=2.0.0", features = ["unstable_auth_methods", "unstable_elicitation"] }
 async-channel = "2.5.0"
 async-io = "2.6.0"
 directories = "6.0.0"
@@ -22,6 +22,7 @@ image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg
 keyring = "4.1.6"
 lsp-types = "=0.97.0"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+regex = "1.13.1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 portable-pty = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }

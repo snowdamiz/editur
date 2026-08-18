@@ -7,6 +7,10 @@
       "version": "1.1.14"
     },
     "agentCapabilities": {
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
       "loadSession": true,
       "promptCapabilities": {
         "embeddedContext": true,
@@ -18,6 +22,11 @@
         "close": {},
         "delete": {},
         "additionalDirectories": {}
+      },
+      "mcpCapabilities": {
+        "acp": false,
+        "http": true,
+        "sse": false
       }
     },
     "authMethods": [
@@ -35,11 +44,21 @@
         "id": "chat-gpt",
         "name": "ChatGPT",
         "description": "Use ChatGPT to authenticate"
+      },
+      {
+        "id": "chat-gpt-device-code",
+        "name": "ChatGPT (device code)",
+        "description": "Sign in to ChatGPT by opening a verification page and entering a one-time code"
       }
     ],
     "_meta": {
-      "codex": {
-        "ignoredByEditur": true
+      "steering": {
+        "supported": true
+      },
+      "goal": {
+        "version": 1,
+        "controlMethod": "_session/goal",
+        "actions": ["set", "pause", "resume", "clear"]
       }
     }
   },

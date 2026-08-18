@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::controller::{
-    CommandChoice, ConfigChoice, ConnectionState, ContentRole, DisplayContent, Event,
+    CommandChoice, ConfigChoice, ConnectionState, ContentRole, DisplayContent, Event, GoalState,
     InteractionKind, InteractionRequest, ModeChoice, PermissionChoice, PlanItem, PlanPhase,
     PlanProposal, Question, QuestionOption, SessionChoice, SessionTranscriptMessage, ToolActivity,
     ToolDetail, ToolOutput,
@@ -132,6 +132,7 @@ struct SessionLoadBackup {
     tool_changes: HashMap<String, FileChange>,
     title: Option<String>,
     usage: Option<UsageState>,
+    goal: Option<GoalState>,
 }
 
 pub struct AgentState {
@@ -140,6 +141,8 @@ pub struct AgentState {
     pub active: bool,
     pub history_available: bool,
     pub allow_run_everything: bool,
+    pub steering: bool,
+    pub goal_actions: Vec<String>,
     pub prompt: String,
     pub transcript: VecDeque<TranscriptItem>,
     transcript_records: VecDeque<Option<ArchivedTranscriptItem>>,
@@ -172,6 +175,7 @@ pub struct AgentState {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub usage: Option<UsageState>,
+    pub goal: Option<GoalState>,
     pub diagnostics: Option<String>,
     session_load_backup: Option<SessionLoadBackup>,
 }
@@ -184,6 +188,8 @@ impl Default for AgentState {
             active: false,
             history_available: false,
             allow_run_everything: false,
+            steering: false,
+            goal_actions: Vec::new(),
             prompt: String::new(),
             transcript: VecDeque::new(),
             transcript_records: VecDeque::new(),
@@ -203,6 +209,7 @@ impl Default for AgentState {
             session_id: None,
             title: None,
             usage: None,
+            goal: None,
             diagnostics: None,
             session_load_backup: None,
         }
@@ -211,7 +218,10 @@ impl Default for AgentState {
 
 impl AgentState {
     pub fn can_send(&self, buffer_saved: bool) -> bool {
-        buffer_saved && self.session_ready && !self.active && !self.prompt.trim().is_empty()
+        buffer_saved
+            && self.session_ready
+            && (!self.active || self.steering)
+            && !self.prompt.trim().is_empty()
     }
 
     pub fn waiting_permission(&self) -> bool {
@@ -248,6 +258,11 @@ impl AgentState {
         if card.answered {
             return false;
         }
+        if let InteractionKind::Questions { questions, .. } = &card.request.kind {
+            for question in questions.iter().filter(|question| question.secret) {
+                card.selections.remove(&question.id);
+            }
+        }
         card.answered = true;
         true
     }
@@ -271,9 +286,13 @@ impl AgentState {
             Event::Capabilities {
                 history,
                 allow_run_everything,
+                steering,
+                goal_actions,
             } => {
                 self.history_available = history;
                 self.allow_run_everything = allow_run_everything;
+                self.steering = steering;
+                self.goal_actions = goal_actions;
                 if !history {
                     self.sessions = None;
                 }
@@ -306,6 +325,7 @@ impl AgentState {
                     .collect();
                 self.config_options = bounded_configs(config_options);
                 self.usage = None;
+                self.goal = None;
                 self.diagnostics = None;
             }
             Event::SessionsUpdated(sessions) => {
@@ -323,6 +343,7 @@ impl AgentState {
                     tool_changes: std::mem::take(&mut self.tool_changes),
                     title: self.title.take(),
                     usage: self.usage.take(),
+                    goal: self.goal.take(),
                 });
                 self.refresh_queue.clear();
                 self.session_ready = false;
@@ -343,6 +364,7 @@ impl AgentState {
                     self.tool_changes = backup.tool_changes;
                     self.title = backup.title;
                     self.usage = backup.usage;
+                    self.goal = backup.goal;
                 }
                 self.session_ready = true;
                 self.active = false;
@@ -561,7 +583,13 @@ impl AgentState {
                             if detail.input.is_some() {
                                 current.input = detail.input;
                             }
-                            if !detail.content.is_empty() {
+                            if detail
+                                .content
+                                .iter()
+                                .all(|content| matches!(content, ToolOutput::Log { .. }))
+                            {
+                                merge_tool_logs(&mut current.content, detail.content);
+                            } else if !detail.content.is_empty() {
                                 let task = current
                                     .content
                                     .iter()
@@ -631,9 +659,18 @@ impl AgentState {
                 }));
             }
             Event::InteractionRequested(request) => {
+                let request = bounded_interaction(request);
+                let selections = match &request.kind {
+                    InteractionKind::Questions { questions, .. } => questions
+                        .iter()
+                        .filter(|question| !question.default_values.is_empty())
+                        .map(|question| (question.id.clone(), question.default_values.clone()))
+                        .collect(),
+                    _ => HashMap::new(),
+                };
                 self.push(TranscriptItem::Interaction(InteractionCard {
-                    request: bounded_interaction(request),
-                    selections: HashMap::new(),
+                    request,
+                    selections,
                     answered: false,
                 }));
             }
@@ -642,6 +679,17 @@ impl AgentState {
                     used,
                     size,
                     cost: cost.map(bounded),
+                });
+            }
+            Event::GoalUpdated(goal) => {
+                self.goal = goal.map(|goal| GoalState {
+                    objective: bounded(goal.objective),
+                    status: bounded(goal.status),
+                    iterations: goal.iterations,
+                    last_reason: goal.last_reason.map(bounded),
+                    token_budget: goal.token_budget,
+                    tokens_used: goal.tokens_used,
+                    time_used_seconds: goal.time_used_seconds,
                 });
             }
             Event::TurnFinished { cancelled } => {
@@ -895,6 +943,26 @@ impl AgentState {
     }
 }
 
+fn merge_tool_logs(current: &mut Vec<ToolOutput>, logs: Vec<ToolOutput>) {
+    for log in logs {
+        let ToolOutput::Log { label, text } = log else {
+            continue;
+        };
+        if let Some(ToolOutput::Log {
+            text: current_text,
+            ..
+        }) = current
+            .iter_mut()
+            .rev()
+            .find(|content| matches!(content, ToolOutput::Log { label: current, .. } if current == &label))
+        {
+            append_bounded(current_text, &text);
+        } else {
+            current.push(ToolOutput::Log { label, text });
+        }
+    }
+}
+
 /// Added/removed line counts for one diff, matching the numbers the diff card
 /// renders: an LCS comparison while the input is small enough, and a
 /// prefix/suffix trim beyond that (the same bound and fallback as the UI's
@@ -979,6 +1047,15 @@ fn bounded_interaction(mut request: InteractionRequest) -> InteractionRequest {
                         })
                         .collect(),
                     allow_multiple: question.allow_multiple,
+                    required: question.required,
+                    secret: question.secret,
+                    default_values: question
+                        .default_values
+                        .into_iter()
+                        .take(MAX_CHOICES)
+                        .map(bounded)
+                        .collect(),
+                    value_kind: question.value_kind,
                 })
                 .collect(),
         },
@@ -1008,6 +1085,10 @@ fn bounded_interaction(mut request: InteractionRequest) -> InteractionRequest {
                 })
                 .collect(),
         }),
+        InteractionKind::Url { title, url } => InteractionKind::Url {
+            title: bounded(title),
+            url: bounded(url),
+        },
     };
     request
 }
@@ -1028,6 +1109,10 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
             .take(MAX_CHOICES)
             .map(|content| match content {
                 ToolOutput::Text(text) => ToolOutput::Text(bounded(text)),
+                ToolOutput::Log { label, text } => ToolOutput::Log {
+                    label: bounded(label),
+                    text: bounded(text),
+                },
                 ToolOutput::Content(content) => ToolOutput::Content(bounded_content(content)),
                 ToolOutput::Diff {
                     path,
@@ -1054,6 +1139,9 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     subagent_type,
                     model,
                     agent_id,
+                    agents,
+                    path,
+                    activity,
                     duration_ms,
                 } => ToolOutput::Task {
                     description: bounded(description),
@@ -1061,6 +1149,17 @@ fn bounded_tool_detail(detail: ToolDetail) -> ToolDetail {
                     subagent_type: bounded(subagent_type),
                     model: model.map(bounded),
                     agent_id: agent_id.map(bounded),
+                    agents: agents
+                        .into_iter()
+                        .take(MAX_CHOICES)
+                        .map(|agent| crate::agent::controller::SubagentInfo {
+                            id: bounded(agent.id),
+                            status: agent.status.map(bounded),
+                            message: agent.message.map(bounded),
+                        })
+                        .collect(),
+                    path: path.map(bounded),
+                    activity: activity.map(bounded),
                     duration_ms,
                 },
                 ToolOutput::GeneratedImage {
@@ -1294,6 +1393,7 @@ fn interaction_size(request: &InteractionRequest) -> usize {
                         })
                         .sum::<usize>()
             }
+            InteractionKind::Url { title, url } => title.len() + url.len(),
         }
 }
 
@@ -1305,6 +1405,7 @@ fn tool_detail_size(detail: &ToolDetail) -> usize {
             .iter()
             .map(|content| match content {
                 ToolOutput::Text(text) | ToolOutput::Terminal(text) => text.len(),
+                ToolOutput::Log { label, text } => label.len().saturating_add(text.len()),
                 ToolOutput::Content(content) => display_content_size(content),
                 ToolOutput::Diff {
                     path,
@@ -1326,6 +1427,9 @@ fn tool_detail_size(detail: &ToolDetail) -> usize {
                     subagent_type,
                     model,
                     agent_id,
+                    agents,
+                    path,
+                    activity,
                     ..
                 } => {
                     description.len()
@@ -1333,6 +1437,16 @@ fn tool_detail_size(detail: &ToolDetail) -> usize {
                         + subagent_type.len()
                         + model.as_ref().map_or(0, String::len)
                         + agent_id.as_ref().map_or(0, String::len)
+                        + path.as_ref().map_or(0, String::len)
+                        + activity.as_ref().map_or(0, String::len)
+                        + agents
+                            .iter()
+                            .map(|agent| {
+                                agent.id.len()
+                                    + agent.status.as_ref().map_or(0, String::len)
+                                    + agent.message.as_ref().map_or(0, String::len)
+                            })
+                            .sum::<usize>()
                 }
                 ToolOutput::GeneratedImage {
                     description,
