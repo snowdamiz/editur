@@ -6,7 +6,7 @@ use std::{
     ptr,
 };
 
-use core_graphics_types::geometry::CGSize;
+use core_graphics_types::geometry::{CGRect, CGSize};
 use egui::{
     ClippedPrimitive, ImageData, TextureFilter, TextureId, TextureOptions, TextureWrapMode,
     TexturesDelta,
@@ -34,7 +34,11 @@ use winit::{
 
 use super::{buffer_capacity, choose_adapter};
 
-const FRAMES_IN_FLIGHT: usize = 3;
+const FRAMES_IN_FLIGHT: usize = 2;
+
+fn window_clear_color() -> MTLClearColor {
+    MTLClearColor::new(0.0, 0.0, 0.0, 0.0)
+}
 
 #[cfg(editur_precompiled_metal)]
 const SHADER_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.metallib"));
@@ -163,6 +167,7 @@ impl Renderer {
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm_sRGB);
         layer.set_presents_with_transaction(false);
+        layer.set_maximum_drawable_count(FRAMES_IN_FLIGHT as u64);
         attach_layer(window, &mut layer)?;
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
@@ -276,7 +281,7 @@ impl Renderer {
             .ok_or_else(|| "Metal: color attachment 0 is unavailable".to_owned())?;
         attachment.set_texture(Some(drawable.texture()));
         attachment.set_load_action(MTLLoadAction::Clear);
-        attachment.set_clear_color(MTLClearColor::new(0.078, 0.078, 0.086, 1.0));
+        attachment.set_clear_color(window_clear_color());
         attachment.set_store_action(MTLStoreAction::Store);
 
         let command_buffer = self.command_queue.new_command_buffer();
@@ -301,7 +306,8 @@ impl Renderer {
             let mesh = match &primitive.primitive {
                 Primitive::Mesh(mesh) => mesh,
                 Primitive::Callback(_) => {
-                    retained = super::retained_paint(&primitive.primitive)?;
+                    retained = super::retained_paint(&primitive.primitive)?
+                        .map(|paint| (paint, primitive.clip_rect));
                     continue;
                 }
             };
@@ -318,7 +324,8 @@ impl Renderer {
                 .ok_or_else(|| format!("Metal: missing egui texture {:?}", mesh.texture_id))?;
             let vertices: &[u8] = bytemuck::cast_slice(mesh.vertices.as_slice());
             let indices: &[u8] = bytemuck::cast_slice(mesh.indices.as_slice());
-            let upload = retained.take().map(|paint| {
+            let paint = super::retained_for_mesh(&mut retained, primitive.clip_rect);
+            let upload = paint.map(|paint| {
                 active_retained.insert(paint.key);
                 (
                     paint.key,
@@ -508,9 +515,69 @@ fn attach_layer(window: &Window, layer: &mut MetalLayer) -> Result<(), String> {
             ((layer.as_mut() as *mut metal::MetalLayerRef).cast::<Object>(),),
         )
         .map_err(|error| format!("Metal: cannot attach CAMetalLayer: {error}"))?;
+        install_backdrop(view)?;
         round_view_layers(view)?;
     }
     Ok(())
+}
+
+fn configure_backdrop(effect: &Object) -> Result<(), String> {
+    unsafe {
+        effect
+            .send_message::<_, ()>(Sel::register("setMaterial:"), (7_isize,))
+            .map_err(|error| format!("Metal: cannot set sidebar backdrop material: {error}"))?;
+        effect
+            .send_message::<_, ()>(Sel::register("setBlendingMode:"), (0_isize,))
+            .map_err(|error| format!("Metal: cannot enable behind-window blending: {error}"))?;
+        effect
+            .send_message::<_, ()>(Sel::register("setState:"), (0_isize,))
+            .map_err(|error| format!("Metal: cannot follow the window backdrop state: {error}"))?;
+        effect
+            .send_message::<_, ()>(Sel::register("setAutoresizingMask:"), (18_usize,))
+            .map_err(|error| format!("Metal: cannot resize the native backdrop: {error}"))?;
+    }
+    Ok(())
+}
+
+unsafe fn install_backdrop(view: &Object) -> Result<(), String> {
+    let frame_view = unsafe {
+        view.send_message::<_, *mut Object>(Sel::register("superview"), ())
+            .map_err(|error| format!("Metal: cannot obtain the AppKit frame view: {error}"))?
+    };
+    let frame_view = unsafe { frame_view.as_ref() }
+        .ok_or_else(|| "Metal: AppKit frame view is unavailable".to_owned())?;
+    let frame = unsafe {
+        view.send_message::<_, CGRect>(Sel::register("frame"), ())
+            .map_err(|error| format!("Metal: cannot read the content view frame: {error}"))?
+    };
+    let class = Class::get("NSVisualEffectView")
+        .ok_or_else(|| "Metal: NSVisualEffectView class is unavailable".to_owned())?;
+    let effect = unsafe {
+        class
+            .send_message::<_, *mut Object>(Sel::register("alloc"), ())
+            .map_err(|error| format!("Metal: cannot allocate the native backdrop: {error}"))?
+    };
+    let effect = unsafe {
+        effect
+            .as_ref()
+            .ok_or_else(|| "Metal: cannot allocate the native backdrop".to_owned())?
+            .send_message::<_, *mut Object>(Sel::register("initWithFrame:"), (frame,))
+            .map_err(|error| format!("Metal: cannot initialize the native backdrop: {error}"))?
+    };
+    let effect = unsafe { effect.as_ref() }
+        .ok_or_else(|| "Metal: cannot initialize the native backdrop".to_owned())?;
+    let result = configure_backdrop(effect).and_then(|()| unsafe {
+        frame_view
+            .send_message::<_, ()>(
+                Sel::register("addSubview:positioned:relativeTo:"),
+                (effect, -1_isize, view),
+            )
+            .map_err(|error| format!("Metal: cannot install the native backdrop: {error}"))
+    });
+    unsafe {
+        let _ = effect.send_message::<_, ()>(Sel::register("release"), ());
+    }
+    result
 }
 
 unsafe fn round_view_layers(view: &Object) -> Result<(), String> {
@@ -602,6 +669,40 @@ mod tests {
             assert_eq!(radius, 10.0);
             assert_eq!(clips, YES);
             layer
+                .send_message::<_, ()>(Sel::register("release"), ())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_backdrop_uses_sidebar_material_behind_the_window() {
+        assert_eq!(super::window_clear_color().alpha, 0.0);
+        unsafe {
+            let class = Class::get("NSVisualEffectView").unwrap();
+            let effect = class
+                .send_message::<_, *mut Object>(Sel::register("new"), ())
+                .unwrap();
+            let effect = effect.as_ref().unwrap();
+
+            super::configure_backdrop(effect).unwrap();
+
+            let material = effect
+                .send_message::<_, isize>(Sel::register("material"), ())
+                .unwrap();
+            let blending = effect
+                .send_message::<_, isize>(Sel::register("blendingMode"), ())
+                .unwrap();
+            let state = effect
+                .send_message::<_, isize>(Sel::register("state"), ())
+                .unwrap();
+            let autoresizing = effect
+                .send_message::<_, usize>(Sel::register("autoresizingMask"), ())
+                .unwrap();
+            assert_eq!(material, 7);
+            assert_eq!(blending, 0);
+            assert_eq!(state, 0);
+            assert_eq!(autoresizing, 18);
+            effect
                 .send_message::<_, ()>(Sel::register("release"), ())
                 .unwrap();
         }

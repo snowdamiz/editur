@@ -11,21 +11,62 @@ const MAX_APP_UNPACKED_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_SIZE: u64 = 1024;
 const MAX_AGENT_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
 
-pub fn run() -> Result<(), String> {
-    let base = env::var("EDITUR_UPDATE_BASE")
+fn update_base() -> Result<String, String> {
+    env::var("EDITUR_UPDATE_BASE")
         .ok()
         .or_else(|| EMBEDDED_UPDATE_BASE.map(str::to_owned))
         .ok_or_else(|| {
             "this build has no update source; install a release build or set EDITUR_UPDATE_BASE"
                 .to_owned()
-        })?;
-    let asset = asset_name_for(env::consts::OS, env::consts::ARCH)?;
-    let (binary_url, checksum_url) = update_urls(&base, asset)?;
+        })
+}
+
+fn current_executable() -> Result<std::path::PathBuf, String> {
     let executable = env::current_exe()
         .map_err(|error| format!("cannot locate the running Editur executable: {error}"))?;
     #[cfg(target_os = "macos")]
     let executable = fs::canonicalize(&executable)
         .map_err(|error| format!("cannot resolve {}: {error}", executable.display()))?;
+    Ok(executable)
+}
+
+/// True when the release channel advertises a binary other than the one
+/// running now. An error means "unknown" rather than "update available", so
+/// callers stay quiet on failure.
+pub fn check_available() -> Result<bool, String> {
+    let base = update_base()?;
+    let asset = asset_name_for(env::consts::OS, env::consts::ARCH)?;
+    let (_, checksum_url) = update_urls(&base, asset)?;
+    let executable = current_executable()?;
+    let current = fs::read(&executable)
+        .map_err(|error| format!("cannot read {}: {error}", executable.display()))?;
+    let checksum = download(&checksum_url, MAX_CHECKSUM_SIZE)?;
+    let advertised = advertised_checksum(&checksum)?;
+    Ok(!crate::agent::provision::sha256_hex(&current).eq_ignore_ascii_case(advertised))
+}
+
+/// Relaunches this executable as `editur update`, handing the swap to a
+/// process that survives the editor quitting. The child's stderr is returned
+/// so the caller can report a failed update.
+pub fn start_in_background() -> Result<std::process::Child, String> {
+    use std::process::{Command, Stdio};
+
+    let executable =
+        env::current_exe().map_err(|error| format!("cannot locate the updater: {error}"))?;
+    Command::new(&executable)
+        .arg("update")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start the updater: {error}"))
+}
+
+pub fn run() -> Result<(), String> {
+    let base = update_base()?;
+    let asset = asset_name_for(env::consts::OS, env::consts::ARCH)?;
+    let (binary_url, checksum_url) = update_urls(&base, asset)?;
+    let executable = current_executable()?;
     #[cfg(target_os = "macos")]
     if macos_bundle_root(&executable).is_none() {
         return migrate_macos_install(&base, &executable);
@@ -48,7 +89,7 @@ pub fn run() -> Result<(), String> {
     if !crate::instance::quit_running()? {
         return Err("save or discard changes in the running editor before updating".into());
     }
-    provision_sidecar(&sidecar_manifest_url(&binary_url))?;
+    provision_sidecar_best_effort(&binary_url);
 
     #[cfg(unix)]
     {
@@ -94,6 +135,17 @@ fn sidecar_manifest_url(binary_url: &str) -> String {
     format!("{binary_url}.agent.json")
 }
 
+/// Pre-installs the Cursor agent so the updated build starts fast, but never
+/// blocks a verified binary update on it: the new build provisions its own
+/// agents at launch, and aborting here once stranded old installs on a
+/// manifest format they could not read.
+fn provision_sidecar_best_effort(binary_url: &str) {
+    if let Err(error) = provision_sidecar(&sidecar_manifest_url(binary_url)) {
+        eprintln!("editur: skipping the Cursor agent pre-install: {error}");
+        eprintln!("editur: the updated build will install its agents on launch.");
+    }
+}
+
 fn provision_sidecar(url: &str) -> Result<(), String> {
     let bytes = download(url, MAX_AGENT_MANIFEST_SIZE)?;
     let bundle = crate::agent::provision::ProviderBundle::parse(&bytes)?;
@@ -122,9 +174,8 @@ fn advertised_checksum(checksum: &[u8]) -> Result<&str, String> {
 #[cfg(feature = "network")]
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     crate::network::retry(|| {
-        let mut response = ureq::get(url)
-            .call()
-            .map_err(|error| format!("cannot download {url}: {error}"))?;
+        let mut response =
+            crate::network::get(url).map_err(|error| format!("cannot download {url}: {error}"))?;
         response
             .body_mut()
             .with_config()
@@ -300,11 +351,7 @@ fn migrate_macos_install(base: &str, executable: &std::path::Path) -> Result<(),
         return Err("save or discard changes in the running editor before updating".into());
     }
     let update_asset = format!("editur-macos-{}", env::consts::ARCH);
-    provision_sidecar(&sidecar_manifest_url(&format!(
-        "{}/{}",
-        base.trim_end_matches('/'),
-        update_asset
-    )))?;
+    provision_sidecar_best_effort(&format!("{}/{}", base.trim_end_matches('/'), update_asset));
 
     let parent = executable
         .parent()

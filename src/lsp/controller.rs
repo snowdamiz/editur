@@ -761,7 +761,7 @@ fn handle_wire(
                         match result {
                             Ok(result) => {
                                 let (items, truncated) =
-                                    normalize_completion(&result, documents.get(&tag.path))?;
+                                    normalize_completion(result, documents.get(&tag.path))?;
                                 events.send(Event::Completion {
                                     tag,
                                     items,
@@ -782,7 +782,7 @@ fn handle_wire(
                     {
                         match result {
                             Ok(result) => {
-                                let content = normalize_hover(&result, documents.get(&tag.path))?;
+                                let content = normalize_hover(result, documents.get(&tag.path))?;
                                 events.send(Event::Hover { tag, content });
                             }
                             Err(error) => {
@@ -799,7 +799,7 @@ fn handle_wire(
                     {
                         match result {
                             Ok(result) => {
-                                let (locations, truncated) = normalize_definitions(&result)?;
+                                let (locations, truncated) = normalize_definitions(result)?;
                                 events.send(Event::Definitions {
                                     tag,
                                     locations,
@@ -876,12 +876,12 @@ fn request_definition(
     Ok(())
 }
 
-fn normalize_definitions(result: &Value) -> Result<(Vec<DefinitionLocation>, bool), String> {
+fn normalize_definitions(result: Value) -> Result<(Vec<DefinitionLocation>, bool), String> {
     const MAX_LOCATIONS: usize = 200;
     if result.is_null() {
         return Ok((Vec::new(), false));
     }
-    let response: lsp_types::GotoDefinitionResponse = serde_json::from_value(result.clone())
+    let response: lsp_types::GotoDefinitionResponse = serde_json::from_value(result)
         .map_err(|error| format!("invalid definition response: {error}"))?;
     let raw = match response {
         lsp_types::GotoDefinitionResponse::Scalar(location) => vec![(location.uri, location.range)],
@@ -960,7 +960,7 @@ fn request_hover(
 }
 
 fn normalize_hover(
-    result: &Value,
+    result: Value,
     document: Option<&Document>,
 ) -> Result<Option<HoverContent>, String> {
     let document =
@@ -968,7 +968,7 @@ fn normalize_hover(
     if result.is_null() {
         return Ok(None);
     }
-    let hover: lsp_types::Hover = serde_json::from_value(result.clone())
+    let hover: lsp_types::Hover = serde_json::from_value(result)
         .map_err(|error| format!("invalid hover response: {error}"))?;
     let (text, markdown) = match hover.contents {
         lsp_types::HoverContents::Scalar(marked) => marked_string(marked),
@@ -1014,10 +1014,10 @@ fn publish_diagnostics(
     const MAX_DIAGNOSTICS: usize = 5_000;
     let params: lsp_types::PublishDiagnosticsParams = serde_json::from_value(params)
         .map_err(|error| format!("invalid publishDiagnostics notification: {error}"))?;
-    let Some((path, document)) = documents
-        .iter()
-        .find(|(path, _)| file_uri(path).as_ref().is_ok_and(|uri| uri == &params.uri))
-    else {
+    let Ok(path) = super::path_from_file_uri(&params.uri) else {
+        return Ok(());
+    };
+    let Some(document) = documents.get(&path) else {
         return Ok(());
     };
     if document.change_due.is_some() || document.text != document.last_sent {
@@ -1190,7 +1190,7 @@ fn request_completion(
 }
 
 fn normalize_completion(
-    result: &Value,
+    result: Value,
     document: Option<&Document>,
 ) -> Result<(Vec<CompletionItem>, bool), String> {
     const MAX_ITEMS: usize = 500;
@@ -1199,7 +1199,7 @@ fn normalize_completion(
     if result.is_null() {
         return Ok((Vec::new(), false));
     }
-    let response: lsp_types::CompletionResponse = serde_json::from_value(result.clone())
+    let response: lsp_types::CompletionResponse = serde_json::from_value(result)
         .map_err(|error| format!("invalid completion response: {error}"))?;
     let raw = match response {
         lsp_types::CompletionResponse::Array(items) => items,

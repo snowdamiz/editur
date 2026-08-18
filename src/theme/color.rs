@@ -1,6 +1,9 @@
 //! The palette. Every color in the product resolves through the active
 //! `Palette`, so a second theme is a data change rather than a refactor.
 
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::Color32;
@@ -17,6 +20,20 @@ pub(crate) struct Surfaces {
     pub(crate) raised: Color32,
     /// Text fields and wells inside raised surfaces.
     pub(crate) input: Color32,
+}
+
+/// The settings page sits visually apart from the document: its column and
+/// cards are darker than the editor ramp, while the controls on those cards
+/// lift above them. Separate tokens so retuning settings never moves the
+/// editor, terminal, or menus.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingsSurfaces {
+    /// The content column behind the cards.
+    pub(crate) content: Color32,
+    /// A card grouping related settings rows.
+    pub(crate) card: Color32,
+    /// Buttons and closed dropdowns sitting on a card.
+    pub(crate) control: Color32,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +73,7 @@ pub(crate) struct Palette {
     pub(crate) dark: bool,
     pub(crate) accent: Color32,
     pub(crate) surface: Surfaces,
+    pub(crate) settings: SettingsSurfaces,
     pub(crate) text: TextRoles,
     pub(crate) semantic: Semantics,
     pub(crate) syntax: SyntaxRoles,
@@ -67,11 +85,16 @@ pub(crate) const DARK: Palette = Palette {
     dark: true,
     accent: CYAN,
     surface: Surfaces {
-        sunken: Color32::from_rgb(16, 16, 18),
-        chrome: Color32::from_rgb(22, 22, 25),
-        editor: Color32::from_rgb(30, 30, 34),
-        raised: Color32::from_rgb(38, 38, 43),
-        input: Color32::from_rgb(26, 26, 30),
+        sunken: Color32::from_rgb(12, 12, 14),
+        chrome: Color32::from_rgb(18, 18, 21),
+        editor: Color32::from_rgb(27, 27, 31),
+        raised: Color32::from_rgb(33, 33, 38),
+        input: Color32::from_rgb(21, 21, 25),
+    },
+    settings: SettingsSurfaces {
+        content: Color32::from_rgb(22, 22, 26),
+        card: Color32::from_rgb(30, 30, 35),
+        control: Color32::from_rgb(40, 40, 46),
     },
     text: TextRoles {
         primary: Color32::from_rgb(233, 234, 238),
@@ -109,6 +132,11 @@ pub(crate) const LIGHT: Palette = Palette {
         raised: Color32::from_rgb(255, 255, 255),
         input: Color32::from_rgb(236, 236, 240),
     },
+    settings: SettingsSurfaces {
+        content: Color32::from_rgb(234, 234, 238),
+        card: Color32::from_rgb(247, 247, 250),
+        control: Color32::from_rgb(255, 255, 255),
+    },
     text: TextRoles {
         primary: Color32::from_rgb(18, 19, 23),
         secondary: Color32::from_rgb(66, 69, 77),
@@ -135,22 +163,34 @@ pub(crate) const LIGHT: Palette = Palette {
 
 /// The window renders one palette at a time on one thread; a flag is enough,
 /// and it keeps every token a plain call instead of a threaded parameter.
+#[cfg(not(test))]
 static LIGHT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+std::thread_local! {
+    static LIGHT_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 pub(crate) fn set_light(light: bool) {
+    #[cfg(not(test))]
     LIGHT_ACTIVE.store(light, Ordering::Relaxed);
+    #[cfg(test)]
+    LIGHT_ACTIVE.set(light);
 }
 
 pub(crate) fn palette() -> Palette {
-    if LIGHT_ACTIVE.load(Ordering::Relaxed) {
-        LIGHT
-    } else {
-        DARK
-    }
+    #[cfg(not(test))]
+    let light = LIGHT_ACTIVE.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let light = LIGHT_ACTIVE.get();
+    if light { LIGHT } else { DARK }
 }
 
 pub(crate) fn surface() -> Surfaces {
     palette().surface
+}
+
+pub(crate) fn settings() -> SettingsSurfaces {
+    palette().settings
 }
 
 pub(crate) fn text() -> TextRoles {
@@ -313,7 +353,6 @@ pub(crate) fn composite(overlay: Color32, base: Color32) -> Color32 {
     )
 }
 
-#[cfg(test)]
 fn relative_luminance(color: Color32) -> f32 {
     let channel = |value: u8| {
         let value = f32::from(value) / 255.0;
@@ -327,7 +366,6 @@ fn relative_luminance(color: Color32) -> f32 {
 }
 
 /// WCAG contrast ratio between two opaque colors, from 1.0 to 21.0.
-#[cfg(test)]
 pub(crate) fn contrast_ratio(first: Color32, second: Color32) -> f32 {
     let (first, second) = (relative_luminance(first), relative_luminance(second));
     let (lighter, darker) = if first >= second {
@@ -340,12 +378,40 @@ pub(crate) fn contrast_ratio(first: Color32, second: Color32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DARK, LIGHT, Palette, composite, contrast_ratio, subtle};
+    use super::{DARK, LIGHT, Palette, composite, contrast_ratio, palette, set_light, subtle};
     use crate::theme::state;
     use egui::Color32;
+    use std::sync::{Arc, Barrier};
 
     fn palettes() -> [Palette; 2] {
         [DARK, LIGHT]
+    }
+
+    #[test]
+    fn parallel_tests_keep_their_palette_local() {
+        let _flag = crate::theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_light(false);
+        let ready = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let thread = std::thread::spawn({
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            move || {
+                set_light(true);
+                ready.wait();
+                release.wait();
+            }
+        });
+
+        ready.wait();
+        let main_stayed_dark = palette().dark;
+        release.wait();
+        thread.join().unwrap();
+        set_light(false);
+
+        assert!(main_stayed_dark);
     }
 
     fn ramp(palette: &Palette) -> [Color32; 4] {
@@ -428,6 +494,39 @@ mod tests {
                     ratio >= minimum,
                     "{color:?} code is only {ratio:.2}:1 against the document"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_surfaces_sit_darker_than_the_page_but_keep_text_legible() {
+        for palette in palettes() {
+            let settings = palette.settings;
+            assert!(
+                settings.content.r() > palette.surface.chrome.r(),
+                "the settings column has to sit slightly above the rail beside it"
+            );
+            assert!(
+                settings.content.r() < palette.surface.editor.r(),
+                "the settings column has to sit below the document surface"
+            );
+            assert!(settings.card.r() > settings.content.r());
+            assert!(
+                settings.control.r() > settings.card.r(),
+                "a button has to lift above the card it sits on"
+            );
+            for color in [
+                palette.text.primary,
+                palette.text.secondary,
+                palette.text.muted,
+            ] {
+                for surface in [settings.content, settings.card, settings.control] {
+                    let ratio = contrast_ratio(color, surface);
+                    assert!(
+                        ratio >= 4.5,
+                        "{color:?} on {surface:?} is only {ratio:.2}:1"
+                    );
+                }
             }
         }
     }

@@ -1,0 +1,19 @@
+---
+import { withBase } from "../lib/paths";
+
+interface Props {
+  size?: number;
+  alt?: string;
+  class?: string;
+}
+
+const { size = 28, alt = "", class: className = "" } = Astro.props;
+---
+
+<img
+  src={withBase("/editur-icon.png")}
+  width={size}
+  height={size}
+  alt={alt}
+  class:list={[className]}
+/>

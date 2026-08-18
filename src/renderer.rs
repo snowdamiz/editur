@@ -22,6 +22,8 @@ pub(crate) struct RetainedUpload {
 }
 
 pub(crate) fn mark_retained(painter: &Painter, rect: Rect, key: u64, revision: u64) {
+    let revision =
+        revision ^ crate::theme::paint_appearance(painter.pixels_per_point()).rotate_left(23);
     painter.add(PaintCallback {
         rect,
         callback: Arc::new(RetainedPaint { key, revision }),
@@ -50,6 +52,16 @@ pub(crate) fn retained_paint(primitive: &Primitive) -> Result<Option<RetainedPai
     } else {
         Err("unsupported egui paint callback".to_owned())
     }
+}
+
+fn retained_for_mesh(
+    retained: &mut Option<(RetainedPaint, Rect)>,
+    mesh_clip_rect: Rect,
+) -> Option<RetainedPaint> {
+    retained
+        .take()
+        .filter(|(_, marker_clip_rect)| *marker_clip_rect == mesh_clip_rect)
+        .map(|(paint, _)| paint)
 }
 
 pub(crate) fn upload_required(current: Option<&RetainedUpload>, next: RetainedUpload) -> bool {
@@ -116,9 +128,13 @@ compile_error!("editur supports macOS, Windows, and Linux");
 mod tests {
     use super::{
         RetainedUpload, buffer_capacity, choose_adapter,
-        invalidate_retained_uploads_on_texture_replace, retain_active_uploads, upload_required,
+        invalidate_retained_uploads_on_texture_replace, retain_active_uploads, retained_for_mesh,
+        upload_required,
     };
-    use egui::{Color32, ColorImage, TextureId, TextureOptions, TexturesDelta, epaint::ImageDelta};
+    use egui::{
+        Color32, ColorImage, RawInput, Rect, TextureId, TextureOptions, TexturesDelta, Vec2,
+        epaint::ImageDelta, pos2,
+    };
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -159,6 +175,82 @@ mod tests {
                 ..upload
             }
         ));
+    }
+
+    #[test]
+    fn retained_paint_changes_revision_with_the_theme() {
+        let _flag = crate::theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::theme::set_light(false);
+        let context = crate::theme::test_context();
+        let draw = || {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(100.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    super::mark_retained(ui.painter(), ui.max_rect(), 1, 7);
+                },
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .find_map(|primitive| super::retained_paint(&primitive.primitive).unwrap())
+                .unwrap()
+                .revision
+        };
+
+        let dark = draw();
+        crate::theme::set_light(true);
+        crate::theme::apply(&context);
+        let light = draw();
+        crate::theme::set_light(false);
+        crate::theme::apply(&context);
+
+        assert_ne!(dark, light);
+    }
+
+    #[test]
+    fn retained_paint_changes_revision_with_pixels_per_point() {
+        let context = crate::theme::test_context();
+        let draw = || {
+            let output = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(100.0))),
+                    ..RawInput::default()
+                },
+                |ui| super::mark_retained(ui.painter(), ui.max_rect(), 1, 7),
+            );
+            context
+                .tessellate(output.shapes, output.pixels_per_point)
+                .iter()
+                .find_map(|primitive| super::retained_paint(&primitive.primitive).unwrap())
+                .unwrap()
+                .revision
+        };
+
+        let regular = draw();
+        context.set_pixels_per_point(1.5);
+        let scaled = draw();
+
+        assert_ne!(regular, scaled);
+    }
+
+    #[test]
+    fn retained_marker_does_not_cross_into_an_adjacent_panel() {
+        let marker_clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(240.0, 700.0));
+        let mesh_clip = Rect::from_min_max(pos2(240.0, 0.0), pos2(1_000.0, 700.0));
+        let mut retained = Some((
+            super::RetainedPaint {
+                key: 1,
+                revision: 1,
+            },
+            marker_clip,
+        ));
+
+        assert_eq!(retained_for_mesh(&mut retained, mesh_clip), None);
     }
 
     #[test]

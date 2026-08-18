@@ -1,9 +1,11 @@
 use crate::buffer::{Buffer, DiskFingerprint};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OpenTarget {
@@ -63,14 +65,19 @@ pub fn reconcile_buffer(buffer: &mut Buffer) -> Result<ReconcileOutcome, String>
     }) {
         return Ok(ReconcileOutcome::Unchanged);
     }
-    let fingerprint = disk_fingerprint(&buffer.path)?;
+    let path = buffer.path.clone();
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let fingerprint = fingerprint_from(&metadata, &bytes);
     if buffer.fingerprint.as_ref() == Some(&fingerprint) {
         return Ok(ReconcileOutcome::Unchanged);
     }
     if buffer.dirty {
         return Ok(ReconcileOutcome::Conflict);
     }
-    *buffer = load_buffer(&buffer.path)?;
+    *buffer = Buffer::from_bytes(path, bytes, fingerprint)?;
     Ok(ReconcileOutcome::Reloaded)
 }
 
@@ -226,6 +233,85 @@ pub fn resolve_target(cwd: &Path, input: Option<&Path>) -> Result<OpenTarget, St
         file: Some(path),
         create: true,
     })
+}
+
+pub(crate) fn unique_copy_path(source: &Path, directory: &Path) -> Result<PathBuf, String> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", source.display()))?;
+    let (stem, extension) = if source.is_dir() {
+        (name, None)
+    } else {
+        (source.file_stem().unwrap_or(name), source.extension())
+    };
+    for number in 1.. {
+        let mut name = OsString::from(stem);
+        name.push(if number == 1 {
+            " copy".into()
+        } else {
+            format!(" copy {number}")
+        });
+        if let Some(extension) = extension {
+            name.push(".");
+            name.push(extension);
+        }
+        let candidate = directory.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn copy_tree_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("cannot copy symlink {}", source.display()));
+    }
+    if metadata.is_file() {
+        fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+        return Ok(());
+    }
+    fs::create_dir(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        copy_tree_entry(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn child_path(directory: &Path, name: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => Ok(directory.join(name)),
+        _ => Err("enter a single file or folder name".into()),
+    }
+}
+
+pub(crate) fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg("-R").arg(path).status();
+    #[cfg(target_os = "windows")]
+    let status = Command::new("explorer").arg("/select,").arg(path).status();
+    #[cfg(target_os = "linux")]
+    let status = Command::new("xdg-open")
+        .arg(if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        })
+        .status();
+    let status = status.map_err(|error| format!("cannot open the file manager: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "the file manager could not reveal the selected path".into())
 }
 
 #[cfg(test)]

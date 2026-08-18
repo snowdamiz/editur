@@ -1,0 +1,17 @@
+{
+  "tools": [
+    {"name": "read_wiki_structure"},
+    {"name": "read_wiki_contents"},
+    {"name": "ask_question"},
+    {"name": "list_available_repos"},
+    {"name": "devin_session_create"},
+    {"name": "devin_session_search"},
+    {"name": "devin_session_interact"},
+    {"name": "devin_session_events"},
+    {"name": "devin_session_gather"},
+    {"name": "devin_playbook_manage"},
+    {"name": "devin_knowledge_manage"},
+    {"name": "devin_schedule_manage"},
+    {"name": "list_integrations"}
+  ]
+}

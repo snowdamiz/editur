@@ -1,0 +1,78 @@
+---
+import Section from "./Section.astro";
+
+const facts = [
+  {
+    title: "External edits never disappear.",
+    body: "A changed file offers Reload, Save As, or Cancel instead of overwriting.",
+  },
+  {
+    title: "Line endings and permissions survive.",
+    body: "LF and CRLF are preserved exactly as found, and the file mode is left alone.",
+  },
+  {
+    title: "Binary input is refused.",
+    body: "Invalid UTF-8 never gets opened, so it can never be written back mangled.",
+  },
+  {
+    title: "One resident process.",
+    body: "A later editur PATH forwards the target to the running window and returns immediately.",
+  },
+];
+---
+
+<Section
+  id="editor"
+  index="editor.rs"
+  title="Saving is the part that has to be right."
+  lede="Every write goes through conflict-checked atomic replacement. If the file changed underneath you, the save stops and asks first."
+>
+  <div class="grid items-start gap-10 lg:grid-cols-2">
+    <ul class="rise space-y-5" style="--i:3">
+      {
+        facts.map((fact) => (
+          <li class="grid grid-cols-[auto_minmax(0,1fr)] gap-3 text-[15px] leading-relaxed text-ink-2">
+            <svg class="mt-1 size-4 text-accent" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+            <span>
+              <strong class="font-semibold text-ink">{fact.title}</strong>{" "}
+              {fact.body}
+            </span>
+          </li>
+        ))
+      }
+    </ul>
+
+    <div class="rise overflow-hidden rounded-xl border border-line-2 bg-raised shadow-(--shadow-lift)" style="--i:4">
+      <div class="flex items-center gap-2 border-b border-line px-3.5 py-2.5 font-mono text-[12px] text-ink-2">
+        <svg class="size-3.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M4 2.5h5.5L12.5 6v7.5H4z" stroke="currentColor"></path>
+        </svg>
+        save.rs
+        <span class="ml-auto text-ink-3">UTF-8</span>
+      </div>
+      <div class="bg-editor p-4 font-mono text-[13px] leading-5">
+        <div class="text-syn-comment">{"// The write is a rename, so a crash mid-save cannot"}</div>
+        <div class="text-syn-comment">{"// leave a half-written file on disk."}</div>
+        <div>
+          <span class="text-syn-keyword">let</span> stamp = <span class="text-syn-type">Metadata</span>::read(path)?;
+        </div>
+        <div><span class="text-syn-keyword">if</span> stamp != opened_at {"{"}</div>
+        <div>
+          &nbsp;&nbsp;<span class="text-syn-keyword">return</span> <span class="text-syn-type">Err</span>(<span class="text-syn-type">Conflict</span>::<span class="text-syn-macro">Changed</span>);
+        </div>
+        <div>{"}"}</div>
+        <div class="mt-3">temp.write_all(buffer.as_bytes())?;</div>
+        <div>
+          temp.<span class="text-syn-macro">persist</span>(path)?;
+          <span class="text-syn-comment">{"  // atomic"}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="rise mt-10 max-w-[62ch] text-sm leading-relaxed text-ink-3" style="--i:5">
+    The editor wraps long lines and scrolls vertically, so there is no horizontal scrollbar to chase. Closing the window exits completely, after the usual unsaved-change check.
+  </p>
+</Section>

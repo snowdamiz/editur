@@ -1,0 +1,65 @@
+{
+  "repositories": [
+    {
+      "repository_path": "example/project",
+      "indexing_enabled": true,
+      "indexing_status": "ready",
+      "branches": ["main"]
+    }
+  ],
+  "notes": [
+    {
+      "note_id": "note-sanitized-1",
+      "name": "Testing",
+      "content": "Run focused tests.",
+      "folder_path": "Engineering",
+      "repositories": ["example/project"]
+    }
+  ],
+  "playbooks": [
+    {
+      "playbook_id": "playbook-sanitized-1",
+      "title": "Fix and verify",
+      "content": "Reproduce, fix, and run focused tests."
+    }
+  ],
+  "schedules": [
+    {
+      "schedule_id": "schedule-sanitized-1",
+      "name": "Nightly checks",
+      "prompt": "Run the nightly checks.",
+      "frequency": "0 2 * * *",
+      "enabled": true
+    }
+  ],
+  "automations": [
+    {
+      "automation_id": "automation-sanitized-1",
+      "name": "Issue triage",
+      "enabled": true,
+      "description": "Starts a session for matching issues."
+    }
+  ],
+  "secrets": [
+    {
+      "secret_id": "secret-sanitized-1",
+      "key": "PACKAGE_TOKEN",
+      "type": "key-value"
+    }
+  ],
+  "blueprints": [
+    {
+      "blueprint_id": "blueprint-sanitized-1",
+      "type": "repository",
+      "repo_name": "example/project"
+    }
+  ],
+  "builds": [
+    {
+      "build_id": "build-sanitized-1",
+      "status": "succeeded",
+      "created_at": 1786881600,
+      "pinned": true
+    }
+  ]
+}

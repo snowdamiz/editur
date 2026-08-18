@@ -19,7 +19,6 @@ pub(crate) enum Icon {
     ChevronRight,
     Close,
     Check,
-    CheckCircle,
     Plus,
     Minus,
     #[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
@@ -27,15 +26,24 @@ pub(crate) enum Icon {
     Stop,
     Folder,
     File,
+    Home,
+    Search,
     Terminal,
+    SourceControl,
     Gear,
     ArrowUp,
+    Download,
     Refresh,
+    Undo,
     History,
     Warning,
     Error,
     Info,
+    Robot,
     Sparkle,
+    Bolt,
+    Ellipsis,
+    ExternalLink,
 }
 
 /// One piece of an icon, in grid coordinates.
@@ -71,13 +79,6 @@ const CLOSE: &[Segment] = &[
     Segment::Line(&[(11.8, 4.2), (4.2, 11.8)]),
 ];
 const CHECK: &[Segment] = &[Segment::Line(&[(3.2, 8.6), (6.4, 11.8), (12.8, 4.6)])];
-const CHECK_CIRCLE: &[Segment] = &[
-    Segment::Circle {
-        center: (8.0, 8.0),
-        radius: 5.8,
-    },
-    Segment::Line(&[(5.3, 8.2), (7.2, 10.2), (10.9, 5.8)]),
-];
 const PLUS: &[Segment] = &[
     Segment::Line(&[(8.0, 3.2), (8.0, 12.8)]),
     Segment::Line(&[(3.2, 8.0), (12.8, 8.0)]),
@@ -113,10 +114,43 @@ const FILE: &[Segment] = &[
     ]),
     Segment::Line(&[(9.4, 2.4), (9.4, 5.2), (12.2, 5.2)]),
 ];
+const HOME: &[Segment] = &[
+    Segment::Outline(&[
+        (3.2, 7.0),
+        (8.0, 3.0),
+        (12.8, 7.0),
+        (12.8, 13.0),
+        (3.2, 13.0),
+    ]),
+    Segment::Line(&[(6.6, 13.0), (6.6, 9.6), (9.4, 9.6), (9.4, 13.0)]),
+];
+const SEARCH: &[Segment] = &[
+    Segment::Circle {
+        center: (7.0, 7.0),
+        radius: 3.6,
+    },
+    Segment::Line(&[(9.7, 9.7), (12.6, 12.6)]),
+];
 const TERMINAL: &[Segment] = &[
     Segment::Outline(&[(2.2, 3.4), (13.8, 3.4), (13.8, 12.6), (2.2, 12.6)]),
     Segment::Line(&[(4.8, 6.6), (7.0, 8.4), (4.8, 10.2)]),
     Segment::Line(&[(8.4, 10.2), (11.4, 10.2)]),
+];
+const SOURCE_CONTROL: &[Segment] = &[
+    Segment::Circle {
+        center: (4.0, 4.0),
+        radius: 1.6,
+    },
+    Segment::Circle {
+        center: (4.0, 12.0),
+        radius: 1.6,
+    },
+    Segment::Circle {
+        center: (12.0, 4.0),
+        radius: 1.6,
+    },
+    Segment::Line(&[(4.0, 5.6), (4.0, 10.4)]),
+    Segment::Line(&[(5.6, 4.0), (10.4, 4.0)]),
 ];
 const GEAR: &[Segment] = &[
     Segment::Circle {
@@ -137,12 +171,54 @@ const ARROW_UP: &[Segment] = &[
     Segment::Line(&[(8.0, 12.8), (8.0, 3.4)]),
     Segment::Line(&[(3.9, 7.5), (8.0, 3.4), (12.1, 7.5)]),
 ];
+const DOWNLOAD: &[Segment] = &[
+    Segment::Line(&[(8.0, 2.6), (8.0, 10.2)]),
+    Segment::Line(&[(4.2, 6.4), (8.0, 10.2), (11.8, 6.4)]),
+    Segment::Line(&[(3.2, 13.2), (12.8, 13.2)]),
+];
 const REFRESH: &[Segment] = &[
-    Segment::Circle {
-        center: (8.0, 8.0),
-        radius: 5.2,
-    },
-    Segment::Line(&[(10.4, 2.4), (13.6, 2.4), (13.6, 5.6)]),
+    Segment::Line(&[
+        (3.0, 6.0),
+        (3.7, 4.5),
+        (5.0, 3.3),
+        (6.6, 2.7),
+        (8.3, 2.7),
+        (10.1, 3.2),
+        (11.5, 4.3),
+        (12.3, 5.6),
+    ]),
+    Segment::Line(&[(9.8, 5.6), (12.3, 5.6), (12.3, 3.1)]),
+    Segment::Line(&[
+        (13.0, 10.0),
+        (12.3, 11.5),
+        (11.0, 12.7),
+        (9.4, 13.3),
+        (7.7, 13.3),
+        (5.9, 12.8),
+        (4.5, 11.7),
+        (3.7, 10.4),
+    ]),
+    Segment::Line(&[(6.2, 10.4), (3.7, 10.4), (3.7, 12.9)]),
+];
+const UNDO: &[Segment] = &[
+    Segment::Line(&[
+        (3.3, 7.5),
+        (3.5, 9.2),
+        (4.4, 10.8),
+        (5.8, 12.0),
+        (7.5, 12.5),
+        (9.3, 12.2),
+        (10.9, 11.2),
+        (12.0, 9.8),
+        (12.5, 8.0),
+        (12.2, 6.2),
+        (11.2, 4.6),
+        (9.7, 3.5),
+        (8.0, 3.1),
+        (6.2, 3.4),
+        (5.4, 4.0),
+    ]),
+    Segment::Line(&[(3.3, 3.4), (3.3, 7.5), (7.4, 7.5)]),
 ];
 const HISTORY: &[Segment] = &[
     Segment::Circle {
@@ -178,6 +254,32 @@ const INFO: &[Segment] = &[
         radius: 0.8,
     },
 ];
+const ROBOT: &[Segment] = &[
+    Segment::Line(&[(8.0, 4.6), (8.0, 2.6)]),
+    Segment::Dot {
+        center: (8.0, 2.0),
+        radius: 0.7,
+    },
+    Segment::Outline(&[
+        (3.2, 5.0),
+        (12.8, 5.0),
+        (13.6, 5.8),
+        (13.6, 12.4),
+        (12.8, 13.2),
+        (3.2, 13.2),
+        (2.4, 12.4),
+        (2.4, 5.8),
+    ]),
+    Segment::Dot {
+        center: (5.8, 8.6),
+        radius: 0.8,
+    },
+    Segment::Dot {
+        center: (10.2, 8.6),
+        radius: 0.8,
+    },
+    Segment::Line(&[(5.8, 11.2), (10.2, 11.2)]),
+];
 const SPARKLE: &[Segment] = &[
     Segment::Solid(&[
         (6.4, 2.0),
@@ -200,6 +302,40 @@ const SPARKLE: &[Segment] = &[
         (11.3, 11.3),
     ]),
 ];
+const BOLT: &[Segment] = &[Segment::Solid(&[
+    (8.8, 1.6),
+    (3.8, 8.6),
+    (7.2, 8.6),
+    (6.2, 14.4),
+    (12.2, 6.6),
+    (8.8, 6.6),
+])];
+const ELLIPSIS: &[Segment] = &[
+    Segment::Dot {
+        center: (3.4, 8.0),
+        radius: 1.1,
+    },
+    Segment::Dot {
+        center: (8.0, 8.0),
+        radius: 1.1,
+    },
+    Segment::Dot {
+        center: (12.6, 8.0),
+        radius: 1.1,
+    },
+];
+const EXTERNAL_LINK: &[Segment] = &[
+    // The box stops short of its top-right corner, where the arrow departs.
+    Segment::Line(&[
+        (7.2, 4.4),
+        (4.2, 4.4),
+        (4.2, 11.8),
+        (11.6, 11.8),
+        (11.6, 8.8),
+    ]),
+    Segment::Line(&[(8.8, 7.2), (12.6, 3.4)]),
+    Segment::Line(&[(9.6, 3.4), (12.6, 3.4), (12.6, 6.4)]),
+];
 
 fn segments(icon: Icon) -> &'static [Segment] {
     match icon {
@@ -209,50 +345,66 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::ChevronRight => CHEVRON_RIGHT,
         Icon::Close => CLOSE,
         Icon::Check => CHECK,
-        Icon::CheckCircle => CHECK_CIRCLE,
         Icon::Plus => PLUS,
         Icon::Minus => MINUS,
         Icon::Square => SQUARE,
         Icon::Stop => STOP,
         Icon::Folder => FOLDER,
         Icon::File => FILE,
+        Icon::Home => HOME,
+        Icon::Search => SEARCH,
         Icon::Terminal => TERMINAL,
+        Icon::SourceControl => SOURCE_CONTROL,
         Icon::Gear => GEAR,
         Icon::ArrowUp => ARROW_UP,
+        Icon::Download => DOWNLOAD,
         Icon::Refresh => REFRESH,
+        Icon::Undo => UNDO,
         Icon::History => HISTORY,
         Icon::Warning => WARNING,
         Icon::Error => ERROR,
         Icon::Info => INFO,
+        Icon::Robot => ROBOT,
         Icon::Sparkle => SPARKLE,
+        Icon::Bolt => BOLT,
+        Icon::Ellipsis => ELLIPSIS,
+        Icon::ExternalLink => EXTERNAL_LINK,
     }
 }
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 22] = [
+pub(crate) const ALL: [Icon; 30] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
     Icon::ChevronRight,
     Icon::Close,
     Icon::Check,
-    Icon::CheckCircle,
     Icon::Plus,
     Icon::Minus,
     Icon::Square,
     Icon::Stop,
     Icon::Folder,
     Icon::File,
+    Icon::Home,
+    Icon::Search,
     Icon::Terminal,
+    Icon::SourceControl,
     Icon::Gear,
     Icon::ArrowUp,
+    Icon::Download,
     Icon::Refresh,
+    Icon::Undo,
     Icon::History,
     Icon::Warning,
     Icon::Error,
     Icon::Info,
+    Icon::Robot,
     Icon::Sparkle,
+    Icon::Bolt,
+    Icon::Ellipsis,
+    Icon::ExternalLink,
 ];
 
 /// Paints `icon` centered inside `rect`, scaled from the 16 px grid so the
@@ -518,5 +670,37 @@ mod tests {
                 other => panic!("{icon:?} painted {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn refresh_is_two_joined_directional_arcs() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Refresh, rect, Color32::WHITE);
+
+        assert_eq!(painted.len(), 4);
+        assert!(painted.iter().all(|shape| matches!(shape, Shape::Path(_))));
+    }
+
+    #[test]
+    fn undo_is_one_circular_arrow_without_a_clock_face() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Undo, rect, Color32::WHITE);
+
+        assert_eq!(painted.len(), 2);
+        assert!(painted.iter().all(|shape| matches!(shape, Shape::Path(_))));
+    }
+
+    #[test]
+    fn undo_keeps_a_gap_between_the_arc_and_arrowhead() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::Vec2::splat(GRID));
+        let painted = shapes(Icon::Undo, rect, Color32::WHITE);
+        let [Shape::Path(arc), Shape::Path(arrowhead)] = painted.as_slice() else {
+            panic!("undo should be two paths");
+        };
+
+        assert!(
+            arc.points.last().expect("arc end").x - arrowhead.points[0].x > arc.stroke.width,
+            "the loose arc end touches the arrowhead"
+        );
     }
 }

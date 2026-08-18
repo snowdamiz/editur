@@ -9,7 +9,7 @@ It uses the host graphics API directly: Metal on macOS, Direct3D 12 on Windows 1
 Install on macOS or Linux:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh
+curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -LsSf https://raw.githubusercontent.com/snowdamiz/editur/release/install.sh | sh
 ```
 
 Install on Windows from PowerShell:
@@ -86,6 +86,7 @@ application.openKeyboardShortcuts
 application.openSettings
 application.toggleAgentSidebar
 application.toggleAgenticView
+application.toggleDevinSidebar
 
 Files and workbench
 file.closeActiveEditor
@@ -235,6 +236,8 @@ Use the sidebar icon at the right of the titlebar to open an ACP coding agent fo
 
 The shared Agent UI supports streamed replies, plans, tool activity and supplied diffs, follow-ups, advertised model/mode controls, ACP image, audio, and resource attachments, exact permission choices, cancellation, reconnect, and bounded in-memory transcripts. History and provider-specific permission controls appear only when the connected agent advertises them. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
+The full Agent view organizes recent project roots as workspaces, including Git worktrees opened as folders. Selecting a workspace switches the agent working directory; ACP history is requested and filtered by that exact root, so each workspace shows only its own sessions. Git workspaces show their current branch. When the optional `gh` CLI is available on Editur's inherited `PATH` and authenticated, the current branch also shows its pull request state; Editur refreshes it after agent turns and silently omits it when GitHub status is unavailable.
+
 Official release builds embed one attested provider bundle. Cursor `2026.07.23-e383d2b` is provisioned during installation. Codex uses the canonical `@agentclientprotocol/codex-acp` `1.1.14` adapter, its locked `@openai/codex` `0.147.0` dependency, and a private Node.js `22.22.0` runtime; it is downloaded lazily only after its first-use license and provider-terms notice is accepted. Editur never invokes `npx`, a global Node installation, or a mutable package tag. Claude remains an unavailable catalog entry until its canonical distribution and licensing can meet the same pinned private-package policy.
 
 To run the Cursor-only local development flow, use `./dev.sh .`; it generates and caches the current platform manifest under `target/`. A plain `cargo run` intentionally omits provider metadata.
@@ -243,7 +246,17 @@ Authentication is owned by the selected agent. Editur renders agent-launched log
 
 Prompts, relevant project code, tool results, and conversation context may be sent to the selected provider and its model providers. Editur does not add telemetry or persist the transcript. Review [Cursor's data-use policy](https://cursor.com/data-use) or [OpenAI's data controls](https://platform.openai.com/docs/guides/your-data), use provider ignore controls where available, and do not submit regulated or third-party data unless your agreements permit it.
 
-Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. It has no cloud agents, parallel chats, persisted transcripts, Editur-owned allowlists, worktrees, automatic Git operations, or ACP v2 draft features.
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. The ACP surface has no cloud sessions, parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
+
+## Devin cloud sidebar
+
+Use the bolt icon at the right of the titlebar, or bind `application.toggleDevinSidebar`, to supervise cloud Devin separately from the local ACP Agent. The two assistant sidebars share one right-hand slot but retain independent state and drafts. Sessions support server filters, advanced and batch creation, messages and attachments, event search/detail, tags, insights, lineage, pull requests, and lifecycle controls. The sidebar section switcher also exposes repository docs and indexing, knowledge, playbooks, schedules and event automations, integrations, Devin Review, blueprints/builds, and write-only organization secrets. Every resource is permission-gated independently.
+
+Connect with a Devin personal access token or service-user key beginning with `cog_`. User-entered credentials are stored only in the operating-system credential store. Developer builds can instead inherit `DEVIN_API_KEY` and optional `DEVIN_ORG_ID`; environment values take precedence and are never copied into Editur settings. Editur discovers the organization when the credential identifies one, and asks you to choose when a PAT can access several. It uses Devin's documented MCP endpoint plus organization-scoped v3/v3beta1 endpoints; a `403` disables only the affected feature. See [Devin authentication](https://docs.devin.ai/api-reference/authentication), [Devin MCP](https://docs.devin.ai/work-with-devin/devin-mcp), and the [v3 permission model](https://docs.devin.ai/api-reference/v3/overview).
+
+Devin works from its remote clone: it cannot see unsaved buffers, uncommitted changes, or commits that have not been pushed. Editur never uploads a local diff, turns remote paths into local file links, checks out a Devin pull request, or adds remote activity to local changed-file state. Polling runs only while the Devin sidebar is visible, resumes immediately when reopened, and stopping the polling does not stop the remote session.
+
+Sleep and archive are reversible; sending to a sleeping session wakes it, and archived sessions can be unarchived from the Archived scope. Termination permanently stops remote work and always requires the danger confirmation dialog. Disconnect removes only the stored local token after confirmation and does not alter remote sessions. Authentication, transport, rate-limit, offline, and lifecycle errors shown by the UI are sanitized; raw response bodies, authorization headers, and credential-bearing URL parameters are never written to preferences, diagnostics, or logs.
 
 ## Language servers
 
@@ -269,4 +282,4 @@ Syntax highlighting is fully built in and selected automatically from the file n
 
 `EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan, [LSP_PLAN.md](LSP_PLAN.md) for the language-server contract and Settings UI, and [KEYBINDINGS_PLAN.md](KEYBINDINGS_PLAN.md) for configurable VS Code, Vim, and custom keyboard profiles.
+See [PERFORMANCE.md](PERFORMANCE.md) for the current release baseline, [PLAN.md](PLAN.md) for the v1 product contract, [AURA_INTERNAL_EDITOR_PLAN.md](AURA_INTERNAL_EDITOR_PLAN.md) for the company workbench architecture and roadmap, [ACP_AGENT_PLAN.md](ACP_AGENT_PLAN.md) for the agent-sidebar implementation plan, [DEVIN_SIDEBAR_PLAN.md](DEVIN_SIDEBAR_PLAN.md) for the dedicated Devin cloud sidebar, [LSP_PLAN.md](LSP_PLAN.md) for the language-server contract and Settings UI, and [KEYBINDINGS_PLAN.md](KEYBINDINGS_PLAN.md) for configurable VS Code, Vim, and custom keyboard profiles.

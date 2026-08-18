@@ -13,8 +13,8 @@ pub(crate) use color::contrast_ratio;
 pub(crate) use color::traffic;
 #[allow(unused_imports)] // public token surface; consumers arrive over time
 pub(crate) use color::{
-    accent, ansi, composite, ink, mix, semantic, set_light, subtle, surface, syntax, text,
-    text_disabled,
+    accent, ansi, composite, ink, mix, semantic, set_light, settings, subtle, surface, syntax,
+    text, text_disabled,
 };
 pub(crate) use metrics::{
     Density, chrome, control, corner, density, radius, set_density, shadow, space, stroke,
@@ -22,6 +22,10 @@ pub(crate) use metrics::{
 pub(crate) use state::{border, callout, diff, editor};
 
 use egui::{Context, Stroke, Style, style::WidgetVisuals};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+#[cfg(test)]
+pub(crate) static PALETTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn apply(context: &Context) {
     install_fonts(context);
@@ -36,11 +40,19 @@ fn install_fonts(context: &Context) {
 /// One number that changes whenever anything the retained caches baked in has
 /// moved: the palette, the editor's metrics, or the density.
 pub(crate) fn appearance() -> u64 {
-    let light = u64::from(!color::palette().dark);
-    let compact = u64::from(density() == Density::Compact);
-    let size = u64::from(typography::code_size().to_bits());
-    let ratio = u64::from(typography::code_ratio().to_bits());
-    light | compact << 1 | size << 8 | ratio.rotate_left(40)
+    let mut hasher = DefaultHasher::new();
+    color::palette().dark.hash(&mut hasher);
+    (density() == Density::Compact).hash(&mut hasher);
+    typography::code_size().to_bits().hash(&mut hasher);
+    typography::code_ratio().to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Everything baked into a laid-out galley or tessellated retained mesh.
+/// Egui recreates its font atlas when the physical pixel scale changes, so
+/// cached text must move revisions even when the palette and font sizes do not.
+pub(crate) fn paint_appearance(pixels_per_point: f32) -> u64 {
+    appearance() ^ u64::from(pixels_per_point.to_bits()).rotate_left(17)
 }
 
 #[cfg(test)]
@@ -53,8 +65,10 @@ pub(crate) fn test_context() -> Context {
 pub(crate) fn apply_to(style: &mut Style) {
     // Motion is explicit and quantized in `theme::motion`; nothing may rely on
     // egui's implicit per-widget animation, which the retained renderer cannot
-    // fold into a revision.
+    // fold into a revision. Programmatic scrolls (scroll_to_rect) jump for the
+    // same reason.
     style.animation_time = 0.0;
+    style.scroll_animation = egui::style::ScrollAnimation::none();
     style.text_styles = typography::text_styles();
     style.spacing.item_spacing = egui::vec2(space::SMALL, space::TIGHT);
     style.spacing.button_padding = egui::vec2(space::MEDIUM, space::SNUG);
@@ -66,7 +80,7 @@ pub(crate) fn apply_to(style: &mut Style) {
     visuals.dark_mode = color::palette().dark;
     visuals.weak_text_color = Some(text.muted);
     visuals.selection.bg_fill = editor::selection();
-    visuals.selection.stroke = Stroke::new(stroke::DIVIDER, text.primary);
+    visuals.selection.stroke = Stroke::new(0.0, text.primary);
     visuals.hyperlink_color = accent();
     visuals.faint_bg_color = state::hover();
     visuals.extreme_bg_color = surface.input;
@@ -137,7 +151,6 @@ mod tests {
     use super::{
         accent, apply, color, editor, radius, set_light, space, surface, text, typography,
     };
-
     /// The one test that keeps this plan from unwinding: a color built outside
     /// the theme module is a color that will drift away from every other color.
     #[test]
@@ -175,6 +188,9 @@ mod tests {
 
     #[test]
     fn theme_switching_does_not_require_a_restart() {
+        let _flag = super::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = super::test_context();
         assert!(color::palette().dark);
         set_light(true);
@@ -191,6 +207,9 @@ mod tests {
 
     #[test]
     fn apply_wires_the_token_layer_into_every_egui_style() {
+        let _flag = super::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = egui::Context::default();
 
         apply(&context);
@@ -200,6 +219,10 @@ mod tests {
         assert_eq!(style.visuals.window_fill, surface().raised);
         assert_eq!(style.visuals.text_edit_bg_color, Some(surface().input));
         assert_eq!(style.visuals.selection.bg_fill, editor::selection());
+        assert_eq!(
+            style.visuals.selection.stroke.width, 0.0,
+            "focused text inputs must not gain an outline"
+        );
         assert_eq!(
             style.visuals.selection.stroke.color,
             text().primary,

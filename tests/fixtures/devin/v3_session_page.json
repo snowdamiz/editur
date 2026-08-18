@@ -1,0 +1,36 @@
+{
+  "items": [
+    {
+      "session_id": "devin-session-fixture",
+      "url": "https://app.devin.ai/sessions/devin-session-fixture",
+      "status": "running",
+      "status_detail": "waiting_for_user",
+      "title": "Sanitized session",
+      "tags": ["fixture"],
+      "org_id": "org-fixture",
+      "created_at": 1786881600,
+      "updated_at": 1786885200,
+      "acus_consumed": 3.5,
+      "devin_mode": "fast",
+      "category": "bug_fixing",
+      "subcategory": "Other",
+      "playbook_id": "playbook-fixture",
+      "automation_id": "automation-fixture",
+      "structured_output": {"result": "sanitized"},
+      "pull_requests": [
+        {
+          "pr_url": "https://github.com/example/example/pull/1",
+          "pr_state": "open"
+        },
+        {
+          "pr_url": "https://gitlab.com/example/example/-/merge_requests/2",
+          "pr_state": "merged"
+        }
+      ],
+      "child_session_ids": ["devin-child-one", "devin-child-two"]
+    }
+  ],
+  "end_cursor": "cursor-fixture",
+  "has_next_page": true,
+  "total": 1
+}

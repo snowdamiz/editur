@@ -1,0 +1,83 @@
+---
+import "../styles/global.css";
+import { withBase } from "../lib/paths";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const title =
+  Astro.props.title ??
+  "Editur — a small native editor for focused file changes";
+const description =
+  Astro.props.description ??
+  "Editur is a focused native macOS editor built directly on Metal, with no runtime graphics fallback.";
+
+const canonical = new URL(withBase("/"), Astro.site).href;
+const ogImage = new URL(withBase("/og.png"), Astro.site).href;
+const favicon = withBase("/editur-icon.png");
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0c0c0e" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Editur" />
+    <meta property="og:description" content="A small native editor for quick, focused file changes." />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Editur" />
+    <meta name="twitter:description" content="A small native editor for quick, focused file changes." />
+    <meta name="twitter:image" content={ogImage} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={favicon} type="image/png" />
+    <link rel="apple-touch-icon" href={favicon} />
+    <script is:inline>
+      (function () {
+        try {
+          var stored = localStorage.getItem("editur-theme");
+          var mode =
+            stored ||
+            (window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark");
+          document.documentElement.setAttribute(
+            "data-theme",
+            mode === "light" ? "light" : "dark",
+          );
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) {
+            meta.setAttribute(
+              "content",
+              mode === "light" ? "#f6f6f8" : "#0c0c0e",
+            );
+          }
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+        document.documentElement.classList.add("js");
+      })();
+    </script>
+  </head>
+  <body class="bg-sunken text-ink antialiased">
+    <div class="grain" aria-hidden="true"></div>
+    <a
+      href="#content"
+      class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-[100] focus:rounded-md focus:bg-raised focus:px-3 focus:py-2 focus:text-ink"
+    >
+      Skip to content
+    </a>
+    <slot />
+    <script>
+      import "../scripts/ui.ts";
+    </script>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+---
+import InstallChoice from "./InstallChoice.astro";
+import { RELEASE, REPO, README } from "../lib/commands";
+---
+
+<section class="border-t border-line py-24 md:py-32">
+  <div class="mx-auto min-w-0 max-w-6xl px-6">
+    <h2 class="rise max-w-[16ch] text-3xl font-semibold tracking-tight text-ink md:text-5xl md:leading-[1.08]">
+      Small enough to stay out of the way.
+    </h2>
+    <p class="rise mt-5 text-lg text-ink-2" style="--i:1">
+      One file, one window, one keystroke to save it. Download the native build, or install from the terminal.
+    </p>
+    <div class="rise mt-12 min-w-0" style="--i:2">
+      <InstallChoice />
+    </div>
+    <p class="rise mt-8 text-sm text-ink-3" style="--i:3">
+      <a class="text-ink-2 underline decoration-line underline-offset-2 hover:text-ink" href={RELEASE}>
+        All release assets
+      </a>
+    </p>
+  </div>
+</section>
+
+<footer class="border-t border-line">
+  <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-6 py-6 font-mono text-[12px] text-ink-3">
+    <span>Built in Rust</span>
+    <a class="text-ink-2 no-underline hover:text-ink" href={REPO}>github.com/snowdamiz/editur</a>
+    <a class="text-ink-2 no-underline hover:text-ink" href={README}>Documentation</a>
+  </div>
+</footer>

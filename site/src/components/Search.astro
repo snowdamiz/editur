@@ -1,0 +1,78 @@
+---
+import Section from "./Section.astro";
+---
+
+<Section
+  id="search"
+  index="search.rs"
+  title="Search that stays out of the way."
+  lede="Recursive indexing does not start until your first non-empty project query. Opening a large repository costs nothing until you actually ask it something."
+>
+  <div class="grid items-start gap-10 lg:grid-cols-2">
+    <div class="rise overflow-hidden rounded-xl border border-line-2 bg-raised shadow-(--shadow-lift)" style="--i:3">
+      <div class="flex items-center gap-2.5 border-b border-line bg-input px-3.5 py-3 font-mono text-[13px] text-ink">
+        <svg class="size-3.5 text-ink-3" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.25" stroke="currentColor"></circle>
+          <path d="m10.5 10.5 3 3" stroke="currentColor" stroke-linecap="round"></path>
+        </svg>
+        atomic<span class="caret" aria-hidden="true"></span>
+      </div>
+      <p class="px-3.5 pt-3 pb-1 font-mono text-[10px] tracking-[0.14em] text-ink-3 uppercase">Filenames</p>
+      <div class="flex items-center justify-between bg-accent/12 px-3.5 py-2 font-mono text-[12.5px]">
+        <span><mark class="bg-accent/25 text-ink">atomic</mark>_save.rs</span>
+        <span class="text-ink-3">src/</span>
+      </div>
+      <p class="px-3.5 pt-3 pb-1 font-mono text-[10px] tracking-[0.14em] text-ink-3 uppercase">Contents</p>
+      <div class="flex items-center justify-between px-3.5 py-2 font-mono text-[12.5px] text-ink-2">
+        <span>fn <mark class="bg-accent/25 text-ink">atomic</mark>_replace(&amp;self)</span>
+        <span class="text-ink-3">src/save.rs:118</span>
+      </div>
+      <div class="flex items-center justify-between px-3.5 py-2 font-mono text-[12.5px] text-ink-2">
+        <span>{"// "}<mark class="bg-accent/25 text-ink">atomic</mark> rename, never truncate</span>
+        <span class="text-ink-3">src/save.rs:104</span>
+      </div>
+      <p class="border-t border-line px-3.5 py-2.5 font-mono text-[11px] text-ink-3">
+        Enter to open · Shift+Enter for previous
+      </p>
+    </div>
+
+    <ul class="rise space-y-5" style="--i:4">
+      <li class="grid grid-cols-[auto_minmax(0,1fr)] gap-3 text-[15px] leading-relaxed text-ink-2">
+        <svg class="mt-1 size-4 text-accent" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+        <span>
+          <strong class="font-semibold text-ink">
+            <kbd class="mod inline-block min-w-[1.5em] rounded-md border border-line-2 border-b-2 bg-raised px-1.5 py-0.5 font-mono text-[0.78em] text-ink">⌘</kbd>
+            <kbd class="inline-block min-w-[1.5em] rounded-md border border-line-2 border-b-2 bg-raised px-1.5 py-0.5 font-mono text-[0.78em] text-ink">F</kbd>
+            in the file.
+          </strong>
+          Matches highlight live, with Enter and Shift+Enter to walk them.
+        </span>
+      </li>
+      <li class="grid grid-cols-[auto_minmax(0,1fr)] gap-3 text-[15px] leading-relaxed text-ink-2">
+        <svg class="mt-1 size-4 text-accent" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+        <span>
+          <strong class="font-semibold text-ink">
+            <kbd class="mod inline-block min-w-[1.5em] rounded-md border border-line-2 border-b-2 bg-raised px-1.5 py-0.5 font-mono text-[0.78em] text-ink">⌘</kbd>
+            <kbd class="inline-block min-w-[1.5em] rounded-md border border-line-2 border-b-2 bg-raised px-1.5 py-0.5 font-mono text-[0.78em] text-ink">⇧</kbd>
+            <kbd class="inline-block min-w-[1.5em] rounded-md border border-line-2 border-b-2 bg-raised px-1.5 py-0.5 font-mono text-[0.78em] text-ink">F</kbd>
+            across the project.
+          </strong>
+          Results arrive grouped into filename and content matches.
+        </span>
+      </li>
+      <li class="grid grid-cols-[auto_minmax(0,1fr)] gap-3 text-[15px] leading-relaxed text-ink-2">
+        <svg class="mt-1 size-4 text-accent" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M3.5 8.5 6.5 11.5 12.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+        <span>
+          <strong class="font-semibold text-ink">A lazy tree.</strong>
+          The explorer reads directories as you expand them, not on launch.
+        </span>
+      </li>
+    </ul>
+  </div>
+</Section>

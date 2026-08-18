@@ -36,6 +36,7 @@ struct LabelKey {
     width: u32,
     selected: bool,
     hovered: bool,
+    appearance: u64,
 }
 
 #[derive(Default)]
@@ -51,6 +52,8 @@ pub struct TreeOutput {
     pub clicked: Option<usize>,
     pub drag_started: Option<usize>,
     pub context_requested: Option<usize>,
+    /// The project name at the top was clicked; the app opens the switcher.
+    pub root_clicked: bool,
 }
 
 impl TreeSurface {
@@ -63,9 +66,8 @@ impl TreeSurface {
         scroll_to_selected: bool,
     ) -> TreeOutput {
         let (id, full) = ui.allocate_space(ui.available_size());
-        ui.painter().rect_filled(full, 0.0, theme::surface().chrome);
         let header = full.with_max_y((full.top() + theme::control::ROW).min(full.bottom()));
-        self.draw_root_header(ui, id, header, root);
+        let root_clicked = self.draw_root_header(ui, id, header, root);
         let rect = full.with_min_y(header.bottom());
         let content = rect;
         let response = ui.interact(content, id.with("tree"), Sense::click_and_drag());
@@ -199,6 +201,7 @@ impl TreeSurface {
                 width: available.to_bits(),
                 selected: is_selected,
                 hovered: is_hovered,
+                appearance: theme::paint_appearance(ui.pixels_per_point()),
             };
             let label = self.labels.entry(key).or_insert_with(|| {
                 let color = if is_selected || is_hovered {
@@ -256,17 +259,28 @@ impl TreeSurface {
             clicked,
             drag_started,
             context_requested,
+            root_clicked,
         }
     }
 
-    /// The first thing in the window that says which project is open.
-    fn draw_root_header(&self, ui: &mut Ui, id: egui::Id, header: Rect, root: &Path) {
-        let response = ui.interact(header, id.with("tree_root"), Sense::hover());
+    /// The first thing in the window that says which project is open. Clicking
+    /// it is how the editor switches projects, so it reads as a button on
+    /// hover.
+    fn draw_root_header(&self, ui: &mut Ui, id: egui::Id, header: Rect, root: &Path) -> bool {
+        let response = ui
+            .interact(header, id.with("tree_root"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Switch project")
+        });
         let name = root
             .file_name()
             .unwrap_or(root.as_os_str())
             .to_string_lossy();
         let painter = ui.painter_at(header);
+        if response.hovered() {
+            painter.rect_filled(header, 0.0, theme::state::hover());
+        }
         let left = header.left() + theme::space::MEDIUM;
         icons::paint(
             &painter,
@@ -277,15 +291,38 @@ impl TreeSurface {
             ),
             theme::text().muted,
         );
+        let label_left = left + icons::GRID + theme::space::SNUG;
         painter.text(
-            egui::pos2(left + icons::GRID + theme::space::SNUG, header.center().y),
+            egui::pos2(label_left, header.center().y),
             egui::Align2::LEFT_CENTER,
-            name,
+            name.as_ref(),
             theme::typography::strong(),
             theme::text().primary,
         );
+        if response.hovered() {
+            let name_width = painter
+                .layout_no_wrap(
+                    name.into_owned(),
+                    theme::typography::strong(),
+                    theme::text().primary,
+                )
+                .size()
+                .x;
+            icons::paint(
+                &painter,
+                Icon::ChevronDown,
+                Rect::from_center_size(
+                    egui::pos2(
+                        label_left + name_width + theme::space::SNUG + icons::GRID * 0.5,
+                        header.center().y,
+                    ),
+                    egui::Vec2::splat(icons::GRID * 0.75),
+                ),
+                theme::text().muted,
+            );
+        }
         painter.hline(header.x_range(), header.bottom(), theme::border::hairline());
-        response.on_hover_text(root.display().to_string());
+        response.on_hover_text(root.display().to_string()).clicked()
     }
 
     pub fn visible_rows(&self, total: usize, viewport_height: f32) -> Range<usize> {
@@ -322,9 +359,10 @@ impl TreeSurface {
 }
 
 /// The x of the indent guide for `depth`, which is also where that depth's
-/// content starts.
+/// content starts. The base offset leaves the depth-0 disclosure chevron a
+/// full gutter instead of pressing it against the sidebar border.
 fn column(rect: Rect, depth: usize) -> f32 {
-    rect.left() + 14.0 + depth as f32 * INDENT
+    rect.left() + theme::space::XWIDE + depth as f32 * INDENT
 }
 
 #[cfg(test)]
@@ -345,6 +383,60 @@ mod tests {
         let visible = surface.visible_rows(100, 220.0);
         assert!(visible.contains(&50));
         assert!(visible.len() <= 13);
+    }
+
+    #[test]
+    fn file_tree_scrollbar_matches_the_agent_sidebar_style() {
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows: Vec<_> = (0..40)
+            .map(|index| TreeRow {
+                entry: TreeEntry {
+                    name: OsString::from(format!("file-{index}.rs")),
+                    path: PathBuf::from(format!("file-{index}.rs")),
+                    is_dir: false,
+                    is_symlink: false,
+                },
+                label: format!("file-{index}.rs"),
+                depth: 0,
+                directory: false,
+                expanded: false,
+                revision: index,
+            })
+            .collect();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(200.0, 240.0));
+        let mut agent_width = 0.0;
+        let output = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    Event::PointerMoved(screen.center()),
+                    Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -40.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                agent_width = ui.spacing().scroll.floating_width;
+                surface.show(ui, Path::new("/tmp/project"), &rows, None, false);
+            },
+        );
+        let thumb = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Rect(shape) if shape.fill == theme::state::scrollbar::thumb() => {
+                    Some(shape.rect)
+                }
+                _ => None,
+            })
+            .expect("visible file tree scrollbar thumb");
+        assert_eq!(thumb.width(), agent_width);
+        assert_eq!(thumb.right(), screen.right());
     }
 
     #[test]
@@ -419,6 +511,50 @@ mod tests {
         );
 
         assert_eq!(surface.hovered, Some(0));
+    }
+
+    #[test]
+    fn theme_switch_rebuilds_a_previously_hovered_label() {
+        let _flag = theme::PALETTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        theme::set_light(false);
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows = [TreeRow {
+            entry: TreeEntry {
+                name: OsString::from("main.rs"),
+                path: PathBuf::from("main.rs"),
+                is_dir: false,
+                is_symlink: false,
+            },
+            label: "main.rs".into(),
+            depth: 0,
+            directory: false,
+            expanded: false,
+            revision: 1,
+        }];
+        let mut draw = || {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0))),
+                    events: vec![Event::PointerMoved(pos2(100.0, 42.0))],
+                    ..RawInput::default()
+                },
+                |ui| {
+                    surface.show(ui, Path::new("/tmp/project"), &rows, None, false);
+                },
+            );
+        };
+
+        draw();
+        theme::set_light(true);
+        theme::apply(&context);
+        draw();
+        theme::set_light(false);
+        theme::apply(&context);
+
+        assert_eq!(surface.labels.len(), 2);
     }
 
     #[test]
@@ -539,6 +675,49 @@ mod tests {
             }]),
             Some(0)
         );
+    }
+
+    #[test]
+    fn clicking_the_root_header_reports_a_project_switch_request() {
+        let context = theme::test_context();
+        let mut surface = TreeSurface::default();
+        let rows: [TreeRow; 0] = [];
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0)));
+        let header = pos2(100.0, 10.0);
+        let mut draw = |events| {
+            let mut root_clicked = false;
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    root_clicked = surface
+                        .show(ui, Path::new("/tmp/project"), &rows, None, false)
+                        .root_clicked
+                },
+            );
+            root_clicked
+        };
+
+        draw(Vec::new());
+        draw(vec![
+            Event::PointerMoved(header),
+            Event::PointerButton {
+                pos: header,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+
+        assert!(draw(vec![Event::PointerButton {
+            pos: header,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]));
     }
 
     #[test]
@@ -667,6 +846,20 @@ mod tests {
                 "depth {depth} draws its chevron on top of its own guide"
             );
         }
+    }
+
+    #[test]
+    fn the_top_level_chevron_keeps_a_breathing_gutter_from_the_left_border() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(200.0));
+        let chevron_center = super::column(rect, 0) - super::CHEVRON_INSET;
+        let chevron_left = chevron_center - crate::icons::GRID * 0.75 * 0.5;
+
+        assert!(
+            chevron_left - rect.left() >= theme::space::MEDIUM,
+            "the depth-0 chevron glyph starts {}px from the border, wants at least {}px",
+            chevron_left - rect.left(),
+            theme::space::MEDIUM
+        );
     }
 
     #[test]

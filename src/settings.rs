@@ -12,6 +12,9 @@ const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_BYTES: usize = 32 * 1024;
+pub const UI_SCALE_MIN_PERCENT: u16 = 50;
+pub const UI_SCALE_MAX_PERCENT: u16 = 200;
+pub const UI_SCALE_STEP_PERCENT: u16 = 10;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -32,10 +35,13 @@ pub struct Settings {
 pub struct AppearanceSettings {
     pub theme: ThemePreference,
     pub density: DensityPreference,
+    pub dense_agent: bool,
+    pub ui_scale_percent: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_font_family: Option<String>,
     pub editor_font_size: f32,
     pub line_height: LineHeightPreference,
+    pub line_wrap: LineWrapPreference,
     pub reduced_motion: bool,
 }
 
@@ -44,9 +50,12 @@ impl Default for AppearanceSettings {
         Self {
             theme: ThemePreference::Dark,
             density: DensityPreference::Comfortable,
+            dense_agent: false,
+            ui_scale_percent: 100,
             editor_font_family: None,
             editor_font_size: 14.0,
             line_height: LineHeightPreference::Default,
+            line_wrap: LineWrapPreference::NoWrap,
             reduced_motion: false,
         }
     }
@@ -58,6 +67,9 @@ impl AppearanceSettings {
     }
 
     pub fn normalized(mut self) -> Self {
+        self.ui_scale_percent = self
+            .ui_scale_percent
+            .clamp(UI_SCALE_MIN_PERCENT, UI_SCALE_MAX_PERCENT);
         self.editor_font_size = self.editor_font_size.clamp(10.0, 24.0).round();
         if let Some(family) = self.editor_font_family.as_mut() {
             let trimmed = family.trim().to_owned();
@@ -97,6 +109,14 @@ pub enum LineHeightPreference {
     #[default]
     Default,
     Comfortable,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineWrapPreference {
+    #[default]
+    NoWrap,
+    Wrap,
 }
 
 impl LineHeightPreference {
@@ -184,6 +204,12 @@ pub fn load(path: &Path) -> Result<Settings, String> {
 
 fn validate(settings: &Settings) -> Result<(), String> {
     let appearance = settings.appearance.clone().normalized();
+    if appearance.ui_scale_percent != settings.appearance.ui_scale_percent {
+        return Err(format!(
+            "uiScalePercent must be between {UI_SCALE_MIN_PERCENT} and {UI_SCALE_MAX_PERCENT}, got {}",
+            settings.appearance.ui_scale_percent
+        ));
+    }
     if appearance.editor_font_size != settings.appearance.editor_font_size {
         return Err(format!(
             "editorFontSize must be between 10 and 24, got {}",
@@ -294,6 +320,10 @@ mod tests {
         let path = directory.path().join("settings.json");
 
         assert_eq!(load(&path).unwrap(), Settings::default());
+        assert_eq!(
+            Settings::default().appearance.line_wrap,
+            LineWrapPreference::NoWrap
+        );
         assert!(!path.exists());
     }
 
@@ -448,9 +478,12 @@ mod tests {
             appearance: AppearanceSettings {
                 theme: ThemePreference::Light,
                 density: DensityPreference::Compact,
+                dense_agent: true,
+                ui_scale_percent: 100,
                 editor_font_family: Some("Menlo".into()),
                 editor_font_size: 16.0,
                 line_height: LineHeightPreference::Comfortable,
+                line_wrap: LineWrapPreference::Wrap,
                 reduced_motion: true,
             },
             ..Settings::default()
@@ -478,6 +511,46 @@ mod tests {
         assert_eq!(loaded.appearance.theme, ThemePreference::System);
         assert_eq!(loaded.appearance.line_height, LineHeightPreference::Compact);
         assert_eq!(loaded.appearance.editor_font_size, 13.0);
+    }
+
+    #[test]
+    fn interface_scale_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.appearance.ui_scale_percent = 150;
+
+        save(&path, &settings).unwrap();
+
+        assert_eq!(load(&path).unwrap().appearance.ui_scale_percent, 150);
+    }
+
+    #[test]
+    fn dense_agent_is_opt_in_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = Settings::default();
+        assert!(!settings.appearance.dense_agent);
+        settings.appearance.dense_agent = true;
+
+        save(&path, &settings).unwrap();
+
+        assert!(load(&path).unwrap().appearance.dense_agent);
+    }
+
+    #[test]
+    fn interface_scale_outside_supported_range_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+
+        for percent in [49, 201] {
+            fs::write(
+                &path,
+                format!(r#"{{"appearance":{{"uiScalePercent":{percent}}}}}"#),
+            )
+            .unwrap();
+            assert!(load(&path).unwrap_err().contains("uiScalePercent"));
+        }
     }
 
     #[test]

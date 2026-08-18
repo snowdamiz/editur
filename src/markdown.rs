@@ -69,12 +69,7 @@ fn layout_with_code_highlighting(
                 Tag::List(first) => lists.push(List { next: first }),
                 Tag::Item => {
                     ensure_newlines(&mut job, 1);
-                    append(
-                        &mut job,
-                        &"  ".repeat(lists.len().saturating_sub(1)),
-                        &style,
-                        false,
-                    );
+                    append(&mut job, &"  ".repeat(lists.len()), &style, false);
                     let marker = lists.last_mut().map_or_else(
                         || "• ".to_owned(),
                         |list| match list.next.as_mut() {
@@ -200,11 +195,8 @@ fn compact(mut job: LayoutJob) -> LayoutJob {
             .retain(|section| !section.byte_range.is_empty());
     }
     for section in &mut job.sections {
-        section.format.font_id.size = (section.format.font_id.size * 0.93).min(18.5);
-        section.format.line_height = section
-            .format
-            .line_height
-            .map(|height| (height * 0.89).min(22.5));
+        section.format.font_id.size = section.format.font_id.size.min(20.0);
+        section.format.line_height = section.format.line_height.map(|height| height.min(25.0));
     }
     job
 }
@@ -234,11 +226,15 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
         TextFormat {
             font_id: if code {
                 theme::typography::code_small()
+            } else if style.strong > 0 || style.heading.is_some() {
+                FontId::new(heading_size, theme::typography::strong_family())
             } else {
                 FontId::proportional(heading_size)
             },
             color,
-            background: if code {
+            background: if inline_code {
+                theme::state::hover()
+            } else if style.code_block > 0 {
                 theme::state::selected()
             } else {
                 Color32::TRANSPARENT
@@ -265,6 +261,9 @@ fn append(job: &mut LayoutJob, text: &str, style: &Style, inline_code: bool) {
 }
 
 fn ensure_newlines(job: &mut LayoutJob, count: usize) {
+    if job.text.is_empty() {
+        return;
+    }
     let missing = count.saturating_sub(job.text.chars().rev().take_while(|c| *c == '\n').count());
     if missing > 0 {
         append(job, &"\n".repeat(missing), &Style::default(), false);
@@ -284,7 +283,7 @@ mod tests {
 
         assert_eq!(
             job.text,
-            "Title\n\nRead carefully and visit Editur.\n\n• first\n• second\n\nlet answer = 42;\n"
+            "Title\n\nRead carefully and visit Editur.\n\n  • first\n  • second\n\nlet answer = 42;\n"
         );
         let title = job.sections.first().expect("title formatting");
         assert!(title.format.font_id.size > 20.0);
@@ -322,7 +321,7 @@ mod tests {
         let title = font_at("Title");
         let body = font_at("Body");
         let code = font_at("code");
-        assert_eq!(title.family, egui::FontFamily::Proportional);
+        assert_eq!(title.family, theme::typography::strong_family());
         assert_eq!(body.family, egui::FontFamily::Proportional);
         assert_eq!(code.family, egui::FontFamily::Monospace);
         assert!(title.size <= 24.0);
@@ -331,11 +330,64 @@ mod tests {
     }
 
     #[test]
-    fn compact_agent_markdown_keeps_body_copy_comfortably_readable() {
+    fn compact_agent_markdown_uses_readable_body_metrics() {
         let job = compact_layout("Body copy", 320.0, |_, _| None);
-        let body_size = job.sections[0].format.font_id.size;
+        let body = &job.sections[0].format;
 
-        assert!(body_size > 12.8, "compact body text was {body_size}px");
+        assert!(
+            body.font_id.size >= 14.0,
+            "agent body was {}px",
+            body.font_id.size
+        );
+        assert!(
+            body.line_height.is_some_and(|height| height >= 21.0),
+            "agent line box was {:?}",
+            body.line_height
+        );
+    }
+
+    #[test]
+    fn compact_agent_markdown_uses_semibold_for_visual_hierarchy() {
+        let job = compact_layout("## Result\n\nRead **carefully**.", 320.0, |_, _| None);
+        let family_at = |needle: &str| {
+            let offset = job.text.find(needle).unwrap();
+            job.sections
+                .iter()
+                .find(|section| section.byte_range.contains(&offset.into()))
+                .unwrap()
+                .format
+                .font_id
+                .family
+                .clone()
+        };
+
+        assert_eq!(family_at("Result"), theme::typography::strong_family());
+        assert_eq!(family_at("carefully"), theme::typography::strong_family());
+        assert_eq!(family_at("Read"), egui::FontFamily::Proportional);
+    }
+
+    #[test]
+    fn compact_agent_markdown_indents_list_hierarchy() {
+        let job = compact_layout("- top\n  - nested", 320.0, |_, _| None);
+
+        assert_eq!(job.text, "  • top\n    • nested");
+    }
+
+    #[test]
+    fn inline_code_is_quieter_than_fenced_code() {
+        let job = layout("Use `inline`.\n\n```text\nblock\n```", 320.0);
+        let background_at = |needle: &str| {
+            let offset = job.text.find(needle).unwrap();
+            job.sections
+                .iter()
+                .find(|section| section.byte_range.contains(&offset.into()))
+                .unwrap()
+                .format
+                .background
+        };
+
+        assert_eq!(background_at("inline"), theme::state::hover());
+        assert_eq!(background_at("block"), theme::state::selected());
     }
 
     #[test]

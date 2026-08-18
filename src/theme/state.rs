@@ -35,6 +35,44 @@ pub(crate) fn selected_focus() -> Color32 {
     color::accent().gamma_multiply(0.16)
 }
 
+/// Search hits. A find highlight has to survive on any surface the document
+/// or transcript puts under it — including the red and green diff washes —
+/// so both chips are fully opaque: a translucent wash blended into a diff row
+/// turns into mud.
+pub(crate) mod find {
+    use egui::Color32;
+
+    use super::super::color;
+
+    /// Every match except the active one: a warm chip no interaction state
+    /// uses, so a hit cannot be misread as a hover or a selection. Opaque so
+    /// it looks identical over the editor, markdown, and diff rows.
+    pub(crate) fn match_fill() -> Color32 {
+        color::composite(
+            color::semantic().warning.gamma_multiply(0.45),
+            color::surface().editor,
+        )
+    }
+
+    /// The match the search is parked on: the full accent, no wash.
+    pub(crate) fn active_fill() -> Color32 {
+        color::accent()
+    }
+
+    /// The text on the active chip. The accent is a solid fill now, so the
+    /// original syntax color underneath can no longer be trusted to read.
+    pub(crate) fn active_ink() -> Color32 {
+        let fill = active_fill();
+        if color::contrast_ratio(Color32::BLACK, fill)
+            >= color::contrast_ratio(Color32::WHITE, fill)
+        {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        }
+    }
+}
+
 pub(crate) fn fill(selected_row: bool, focused: bool, hovered: bool, pressed: bool) -> Color32 {
     if selected_row {
         if focused {
@@ -56,6 +94,46 @@ pub(crate) fn scrim() -> Color32 {
     color::palette().surface.sunken.gamma_multiply(0.45)
 }
 
+/// Tint over macOS's native sidebar material. The partial opacity keeps the
+/// blur visible without letting a bright wallpaper wash out the sidebar.
+pub(crate) fn sidebar_material() -> Color32 {
+    #[cfg(target_os = "macos")]
+    {
+        let chrome = color::surface().chrome;
+        Color32::from_rgba_unmultiplied(chrome.r(), chrome.g(), chrome.b(), 120)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        color::surface().chrome
+    }
+}
+
+/// The quieter native material used behind primary content. It reveals less
+/// of the desktop than the sidebar so code and long-form text stay dominant.
+pub(crate) fn content_material() -> Color32 {
+    #[cfg(target_os = "macos")]
+    {
+        let editor = color::mix(color::surface().editor, color::surface().sunken, 0.20);
+        Color32::from_rgba_unmultiplied(editor.r(), editor.g(), editor.b(), 216)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        color::surface().editor
+    }
+}
+
+pub(crate) fn secondary_material() -> Color32 {
+    #[cfg(target_os = "macos")]
+    {
+        let content = color::mix(color::settings().content, color::surface().sunken, 0.20);
+        Color32::from_rgba_unmultiplied(content.r(), content.g(), content.b(), 216)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        color::settings().content
+    }
+}
+
 pub(crate) mod border {
     use egui::{Color32, Stroke};
 
@@ -68,12 +146,28 @@ pub(crate) mod border {
 
     /// Dialog, menu, and palette outlines.
     pub(crate) fn strong_color() -> Color32 {
-        super::overlay(36)
+        strong_color_for(color::palette())
+    }
+
+    pub(super) fn strong_color_for(palette: color::Palette) -> Color32 {
+        if palette.dark {
+            Color32::from_white_alpha(36)
+        } else {
+            Color32::from_black_alpha(112)
+        }
     }
 
     /// Keyboard focus ring, focused pane.
     pub(crate) fn focus_color() -> Color32 {
-        color::accent().gamma_multiply(0.55)
+        focus_color_for(color::palette())
+    }
+
+    pub(super) fn focus_color_for(palette: color::Palette) -> Color32 {
+        if palette.dark {
+            palette.accent.gamma_multiply(0.55)
+        } else {
+            palette.accent
+        }
     }
 
     pub(crate) fn hairline() -> Stroke {
@@ -134,24 +228,38 @@ pub(crate) fn callout(color: Color32) -> Callout {
     }
 }
 
-/// The diff colors, which are the callout recipe applied to success and danger.
+/// The diff colors. Dark mode uses a deep tint; light mode uses the same pale
+/// semantic wash as callouts so green and red never become muddy blocks.
 pub(crate) mod diff {
     use egui::Color32;
 
     use super::super::color;
 
+    pub(super) fn wash_for(palette: color::Palette, semantic: Color32) -> Color32 {
+        if palette.dark {
+            color::mix(palette.surface.sunken, semantic.gamma_multiply(0.58), 0.46)
+        } else {
+            color::composite(color::subtle(semantic), palette.surface.editor)
+        }
+    }
+
+    fn wash(semantic: Color32) -> Color32 {
+        wash_for(color::palette(), semantic)
+    }
+
+    /// A syntax color on a tinted row: pushed toward the page the same way
+    /// ink is, because hues tuned for the editor surface lose their contrast
+    /// once a green or red wash sits underneath them.
+    pub(crate) fn code(color: Color32) -> Color32 {
+        color::ink(color)
+    }
+
     pub(crate) fn added() -> Color32 {
-        color::composite(
-            color::subtle(color::semantic().success),
-            color::surface().editor,
-        )
+        wash(color::semantic().success)
     }
 
     pub(crate) fn removed() -> Color32 {
-        color::composite(
-            color::subtle(color::semantic().danger),
-            color::surface().editor,
-        )
+        wash(color::semantic().danger)
     }
 
     pub(crate) fn added_ink() -> Color32 {
@@ -160,6 +268,17 @@ pub(crate) mod diff {
 
     pub(crate) fn removed_ink() -> Color32 {
         color::ink(color::semantic().danger)
+    }
+
+    /// Gutter numbers on tinted rows: the row's ink pulled partway toward the
+    /// wash, so numbers stay legible on green/red without competing with the
+    /// code beside them.
+    pub(crate) fn added_number() -> Color32 {
+        color::mix(added(), added_ink(), 0.65)
+    }
+
+    pub(crate) fn removed_number() -> Color32 {
+        color::mix(removed(), removed_ink(), 0.65)
     }
 }
 
@@ -171,7 +290,7 @@ pub(crate) mod editor {
 
     /// Replaces the 1.1:1 fill that made selecting a paragraph invisible.
     pub(crate) fn selection() -> Color32 {
-        color::accent().gamma_multiply(0.22)
+        color::accent().gamma_multiply(0.35)
     }
 
     /// The same selection in an unfocused pane.
@@ -196,7 +315,190 @@ pub(crate) mod editor {
 
 #[cfg(test)]
 mod tests {
-    use super::{fill, hover, selected_focus};
+    use super::super::color;
+    use super::{
+        border, content_material, diff, editor, fill, find, hover, secondary_material,
+        selected_focus, sidebar_material,
+    };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn main_canvas_material_is_darker_and_quieter_than_the_sidebar() {
+        let backdrop = egui::Color32::from_rgb(72, 64, 112);
+        let sidebar = color::composite(sidebar_material(), backdrop);
+        let content = color::composite(content_material(), backdrop);
+        let secondary = color::composite(secondary_material(), backdrop);
+        let brightness = |color: egui::Color32| {
+            u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b())
+        };
+
+        assert!(content_material().a() > sidebar_material().a());
+        assert!(brightness(content) < brightness(sidebar));
+        assert_eq!(secondary_material().a(), content_material().a());
+        assert!(brightness(secondary) < brightness(content));
+    }
+
+    #[test]
+    fn light_focus_ring_clears_non_text_contrast() {
+        let rendered = color::composite(
+            border::focus_color_for(color::LIGHT),
+            color::LIGHT.surface.raised,
+        );
+
+        assert!(
+            color::contrast_ratio(rendered, color::LIGHT.surface.raised) >= 3.0,
+            "focus ring is not distinguishable on a light surface: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn light_strong_borders_clear_non_text_contrast() {
+        let rendered = color::composite(
+            border::strong_color_for(color::LIGHT),
+            color::LIGHT.surface.raised,
+        );
+
+        assert!(
+            color::contrast_ratio(rendered, color::LIGHT.surface.raised) >= 3.0,
+            "control border is not distinguishable on a light surface: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn light_diff_rows_use_pale_semantic_washes() {
+        let added = diff::wash_for(color::LIGHT, color::LIGHT.semantic.success);
+        let removed = diff::wash_for(color::LIGHT, color::LIGHT.semantic.danger);
+
+        assert!(
+            added.r() >= 200
+                && added.g() >= added.r() + 10
+                && removed.g() >= 200
+                && removed.r() >= removed.g() + 15,
+            "light semantic rows are muddy instead of pale: {added:?}, {removed:?}"
+        );
+    }
+
+    #[test]
+    fn diff_rows_stay_dark_without_losing_their_green_and_red_hues() {
+        let editor = color::surface().editor;
+        let added = diff::added();
+        let removed = diff::removed();
+
+        assert!(
+            added.g() >= editor.g() + 28 && added.g() <= 60,
+            "the added row is too washed out or too bright: {added:?} over {editor:?}"
+        );
+        assert!(
+            removed.r() >= editor.r() + 35 && removed.r() <= 72,
+            "the removed row is too washed out or too bright: {removed:?} over {editor:?}"
+        );
+        assert!(
+            added.g() >= added.r() + 15 && removed.r() >= removed.g() + 25,
+            "diff rows lost their semantic hues: {added:?}, {removed:?}"
+        );
+    }
+
+    #[test]
+    fn selection_stands_out_on_diff_rows_without_hiding_code() {
+        for row in [diff::added(), diff::removed()] {
+            let selected = color::composite(editor::selection(), row);
+
+            assert!(
+                color::contrast_ratio(selected, row) >= 2.0,
+                "the selection disappears into the diff row: {selected:?} on {row:?}"
+            );
+            assert!(
+                color::contrast_ratio(color::text().primary, selected) >= 4.5,
+                "selected diff text is unreadable: {selected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifted_code_keeps_every_syntax_role_legible_on_the_diff_washes() {
+        let syntax = color::syntax();
+        // A comment recedes to 3:1 like it does on the document; every other
+        // role holds the same 4:1 bar it clears on the editor surface.
+        let roles = [
+            (syntax.comment, 3.0),
+            (syntax.foreground, 4.0),
+            (syntax.string, 4.0),
+            (syntax.keyword, 4.0),
+            (syntax.declared_type, 4.0),
+            (syntax.macro_name, 4.0),
+            (syntax.escape, 4.0),
+            (syntax.link, 4.0),
+        ];
+        for wash in [diff::added(), diff::removed()] {
+            for (role, minimum) in roles {
+                let ratio = color::contrast_ratio(diff::code(role), wash);
+                assert!(
+                    ratio >= minimum,
+                    "{role:?} code is only {ratio:.2}:1 on the {wash:?} wash"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_numbers_stay_legible_on_the_diff_washes() {
+        let contrast = |text: egui::Color32, fill: egui::Color32| {
+            (i32::from(text.r()) - i32::from(fill.r())).abs()
+                + (i32::from(text.g()) - i32::from(fill.g())).abs()
+                + (i32::from(text.b()) - i32::from(fill.b())).abs()
+        };
+
+        assert!(
+            contrast(diff::added_number(), diff::added()) >= 120,
+            "added-row numbers vanish into the wash: {:?} on {:?}",
+            diff::added_number(),
+            diff::added()
+        );
+        assert!(
+            contrast(diff::removed_number(), diff::removed()) >= 120,
+            "removed-row numbers vanish into the wash: {:?} on {:?}",
+            diff::removed_number(),
+            diff::removed()
+        );
+    }
+
+    #[test]
+    fn find_matches_shout_over_the_document_instead_of_whispering() {
+        let editor = color::surface().editor;
+        let matched = find::match_fill();
+        let active = find::active_fill();
+
+        // Opaque chips are the whole point: a translucent wash disappears
+        // into the red and green diff rows.
+        assert_eq!(matched.a(), 255, "the match chip must be opaque");
+        assert_eq!(active.a(), 255, "the active chip must be opaque");
+        assert!(
+            color::contrast_ratio(matched, editor) >= 1.8,
+            "a plain match barely rises off the page: {matched:?} on {editor:?}"
+        );
+        assert!(
+            color::contrast_ratio(active, matched) >= 1.4,
+            "the active match cannot be told from the other hits"
+        );
+        for wash in [diff::added(), diff::removed()] {
+            assert!(
+                color::contrast_ratio(matched, wash) >= 1.5,
+                "a match vanishes into the {wash:?} diff row: {matched:?}"
+            );
+            assert!(
+                color::contrast_ratio(active, wash) >= 3.0,
+                "the active match vanishes into the {wash:?} diff row: {active:?}"
+            );
+        }
+        assert!(
+            color::contrast_ratio(color::text().primary, matched) >= 4.5,
+            "highlighted text stops being readable on {matched:?}"
+        );
+        assert!(
+            color::contrast_ratio(find::active_ink(), active) >= 4.5,
+            "the active chip's ink stops being readable on {active:?}"
+        );
+    }
 
     #[test]
     fn a_focused_list_marks_its_selection_with_accent_and_an_unfocused_one_does_not() {

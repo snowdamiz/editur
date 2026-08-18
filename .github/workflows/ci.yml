@@ -27,12 +27,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact: editur-linux-x86_64
-            archive: dist/editur-linux-x86_64.tar.gz
-            update_asset: editur-linux-x86_64
-            agent_os: linux
-            agent_arch: x86_64
           - os: macos-latest
             artifact: editur-macos-aarch64
             archive: dist/editur-macos-aarch64.zip
@@ -44,12 +38,6 @@ jobs:
             archive: dist/editur-macos-x86_64.zip
             update_asset: editur-macos-x86_64
             agent_os: macos
-            agent_arch: x86_64
-          - os: windows-latest
-            artifact: editur-windows-x86_64
-            archive: dist/editur-windows-x86_64.zip
-            update_asset: editur-windows-x86_64.exe
-            agent_os: windows
             agent_arch: x86_64
     steps:
       - uses: actions/checkout@v6
@@ -254,19 +242,32 @@ jobs:
       - name: Assemble provider bundle
         run: >-
           cargo run --locked --example build_provider_bundle --
-          dist/${{ matrix.update_asset }}.agent.json
+          dist/${{ matrix.update_asset }}.providers.json
           dist/${{ matrix.update_asset }}.cursor.json
           dist/${{ matrix.update_asset }}.codex.json
           dist/${{ matrix.update_asset }}.claude.json
+      # Deployed builds fetch <asset>.agent.json during `editur update` and
+      # parse it with a strict single-provider schema, so this published file
+      # must stay in the legacy format-1 shape forever; the multi-provider
+      # bundle above is only embedded into new binaries at build time.
+      - name: Publish the updater manifest in the legacy single-provider format
+        shell: bash
+        run: |
+          cp "dist/${{ matrix.update_asset }}.cursor.json" "dist/${{ matrix.update_asset }}.agent.json"
+          grep -q '"format_version": 1' "dist/${{ matrix.update_asset }}.agent.json"
+          if grep -qE '"(providers|version_probes|package_probes)"' "dist/${{ matrix.update_asset }}.agent.json"; then
+            echo "updater manifest contains fields deployed builds cannot parse" >&2
+            exit 1
+          fi
       - name: Assemble bundle-without-Claude rollback candidate
         run: >-
           cargo run --locked --example build_provider_bundle --
-          dist/${{ matrix.update_asset }}.without-claude.agent.json
+          dist/${{ matrix.update_asset }}.without-claude.providers.json
           dist/${{ matrix.update_asset }}.cursor.json
           dist/${{ matrix.update_asset }}.codex.json
       - name: Build bundle-without-Claude rollback candidate
         env:
-          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.without-claude.agent.json
+          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.without-claude.providers.json
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
           EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
@@ -282,7 +283,7 @@ jobs:
           dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
       - name: Build release binary
         env:
-          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.agent.json
+          EDITUR_PROVIDER_BUNDLE: dist/${{ matrix.update_asset }}.providers.json
           EDITUR_UPDATE_BASE: https://github.com/${{ github.repository }}/releases/download/release
           EDITUR_REQUIRE_PRECOMPILED_METAL: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: cargo build --release --locked
@@ -360,6 +361,7 @@ jobs:
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
             dist/${{ matrix.update_asset }}.agent.json
+            dist/${{ matrix.update_asset }}.providers.json
             dist/editur-provider-codex-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
             dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
           if-no-files-found: error
@@ -373,6 +375,7 @@ jobs:
             dist/${{ matrix.update_asset }}
             dist/${{ matrix.update_asset }}.sha256
             dist/${{ matrix.update_asset }}.agent.json
+            dist/${{ matrix.update_asset }}.providers.json
             dist/editur-provider-codex-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
             dist/editur-provider-claude-${{ matrix.agent_os }}-${{ matrix.agent_arch }}.zip
   release-gate:
@@ -496,6 +499,32 @@ jobs:
               true,
             );
 
+      - name: Wait until release downloads are reachable
+        env:
+          RELEASE_TAG: ${{ github.ref == 'refs/heads/release' && 'release' || github.ref_name }}
+        run: |
+          set -eu
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          for asset in \
+            editur-macos-aarch64.sha256 \
+            editur-macos-x86_64.sha256
+          do
+            ready=0
+            for _ in $(seq 1 30); do
+              if curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+                --max-time 20 --output /dev/null "$base/$asset"; then
+                echo "ready $asset"
+                ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "timed out waiting for $base/$asset" >&2
+              exit 1
+            fi
+          done
+
   verify-release:
     name: Verify ${{ matrix.platform }} bootstrap
     if: github.ref == 'refs/heads/release'
@@ -507,12 +536,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: Unix
-            os: ubuntu-latest
           - platform: macOS
             os: macos-latest
-          - platform: Windows
-            os: windows-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install and update on Unix

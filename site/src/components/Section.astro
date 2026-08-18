@@ -1,0 +1,30 @@
+---
+interface Props {
+  id: string;
+  index: string;
+  title: string;
+  lede: string;
+}
+
+const { id, index, title, lede } = Astro.props;
+---
+
+<section id={id} class="scroll-mt-24 border-t border-line py-24 md:py-32">
+  <div class="mx-auto max-w-6xl px-6">
+    <p class="rise font-mono text-[11px] font-medium tracking-[0.14em] text-accent uppercase">
+      {index}
+    </p>
+    <h2
+      class="rise mt-3 max-w-[20ch] text-3xl font-semibold tracking-tight text-ink md:text-5xl md:leading-[1.08]"
+      style="--i:1"
+    >
+      {title}
+    </h2>
+    <p class="rise mt-5 max-w-[54ch] text-lg leading-relaxed text-ink-2" style="--i:2">
+      {lede}
+    </p>
+    <div class="mt-12">
+      <slot />
+    </div>
+  </div>
+</section>

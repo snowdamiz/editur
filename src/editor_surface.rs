@@ -4,13 +4,13 @@ use egui::{
     epaint::text::{Galley, LayoutJob},
     text::{ByteIndex, CCursor, CCursorRange, LayoutSection},
 };
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use crate::{keybindings::Command, renderer::mark_retained, theme};
 
 const TEXT_LEFT_PADDING: f32 = 8.0;
 const TEXT_TOP_PADDING: f32 = 6.0;
-const CARET_BLINK_INTERVAL: f64 = 0.7;
+const CARET_BLINK_INTERVAL: f64 = 0.5;
 /// One tab stop, in characters. Indent guides land on these.
 const INDENT_WIDTH: usize = 4;
 /// A wrapped continuation is pushed past its own indent by this much, so the
@@ -23,7 +23,7 @@ fn line_height() -> f32 {
 }
 
 pub(crate) fn editor_background() -> Color32 {
-    theme::surface().editor
+    theme::state::content_material()
 }
 
 struct RetainedLine {
@@ -52,7 +52,9 @@ pub struct EditorSurface {
     anchor: usize,
     cursor: usize,
     h_pos: Option<f32>,
+    scroll_x: f32,
     scroll_y: f32,
+    horizontal_scrollbar: crate::scrollbar::State,
     scrollbar: crate::scrollbar::State,
     undo: Vec<Vec<Edit>>,
     redo: Vec<Vec<Edit>>,
@@ -82,10 +84,12 @@ pub(crate) struct EditorShowOptions<'a> {
     pub request_focus: bool,
     pub scroll_to_character: Option<usize>,
     pub id: Id,
-    pub line_markers: &'a [(usize, Color32)],
+    pub line_markers: &'a HashMap<usize, crate::lsp::DiagnosticSeverity>,
+    pub line_markers_stale: bool,
     pub text_input: TextInputMode,
     pub native_keybindings: bool,
     pub block_caret: bool,
+    pub wrap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,15 +258,24 @@ impl EditorSurface {
             Command::EditorIndent => self.replace_selection(text, "    "),
             Command::EditorOutdent => self.decrease_indent(text),
             Command::EditorCursorLeft | Command::EditorSelectLeft => {
-                self.move_cursor(self.cursor.saturating_sub(1), movement(command));
+                let target = if command == Command::EditorCursorLeft && !self.selection().is_empty()
+                {
+                    self.selection().start
+                } else {
+                    self.cursor.saturating_sub(1)
+                };
+                self.move_cursor(target, movement(command));
                 self.h_pos = None;
                 false
             }
             Command::EditorCursorRight | Command::EditorSelectRight => {
-                self.move_cursor(
-                    (self.cursor + 1).min(text.chars().count()),
-                    movement(command),
-                );
+                let target =
+                    if command == Command::EditorCursorRight && !self.selection().is_empty() {
+                        self.selection().end
+                    } else {
+                        (self.cursor + 1).min(text.chars().count())
+                    };
+                self.move_cursor(target, movement(command));
                 self.h_pos = None;
                 false
             }
@@ -362,10 +375,12 @@ impl EditorSurface {
                 request_focus,
                 scroll_to_character,
                 id: Id::new("editor"),
-                line_markers: &[],
+                line_markers: &HashMap::new(),
+                line_markers_stale: false,
                 text_input: TextInputMode::Standard,
                 native_keybindings: true,
                 block_caret: false,
+                wrap: false,
             },
         )
     }
@@ -383,9 +398,11 @@ impl EditorSurface {
             scroll_to_character,
             id: editor_id,
             line_markers,
+            line_markers_stale,
             text_input,
             native_keybindings,
             block_caret,
+            wrap,
         } = options;
         let desired = ui.available_size();
         let (_, rect) = ui.allocate_space(desired);
@@ -408,34 +425,81 @@ impl EditorSurface {
             ),
             editor_rect.right_bottom(),
         );
-        let wrap_width = (content.width() - TEXT_LEFT_PADDING).max(1.0);
-        self.sync_lines(highlighted, document.revision, wrap_width, advance);
+        let wrap_width = if wrap {
+            (content.width() - TEXT_LEFT_PADDING).max(1.0)
+        } else {
+            f32::INFINITY
+        };
+        self.sync_lines(
+            highlighted,
+            document.revision,
+            wrap_width,
+            advance,
+            ui.pixels_per_point(),
+        );
         self.clamp_selection(document.character_len);
         let cursor_before_input = self.cursor;
 
         if request_focus {
             response.request_focus();
         }
-        let scrolling = ui.input(|input| {
+        let pointer_over_editor = ui.input(|input| {
             input
                 .pointer
                 .hover_pos()
                 .is_some_and(|pointer| rect.contains(pointer))
-        }) && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+        });
+        let (scroll_delta, shift) =
+            ui.input(|input| (input.smooth_scroll_delta, input.modifiers.shift));
+        let horizontal_delta = if scroll_delta.x != 0.0 {
+            scroll_delta.x
+        } else if !wrap && shift {
+            scroll_delta.y
+        } else {
+            0.0
+        };
+        let horizontal_scrolling = pointer_over_editor && !wrap && horizontal_delta != 0.0;
+        let scrolling = pointer_over_editor
+            && scroll_delta.y != 0.0
+            && !(horizontal_scrolling && scroll_delta.x == 0.0);
         if scrolling {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            self.scroll_y -= scroll;
+            self.scroll_y -= scroll_delta.y;
+        }
+        if horizontal_scrolling {
+            self.scroll_x -= horizontal_delta;
+        }
+        if wrap {
+            self.scroll_x = 0.0;
         }
         self.clamp_scroll(content.height());
 
         self.layout_visible_lines(ui, content);
+        let mut document_width = self.document_width(advance).max(content.width());
+        self.clamp_horizontal_scroll(content.width(), document_width);
         let mut ensure_cursor_visible = request_focus;
         if let Some(character) = scroll_to_character {
             self.scroll_character_into_view(character, content.height());
             self.layout_visible_lines(ui, content);
+            document_width = self.document_width(advance).max(content.width());
+            if !wrap {
+                self.scroll_character_horizontally_into_view(character, content.width());
+            }
+            self.clamp_horizontal_scroll(content.width(), document_width);
         }
 
-        if response.clicked() || response.drag_started() {
+        if (response.double_clicked() || response.triple_clicked())
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            response.request_focus();
+            let character = self.character_at(pointer, content);
+            let range = if response.triple_clicked() {
+                text_line_range(text, character)
+            } else {
+                text_word_range(text, character)
+            };
+            self.set_selection(range.start, range.end);
+            ensure_cursor_visible = true;
+        } else if response.clicked() || response.drag_started() {
             response.request_focus();
             if let Some(pointer) = response.interact_pointer_pos() {
                 let character = self.character_at(pointer, content);
@@ -457,6 +521,19 @@ impl EditorSurface {
                 self.scroll_y += delta;
                 self.clamp_scroll(content.height());
                 ui.ctx().request_repaint();
+            }
+            if !wrap {
+                let delta = selection_drag_scroll_delta(
+                    pointer.x,
+                    content.left(),
+                    content.right(),
+                    ui.input(|input| input.stable_dt),
+                );
+                if delta != 0.0 {
+                    self.scroll_x += delta;
+                    self.clamp_horizontal_scroll(content.width(), document_width);
+                    ui.ctx().request_repaint();
+                }
             }
         }
 
@@ -488,6 +565,10 @@ impl EditorSurface {
         self.clamp_selection(document.character_len);
         if ensure_cursor_visible {
             self.scroll_character_into_view(self.cursor, content.height());
+            if !wrap {
+                self.scroll_character_horizontally_into_view(self.cursor, content.width());
+                self.clamp_horizontal_scroll(content.width(), document_width);
+            }
         }
         let focused = response.has_focus();
         let time = ui.input(|input| input.time);
@@ -507,7 +588,14 @@ impl EditorSurface {
             ui.ctx()
                 .request_repaint_after(Duration::from_secs_f64(until_next));
         }
-        self.paint(ui, rect, content, focused, block_caret, line_markers);
+        self.paint(
+            ui,
+            rect,
+            content,
+            focused,
+            block_caret,
+            (line_markers, line_markers_stale),
+        );
         if focused {
             self.update_ime(ui, rect, content);
         }
@@ -523,6 +611,20 @@ impl EditorSurface {
             self.clamp_scroll(content.height());
             ui.ctx().request_repaint();
         }
+        if !wrap
+            && crate::scrollbar::show_horizontal(
+                ui,
+                editor_id.with("horizontal_scrollbar"),
+                content,
+                document_width,
+                &mut self.scroll_x,
+                &mut self.horizontal_scrollbar,
+                horizontal_scrolling,
+            )
+        {
+            self.clamp_horizontal_scroll(content.width(), document_width);
+            ui.ctx().request_repaint();
+        }
 
         EditorOutput {
             response,
@@ -535,7 +637,7 @@ impl EditorSurface {
                 .map(|pointer| self.character_at(pointer, content)),
             last_inserted,
             inserted_text,
-            scrolled: scrolling,
+            scrolled: scrolling || horizontal_scrolling,
         }
     }
 
@@ -545,9 +647,10 @@ impl EditorSurface {
         revision: u64,
         wrap_width: f32,
         advance: f32,
+        pixels_per_point: f32,
     ) {
         let width = wrap_width.round().to_bits();
-        let appearance = theme::appearance();
+        let appearance = theme::paint_appearance(pixels_per_point);
         if self.appearance != appearance {
             // Font size, line height, and palette are all baked into a galley.
             self.appearance = appearance;
@@ -697,11 +800,14 @@ impl EditorSurface {
         content: Rect,
         focused: bool,
         block_caret: bool,
-        line_markers: &[(usize, Color32)],
+        line_markers: (&HashMap<usize, crate::lsp::DiagnosticSeverity>, bool),
     ) {
+        let (line_markers, line_markers_stale) = line_markers;
         let painter = ui.painter_at(rect);
+        let text_painter = painter.with_clip_rect(content);
         let horizontal_geometry = u64::from(content.left().to_bits())
-            ^ u64::from(content.width().to_bits()).rotate_left(32);
+            ^ u64::from(content.width().to_bits()).rotate_left(32)
+            ^ u64::from(self.scroll_x.to_bits()).rotate_left(16);
         mark_retained(
             &painter,
             rect,
@@ -714,6 +820,7 @@ impl EditorSurface {
         let cursor_line = self.line_for_character(self.cursor);
         let advance =
             ui.fonts_mut(|fonts| fonts.glyph_width(&theme::typography::code_editor(), '0'));
+        let text_left = content.left() + TEXT_LEFT_PADDING - self.scroll_x;
         let line_height = line_height();
         // The block that encloses the caret owns the one guide that is allowed
         // to be an accent.
@@ -772,8 +879,8 @@ impl EditorSurface {
             let mut column = 0;
             while column + INDENT_WIDTH <= indent {
                 let active = active_guide == Some(column) && is_cursor_line;
-                painter.vline(
-                    content.left() + TEXT_LEFT_PADDING + column as f32 * advance,
+                text_painter.vline(
+                    text_left + column as f32 * advance,
                     y..=(y + line.height),
                     Stroke::new(
                         theme::stroke::DIVIDER,
@@ -800,14 +907,21 @@ impl EditorSurface {
                     },
                 );
             }
-            if let Some((_, color)) = line_markers.iter().find(|(line, _)| *line == index) {
+            if !line_markers.is_empty()
+                && let Some(severity) = line_markers.get(&index)
+            {
+                let color = diagnostic_marker_color(*severity);
                 painter.rect_filled(
                     Rect::from_min_size(
                         egui::pos2(content.left() - 3.0, y + (line_height - 6.0) * 0.5),
                         egui::vec2(3.0, 6.0),
                     ),
                     theme::corner(2),
-                    *color,
+                    if line_markers_stale {
+                        color.gamma_multiply(0.55)
+                    } else {
+                        color
+                    },
                 );
             }
             let mut galley = Arc::clone(base_galley);
@@ -827,11 +941,7 @@ impl EditorSurface {
                     None,
                 );
             }
-            painter.galley(
-                egui::pos2(content.left() + TEXT_LEFT_PADDING, y),
-                galley,
-                theme::syntax().foreground,
-            );
+            text_painter.galley(egui::pos2(text_left, y), galley, theme::syntax().foreground);
         }
         let caret_visible = focused
             && (((ui.input(|input| input.time) - self.caret_blink_started).max(0.0)
@@ -846,13 +956,13 @@ impl EditorSurface {
             );
             if let Some(caret) = self.cursor_rect(content) {
                 if block_caret {
-                    painter.rect_filled(
+                    text_painter.rect_filled(
                         Rect::from_min_size(caret.left_top(), egui::vec2(8.0, caret.height())),
                         0.0,
                         theme::accent().gamma_multiply(0.65),
                     );
                 } else {
-                    painter.line_segment(
+                    text_painter.line_segment(
                         [caret.left_top(), caret.left_bottom()],
                         Stroke::new(1.5, theme::accent()),
                     );
@@ -1074,7 +1184,7 @@ impl EditorSurface {
             return line.char_start;
         };
         let local = egui::vec2(
-            pointer.x - content.left() - TEXT_LEFT_PADDING,
+            pointer.x - content.left() - TEXT_LEFT_PADDING + self.scroll_x,
             document_y - self.offsets[line_index],
         );
         line.char_start + galley.cursor_from_pos(local).index.0
@@ -1087,7 +1197,7 @@ impl EditorSurface {
         let relative = CCursor::new(self.cursor.saturating_sub(line.char_start));
         let local = galley.pos_from_cursor(relative);
         let translated = local.translate(egui::vec2(
-            content.left() + TEXT_LEFT_PADDING,
+            content.left() + TEXT_LEFT_PADDING - self.scroll_x,
             content.top() + self.offsets[line_index] - self.scroll_y,
         ));
         Some(Rect::from_min_size(
@@ -1111,6 +1221,24 @@ impl EditorSurface {
         self.clamp_scroll(viewport_height);
     }
 
+    fn scroll_character_horizontally_into_view(&mut self, character: usize, viewport_width: f32) {
+        let index = self.line_for_character(character);
+        let Some(line) = self.lines.get(index) else {
+            return;
+        };
+        let Some(galley) = &line.galley else {
+            return;
+        };
+        let relative = CCursor::new(character.saturating_sub(line.char_start));
+        let cursor = galley.pos_from_cursor(relative);
+        let visible_width = (viewport_width - TEXT_LEFT_PADDING).max(1.0);
+        if cursor.left() < self.scroll_x {
+            self.scroll_x = cursor.left();
+        } else if cursor.right() > self.scroll_x + visible_width {
+            self.scroll_x = cursor.right() - visible_width;
+        }
+    }
+
     fn clamp_selection(&mut self, character_len: usize) {
         self.anchor = self.anchor.min(character_len);
         self.cursor = self.cursor.min(character_len);
@@ -1119,6 +1247,26 @@ impl EditorSurface {
     fn clamp_scroll(&mut self, viewport_height: f32) {
         let total = self.offsets.last().copied().unwrap_or(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, (total - viewport_height).max(0.0));
+    }
+
+    fn document_width(&self, advance: f32) -> f32 {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.galley
+                    .as_ref()
+                    .map_or(line.character_len as f32 * advance, |galley| {
+                        galley.size().x
+                    })
+            })
+            .fold(0.0, f32::max)
+            + TEXT_LEFT_PADDING
+    }
+
+    fn clamp_horizontal_scroll(&mut self, viewport_width: f32, document_width: f32) {
+        self.scroll_x = self
+            .scroll_x
+            .clamp(0.0, (document_width - viewport_width).max(0.0));
     }
 
     fn update_ime(&self, ui: &Ui, rect: Rect, content: Rect) {
@@ -1142,6 +1290,16 @@ struct LineSpec {
 }
 
 /// Leading whitespace in characters, with a tab counted as one tab stop.
+fn diagnostic_marker_color(severity: crate::lsp::DiagnosticSeverity) -> Color32 {
+    match severity {
+        crate::lsp::DiagnosticSeverity::Error => theme::semantic().danger,
+        crate::lsp::DiagnosticSeverity::Warning => theme::semantic().warning,
+        crate::lsp::DiagnosticSeverity::Information | crate::lsp::DiagnosticSeverity::Hint => {
+            theme::semantic().info
+        }
+    }
+}
+
 fn indent_of(text: &str) -> usize {
     text.chars()
         .take_while(|character| *character == ' ' || *character == '\t')
@@ -1286,28 +1444,42 @@ fn text_line_end(text: &str, cursor: usize) -> usize {
         })
 }
 
+fn text_line_range(text: &str, cursor: usize) -> Range<usize> {
+    let start = text_line_start(text, cursor);
+    let end = text_line_end(text, cursor);
+    start..end + usize::from(end < text.chars().count())
+}
+
+fn text_word_range(text: &str, cursor: usize) -> Range<usize> {
+    let line_start = text_line_start(text, cursor);
+    let line_end = text_line_end(text, cursor);
+    let line = char_slice(text, line_start..line_end);
+    let cursor = CCursor::new(cursor.saturating_sub(line_start).min(line.chars().count()));
+    let start = egui::text_selection::text_cursor_state::ccursor_previous_word(line, cursor)
+        .index
+        .0;
+    let end = egui::text_selection::text_cursor_state::ccursor_next_word(line, cursor)
+        .index
+        .0;
+    line_start + start..line_start + end
+}
+
 fn previous_word(text: &str, cursor: usize) -> usize {
-    let characters: Vec<_> = text.chars().collect();
-    let mut index = cursor.min(characters.len());
-    while index > 0 && characters[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    while index > 0 && !characters[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    index
+    egui::text_selection::text_cursor_state::ccursor_previous_word(
+        text,
+        CCursor::new(cursor.min(text.chars().count())),
+    )
+    .index
+    .0
 }
 
 fn next_word(text: &str, cursor: usize) -> usize {
-    let characters: Vec<_> = text.chars().collect();
-    let mut index = cursor.min(characters.len());
-    while index < characters.len() && !characters[index].is_whitespace() {
-        index += 1;
-    }
-    while index < characters.len() && characters[index].is_whitespace() {
-        index += 1;
-    }
-    index
+    egui::text_selection::text_cursor_state::ccursor_next_word(
+        text,
+        CCursor::new(cursor.min(text.chars().count())),
+    )
+    .index
+    .0
 }
 
 fn selection_drag_scroll_delta(pointer_y: f32, top: f32, bottom: f32, dt: f32) -> f32 {
@@ -1342,10 +1514,14 @@ mod tests {
         EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job, theme,
     };
     use egui::{
-        Color32, CursorIcon, Event, Id, Key, Modifiers, RawInput, Rect, TextFormat, Vec2, pos2,
-        text::LayoutJob,
+        Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput,
+        Rect, TextFormat, TouchPhase, Vec2, pos2, text::LayoutJob,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        ops::Range,
+        time::{Duration, Instant},
+    };
 
     fn painted_caret(primitives: &[egui::ClippedPrimitive]) -> bool {
         primitives
@@ -1357,6 +1533,101 @@ mod tests {
                     .any(|vertex| vertex.color == theme::accent()),
                 egui::epaint::Primitive::Callback(_) => false,
             })
+    }
+
+    fn multi_click_selection(text: &str, cursor: usize, clicks: usize) -> Range<usize> {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = text.to_owned();
+        editor.set_selection(cursor, cursor);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            400.0,
+        );
+        let screen = Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 160.0)));
+        let mut caret = None;
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                ..RawInput::default()
+            },
+            |ui| caret = editor.show(ui, &mut text, &job, 1, true, None).caret_rect,
+        );
+        let pointer = caret.unwrap().center() - Vec2::new(2.0, 0.0);
+        for click in 0..clicks {
+            for pressed in [true, false] {
+                let _ = context.run_ui(
+                    RawInput {
+                        screen_rect: screen,
+                        time: Some(click as f64 * 0.1 + if pressed { 0.01 } else { 0.02 }),
+                        events: vec![
+                            Event::PointerMoved(pointer),
+                            Event::PointerButton {
+                                pos: pointer,
+                                button: PointerButton::Primary,
+                                pressed,
+                                modifiers: Modifiers::NONE,
+                            },
+                        ],
+                        ..RawInput::default()
+                    },
+                    |ui| {
+                        editor.show(ui, &mut text, &job, 1, false, None);
+                    },
+                );
+            }
+        }
+        editor.selection()
+    }
+
+    #[test]
+    fn double_click_selects_the_complete_identifier() {
+        assert_eq!(
+            multi_click_selection("let my_value = calculate();", 8, 2),
+            4..12
+        );
+    }
+
+    #[test]
+    fn triple_click_selects_the_complete_line_including_its_break() {
+        assert_eq!(
+            multi_click_selection("first\nlet my_value = calculate();\nthird", 14, 3),
+            6..34
+        );
+    }
+
+    #[test]
+    fn horizontal_arrows_collapse_a_selection_toward_their_direction() {
+        let context = theme::test_context();
+        let mut text = "abcdef".to_owned();
+        for (command, expected) in [
+            (crate::keybindings::Command::EditorCursorLeft, 2..2),
+            (crate::keybindings::Command::EditorCursorRight, 5..5),
+        ] {
+            let mut editor = EditorSurface::default();
+            editor.set_selection(2, 5);
+            editor.execute_command(&context, &mut text, command, None);
+            assert_eq!(editor.selection(), expected, "command {command:?}");
+        }
+    }
+
+    #[test]
+    fn word_navigation_stops_at_code_punctuation() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "foo.bar".to_owned();
+        editor.set_selection(text.chars().count(), text.chars().count());
+
+        editor.execute_command(
+            &context,
+            &mut text,
+            crate::keybindings::Command::EditorCursorWordLeft,
+            None,
+        );
+
+        assert_eq!(editor.selection(), 4..4);
     }
 
     #[test]
@@ -1419,14 +1690,14 @@ mod tests {
             400.0,
         );
         let mut editor = EditorSurface::default();
-        editor.sync_lines(&job, 1, 400.0, 8.0);
+        editor.sync_lines(&job, 1, 400.0, 8.0, 1.0);
         let allocations = editor
             .lines
             .iter()
             .map(|line| line.job.text.as_ptr())
             .collect::<Vec<_>>();
 
-        editor.sync_lines(&job, 1, 800.0, 8.0);
+        editor.sync_lines(&job, 1, 800.0, 8.0, 1.0);
 
         assert_eq!(
             allocations,
@@ -1771,6 +2042,69 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_do_not_wrap_by_default() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "word ".repeat(60);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            240.0,
+        );
+        for _ in 0..2 {
+            let _ = context.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(240.0, 300.0))),
+                    ..RawInput::default()
+                },
+                |ui| {
+                    editor.show(ui, &mut text, &job, 1, true, None);
+                },
+            );
+        }
+
+        assert_eq!(editor.lines[0].galley.as_ref().unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn long_lines_scroll_horizontally() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "word ".repeat(60);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            240.0,
+        );
+        let input = |events| RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(240.0, 300.0))),
+            events,
+            ..RawInput::default()
+        };
+        let _ = context.run_ui(input(Vec::new()), |ui| {
+            editor.show(ui, &mut text, &job, 1, false, None);
+        });
+        let _ = context.run_ui(
+            input(vec![
+                Event::PointerMoved(pos2(120.0, 120.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Line,
+                    delta: Vec2::new(-8.0, 0.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            },
+        );
+
+        assert!(editor.scroll_x > 0.0);
+    }
+
+    #[test]
     fn a_wrapped_continuation_resumes_under_its_own_indent() {
         let context = theme::test_context();
         let mut editor = EditorSurface::default();
@@ -1789,7 +2123,28 @@ mod tests {
                     ..RawInput::default()
                 },
                 |ui| {
-                    editor.show(ui, &mut text, &job, 1, true, None);
+                    let character_len = text.chars().count();
+                    editor.show_document_with_options(
+                        ui,
+                        &mut text,
+                        &job,
+                        super::DocumentMetrics {
+                            revision: 1,
+                            line_count: 1,
+                            character_len,
+                        },
+                        super::EditorShowOptions {
+                            request_focus: true,
+                            scroll_to_character: None,
+                            id: Id::new("editor"),
+                            line_markers: &HashMap::new(),
+                            line_markers_stale: false,
+                            text_input: super::TextInputMode::Standard,
+                            native_keybindings: true,
+                            block_caret: false,
+                            wrap: true,
+                        },
+                    );
                 },
             );
             rows = editor.lines[0]
@@ -1818,6 +2173,7 @@ mod tests {
             400.0,
         );
         let danger = theme::semantic().danger;
+        let line_markers = HashMap::from([(0, crate::lsp::DiagnosticSeverity::Error)]);
         let character_len = text.chars().count();
         let mut shapes = Vec::new();
         for _ in 0..2 {
@@ -1840,10 +2196,12 @@ mod tests {
                             request_focus: false,
                             scroll_to_character: None,
                             id: Id::new("editor"),
-                            line_markers: &[(0, danger)],
+                            line_markers: &line_markers,
+                            line_markers_stale: false,
                             text_input: super::TextInputMode::Standard,
                             native_keybindings: true,
                             block_caret: false,
+                            wrap: false,
                         },
                     );
                 },
@@ -1940,7 +2298,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_caret_blinks_on_a_slow_cadence() {
+    fn focused_caret_blinks_on_a_quick_cadence() {
         let context = theme::test_context();
         let mut editor = EditorSurface::default();
         let mut text = "text".to_owned();
@@ -1958,10 +2316,10 @@ mod tests {
         let first = context.run_ui(input(0.0), |ui| {
             editor.show(ui, &mut text, &job, 1, true, None);
         });
-        let hidden = context.run_ui(input(0.8), |ui| {
+        let hidden = context.run_ui(input(0.55), |ui| {
             editor.show(ui, &mut text, &job, 1, false, None);
         });
-        let visible_again = context.run_ui(input(1.5), |ui| {
+        let visible_again = context.run_ui(input(1.05), |ui| {
             editor.show(ui, &mut text, &job, 1, false, None);
         });
 

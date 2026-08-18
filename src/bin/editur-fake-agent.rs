@@ -9,16 +9,20 @@ use std::{
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
-    AuthenticateResponse, CancelNotification, ContentBlock, ContentChunk, Diff,
+    AuthenticateResponse, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, ContentChunk, CreateElicitationRequest, Diff, ElicitationAction,
+    ElicitationContentValue, ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
     EmbeddedResourceResource, InitializeRequest, InitializeResponse, ListSessionsRequest,
     ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionConfigOption, SessionConfigSelectOption, SessionInfo, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigSelectOption, SessionInfo,
+    SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    StringPropertySchema, Terminal, TextContent, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Result, Stdio};
 use serde::Deserialize;
@@ -60,6 +64,37 @@ impl agent_client_protocol::JsonRpcRequest for CursorRequest {
     type Response = serde_json::Value;
 }
 
+#[derive(Clone, Debug)]
+struct CodexExtensionRequest {
+    method: String,
+    params: serde_json::Value,
+}
+
+impl agent_client_protocol::JsonRpcMessage for CodexExtensionRequest {
+    fn matches_method(method: &str) -> bool {
+        matches!(method, "_session/steering" | "_session/goal")
+    }
+
+    fn method(&self) -> &str {
+        &self.method
+    }
+
+    fn to_untyped_message(&self) -> Result<agent_client_protocol::UntypedMessage> {
+        agent_client_protocol::UntypedMessage::new(&self.method, &self.params)
+    }
+
+    fn parse_message(method: &str, params: &impl serde::Serialize) -> Result<Self> {
+        Ok(Self {
+            method: method.into(),
+            params: serde_json::to_value(params)?,
+        })
+    }
+}
+
+impl agent_client_protocol::JsonRpcRequest for CodexExtensionRequest {
+    type Response = serde_json::Value;
+}
+
 fn main() {
     if run_descendant_child() {
         return;
@@ -78,6 +113,10 @@ fn main() {
     let mut claude_auth_file = None;
     let mut sessions_supported = false;
     let mut stale_session = false;
+    let mut paged_sessions = false;
+    let mut codex_extensions = false;
+    let mut session_lifecycle_file = None;
+    let mut additional_directories_file = None;
     let mut address_file = None;
     let mut descendant_file = None;
     let mut compatibility_fixture = None;
@@ -100,6 +139,15 @@ fn main() {
             }
             Some("--sessions") => sessions_supported = true,
             Some("--stale-session") => stale_session = true,
+            Some("--paged-sessions") => paged_sessions = true,
+            Some("--codex-extensions") => codex_extensions = true,
+            Some("--session-lifecycle") => {
+                session_lifecycle_file = Some(arguments.next().expect("session lifecycle marker"));
+            }
+            Some("--additional-directories") => {
+                additional_directories_file =
+                    Some(arguments.next().expect("additional directories marker"));
+            }
             Some("--codex-fixture" | "--claude-fixture") => {
                 let path = arguments.next().expect("compatibility fixture path");
                 compatibility_fixture = Some(
@@ -136,6 +184,10 @@ fn main() {
         (claude_auth, claude_auth_file),
         sessions_supported,
         stale_session,
+        paged_sessions,
+        codex_extensions,
+        session_lifecycle_file,
+        additional_directories_file,
         compatibility_fixture,
     ));
     drop(listener);
@@ -215,6 +267,7 @@ fn run_windows_job_fixture() -> bool {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run(
     authentication_required: bool,
     terminal_auth: bool,
@@ -222,11 +275,22 @@ async fn run(
     (claude_auth, claude_auth_file): (bool, Option<std::ffi::OsString>),
     sessions_supported: bool,
     stale_session: bool,
+    paged_sessions: bool,
+    codex_extensions: bool,
+    session_lifecycle_file: Option<std::ffi::OsString>,
+    additional_directories_file: Option<std::ffi::OsString>,
     compatibility_fixture: Option<CompatibilityFixture>,
 ) -> Result<()> {
     let compatibility_fixture = compatibility_fixture.map(Arc::new);
-    let sessions_supported = sessions_supported || compatibility_fixture.is_some();
+    let sessions_supported = sessions_supported
+        || paged_sessions
+        || compatibility_fixture.is_some()
+        || session_lifecycle_file.is_some()
+        || additional_directories_file.is_some();
+    let session_lifecycle_file = session_lifecycle_file.map(PathBuf::from).map(Arc::new);
+    let additional_directories_file = additional_directories_file.map(PathBuf::from).map(Arc::new);
     let prompts = Arc::new(AtomicUsize::new(0));
+    let always_drop_transport = Arc::new(AtomicBool::new(false));
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
     let claude_auth_file = claude_auth_file.map(PathBuf::from).map(Arc::new);
     let boolean_config_options = Arc::new(AtomicBool::new(false));
@@ -238,6 +302,8 @@ async fn run(
             {
                 let boolean_config_options = Arc::clone(&boolean_config_options);
                 let compatibility_fixture = compatibility_fixture.clone();
+                    let session_lifecycle = session_lifecycle_file.is_some();
+                    let additional_directories = additional_directories_file.is_some();
                 async move |request: InitializeRequest, responder, _connection| {
                     boolean_config_options.store(
                         request
@@ -261,7 +327,15 @@ async fn run(
                     let mut response = InitializeResponse::new(request.protocol_version);
                     if sessions_supported {
                         capabilities = capabilities.load_session(true).session_capabilities(
-                            SessionCapabilities::new().list(SessionListCapabilities::new()),
+                            SessionCapabilities::new()
+                                .list(SessionListCapabilities::new())
+                                .close(session_lifecycle.then(SessionCloseCapabilities::new))
+                                .resume(
+                                    additional_directories.then(SessionResumeCapabilities::new),
+                                )
+                                .additional_directories(additional_directories.then(
+                                    SessionAdditionalDirectoriesCapabilities::new,
+                                )),
                         );
                     }
                     if authentication_required {
@@ -315,7 +389,99 @@ async fn run(
                         });
                     }
                     response = response.agent_capabilities(capabilities);
+                    if codex_extensions {
+                        response = response.meta(serde_json::Map::from_iter([
+                            (
+                                "steering".into(),
+                                serde_json::json!({"supported": true}),
+                            ),
+                            (
+                                "goal".into(),
+                                serde_json::json!({
+                                    "version": 1,
+                                    "controlMethod": "_session/goal",
+                                    "actions": ["set", "pause", "resume", "clear"]
+                                }),
+                            ),
+                        ]));
+                    }
                     responder.respond(response)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CodexExtensionRequest,
+                        responder,
+                        connection: ConnectionTo<agent_client_protocol::Client>| {
+                let session_id = request
+                    .params
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(agent_client_protocol::Error::invalid_params)?
+                    .to_owned();
+                match request.method.as_str() {
+                    "_session/steering" => {
+                        let text = request.params["prompt"]
+                            .as_array()
+                            .and_then(|blocks| blocks.first())
+                            .and_then(|block| block.get("text"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        connection.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(format!("steered:{text}"))),
+                            )),
+                        ))?;
+                        responder.respond(serde_json::json!({"outcome": "injected"}))
+                    }
+                    "_session/goal" => {
+                        let action = request.params["action"].as_str().unwrap_or_default();
+                        let goal = if action == "clear" {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!({
+                                "objective": request.params["objective"]
+                                    .as_str()
+                                    .unwrap_or("Ship the editor"),
+                                "status": if action == "pause" { "paused" } else { "active" },
+                                "controlMethod": "_session/goal"
+                            })
+                        };
+                        connection.send_notification(SessionNotification::new(
+                            session_id,
+                            SessionUpdate::SessionInfoUpdate(
+                                SessionInfoUpdate::new().meta(serde_json::Map::from_iter([(
+                                    "goal".into(),
+                                    goal,
+                                )])),
+                            ),
+                        ))?;
+                        responder.respond(serde_json::json!({}))
+                    }
+                    _ => responder.respond_with_result(Err(
+                        agent_client_protocol::Error::method_not_found(),
+                    )),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let marker = additional_directories_file.clone();
+                async move |request: ResumeSessionRequest, responder, _connection| {
+                    if let Some(path) = marker.as_deref() {
+                        let value = request
+                            .additional_directories
+                            .iter()
+                            .map(|path| path.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        std::fs::write(path, value)
+                            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                    }
+                    responder.respond(ResumeSessionResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -387,6 +553,23 @@ async fn run(
                     return responder.respond(ListSessionsResponse::new(Vec::new()));
                 }
                 let cwd = request.cwd.expect("validated cwd");
+                if paged_sessions {
+                    let (id, title, next_cursor) = if request.cursor.is_none() {
+                        (
+                            "newest-session",
+                            "Newest task",
+                            Some("second-page".to_owned()),
+                        )
+                    } else {
+                        ("older-session", "Older task", None)
+                    };
+                    return responder.respond(
+                        ListSessionsResponse::new(vec![
+                            SessionInfo::new(id, cwd).title(title),
+                        ])
+                        .next_cursor(next_cursor),
+                    );
+                }
                 let mut sessions = vec![
                     SessionInfo::new("older-session", cwd.clone())
                         .title("Older task")
@@ -409,7 +592,22 @@ async fn run(
         )
         .on_receive_request(
             {
+                let session_lifecycle_file = session_lifecycle_file.clone();
+                async move |request: CloseSessionRequest, responder, _connection| {
+                    if let Some(path) = session_lifecycle_file.as_deref() {
+                        std::fs::write(path, request.session_id.0.as_bytes()).map_err(|_| {
+                            agent_client_protocol::Error::internal_error()
+                        })?;
+                    }
+                    responder.respond(CloseSessionResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
                 let boolean_config_options = Arc::clone(&boolean_config_options);
+                let session_lifecycle = session_lifecycle_file.is_some();
                 async move |request: LoadSessionRequest,
                             responder,
                             connection: ConnectionTo<agent_client_protocol::Client>| {
@@ -445,11 +643,30 @@ async fn run(
                             )),
                         ))?;
                         connection.send_notification(SessionNotification::new(
-                            request.session_id,
+                            request.session_id.clone(),
                             SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                 ContentBlock::Text(TextContent::new(reply)),
                             )),
                         ))?;
+                        if session_lifecycle && request.session_id.0.as_ref() == "older-session" {
+                            let delayed = connection.clone();
+                            let session_id = request.session_id.clone();
+                            connection.spawn(async move {
+                                async_io::Timer::after(std::time::Duration::from_millis(40)).await;
+                                delayed.send_notification(SessionNotification::new(
+                                    "newest-session",
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new("stale previous reply")),
+                                    )),
+                                ))?;
+                                delayed.send_notification(SessionNotification::new(
+                                    session_id,
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new("settled current reply")),
+                                    )),
+                                ))
+                            })?;
+                        }
                         responder.respond(
                             LoadSessionResponse::new()
                                 .modes(SessionModeState::new(
@@ -520,13 +737,35 @@ async fn run(
         .on_receive_request(
             {
                 let prompts = Arc::clone(&prompts);
+                let always_drop_transport = Arc::clone(&always_drop_transport);
                 async move |request: PromptRequest,
                             responder,
                             connection: ConnectionTo<agent_client_protocol::Client>| {
                     let cancel_rx = cancel_rx.clone();
+                    let always_drop_transport = Arc::clone(&always_drop_transport);
                     let turn = prompts.fetch_add(1, Ordering::Relaxed) + 1;
                     let task_connection = connection.clone();
                     connection.spawn(async move {
+                        if prompt_text(&request) == "transport-drop-loop" {
+                            always_drop_transport.store(true, Ordering::Release);
+                        }
+                        if prompt_text(&request) == "transport-drop"
+                            || always_drop_transport.load(Ordering::Acquire)
+                        {
+                            task_connection.send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new("drop-edit", "Edit File")
+                                        .status(ToolCallStatus::InProgress),
+                                ),
+                            ))?;
+                            return responder.respond_with_result(Err(
+                                agent_client_protocol::Error::internal_error().data(
+                                    "Error: RetriableError: [canceled] http/2 stream closed \
+                                     with error code CANCEL (0x8)",
+                                ),
+                            ));
+                        }
                         if prompt_text(&request) == "wait" {
                             let _ = cancel_rx.recv().await;
                             return responder.respond(PromptResponse::new(StopReason::Cancelled));
@@ -615,6 +854,23 @@ async fn run(
                             stream_text(&task_connection, &request, "unknown ignored")?;
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
+                        if prompt_text(&request) == "memory-stress" {
+                            let payload = "x".repeat(64 * 1024);
+                            for index in 0..300 {
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    SessionUpdate::ToolCall(
+                                        ToolCall::new(
+                                            format!("memory-stress-{index}"),
+                                            "Memory stress",
+                                        )
+                                        .status(ToolCallStatus::Completed)
+                                        .raw_input(serde_json::json!({"payload": payload})),
+                                    ),
+                                ))?;
+                            }
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
                         if prompt_text(&request) == "tool" {
                             task_connection.send_notification(SessionNotification::new(
                                 request.session_id.clone(),
@@ -639,6 +895,74 @@ async fn run(
                                             .into()]),
                                 )),
                             ))?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "codex-progress" {
+                            task_connection.send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new("progress-tool", "Run checks")
+                                        .status(ToolCallStatus::InProgress)
+                                        .content(vec![ToolCallContent::Terminal(Terminal::new(
+                                            "terminal-1",
+                                        ))]),
+                                ),
+                            ))?;
+                            for meta in [
+                                serde_json::json!({
+                                    "terminal_output_delta": {
+                                        "terminal_id": "terminal-1",
+                                        "data": "compiling\n"
+                                    }
+                                }),
+                                serde_json::json!({
+                                    "mcp_output_delta": {"data": "checking service"}
+                                }),
+                            ] {
+                                task_connection.send_notification(SessionNotification::new(
+                                    request.session_id.clone(),
+                                    SessionUpdate::ToolCallUpdate(
+                                        ToolCallUpdate::new(
+                                            "progress-tool",
+                                            ToolCallUpdateFields::new(),
+                                        )
+                                        .meta(meta.as_object().cloned()),
+                                    ),
+                                ))?;
+                            }
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "elicitation" {
+                            let response = task_connection
+                                .send_request(CreateElicitationRequest::new(
+                                    ElicitationFormMode::new(
+                                        ElicitationSessionScope::new(request.session_id.clone()),
+                                        ElicitationSchema::new()
+                                            .property(
+                                                "name",
+                                                StringPropertySchema::new().title("Name"),
+                                                true,
+                                            )
+                                            .boolean("confirm", true),
+                                    ),
+                                    "Configure",
+                                ))
+                                .block_task()
+                                .await?;
+                            let summary = match response.action {
+                                ElicitationAction::Accept(action) => {
+                                    let content = action.content.unwrap_or_default();
+                                    match (content.get("name"), content.get("confirm")) {
+                                        (
+                                            Some(ElicitationContentValue::String(name)),
+                                            Some(ElicitationContentValue::Boolean(confirm)),
+                                        ) => format!("{name}:{confirm}"),
+                                        _ => "invalid elicitation".into(),
+                                    }
+                                }
+                                _ => "declined elicitation".into(),
+                            };
+                            stream_text(&task_connection, &request, &summary)?;
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                         if prompt_text(&request) == "cursor-question" {
@@ -684,6 +1008,63 @@ async fn run(
                                         }]
                                     }),
                                 )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-task" {
+                            task_connection.send_notification(
+                                agent_client_protocol::UntypedMessage::new(
+                                    "cursor/task",
+                                    serde_json::json!({
+                                        "toolCallId": "task-1",
+                                        "description": "Review changes",
+                                        "prompt": "Look at the diff and report issues.",
+                                        "subagentType": {"custom": "reviewer"},
+                                        "model": "gpt-5",
+                                        "agentId": "agent-9",
+                                        "durationMs": 1200
+                                    }),
+                                )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-image" {
+                            task_connection.send_notification(
+                                agent_client_protocol::UntypedMessage::new(
+                                    "cursor/generate_image",
+                                    serde_json::json!({
+                                        "toolCallId": "image-1",
+                                        "description": "Minimal flat app icon"
+                                    }),
+                                )?,
+                            )?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
+                        if prompt_text(&request) == "cursor-plan" {
+                            let response = task_connection
+                                .send_request(CursorRequest {
+                                    method: "cursor/create_plan".into(),
+                                    params: serde_json::json!({
+                                        "toolCallId": "plan-1",
+                                        "name": "Fix sidebar",
+                                        "overview": "Keep every update visible",
+                                        "plan": "1. Normalize\n2. Render",
+                                        "todos": [{
+                                            "id": "one",
+                                            "content": "Normalize",
+                                            "status": "pending"
+                                        }],
+                                        "isProject": false
+                                    }),
+                                })
+                                .block_task()
+                                .await?;
+                            stream_text(
+                                &task_connection,
+                                &request,
+                                response["outcome"]["outcome"]
+                                    .as_str()
+                                    .unwrap_or("invalid"),
                             )?;
                             return responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }

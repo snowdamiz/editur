@@ -245,6 +245,26 @@ impl VimState {
         self.preferred_column = None;
     }
 
+    pub fn sync_pointer_selection(&mut self, editor: &EditorSurface, linewise: bool) {
+        self.preferred_column = None;
+        if self.text_input_enabled() {
+            return;
+        }
+        self.cancel_pending();
+        let selection = editor.selection();
+        if selection.is_empty() {
+            self.mode = VimMode::Normal;
+            self.visual_anchor = None;
+        } else {
+            self.mode = if linewise {
+                VimMode::VisualLine
+            } else {
+                VimMode::VisualCharacter
+            };
+            self.visual_anchor = Some(selection.start);
+        }
+    }
+
     pub fn cancel_pending(&mut self) {
         self.count = 0;
         self.operator = None;
@@ -634,7 +654,8 @@ impl VimState {
     ) -> VimOutcome {
         if matches!(self.mode, VimMode::VisualCharacter | VimMode::VisualLine) {
             let linewise = self.mode == VimMode::VisualLine;
-            let range = visual_range(self, editor, text);
+            let range = editor.selection();
+            self.operator = Some(operator);
             return self.apply_operator_range(range, linewise, editor, text, session, None);
         }
         if self.operator == Some(operator) {
@@ -931,7 +952,7 @@ impl VimState {
     ) -> VimOutcome {
         let count = self.take_count();
         let range = if matches!(self.mode, VimMode::VisualCharacter | VimMode::VisualLine) {
-            visual_range(self, editor, text)
+            editor.selection()
         } else {
             editor.cursor()..(editor.cursor() + count).min(line_end(text, editor.cursor()))
         };
@@ -1573,16 +1594,6 @@ fn paragraph_object(text: &str, cursor: usize, around: bool) -> Range<usize> {
     start..end
 }
 
-fn visual_range(state: &VimState, editor: &EditorSurface, text: &str) -> Range<usize> {
-    let anchor = state.visual_anchor.unwrap_or(editor.cursor());
-    if state.mode == VimMode::VisualLine {
-        line_start(text, anchor.min(editor.cursor()))
-            ..line_end_with_newline(text, anchor.max(editor.cursor()))
-    } else {
-        anchor.min(editor.cursor())..(anchor.max(editor.cursor()) + 1).min(text.chars().count())
-    }
-}
-
 fn indent_text(text: &str, indent: bool) -> String {
     text.split_inclusive('\n')
         .map(|line| {
@@ -1858,6 +1869,36 @@ mod tests {
         state.execute(Command::VimRepeat, &mut editor, &mut text, &mut session);
 
         assert_eq!(text, "X\n  X\nthree");
+    }
+
+    #[test]
+    fn pointer_selections_use_the_matching_visual_mode_and_exact_range() {
+        let mut state = VimState::default();
+        let mut session = VimSession::default();
+        let mut editor = EditorSurface::default();
+        let mut text = "alpha beta\ngamma".to_owned();
+
+        editor.set_selection(6, 10);
+        state.sync_pointer_selection(&editor, false);
+        assert_eq!(state.mode(), VimMode::VisualCharacter);
+        state.execute(
+            Command::VimOperatorDelete,
+            &mut editor,
+            &mut text,
+            &mut session,
+        );
+        assert_eq!(text, "alpha \ngamma");
+
+        editor.set_selection(0, 7);
+        state.sync_pointer_selection(&editor, true);
+        assert_eq!(state.mode(), VimMode::VisualLine);
+        state.execute(
+            Command::VimOperatorDelete,
+            &mut editor,
+            &mut text,
+            &mut session,
+        );
+        assert_eq!(text, "gamma");
     }
 
     #[test]

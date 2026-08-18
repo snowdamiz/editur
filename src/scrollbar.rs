@@ -3,7 +3,8 @@ use egui::{Id, Rect, Sense, Ui, pos2};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
-pub(crate) const WIDTH: f32 = 10.0;
+pub(crate) const WIDTH: f32 = 2.0;
+const HIT_SLOP: f32 = 4.0;
 pub(crate) const HOLD_SECONDS: f64 = 0.25;
 pub(crate) const FADE_SECONDS: f64 = 0.18;
 
@@ -71,26 +72,64 @@ struct Geometry {
     max_scroll: f32,
 }
 
-fn geometry(viewport: Rect, content_height: f32, scroll_y: f32) -> Option<Geometry> {
-    let viewport_height = viewport.height();
-    if content_height <= viewport_height || viewport_height <= 0.0 {
+#[cfg(test)]
+fn geometry(viewport: Rect, content_length: f32, scroll: f32) -> Option<Geometry> {
+    axis_geometry(viewport, content_length, scroll, false)
+}
+
+fn axis_geometry(
+    viewport: Rect,
+    content_length: f32,
+    scroll: f32,
+    horizontal: bool,
+) -> Option<Geometry> {
+    let viewport_length = if horizontal {
+        viewport.width()
+    } else {
+        viewport.height()
+    };
+    if content_length <= viewport_length || viewport_length <= 0.0 {
         return None;
     }
-    let track = Rect::from_min_max(
-        pos2(viewport.right() - WIDTH + 2.0, viewport.top() + 2.0),
-        pos2(viewport.right() - 2.0, viewport.bottom() - 2.0),
-    );
-    let max_scroll = content_height - viewport_height;
-    let thumb_height =
-        (track.height() * viewport_height / content_height).clamp(24.0, track.height());
-    let travel = track.height() - thumb_height;
-    let top = track.top() + scroll_y.clamp(0.0, max_scroll) / max_scroll * travel;
+    let track = if horizontal {
+        Rect::from_min_max(
+            pos2(viewport.left() + 2.0, viewport.bottom() - WIDTH),
+            pos2(viewport.right() - 2.0, viewport.bottom()),
+        )
+    } else {
+        Rect::from_min_max(
+            pos2(viewport.right() - WIDTH, viewport.top() + 2.0),
+            pos2(viewport.right(), viewport.bottom() - 2.0),
+        )
+    };
+    let max_scroll = content_length - viewport_length;
+    let track_length = if horizontal {
+        track.width()
+    } else {
+        track.height()
+    };
+    let thumb_length = (track_length * viewport_length / content_length).clamp(24.0, track_length);
+    let travel = track_length - thumb_length;
+    let track_start = if horizontal {
+        track.left()
+    } else {
+        track.top()
+    };
+    let start = track_start + scroll.clamp(0.0, max_scroll) / max_scroll * travel;
+    let thumb = if horizontal {
+        Rect::from_min_max(
+            pos2(start, track.top()),
+            pos2(start + thumb_length, track.bottom()),
+        )
+    } else {
+        Rect::from_min_max(
+            pos2(track.left(), start),
+            pos2(track.right(), start + thumb_length),
+        )
+    };
     Some(Geometry {
         track,
-        thumb: Rect::from_min_max(
-            pos2(track.left(), top),
-            pos2(track.right(), top + thumb_height),
-        ),
+        thumb,
         max_scroll,
     })
 }
@@ -123,31 +162,97 @@ pub(crate) fn show(
     state: &mut State,
     scrolling: bool,
 ) -> bool {
-    let Some(mut layout) = geometry(viewport, content_height, *scroll_y) else {
+    show_axis(
+        ui,
+        id,
+        viewport,
+        content_height,
+        scroll_y,
+        state,
+        scrolling,
+        false,
+    )
+}
+
+pub(crate) fn show_horizontal(
+    ui: &mut Ui,
+    id: Id,
+    viewport: Rect,
+    content_width: f32,
+    scroll_x: &mut f32,
+    state: &mut State,
+    scrolling: bool,
+) -> bool {
+    show_axis(
+        ui,
+        id,
+        viewport,
+        content_width,
+        scroll_x,
+        state,
+        scrolling,
+        true,
+    )
+}
+
+// The shared renderer keeps vertical and horizontal axis state explicit.
+#[expect(clippy::too_many_arguments)]
+fn show_axis(
+    ui: &mut Ui,
+    id: Id,
+    viewport: Rect,
+    content_length: f32,
+    scroll: &mut f32,
+    state: &mut State,
+    scrolling: bool,
+    horizontal: bool,
+) -> bool {
+    let Some(mut layout) = axis_geometry(viewport, content_length, *scroll, horizontal) else {
         state.drag_offset = None;
         return false;
     };
-    let response = ui.interact(layout.track.expand(2.0), id, Sense::click_and_drag());
+    let response = ui.interact(layout.track.expand(HIT_SLOP), id, Sense::click_and_drag());
     let pointer = response.interact_pointer_pos();
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = pointer
     {
         state.drag_offset = Some(if layout.thumb.contains(pointer) {
-            pointer.y - layout.thumb.top()
+            if horizontal {
+                pointer.x - layout.thumb.left()
+            } else {
+                pointer.y - layout.thumb.top()
+            }
         } else {
-            layout.thumb.height() * 0.5
+            (if horizontal {
+                layout.thumb.width()
+            } else {
+                layout.thumb.height()
+            }) * 0.5
         });
     }
     let mut changed = false;
     if (response.dragged() || response.clicked())
         && let (Some(pointer), Some(offset)) = (pointer, state.drag_offset)
     {
-        let travel = layout.track.height() - layout.thumb.height();
-        let ratio = ((pointer.y - layout.track.top() - offset) / travel).clamp(0.0, 1.0);
+        let (pointer, track_start, travel) = if horizontal {
+            (
+                pointer.x,
+                layout.track.left(),
+                layout.track.width() - layout.thumb.width(),
+            )
+        } else {
+            (
+                pointer.y,
+                layout.track.top(),
+                layout.track.height() - layout.thumb.height(),
+            )
+        };
+        let ratio = ((pointer - track_start - offset) / travel).clamp(0.0, 1.0);
         let next = ratio * layout.max_scroll;
-        changed = (*scroll_y - next).abs() > f32::EPSILON;
-        *scroll_y = next;
-        layout = geometry(viewport, content_height, *scroll_y).expect("scrollbar remains visible");
+        changed = (*scroll - next).abs() > f32::EPSILON;
+        *scroll = next;
+        layout = axis_geometry(viewport, content_length, *scroll, horizontal)
+            .expect("scrollbar remains visible");
     }
     if !ui.input(|input| input.pointer.primary_down()) {
         state.drag_offset = None;
@@ -185,7 +290,7 @@ pub(crate) fn show(
 
 #[cfg(test)]
 mod tests {
-    use super::{FADE_SECONDS, HOLD_SECONDS, geometry, opacity_at};
+    use super::{FADE_SECONDS, HOLD_SECONDS, axis_geometry, geometry, opacity_at};
     use egui::{Id, RawInput, Rect, Vec2, pos2};
 
     fn retained_scrollbar(viewport: Rect) -> crate::renderer::RetainedPaint {
@@ -227,6 +332,12 @@ mod tests {
         assert_eq!(middle.thumb.center().y, middle.track.center().y);
         assert_eq!(bottom.thumb.bottom(), bottom.track.bottom());
         assert_eq!(bottom.max_scroll, 1_200.0);
+
+        let left = axis_geometry(viewport, 1_600.0, 0.0, true).unwrap();
+        let right = axis_geometry(viewport, 1_600.0, 1_100.0, true).unwrap();
+        assert_eq!(left.thumb.left(), left.track.left());
+        assert_eq!(right.thumb.right(), right.track.right());
+        assert_eq!(right.max_scroll, 1_100.0);
     }
 
     #[test]

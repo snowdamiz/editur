@@ -60,9 +60,11 @@ pub enum Scope {
     VimVisual,
     VimOperator,
     FilesTree,
+    SourceControl,
     Find,
     ProjectSearch,
     Agent,
+    Devin,
     Terminal,
     Settings,
 }
@@ -78,9 +80,11 @@ impl Scope {
             Self::VimVisual => "Vim Visual",
             Self::VimOperator => "Vim Operator-pending",
             Self::FilesTree => "Files tree",
+            Self::SourceControl => "Source control",
             Self::Find => "Find",
             Self::ProjectSearch => "Project search",
             Self::Agent => "Agent",
+            Self::Devin => "Devin",
             Self::Terminal => "Terminal",
             Self::Settings => "Settings",
         }
@@ -102,8 +106,11 @@ impl Scope {
 pub enum Command {
     AppOpenSettings,
     AppOpenKeybindings,
+    AppIncreaseUiScale,
+    AppDecreaseUiScale,
     AppCloseWindow,
     AppToggleAgentSidebar,
+    AppToggleDevinSidebar,
     AppToggleAgenticView,
     FileSave,
     FileSaveAndClose,
@@ -123,6 +130,8 @@ pub enum Command {
     FileFocusLeftPane,
     FileFocusRightPane,
     ViewToggleSidebar,
+    ViewToggleExplorer,
+    ViewToggleSourceControl,
     ViewFocusExplorer,
     ViewToggleTerminal,
     ViewToggleMarkdownPreview,
@@ -270,7 +279,12 @@ const DOCUMENT: &[Scope] = &[
     Scope::VimVisual,
     Scope::VimOperator,
 ];
-const DOCUMENT_AND_FIND: &[Scope] = &[Scope::DocumentEditor, Scope::Find];
+const DOCUMENT_AND_FIND: &[Scope] = &[
+    Scope::DocumentEditor,
+    Scope::Find,
+    Scope::Agent,
+    Scope::Devin,
+];
 const TREE: &[Scope] = &[Scope::FilesTree];
 const VIM_COMMAND: &[Scope] = &[Scope::VimNormal, Scope::VimVisual, Scope::VimOperator];
 const VIM_NORMAL: &[Scope] = &[Scope::VimNormal];
@@ -312,6 +326,14 @@ pub static CATALOG: &[CommandInfo] = &[
         false
     ),
     info!(
+        AppIncreaseUiScale,
+        "application.increaseUiScale", "Increase UI Scale", "Application", GLOBAL, false, false
+    ),
+    info!(
+        AppDecreaseUiScale,
+        "application.decreaseUiScale", "Decrease UI Scale", "Application", GLOBAL, false, false
+    ),
+    info!(
         AppCloseWindow,
         "application.closeWindow", "Close Window", "Application", GLOBAL, false, false
     ),
@@ -319,6 +341,15 @@ pub static CATALOG: &[CommandInfo] = &[
         AppToggleAgentSidebar,
         "application.toggleAgentSidebar",
         "Toggle Agent Sidebar",
+        "Application",
+        GLOBAL,
+        false,
+        false
+    ),
+    info!(
+        AppToggleDevinSidebar,
+        "application.toggleDevinSidebar",
+        "Toggle Devin Sidebar",
         "Application",
         GLOBAL,
         false,
@@ -398,6 +429,14 @@ pub static CATALOG: &[CommandInfo] = &[
         "workbench.toggleSidebar", "Toggle Files Sidebar", "View", GLOBAL, false, false
     ),
     info!(
+        ViewToggleExplorer,
+        "workbench.toggleExplorer", "Toggle Explorer", "View", GLOBAL, false, false
+    ),
+    info!(
+        ViewToggleSourceControl,
+        "workbench.toggleSourceControl", "Toggle Source Control", "View", GLOBAL, false, false
+    ),
+    info!(
         ViewFocusExplorer,
         "workbench.focusExplorer", "Focus Files Explorer", "View", GLOBAL, false, false
     ),
@@ -430,7 +469,12 @@ pub static CATALOG: &[CommandInfo] = &[
         "search.close",
         "Close Search",
         "Search",
-        &[Scope::Find, Scope::ProjectSearch],
+        &[
+            Scope::Find,
+            Scope::ProjectSearch,
+            Scope::Agent,
+            Scope::Devin
+        ],
         false,
         false
     ),
@@ -1821,6 +1865,12 @@ pub fn vscode_bindings() -> Vec<BuiltinBinding> {
             vec![Stroke::primary(Key::E).with_shift()],
         ),
         builtin(
+            "vscode.view.scm",
+            Command::ViewToggleSourceControl,
+            Scope::Global,
+            vec![Stroke::primary(Key::G).with_shift()],
+        ),
+        builtin(
             "vscode.file.split",
             Command::FileSplitEditor,
             Scope::Global,
@@ -1849,6 +1899,18 @@ pub fn vscode_bindings() -> Vec<BuiltinBinding> {
             Command::AppOpenKeybindings,
             Scope::Global,
             vec![Stroke::primary(Key::K), Stroke::primary(Key::S)],
+        ),
+        builtin(
+            "vscode.application.increaseUiScale",
+            Command::AppIncreaseUiScale,
+            Scope::Global,
+            vec![Stroke::primary(Key::Plus).with_shift()],
+        ),
+        builtin(
+            "vscode.application.decreaseUiScale",
+            Command::AppDecreaseUiScale,
+            Scope::Global,
+            vec![Stroke::primary(Key::Minus).with_shift()],
         ),
         builtin(
             "vscode.editor.copy",
@@ -2975,6 +3037,7 @@ pub fn validate_rule(rule: &BindingRule) -> Result<(), String> {
                 | Scope::Find
                 | Scope::ProjectSearch
                 | Scope::Agent
+                | Scope::Devin
                 | Scope::Settings
         ) && printable(key)
             && !stroke.primary
@@ -3307,6 +3370,36 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(result.command, Some(Command::SearchProject));
+    }
+
+    #[test]
+    fn interface_scale_shortcuts_are_global_and_customizable() {
+        let mut resolver = Resolver::new(
+            KeybindingSettings::default().effective_bindings().unwrap(),
+            Platform::Macos,
+        )
+        .unwrap();
+        let modifiers = Modifiers {
+            command: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+
+        let increase = resolver.resolve(
+            InputStroke::new(Key::Plus, Some(Key::Equals), modifiers),
+            &[Scope::Settings],
+            false,
+            Duration::ZERO,
+        );
+        let decrease = resolver.resolve(
+            InputStroke::new(Key::Minus, Some(Key::Minus), modifiers),
+            &[Scope::Terminal],
+            false,
+            Duration::ZERO,
+        );
+
+        assert_eq!(increase.command, Some(Command::AppIncreaseUiScale));
+        assert_eq!(decrease.command, Some(Command::AppDecreaseUiScale));
     }
 
     #[test]

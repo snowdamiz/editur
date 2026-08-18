@@ -3,6 +3,7 @@
 //! modal that stops the person typing.
 
 use egui::{Align2, Context, Id, Rect, Sense, Ui, UiBuilder};
+use std::time::Duration;
 
 use crate::{
     dialog::Severity,
@@ -80,6 +81,7 @@ impl Toasts {
         let screen = ctx.content_rect();
         let mut clicked = None;
         let mut dismissed = Vec::new();
+        let mut repaint_after: Option<f32> = None;
         let hidden = self.items.len().saturating_sub(VISIBLE);
         let mut cursor = screen.bottom() - theme::space::LARGE;
         let pointer = ctx.pointer_hover_pos();
@@ -132,6 +134,9 @@ impl Toasts {
             }
             if toast.remaining <= 0.0 {
                 dismissed.push(toast.id);
+            } else if !held {
+                let delay = toast.remaining.min(0.5);
+                repaint_after = Some(repaint_after.map_or(delay, |current| current.min(delay)));
             }
 
             let painter = ui.painter();
@@ -217,8 +222,10 @@ impl Toasts {
         }
 
         self.items.retain(|toast| !dismissed.contains(&toast.id));
-        if !self.items.is_empty() {
-            ctx.request_repaint();
+        if !self.items.is_empty()
+            && let Some(delay) = repaint_after
+        {
+            ctx.request_repaint_after(Duration::from_secs_f32(delay));
         }
         clicked
     }
@@ -267,7 +274,8 @@ fn severity_icon(severity: Severity) -> Icon {
 mod tests {
     use super::{LIFETIME, Toasts};
     use crate::{dialog::Severity, theme};
-    use egui::{Event, RawInput, Rect, Vec2, pos2};
+    use egui::{Event, RawInput, Rect, Vec2, ViewportId, pos2};
+    use std::time::Duration;
 
     fn frames(
         toasts: &mut Toasts,
@@ -314,6 +322,38 @@ mod tests {
             toasts.len(),
             1,
             "a toast the pointer is reading must not vanish mid-sentence"
+        );
+    }
+
+    #[test]
+    fn a_visible_toast_schedules_expiry_without_spinning_repaints() {
+        let context = theme::test_context();
+        for time in 0..16 {
+            let output = context.run_ui(
+                RawInput {
+                    time: Some(f64::from(time)),
+                    ..RawInput::default()
+                },
+                |_| {},
+            );
+            if output.viewport_output[&ViewportId::ROOT].repaint_delay == Duration::MAX {
+                break;
+            }
+        }
+        let mut toasts = Toasts::default();
+        toasts.push(Severity::Info, "saved");
+        let output = context.run_ui(RawInput::default(), |ui| {
+            toasts.show(ui.ctx());
+        });
+        let delay = output.viewport_output[&ViewportId::ROOT].repaint_delay;
+
+        assert!(
+            delay > Duration::ZERO,
+            "toast requested an immediate repaint"
+        );
+        assert!(
+            delay <= Duration::from_millis(500),
+            "toast expiry was not scheduled"
         );
     }
 }
