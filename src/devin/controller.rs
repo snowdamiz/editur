@@ -160,8 +160,6 @@ pub enum DevinCommand {
         session_id: String,
         generation: u64,
     },
-    LoadMoreMessages,
-    LoadMoreEvents,
     LoadSection(DevinSection),
     LoadKnowledge(String),
     LoadKnowledgeSuggestion(String),
@@ -277,8 +275,6 @@ impl Drop for DevinController {
 struct SelectedSession {
     id: String,
     generation: u64,
-    messages_cursor: Option<String>,
-    events_cursor: Option<String>,
     category: StatusCategory,
 }
 
@@ -373,15 +369,11 @@ impl Worker {
                 self.selected = Some(SelectedSession {
                     id: session_id,
                     generation,
-                    messages_cursor: None,
-                    events_cursor: None,
                     category: StatusCategory::Unknown,
                 });
                 self.fetched_previews.clear();
                 self.run_request(Self::load_selected);
             }
-            DevinCommand::LoadMoreMessages => self.run_request(Self::load_messages),
-            DevinCommand::LoadMoreEvents => self.run_request(Self::load_events),
             DevinCommand::LoadSection(section) => self.run_section_request(section),
             DevinCommand::LoadKnowledge(id) => {
                 if safe_remote_id(&id) {
@@ -1528,10 +1520,58 @@ impl Worker {
             generation: selected.generation,
             detail,
         });
-        self.load_message_page(update)?;
-        self.load_event_page(update)?;
+        self.load_message_pages(update)?;
+        self.load_event_pages(update)?;
         self.fetch_attachment_previews(&selected, previews);
         Ok(())
+    }
+
+    fn load_message_pages(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+        if update == PageUpdate::Refresh {
+            self.load_message_page(update, None)?;
+            return Ok(());
+        }
+        let mut cursors = HashSet::new();
+        let mut cursor = None;
+        let mut page_update = update;
+        loop {
+            let Some(next_cursor) = self.load_message_page(page_update, cursor.as_deref())? else {
+                return Ok(());
+            };
+            if !cursors.insert(next_cursor.clone()) {
+                return Err(TransportError::Protocol(
+                    "Devin message pagination repeated a cursor".into(),
+                ));
+            }
+            cursor = Some(next_cursor);
+            if update == PageUpdate::Initial {
+                page_update = PageUpdate::History;
+            }
+        }
+    }
+
+    fn load_event_pages(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+        if update == PageUpdate::Refresh {
+            self.load_event_page(update, None)?;
+            return Ok(());
+        }
+        let mut cursors = HashSet::new();
+        let mut cursor = None;
+        let mut page_update = update;
+        loop {
+            let Some(next_cursor) = self.load_event_page(page_update, cursor.as_deref())? else {
+                return Ok(());
+            };
+            if !cursors.insert(next_cursor.clone()) {
+                return Err(TransportError::Protocol(
+                    "Devin event pagination repeated a cursor".into(),
+                ));
+            }
+            cursor = Some(next_cursor);
+            if update == PageUpdate::Initial {
+                page_update = PageUpdate::History;
+            }
+        }
     }
 
     /// Downloads image attachments so the transcript can paint the same
@@ -1562,18 +1602,15 @@ impl Worker {
         }
     }
 
-    fn load_messages(&mut self) -> Result<(), TransportError> {
-        self.load_message_page(PageUpdate::History)
-    }
-
-    fn load_message_page(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+    fn load_message_page(
+        &mut self,
+        update: PageUpdate,
+        cursor: Option<&str>,
+    ) -> Result<Option<String>, TransportError> {
         let selected = self
             .selected
             .clone()
             .ok_or_else(|| TransportError::Protocol("no Devin session is selected".into()))?;
-        let cursor = (update == PageUpdate::History)
-            .then_some(selected.messages_cursor.as_deref())
-            .flatten();
         let mut path = format!(
             "/sessions/{}/messages?first=100",
             encode_path_segment(&selected.id)
@@ -1585,28 +1622,21 @@ impl Worker {
         let payload = self.ensure_connected()?.v3(V3Method::Get, &path, None)?;
         let (messages, next_cursor) =
             normalize::messages(&payload).map_err(TransportError::Protocol)?;
-        if update != PageUpdate::Refresh
-            && let Some(current) = self.selected.as_mut()
-            && current.id == selected.id
-            && current.generation == selected.generation
-        {
-            current.messages_cursor = next_cursor.clone();
-        }
         self.emit(DevinEvent::MessagesLoaded {
             session_id: selected.id,
             generation: selected.generation,
             messages,
-            next_cursor,
+            next_cursor: next_cursor.clone(),
             update,
         });
-        Ok(())
+        Ok(next_cursor)
     }
 
-    fn load_events(&mut self) -> Result<(), TransportError> {
-        self.load_event_page(PageUpdate::History)
-    }
-
-    fn load_event_page(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+    fn load_event_page(
+        &mut self,
+        update: PageUpdate,
+        cursor: Option<&str>,
+    ) -> Result<Option<String>, TransportError> {
         let selected = self
             .selected
             .clone()
@@ -1625,32 +1655,20 @@ impl Worker {
                     update,
                 });
             }
-            return Ok(());
+            return Ok(None);
         }
-        let result = self.ensure_connected()?.events(
-            &selected.id,
-            (update == PageUpdate::History)
-                .then_some(selected.events_cursor.as_deref())
-                .flatten(),
-        )?;
+        let result = self.ensure_connected()?.events(&selected.id, cursor)?;
         let payload = normalize::tool_payload(result).map_err(TransportError::Protocol)?;
         let (activity, next_cursor) =
             normalize::activity(&payload).map_err(TransportError::Protocol)?;
-        if update != PageUpdate::Refresh
-            && let Some(current) = self.selected.as_mut()
-            && current.id == selected.id
-            && current.generation == selected.generation
-        {
-            current.events_cursor = next_cursor.clone();
-        }
         self.emit(DevinEvent::ActivityLoaded {
             session_id: selected.id,
             generation: selected.generation,
             activity,
-            next_cursor,
+            next_cursor: next_cursor.clone(),
             update,
         });
-        Ok(())
+        Ok(next_cursor)
     }
 
     fn create_sessions(&mut self, request: CreateSessionRequest) -> Result<(), TransportError> {
@@ -1976,12 +1994,8 @@ impl PollSchedule {
         }
     }
 
-    fn set_visible(&mut self, visible: bool, now: Instant) {
+    fn set_visible(&mut self, visible: bool, _now: Instant) {
         self.visible = visible;
-        if visible {
-            self.next_sessions = now;
-            self.next_selected = now;
-        }
     }
 
     fn wait(&self, now: Instant) -> Option<Duration> {
@@ -2410,6 +2424,15 @@ mod tests {
         schedule.set_visible(true, now);
         assert_eq!(schedule.wait(now), Some(Duration::ZERO));
 
+        schedule.sessions_succeeded(now);
+        schedule.selected_succeeded(now, false);
+        schedule.set_visible(false, now);
+        schedule.set_visible(true, now + Duration::from_secs(1));
+        assert_eq!(
+            schedule.wait(now + Duration::from_secs(1)),
+            Some(super::ACTIVE_POLL - Duration::from_secs(1))
+        );
+
         schedule.failed(now, None);
         assert!(schedule.wait(now).unwrap() >= Duration::from_secs(2));
     }
@@ -2617,12 +2640,9 @@ mod tests {
         worker.selected = Some(super::SelectedSession {
             id: "session-1".into(),
             generation,
-            messages_cursor: None,
-            events_cursor: None,
             category: super::super::state::StatusCategory::Unknown,
         });
         worker.load_selected().unwrap();
-        worker.load_events().unwrap();
         worker.search_activity("tests").unwrap();
         worker.fetch_activity("event-1").unwrap();
         worker.append_tags(vec!["triage".into()]).unwrap();
@@ -2702,7 +2722,7 @@ mod tests {
                 state.messages.len(),
                 state.activity.len()
             ),
-            (1, 1, 2)
+            (1, 2, 2)
         );
         assert_eq!(state.resources.insights.items.len(), 1);
         assert_eq!(
@@ -2744,8 +2764,6 @@ mod tests {
         worker.selected = Some(super::SelectedSession {
             id: session.id,
             generation: 1,
-            messages_cursor: None,
-            events_cursor: None,
             category: super::super::state::StatusCategory::Unknown,
         });
 
@@ -2776,26 +2794,6 @@ mod tests {
                 _ => None,
             })
             .expect("a live event is required");
-        let has_more_activity = events.iter().any(|event| {
-            matches!(
-                event,
-                super::DevinEvent::ActivityLoaded {
-                    next_cursor: Some(_),
-                    ..
-                }
-            )
-        });
-        if has_more_activity {
-            worker.load_events().unwrap();
-            assert!(event_rx.try_iter().any(|event| matches!(
-                event,
-                super::DevinEvent::ActivityLoaded {
-                    activity,
-                    update: super::PageUpdate::History,
-                    ..
-                } if !activity.is_empty()
-            )));
-        }
         worker.fetch_activity(&event_id).unwrap();
         assert!(event_rx.try_iter().any(|event| matches!(
             event,
@@ -2838,8 +2836,6 @@ mod tests {
         worker.selected = Some(super::SelectedSession {
             id: session_id,
             generation: 1,
-            messages_cursor: None,
-            events_cursor: None,
             category: super::super::state::StatusCategory::Active,
         });
         let temp = tempfile::tempdir().unwrap();
@@ -2920,7 +2916,7 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
-    fn background_refresh_never_sends_the_manual_history_cursor() {
+    fn background_refresh_reuses_cached_session_history() {
         let (endpoint, requests, stop, server) = fake_mcp_server();
         let (event_tx, _event_rx) = mpsc::sync_channel(64);
         let mut worker =
@@ -2935,13 +2931,10 @@ mod tests {
         worker.selected = Some(super::SelectedSession {
             id: "session-1".into(),
             generation: 1,
-            messages_cursor: None,
-            events_cursor: None,
             category: super::super::state::StatusCategory::Active,
         });
 
         worker.load_selected().unwrap();
-        worker.load_messages().unwrap();
         worker.refresh_selected().unwrap();
 
         let message_requests = requests
@@ -2951,6 +2944,15 @@ mod tests {
             .filter_map(|request| request.lines().next())
             .filter(|request| request.contains("/sessions/session-1/messages?"))
             .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let event_arguments = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.split("\r\n\r\n").nth(1))
+            .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+            .filter(|body| body["params"]["name"] == "devin_session_events")
+            .map(|body| body["params"]["arguments"].clone())
             .collect::<Vec<_>>();
 
         stop.store(true, Ordering::Relaxed);
@@ -2962,8 +2964,67 @@ mod tests {
                 "GET /v3/organizations/org-fixture/sessions/session-1/messages?first=100&after=message-next HTTP/1.1",
                 "GET /v3/organizations/org-fixture/sessions/session-1/messages?first=100 HTTP/1.1",
             ],
-            "polling must not consume the manual history cursor"
+            "polling should refresh the current page without refetching cached history"
         );
+        assert_eq!(
+            event_arguments,
+            [
+                json!({"session_id":"session-1","action":"list","limit":100}),
+                json!({"session_id":"session-1","action":"list","limit":100,"after":"event-next"}),
+                json!({"session_id":"session-1","action":"list","limit":100}),
+            ],
+            "polling should refresh current actions without refetching cached action history"
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn selecting_a_session_fetches_every_conversation_and_action_page() {
+        let (endpoint, requests, stop, server) = fake_mcp_server();
+        let (event_tx, event_rx) = mpsc::sync_channel(64);
+        let mut worker =
+            super::Worker::new(std::env::temp_dir(), endpoint, event_tx, Arc::new(|| {}));
+        let credentials = super::super::credentials::Credentials::new(
+            "cog_test-only".into(),
+            None,
+            super::super::credentials::CredentialSource::Environment,
+        )
+        .unwrap();
+        worker.connect(credentials).unwrap();
+        let mut state = super::super::state::DevinState::default();
+        let generation = state.select("session-1".into());
+        worker.selected = Some(super::SelectedSession {
+            id: "session-1".into(),
+            generation,
+            category: super::super::state::StatusCategory::Active,
+        });
+
+        worker.load_selected().unwrap();
+        event_rx.try_iter().for_each(|event| state.apply(event));
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-1", "message-2"]
+        );
+        assert_eq!(
+            state
+                .activity
+                .iter()
+                .map(|activity| activity.id.as_str())
+                .collect::<Vec<_>>(),
+            ["event-1", "event-2"]
+        );
+        assert!(state.messages_cursor.is_none() && state.activity_cursor.is_none());
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|request| {
+            request.contains("/sessions/session-1/messages?first=100&after=message-next")
+        }));
     }
 
     #[cfg(feature = "network")]
@@ -3002,8 +3063,6 @@ mod tests {
         worker.selected = Some(super::SelectedSession {
             id: "session-1".into(),
             generation: 1,
-            messages_cursor: None,
-            events_cursor: None,
             category: super::super::state::StatusCategory::Active,
         });
         let temp = tempfile::tempdir().unwrap();
@@ -3412,12 +3471,15 @@ mod tests {
         if request
             .starts_with("GET /v3/organizations/org-fixture/sessions/session-1/messages?first=100")
         {
+            let next = request.contains("&after=message-next");
             write_http(
                 stream,
                 200,
-                Some(
-                    r#"{"items":[{"event_id":"message-1","created_at":1786809600,"source":"devin","message":"Working"}],"end_cursor":"message-next","has_next_page":true,"total":1}"#,
-                ),
+                Some(if next {
+                    r#"{"items":[{"event_id":"message-2","created_at":1786809720,"source":"user","message":"Continue"}],"end_cursor":null,"has_next_page":false,"total":2}"#
+                } else {
+                    r#"{"items":[{"event_id":"message-1","created_at":1786809600,"source":"devin","message":"Working"}],"end_cursor":"message-next","has_next_page":true,"total":2}"#
+                }),
             );
             return;
         }

@@ -864,16 +864,26 @@ fn paint_provider_icon(
     }
 }
 
-/// The "connecting to the agent harness" state, shown while the sidebar or
-/// agentic view waits for a session: a breathing provider mark, a headline,
-/// a status line, and a progress bar — determinate while a download reports
-/// its size, a sweeping segment otherwise.
 fn draw_agent_connecting(
     ui: &mut egui::Ui,
     provider: ProviderId,
     headline: &str,
     detail: &str,
     progress: Option<f32>,
+) {
+    draw_assistant_connecting(ui, headline, detail, progress, |painter, rect, color| {
+        paint_provider_icon(painter, rect, provider_descriptor(provider).icon, color);
+    });
+}
+
+/// The shared assistant-sidebar loading state: a breathing identity mark,
+/// headline, status line, and determinate or sweeping progress bar.
+fn draw_assistant_connecting(
+    ui: &mut egui::Ui,
+    headline: &str,
+    detail: &str,
+    progress: Option<f32>,
+    paint_icon: impl Fn(&egui::Painter, egui::Rect, Color32),
 ) {
     let region = ui.max_rect();
     let block = egui::Rect::from_center_size(
@@ -882,16 +892,17 @@ fn draw_agent_connecting(
     );
     let time = ui.input(|input| input.time);
     ui.scope_builder(
-        UiBuilder::new().id_salt("agent_connecting").max_rect(block),
+        UiBuilder::new()
+            .id_salt("assistant_connecting")
+            .max_rect(block),
         |ui| {
             ui.vertical_centered(|ui| {
                 let pulse =
                     0.55 + 0.45 * (0.5 + 0.5 * (time * std::f64::consts::TAU / 2.4).sin()) as f32;
                 let (mark, _) = ui.allocate_exact_size(egui::vec2(40.0, 44.0), Sense::hover());
-                paint_provider_icon(
+                paint_icon(
                     ui.painter(),
                     egui::Rect::from_center_size(mark.center(), egui::Vec2::splat(40.0)),
-                    provider_descriptor(provider).icon,
                     theme::text().primary.gamma_multiply(pulse),
                 );
                 ui.add_space(theme::space::MEDIUM);

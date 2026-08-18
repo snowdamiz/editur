@@ -130,8 +130,6 @@ enum DevinUiAction {
     Create,
     SendMessage,
     RetryMessage,
-    LoadMoreMessages,
-    LoadMoreEvents,
     OpenSection(DevinSection),
     LoadKnowledge(String),
     LoadKnowledgeSuggestion(String),
@@ -630,12 +628,12 @@ impl EditorApp {
             }
             ui.separator();
             ui.menu_button("Edit labels", |ui| {
-                ui.set_min_width(260.0);
+                ui.set_width(260.0);
                 ui.add(
                     TextEdit::singleline(&mut self.devin_tags)
                         .id(Id::new("devin_tags"))
                         .hint_text(devin_field_hint("Comma-separated labels"))
-                        .desired_width(f32::INFINITY),
+                        .desired_width(260.0),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Add").clicked() {
@@ -649,12 +647,12 @@ impl EditorApp {
                 });
             });
             ui.menu_button("Find work history", |ui| {
-                ui.set_min_width(260.0);
+                ui.set_width(260.0);
                 ui.add(
                     TextEdit::singleline(&mut self.devin_activity_query)
                         .id(Id::new("devin_activity_query"))
                         .hint_text(devin_field_hint("Search remote actions"))
-                        .desired_width(f32::INFINITY),
+                        .desired_width(260.0),
                 );
                 if ui
                     .add_enabled(
@@ -737,25 +735,31 @@ impl EditorApp {
                 ui.label(field_label("API key"));
                 ui.add_space(theme::space::TIGHT);
                 if !self.devin_state.organizations.is_empty() {
-                    egui::ComboBox::from_id_salt("devin_organization_picker")
-                        .selected_text(
-                            self.devin_state
-                                .organizations
-                                .iter()
-                                .find(|organization| organization.id == self.devin_org_id)
-                                .map(|organization| organization.name.as_str())
-                                .unwrap_or("Choose an organization"),
-                        )
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
+                    let selected = self
+                        .devin_state
+                        .organizations
+                        .iter()
+                        .find(|organization| organization.id == self.devin_org_id)
+                        .map(|organization| organization.name.as_str())
+                        .unwrap_or("Choose an organization")
+                        .to_owned();
+                    settings_combo_box(
+                        ui,
+                        "devin_organization_picker",
+                        ui.available_width(),
+                        &selected,
+                        |ui| {
                             for organization in &self.devin_state.organizations {
-                                ui.selectable_value(
-                                    &mut self.devin_org_id,
-                                    organization.id.clone(),
+                                if settings_combo_choice(
+                                    ui,
                                     &organization.name,
-                                );
+                                    organization.id == self.devin_org_id,
+                                ) {
+                                    self.devin_org_id = organization.id.clone();
+                                }
                             }
-                        });
+                        },
+                    );
                     ui.add_space(theme::space::TIGHT);
                 }
                 ui.add(
@@ -1344,21 +1348,24 @@ impl EditorApp {
                         );
                         ui.horizontal(|ui| {
                             ui.label(field_label("Mode"));
-                            egui::ComboBox::from_id_salt("devin_mode")
-                                .selected_text(if self.devin_advanced.mode.is_empty() {
-                                    "Default"
-                                } else {
-                                    &self.devin_advanced.mode
-                                })
-                                .show_ui(ui, |ui| {
-                                    for mode in ["", "normal", "fast", "lite", "ultra", "fusion"] {
-                                        ui.selectable_value(
-                                            &mut self.devin_advanced.mode,
-                                            mode.into(),
-                                            if mode.is_empty() { "Default" } else { mode },
-                                        );
+                            let selected = if self.devin_advanced.mode.is_empty() {
+                                "Default"
+                            } else {
+                                &self.devin_advanced.mode
+                            }
+                            .to_owned();
+                            settings_combo_box(ui, "devin_mode", 120.0, &selected, |ui| {
+                                for mode in ["", "normal", "fast", "lite", "ultra", "fusion"] {
+                                    let label = if mode.is_empty() { "Default" } else { mode };
+                                    if settings_combo_choice(
+                                        ui,
+                                        label,
+                                        self.devin_advanced.mode == mode,
+                                    ) {
+                                        self.devin_advanced.mode = mode.into();
                                     }
-                                });
+                                }
+                            });
                             ui.label(field_label("Batch"));
                             ui.add(
                                 egui::DragValue::new(&mut self.devin_advanced.batch_count)
@@ -1525,14 +1532,14 @@ impl EditorApp {
             return;
         };
         if self.devin_state.busy && self.devin_state.detail.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    RichText::new("Loading session…")
-                        .font(theme::typography::small())
-                        .color(theme::text().muted),
-                );
-            });
+            draw_assistant_connecting(
+                ui,
+                "Loading Devin session",
+                "Fetching conversation and actions…",
+                None,
+                paint_devin_icon,
+            );
+            return;
         }
         let terminal = summary.archived
             || matches!(
@@ -1581,32 +1588,6 @@ impl EditorApp {
             .show(ui, |ui| {
                 self.draw_devin_detail_summary(ui);
                 self.draw_devin_stream(ui, action);
-                if self.devin_state.messages_cursor.is_some()
-                    && ui
-                        .add_enabled_ui(!self.devin_state.busy, |ui| {
-                            ui.small_button(format!(
-                                "Load more messages ({} shown)",
-                                self.devin_state.messages.len()
-                            ))
-                        })
-                        .inner
-                        .clicked()
-                {
-                    *action = Some(DevinUiAction::LoadMoreMessages);
-                }
-                if self.devin_state.activity_cursor.is_some()
-                    && ui
-                        .add_enabled_ui(!self.devin_state.busy, |ui| {
-                            ui.small_button(format!(
-                                "Load more actions ({} shown)",
-                                self.devin_state.activity.len()
-                            ))
-                        })
-                        .inner
-                        .clicked()
-                {
-                    *action = Some(DevinUiAction::LoadMoreEvents);
-                }
             });
         if summary.category == StatusCategory::WaitingApproval {
             let url = summary.url.as_deref().unwrap_or(DEVIN_WEB);
@@ -2655,25 +2636,32 @@ impl EditorApp {
                             self.devin_state.resources.integrations.status,
                             self.devin_state.resources.integrations.error.as_deref(),
                         );
-                        egui::ComboBox::from_id_salt("devin_integration_filter")
-                            .selected_text(match self.devin_resource_query.as_str() {
-                                "installed" => "Installed",
-                                "not_installed" => "Not installed",
-                                _ => "All integrations",
-                            })
-                            .show_ui(ui, |ui| {
+                        let selected = match self.devin_resource_query.as_str() {
+                            "installed" => "Installed",
+                            "not_installed" => "Not installed",
+                            _ => "All integrations",
+                        };
+                        settings_combo_box(
+                            ui,
+                            "devin_integration_filter",
+                            ui.available_width(),
+                            selected,
+                            |ui| {
                                 for (value, label) in [
                                     ("", "All integrations"),
                                     ("installed", "Installed"),
                                     ("not_installed", "Not installed"),
                                 ] {
-                                    ui.selectable_value(
-                                        &mut self.devin_resource_query,
-                                        value.into(),
+                                    if settings_combo_choice(
+                                        ui,
                                         label,
-                                    );
+                                        self.devin_resource_query == value,
+                                    ) {
+                                        self.devin_resource_query = value.into();
+                                    }
                                 }
-                            });
+                            },
+                        );
                         for integration in self
                             .devin_state
                             .resources
@@ -3000,8 +2988,6 @@ impl EditorApp {
                     attachments: pending.attachments.clone(),
                 })
             }
-            DevinUiAction::LoadMoreMessages => Some(DevinCommand::LoadMoreMessages),
-            DevinUiAction::LoadMoreEvents => Some(DevinCommand::LoadMoreEvents),
             DevinUiAction::Lifecycle(lifecycle) => {
                 self.devin_pending_lifecycle = Some(lifecycle);
                 self.devin_state.busy = true;
@@ -3592,11 +3578,18 @@ fn compact_duration(seconds: u64) -> String {
 }
 
 fn parse_timestamp_seconds(value: &str) -> Option<i64> {
+    parse_timestamp_nanos(value).map(|timestamp| (timestamp / 1_000_000_000) as i64)
+}
+
+fn parse_timestamp_nanos(value: &str) -> Option<i128> {
     if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() {
+            return None;
+        }
         return Some(if number > 10_000_000_000.0 {
-            (number / 1_000.0) as i64
+            (number * 1_000_000.0) as i128
         } else {
-            number as i64
+            (number * 1_000_000_000.0) as i128
         });
     }
     let bytes = value.as_bytes();
@@ -3618,7 +3611,26 @@ fn parse_timestamp_seconds(value: &str) -> Option<i64> {
     {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+    let fraction = value
+        .get(19..)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .map(|suffix| suffix.bytes().take_while(u8::is_ascii_digit).take(9))
+        .map(|digits| {
+            let mut value = 0_i128;
+            let mut count = 0;
+            for digit in digits {
+                value = value * 10 + i128::from(digit - b'0');
+                count += 1;
+            }
+            value * 10_i128.pow(9 - count)
+        })
+        .unwrap_or_default();
+    Some(
+        i128::from(
+            days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second,
+        ) * 1_000_000_000
+            + fraction,
+    )
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -3632,10 +3644,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 fn chronological_timestamp(left: &str, right: &str) -> std::cmp::Ordering {
-    match (
-        parse_timestamp_seconds(left),
-        parse_timestamp_seconds(right),
-    ) {
+    match (parse_timestamp_nanos(left), parse_timestamp_nanos(right)) {
         (Some(left), Some(right)) => left.cmp(&right),
         _ => left.cmp(right),
     }

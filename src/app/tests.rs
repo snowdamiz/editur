@@ -1673,6 +1673,79 @@ fn agent_sidebar_command_hides_but_does_not_reset_devin() {
 }
 
 #[test]
+fn devin_session_loading_uses_the_agent_sidebar_progress_state() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    fn has_progress(shape: &Shape) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.fill == theme::accent() && rect.rect.height() <= 4.0,
+            Shape::Vec(shapes) => shapes.iter().any(has_progress),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "loading".into(),
+        title: "Loading task".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    app.devin_state.sessions.push(summary.clone());
+    app.devin_state.select(summary.id);
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            time: Some(0.5),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    for expected in [
+        "Loading Devin session",
+        "Fetching conversation and actions…",
+    ] {
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, expected)),
+            "missing Devin loading text: {expected}"
+        );
+    }
+    assert!(
+        output.shapes.iter().any(|shape| has_progress(&shape.shape)),
+        "Devin loading should use the Agent sidebar progress sweep"
+    );
+}
+
+#[test]
 fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
     fn has_text(shape: &Shape, expected: &str) -> bool {
         match shape {
@@ -2268,6 +2341,20 @@ fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
                 "{tool} remains reachable from the session menu"
             );
         }
+        let edit_labels = menu
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, &|text| text == "Edit labels"))
+            .expect("Edit labels submenu");
+        let _ = draw(vec![Event::PointerMoved(edit_labels.center())]);
+        let field = context
+            .read_response(Id::new("devin_tags"))
+            .expect("labels field in the nested menu")
+            .rect;
+        assert!(
+            field.width() <= 260.0 && field.right() <= window.right(),
+            "the nested labels menu must stay compact and on-screen: {field:?}"
+        );
     }
 
     let generation = app.devin_state.select("archived".into());
@@ -2473,8 +2560,101 @@ fn every_devin_resource_and_advanced_session_view_has_a_focused_sidebar_route() 
         draw(&mut app)
             .shapes
             .iter()
-            .any(|shape| has_text(&shape.shape, "Structured output JSON Schema"))
+            .any(|shape| has_text(&shape.shape, "Mode"))
     );
+}
+
+#[test]
+fn every_devin_select_uses_the_shared_control_height() {
+    fn control_rect(output: &egui::FullOutput, label: &str) -> Rect {
+        fn text_rect(shape: &Shape, label: &str) -> Option<Rect> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == label => {
+                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, label)),
+                _ => None,
+            }
+        }
+        fn containing_rects(shape: &Shape, text: Rect, found: &mut Vec<Rect>) {
+            match shape {
+                Shape::Rect(rect) if rect.rect.contains_rect(text) => found.push(rect.rect),
+                Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        containing_rects(shape, text, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, label))
+            .unwrap_or_else(|| panic!("missing select label {label:?}"));
+        let mut found = Vec::new();
+        for shape in &output.shapes {
+            containing_rects(&shape.shape, text, &mut found);
+        }
+        found
+            .into_iter()
+            .min_by(|left, right| left.area().total_cmp(&right.area()))
+            .unwrap_or_else(|| panic!("missing select surface for {label:?}"))
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_state.organizations = vec![crate::devin::DevinOrganization {
+        id: "org-1".into(),
+        name: "Example organization".into(),
+    }];
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 720.0),
+        )),
+        ..RawInput::default()
+    };
+
+    let output = context.run_ui(input(), |root| app.ui(root));
+    let organization = control_rect(&output, "Choose an organization");
+
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    let output = context.run_ui(input(), |root| app.ui(root));
+    let scope = control_rect(&output, "Active sessions");
+
+    app.devin_view = DevinView::Create;
+    app.devin_advanced.open = true;
+    let output = context.run_ui(input(), |root| app.ui(root));
+    let mode = control_rect(&output, "Default");
+
+    app.devin_view = DevinView::Section(crate::devin::DevinSection::Integrations);
+    let output = context.run_ui(input(), |root| app.ui(root));
+    let integrations = control_rect(&output, "All integrations");
+
+    for (name, rect) in [
+        ("organization", organization),
+        ("mode", mode),
+        ("integrations", integrations),
+    ] {
+        assert_eq!(
+            rect.height(),
+            scope.height(),
+            "{name} select does not match the app select height"
+        );
+    }
 }
 
 #[test]
@@ -2762,6 +2942,104 @@ fn devin_stream_reads_like_the_agent_transcript() {
     assert!(
         rules.len() == 1,
         "exactly the composer divider spans the full panel width, found {rules:?}"
+    );
+}
+
+#[test]
+fn devin_stream_interleaves_subsecond_actions_with_the_conversation() {
+    fn text_top(output: &egui::FullOutput, expected: &str) -> f32 {
+        fn find(shape: &Shape, expected: &str) -> Option<f32> {
+            match shape {
+                Shape::Text(text) if text.galley.text().contains(expected) => Some(text.pos.y),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, expected)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, expected))
+            .unwrap_or_else(|| panic!("missing {expected:?}"))
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "ordered".into(),
+        title: "Ordered task".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_view = DevinView::Detail;
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    let generation = app.devin_state.select(summary.id.clone());
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            ..Default::default()
+        },
+    });
+    app.devin_state.apply(DevinEvent::MessagesLoaded {
+        session_id: "ordered".into(),
+        generation,
+        messages: vec![
+            crate::devin::DevinMessage {
+                id: "before".into(),
+                timestamp: "2026-08-15T20:00:00.100Z".into(),
+                role: "user".into(),
+                text: "Before the action".into(),
+                attachment_ids: Vec::new(),
+            },
+            crate::devin::DevinMessage {
+                id: "after".into(),
+                timestamp: "2026-08-15T20:00:00.300Z".into(),
+                role: "devin".into(),
+                text: "After the action".into(),
+                attachment_ids: Vec::new(),
+            },
+        ],
+        next_cursor: None,
+        update: crate::devin::PageUpdate::Initial,
+    });
+    app.devin_state.apply(DevinEvent::ActivityLoaded {
+        session_id: "ordered".into(),
+        generation,
+        activity: vec![crate::devin::Activity {
+            id: "between".into(),
+            timestamp: "2026-08-15T20:00:00.200Z".into(),
+            category: "shell".into(),
+            summary: "Between action".into(),
+            ..Default::default()
+        }],
+        next_cursor: None,
+        update: crate::devin::PageUpdate::Initial,
+    });
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        text_top(&output, "Before the action") < text_top(&output, "1 remote action")
+            && text_top(&output, "1 remote action") < text_top(&output, "After the action")
     );
 }
 
@@ -3335,10 +3613,11 @@ fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
         "detail loading is not exposed as a manual button"
     );
     assert!(
-        output
+        !output
             .shapes
             .iter()
-            .any(|shape| has_text(&shape.shape, "Load more actions (1 shown)"))
+            .any(|shape| has_text(&shape.shape, "Load more actions (1 shown)")),
+        "remote actions load without a manual pagination control"
     );
     assert!(
         !output

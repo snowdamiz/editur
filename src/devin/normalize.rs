@@ -226,6 +226,9 @@ pub(super) fn messages(value: &Value) -> Result<(Vec<DevinMessage>, Option<Strin
             let role = string(item, &["source", "role", "author", "type"])
                 .unwrap_or_else(|| "unknown".into());
             let raw_text = string(item, &["text", "message", "content"])?;
+            if internal_prompt(&role, &raw_text) {
+                return None;
+            }
             let timestamp = timestamp(item);
             let id = identity(
                 item,
@@ -275,6 +278,21 @@ pub(super) fn messages(value: &Value) -> Result<(Vec<DevinMessage>, Option<Strin
             &["end_cursor", "next_cursor", "nextCursor", "cursor"],
         ),
     ))
+}
+
+fn internal_prompt(role: &str, text: &str) -> bool {
+    if role.eq_ignore_ascii_case("system") || role.eq_ignore_ascii_case("developer") {
+        return true;
+    }
+    if !role.eq_ignore_ascii_case("user") {
+        return false;
+    }
+    // ponytail: recognize Devin's current injected repository wrapper; use
+    // structured message visibility if the API exposes it.
+    let text = text.to_ascii_lowercase();
+    text.starts_with("you are working in the *")
+        && text.contains("\n*objective*\n")
+        && text.contains("\nbranch and pr requirements")
 }
 
 fn slack_handoff(text: &str) -> Option<(String, Vec<String>)> {
@@ -782,6 +800,7 @@ fn session(value: &Value) -> Option<SessionSummary> {
             value,
             &["prompt", "initial_prompt", "initialPrompt", "task"],
         )
+        .filter(|prompt| !internal_prompt("user", prompt))
         .map(|value| bounded(value, MAX_DETAIL_BYTES)),
         category: status_category(&status, status_detail.as_deref(), archived),
         status,
@@ -1041,6 +1060,58 @@ mod tests {
             messages[0].attachment_ids,
             ["535f062f-2cce-47f1-88e9-ce4872a4bc98"]
         );
+    }
+
+    #[test]
+    fn internal_prompt_scaffolding_is_not_a_conversation_message() {
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "event_id": "system-message",
+                    "source": "user",
+                    "created_at": 1,
+                    "message": concat!(
+                        "You are working in the *example/project repository*.\n",
+                        "*Objective*\nFix the app.\n",
+                        "Branch and PR requirements\n",
+                        "For every fix or feature you implement: open a PR."
+                    )
+                },
+                {
+                    "event_id": "user-message",
+                    "source": "user",
+                    "created_at": 2,
+                    "message": "Please continue with the focused fix."
+                },
+                {
+                    "event_id": "devin-message",
+                    "source": "devin",
+                    "created_at": 3,
+                    "message": "I am checking the failing path."
+                }
+            ]
+        });
+
+        let (messages, _) = super::messages(&payload).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "Please continue with the focused fix.");
+        assert_eq!(messages[1].text, "I am checking the failing path.");
+    }
+
+    #[test]
+    fn internal_prompt_scaffolding_is_not_session_preview_text() {
+        let detail = super::detail(&serde_json::json!({
+            "session_id": "session-1",
+            "prompt": concat!(
+                "You are working in the *example/project repository*.\n",
+                "*Objective*\nFix the app.\n",
+                "Branch and PR requirements\nOpen a PR."
+            )
+        }))
+        .unwrap();
+
+        assert!(detail.summary.prompt.is_none());
     }
 
     #[test]
