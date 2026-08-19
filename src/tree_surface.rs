@@ -116,7 +116,6 @@ impl TreeSurface {
         );
         let row_height = row_height();
         let mut ancestor_on_screen = Vec::new();
-        let mut truncated_hover = None;
         for index in self.visible_rows(rows.len(), rect.height()) {
             let row = &rows[index];
             let top = rect.top() + index as f32 * row_height - self.scroll_y;
@@ -229,17 +228,11 @@ impl TreeSurface {
                 };
                 ui.fonts_mut(|fonts| fonts.layout_job(job))
             });
-            if is_hovered && label.elided {
-                truncated_hover = Some(row.entry.path.clone());
-            }
             painter.galley(
                 egui::pos2(label_left, row_rect.center().y - label.size().y * 0.5),
                 Arc::clone(label),
                 theme::text().primary,
             );
-        }
-        if let Some(path) = truncated_hover {
-            response.clone().on_hover_text(path.display().to_string());
         }
         if crate::scrollbar::show(
             ui,
@@ -322,7 +315,7 @@ impl TreeSurface {
             );
         }
         painter.hline(header.x_range(), header.bottom(), theme::border::hairline());
-        response.on_hover_text(root.display().to_string()).clicked()
+        response.clicked()
     }
 
     pub fn visible_rows(&self, total: usize, viewport_height: f32) -> Range<usize> {

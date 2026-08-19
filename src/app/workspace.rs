@@ -40,11 +40,8 @@ impl EditorApp {
         ));
         if changed {
             self.lsp_completion = None;
-            self.lsp_hover = None;
-            self.lsp_hover_probe = None;
             self.lsp_definitions = None;
             self.lsp_pending_completion = None;
-            self.lsp_pending_hover = None;
             self.lsp_pending_definition = None;
             if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
                 find.match_revision = u64::MAX;

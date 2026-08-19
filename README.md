@@ -236,7 +236,7 @@ Use the sidebar icon at the right of the titlebar to open an ACP coding agent fo
 
 The shared Agent UI supports streamed replies, plans, tool activity and supplied diffs, follow-ups, advertised model/mode controls, ACP image, audio, and resource attachments, exact permission choices, cancellation, reconnect, and bounded in-memory transcripts. History and provider-specific permission controls appear only when the connected agent advertises them. A dirty open file must be saved before a prompt; external edits reload a clean buffer but never overwrite a dirty one.
 
-The full Agent view organizes recent project roots as workspaces, including Git worktrees opened as folders. Selecting a workspace switches the agent working directory; ACP history is requested and filtered by that exact root, so each workspace shows only its own sessions. Git workspaces show their current branch. When the optional `gh` CLI is available on Editur's inherited `PATH` and authenticated, the current branch also shows its pull request state; Editur refreshes it after agent turns and silently omits it when GitHub status is unavailable.
+The full Agent view organizes recent project roots as workspaces, including Git worktrees opened as folders. Workspace buttons show only the project name. Selecting a workspace switches the agent working directory; ACP history is requested and filtered by that exact root, so each workspace shows only its own sessions.
 
 Official release builds embed one attested provider bundle. Cursor `2026.07.23-e383d2b` is provisioned during installation. Codex uses the canonical `@agentclientprotocol/codex-acp` `1.1.14` adapter, its locked `@openai/codex` `0.147.0` dependency, and a private Node.js `22.22.0` runtime; it is downloaded lazily only after its first-use license and provider-terms notice is accepted. Editur never invokes `npx`, a global Node installation, or a mutable package tag. Claude remains an unavailable catalog entry until its canonical distribution and licensing can meet the same pinned private-package policy.
 
@@ -262,7 +262,7 @@ Sleep and archive are reversible; sending to a sleeping session wakes it, and ar
 
 Editur uses language servers already installed by the user; it never downloads a server or makes an LSP network request. Open the in-window Settings page with the titlebar gear or `Cmd/Ctrl+,`, then leave a preset on Auto, choose a custom executable plus one argument per line, or turn it Off. The initial presets are rust-analyzer for Rust, TypeScript Language Server for TypeScript/JavaScript, Pyright for Python, gopls for Go, and clangd for C/C++.
 
-Supported language servers provide diagnostics, plain-text completion, hover documentation, and go to definition. Use `Ctrl+Space` for completion, `F8`/`Shift+F8` for next/previous diagnostics, and `F12` or command-click for definitions. Hover documentation appears after the pointer rests over source text. Files above 5 MiB and unsupported file types do not start a server. Editur does not apply server workspace edits, commands, snippets, formatting, rename, or code actions.
+Supported language servers provide diagnostics, plain-text completion, and go to definition. Use `Ctrl+Space` for completion, `F8`/`Shift+F8` for next/previous diagnostics, and `F12` or command-click for definitions. Files above 5 MiB and unsupported file types do not start a server. Editur does not apply server workspace edits, commands, snippets, formatting, rename, or code actions.
 
 Servers run lazily per project and preset, receive only open document text, and stop when their last document closes. `Not found` means the executable is absent from Editur's inherited `PATH`; install it through the language's normal tooling or select an absolute custom path. `Rescan` repeats discovery but installs nothing.
 
@@ -278,7 +278,7 @@ The workflow tests and builds Linux x86_64, macOS Apple Silicon and Intel, and W
 
 ## Syntax highlighting
 
-Syntax highlighting is fully built in and selected automatically from the file name or extension; unknown formats fall back to Plain Text. Editur embeds Syntect's full default syntax set plus C/C++, C#, CSS, Dockerfile, dotenv, Go, GraphQL, HTML, Java, JavaScript, JSON, Kotlin, Lua, Makefile, Markdown, PHP, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript, XML, and YAML grammars. No syntax package download, configuration, or separate CLI command is required.
+Syntax highlighting is fully built in and selected automatically from the file name or extension; unknown formats fall back to Plain Text. Editur embeds Syntect's full default syntax set plus C/C++, C#, CSS/SCSS/Less, Dockerfile, dotenv, Go, GraphQL, HTML and HTML-like Astro/Vue/Svelte files, Java, JavaScript/JSX, JSON/JSONC, Kotlin, Lua, Makefile, Markdown/MDX, PHP, PowerShell, Python, Ruby, Shell, SQL, Swift, TOML, TypeScript/TSX, XML, and YAML grammars. No syntax package download, configuration, or separate CLI command is required.
 
 `EDITUR_GPU_DEVICE` selects a native adapter by a case-insensitive name fragment, `EDITUR_GPU_VALIDATION=1` requests available validation layers, and `EDITUR_LOG=debug` prints startup timings.
 

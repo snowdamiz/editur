@@ -208,30 +208,6 @@ impl EditorApp {
                 }
             }
         }
-        if let Some(tag) = self.lsp_pending_hover.clone() {
-            let current = self
-                .lsp_hover_probe
-                .as_ref()
-                .is_some_and(|probe| probe.tag == tag);
-            if !current {
-                self.lsp_pending_hover = None;
-            } else {
-                match self.send_lsp_feature(
-                    &tag,
-                    |capabilities| capabilities.hover,
-                    LspCommand::Hover(tag.clone()),
-                ) {
-                    LspFeatureSend::Sent | LspFeatureSend::Unsupported => {
-                        self.lsp_pending_hover = None;
-                    }
-                    LspFeatureSend::Retry => {
-                        self.lsp_sync_needed = true;
-                        ctx.request_repaint_after(Duration::from_millis(50));
-                    }
-                    LspFeatureSend::Waiting => {}
-                }
-            }
-        }
         if let Some(tag) = self.lsp_pending_definition.clone() {
             if !self.tag_matches_cursor(&tag) {
                 self.lsp_pending_definition = None;
@@ -324,7 +300,6 @@ impl EditorApp {
                             self.lsp_sync_needed = true;
                         }
                         if self.lsp_pending_completion.is_some()
-                            || self.lsp_pending_hover.is_some()
                             || self.lsp_pending_definition.is_some()
                         {
                             self.lsp_sync_needed = true;
@@ -353,13 +328,6 @@ impl EditorApp {
                                 .is_some_and(|(owner, _)| owner.id == preset)
                         }) {
                             self.lsp_completion = None;
-                        }
-                        if self.lsp_hover.as_ref().is_some_and(|popup| {
-                            preset_for_path(&popup.tag.path)
-                                .is_some_and(|(owner, _)| owner.id == preset)
-                        }) {
-                            self.lsp_hover = None;
-                            self.lsp_hover_probe = None;
                         }
                     }
                     crate::lsp::Event::Diagnostics {
@@ -426,27 +394,7 @@ impl EditorApp {
                             });
                         }
                     }
-                    crate::lsp::Event::Hover { tag, content } => {
-                        if !cursor_context_changed
-                            && self
-                                .lsp_hover_probe
-                                .as_ref()
-                                .is_some_and(|probe| probe.tag == tag)
-                            && let Some(content) = content
-                        {
-                            let probe = self.lsp_hover_probe.as_ref().unwrap();
-                            let markdown = content.markdown.then(|| {
-                                markdown::compact_layout(&content.text, 400.0, |_, _| None)
-                            });
-                            self.lsp_hover = Some(HoverPopup {
-                                tag,
-                                pointer: probe.pointer,
-                                bounds: probe.bounds,
-                                content,
-                                markdown,
-                            });
-                        }
-                    }
+                    crate::lsp::Event::Hover { .. } => {}
                     crate::lsp::Event::Definitions {
                         tag,
                         locations,
@@ -480,7 +428,6 @@ impl EditorApp {
     }
 
     pub(super) fn draw_lsp_popups(&mut self, root: &mut egui::Ui) {
-        self.draw_lsp_hover(root);
         self.draw_lsp_completion(root);
         self.draw_lsp_definitions(root);
     }
@@ -567,41 +514,6 @@ impl EditorApp {
             }
             self.accept_completion();
         }
-    }
-
-    pub(super) fn draw_lsp_hover(&self, root: &mut egui::Ui) {
-        if self.lsp_completion.is_some() {
-            return;
-        }
-        let Some(popup) = self.lsp_hover.as_ref() else {
-            return;
-        };
-        let width = 420.0_f32.min(popup.bounds.width().max(1.0));
-        let position = popup_position(
-            popup.pointer + egui::vec2(12.0, 16.0),
-            egui::vec2(width, 300.0_f32.min(popup.bounds.height())),
-            popup.bounds,
-        );
-        egui::Area::new(Id::new("lsp_hover"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(position)
-            .show(root.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(theme::surface().raised)
-                    .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
-                    .corner_radius(7)
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(width - 20.0);
-                        ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                            if let Some(job) = &popup.markdown {
-                                ui.add(Label::new(job.clone()).wrap());
-                            } else {
-                                ui.label(&popup.content.text);
-                            }
-                        });
-                    });
-            });
     }
 
     pub(super) fn draw_lsp_definitions(&mut self, root: &mut egui::Ui) {

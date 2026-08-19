@@ -1,7 +1,22 @@
 use super::*;
-use std::fmt::Write as _;
+
+fn scoped_agent_id(
+    agentic_mode: bool,
+    pane: PaneId,
+    source: impl std::hash::Hash + std::fmt::Debug,
+) -> Id {
+    if agentic_mode && pane != PaneId(0) {
+        Id::new((source, pane.0))
+    } else {
+        Id::new(source)
+    }
+}
 
 impl EditorApp {
+    fn agent_id(&self, source: impl std::hash::Hash + std::fmt::Debug) -> Id {
+        scoped_agent_id(self.agentic_mode, self.active_agent_pane, source)
+    }
+
     pub(super) fn draw_agent_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         draw_assistant_sidebar_surface(ui, rect);
@@ -34,7 +49,7 @@ impl EditorApp {
                 self.agent_find.matches.len()
             )
         };
-        let query_id = Id::new("agent_find_query");
+        let query_id = self.agent_id("agent_find_query");
         let focused = ui.memory(|memory| memory.has_focus(query_id));
         let (enter, backwards, escape) = ui.input(|input| {
             (
@@ -130,10 +145,15 @@ impl EditorApp {
 
     pub(super) fn warm_providers(&mut self, ctx: &egui::Context) {
         self.ensure_provider_catalog();
-        self.start_provider(self.selected_provider, ctx);
+        self.start_provider(self.selected_provider, ctx, false);
     }
 
-    pub(super) fn start_provider(&mut self, provider: ProviderId, ctx: &egui::Context) {
+    pub(super) fn start_provider(
+        &mut self,
+        provider: ProviderId,
+        ctx: &egui::Context,
+        fresh_session: bool,
+    ) {
         if self.agent_controllers.contains_key(&provider) {
             return;
         }
@@ -153,6 +173,7 @@ impl EditorApp {
                 provider,
                 self.tree.root.clone(),
                 preferred_session,
+                fresh_session,
                 move || wake.request_repaint(),
             ),
         );
@@ -163,7 +184,7 @@ impl EditorApp {
             drop(controller);
         }
         let provider = self.selected_provider;
-        self.start_provider(provider, ctx);
+        self.start_provider(provider, ctx, false);
     }
 
     pub(super) fn request_provider_switch(&mut self, target: ProviderId, ctx: &egui::Context) {
@@ -187,7 +208,7 @@ impl EditorApp {
         self.agent_find.dirty = true;
         self.attachment_file_picker = None;
         self.agent_run_everything = None;
-        self.start_provider(target, ctx);
+        self.start_provider(target, ctx, false);
     }
 
     pub(super) fn select_provider_state(&mut self, target: ProviderId) {
@@ -201,6 +222,20 @@ impl EditorApp {
         self.provider_agents
             .insert(self.selected_provider, previous);
         self.selected_provider = target;
+    }
+
+    pub(super) fn poll_agent_panes(&mut self, ctx: &egui::Context) -> bool {
+        let selected = self.active_agent_pane;
+        let mut any_active = false;
+        for pane in self.agent_pane_layout.panes() {
+            if self.agent_pane_picker == Some(pane) || !self.activate_agent_session_pane(pane) {
+                continue;
+            }
+            self.poll_agent(ctx);
+            any_active |= self.agent.active;
+        }
+        self.activate_agent_session_pane(selected);
+        any_active
     }
 
     pub(super) fn poll_agent(&mut self, ctx: &egui::Context) {
@@ -312,8 +347,6 @@ impl EditorApp {
                     active_reloaded |= self.active_tab == Some(index);
                     self.lsp_sync_needed = true;
                     self.lsp_completion = None;
-                    self.lsp_hover = None;
-                    self.lsp_hover_probe = None;
                 }
                 Ok(ReconcileOutcome::Conflict) => {
                     conflict.get_or_insert(index);
@@ -342,10 +375,6 @@ impl EditorApp {
 
     pub(super) fn refresh_after_agent(&mut self, provider: ProviderId) {
         self.schedule_git_refresh();
-        if provider == self.selected_provider {
-            self.git_workspace_status_started = false;
-            self.git_workspace_status_rx = None;
-        }
         let changed = if provider == self.selected_provider {
             std::mem::take(&mut self.agent.refresh_queue)
         } else {
@@ -530,9 +559,13 @@ impl EditorApp {
     }
 
     pub(super) fn draw_agent(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let agentic_mode = self.agentic_mode;
+        let agent_pane = self.active_agent_pane;
+        let compact_agent_composer = self.agentic_mode && rect.width() <= AGENT_PANE_COMPACT_WIDTH;
+        let floating_agent_composer = self.agentic_mode && !compact_agent_composer;
         // The exact width the prompt is laid out at later, so the measured
         // text height matches what the composer actually shows.
-        let prompt_width = if self.agentic_mode {
+        let prompt_width = if floating_agent_composer {
             (rect.width() - 2.0 * theme::space::WIDE).min(AGENTIC_CONTENT_WIDTH)
                 - 2.0 * theme::space::MEDIUM
         } else {
@@ -545,7 +578,7 @@ impl EditorApp {
             rect.height(),
             !self.agent_attachments.is_empty(),
         );
-        let composer_height = if self.agentic_mode {
+        let composer_height = if floating_agent_composer {
             composer_height + AGENTIC_COMPOSER_TOP_MARGIN + AGENTIC_COMPOSER_BOTTOM_MARGIN
         } else {
             composer_height
@@ -562,6 +595,7 @@ impl EditorApp {
             });
         let status = self.agent.connection.clone();
         let mut new_session = false;
+        let mut new_pane = false;
         let mut session_menu_anchor = None;
         let mut session_menu_toggled = false;
         let mut provider_menu_toggled = false;
@@ -648,6 +682,55 @@ impl EditorApp {
                 theme::text().primary,
             );
         }
+        if self.agentic_mode {
+            if self.agent_pane_layout.panes().len() > 1 {
+                let pane_title = title.to_owned();
+                let (close, dragging) =
+                    draw_agent_pane_controls(ui, header, agent_pane, &pane_title, true);
+                if close {
+                    self.agent_pane_close_requested = Some(agent_pane);
+                }
+                if dragging {
+                    self.agent_pane_drag = Some(AgentPaneDrag {
+                        pane: agent_pane,
+                        title: pane_title,
+                    });
+                }
+            }
+            let button = agent_pane_button_rect(header, ui.ctx().content_rect().right());
+            let response = ui
+                .interact(
+                    button,
+                    scoped_agent_id(agentic_mode, agent_pane, "agent_new_pane"),
+                    Sense::click(),
+                )
+                .on_hover_text("Open session pane");
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Open session pane",
+                )
+            });
+            let color = if response.hovered() {
+                theme::text().primary
+            } else {
+                theme::text().secondary
+            };
+            let icon = egui::Rect::from_center_size(button.center(), egui::vec2(16.0, 12.0));
+            painter.rect_stroke(
+                icon,
+                1.5,
+                egui::Stroke::new(1.2, color),
+                egui::StrokeKind::Inside,
+            );
+            painter.vline(
+                icon.center().x,
+                icon.y_range(),
+                egui::Stroke::new(1.2, color),
+            );
+            new_pane = response.clicked();
+        }
         let agent_button = agent_toggle_rect(header);
         if !self.agentic_mode && self.draw_agent_toggle(ui, agent_button) {
             self.agent_sidebar = false;
@@ -659,7 +742,11 @@ impl EditorApp {
         if !self.agentic_mode && self.agent.session_ready {
             let button = agent_new_session_rect(header);
             let response = ui
-                .interact(button, Id::new("agent_new_session"), Sense::click())
+                .interact(
+                    button,
+                    scoped_agent_id(agentic_mode, agent_pane, "agent_new_session"),
+                    Sense::click(),
+                )
                 .on_hover_text("New Agent session");
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(
@@ -772,7 +859,7 @@ impl EditorApp {
                     );
                     let response = ui.interact(
                         block,
-                        Id::new("agent_auth_state"),
+                        scoped_agent_id(agentic_mode, agent_pane, "agent_auth_state"),
                         Sense::hover(),
                     );
                     response.widget_info(|| {
@@ -944,7 +1031,15 @@ impl EditorApp {
                         egui::vec2(width, height),
                     );
                     let response =
-                        ui.interact(block, Id::new("agent_disconnected_state"), Sense::hover());
+                        ui.interact(
+                            block,
+                            scoped_agent_id(
+                                agentic_mode,
+                                agent_pane,
+                                "agent_disconnected_state",
+                            ),
+                            Sense::hover(),
+                        );
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &title)
                     });
@@ -999,6 +1094,7 @@ impl EditorApp {
                         .to_string_lossy();
                     draw_agent_empty_state(
                         ui,
+                        scoped_agent_id(agentic_mode, agent_pane, "agent_empty_state"),
                         self.selected_provider,
                         &project,
                         self.agentic_mode,
@@ -1146,7 +1242,7 @@ impl EditorApp {
                                 if let Some(cluster) = dense_cluster {
                                     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                                         ui.ctx(),
-                                        Id::new(("dense_agent_work", item_index, cluster.active)),
+                                        scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_work", item_index, cluster.active)),
                                         false,
                                     );
                                     if !find_matches.is_empty() {
@@ -1195,7 +1291,7 @@ impl EditorApp {
                                 if let Some(cluster) = dense_cluster {
                                     dense_work_open = assistant_dense_disclosure_row(
                                         ui,
-                                        Id::new(("dense_agent_work", item_index, cluster.active)),
+                                        scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_work", item_index, cluster.active)),
                                         &cluster.label,
                                         cluster.change,
                                         false,
@@ -1243,7 +1339,7 @@ impl EditorApp {
                                         let width = ui.available_width();
                                         let galley = assistant_markdown_galley(
                                             ui,
-                                            Id::new(("agent_markdown", item_index, dense_agent)),
+                                            scoped_agent_id(agentic_mode, agent_pane, ("agent_markdown", item_index, dense_agent)),
                                             text,
                                             width,
                                             &self.highlighter,
@@ -1265,7 +1361,7 @@ impl EditorApp {
                                         if dense_agent {
                                             assistant_dense_tool(
                                                 ui,
-                                                Id::new(("dense_agent_thought", item_index)),
+                                                scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_thought", item_index)),
                                                 "Thought",
                                                 None,
                                                 None,
@@ -1304,7 +1400,7 @@ impl EditorApp {
                                         {
                                             assistant_dense_tool(
                                                 ui,
-                                                Id::new(("dense_agent_content", item_index)),
+                                                scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_content", item_index)),
                                                 "Thought",
                                                 None,
                                                 None,
@@ -1365,7 +1461,7 @@ impl EditorApp {
                                         if dense_agent {
                                             assistant_dense_tool(
                                                 ui,
-                                                Id::new(("dense_agent_plan", item_index)),
+                                                scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_plan", item_index)),
                                                 "Plan",
                                                 None,
                                                 None,
@@ -1450,7 +1546,7 @@ impl EditorApp {
                                                                     let width = ui.available_width();
                                                                     let galley = agent_code_galley(
                                                                         ui,
-                                                                        Id::new((
+                                                                        scoped_agent_id(agentic_mode, agent_pane, (
                                                                             "agent_tool_code",
                                                                             item_index,
                                                                             content_index,
@@ -1510,7 +1606,7 @@ impl EditorApp {
                                                                 let (clicked, scrolled) =
                                                                     draw_agent_diff(
                                                                         ui,
-                                                                        Id::new((
+                                                                        scoped_agent_id(agentic_mode, agent_pane, (
                                                                             "agent_diff",
                                                                             item_index,
                                                                             content_index,
@@ -1736,7 +1832,7 @@ impl EditorApp {
                                         if dense_agent {
                                                 assistant_dense_tool(
                                                     ui,
-                                                    Id::new(("dense_agent_tool", item_index)),
+                                                    scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_tool", item_index)),
                                                 title,
                                                 tool.status.as_deref(),
                                                 change,
@@ -1869,8 +1965,7 @@ impl EditorApp {
                                                                     theme::text().primary,
                                                                 ),
                                                             };
-                                                        let response = ui
-                                                            .add(
+                                                        let response = ui.add(
                                                                 egui::Button::new(
                                                                     RichText::new(label)
                                                                         .strong()
@@ -1882,13 +1977,6 @@ impl EditorApp {
                                                                     1.0, stroke,
                                                                 ))
                                                                 .corner_radius(6),
-                                                            )
-                                                            .on_hover_text(
-                                                                if option.kind == "AllowAlways" {
-                                                                    "Remember this permission globally"
-                                                                } else {
-                                                                    &option.name
-                                                                },
                                                             );
                                                         if response.clicked() {
                                                             permission_decisions.push((
@@ -2201,10 +2289,21 @@ impl EditorApp {
                             }
                             if self.agent.active {
                                 if dense_agent {
-                                    draw_dense_agent_working(ui);
+                                    draw_dense_agent_working(
+                                        ui,
+                                        scoped_agent_id(
+                                            agentic_mode,
+                                            agent_pane,
+                                            "dense_agent_working",
+                                        ),
+                                    );
                                 } else {
                                     ui.add_space(theme::space::SMALL);
-                                    draw_agent_working(ui, self.selected_provider);
+                                    draw_agent_working(
+                                        ui,
+                                        scoped_agent_id(agentic_mode, agent_pane, "agent_working"),
+                                        self.selected_provider,
+                                    );
                                 }
                             }
                                 });
@@ -2348,7 +2447,7 @@ impl EditorApp {
             session_menu_anchor
         };
         let mut menu_toggled = session_menu_toggled || provider_menu_toggled;
-        let composer_panel = if self.agentic_mode {
+        let composer_panel = if floating_agent_composer {
             let padding =
                 ((composer.width() - AGENTIC_CONTENT_WIDTH) * 0.5).max(theme::space::WIDE);
             let panel = egui::Rect::from_min_max(
@@ -2371,6 +2470,10 @@ impl EditorApp {
             );
             panel
         } else {
+            if compact_agent_composer {
+                ui.painter()
+                    .rect_filled(composer, 0.0, theme::state::sidebar_material());
+            }
             ui.painter().hline(
                 composer.x_range(),
                 composer.top() + 0.5,
@@ -2378,7 +2481,7 @@ impl EditorApp {
             );
             composer
         };
-        let prompt_id = Id::new("agent_prompt");
+        let prompt_id = scoped_agent_id(agentic_mode, agent_pane, "agent_prompt");
         let mention_open = matches!(open_menu, Some(AgentMenu::Mentions(_)))
             && !self.agent_mention_matches.is_empty();
         if mention_open && ui.memory(|memory| memory.has_focus(prompt_id)) {
@@ -2451,8 +2554,8 @@ impl EditorApp {
         let output = (AssistantComposer {
             panel: composer_panel,
             prompt_id,
-            attach_id: Id::new("agent_attach"),
-            scroll_id: Id::new("agent_prompt_scroll"),
+            attach_id: scoped_agent_id(agentic_mode, agent_pane, "agent_attach"),
+            scroll_id: scoped_agent_id(agentic_mode, agent_pane, "agent_prompt_scroll"),
             hint: &composer_hint,
             attach_tooltip: "Attach files (or type @ for files and folders)",
             drop_hint: "Drop files or folders to attach",
@@ -2464,7 +2567,7 @@ impl EditorApp {
             handle_drop: true,
             mouse_wheel: !menu_owns_wheel,
             focus: false,
-            radius: if self.agentic_mode {
+            radius: if floating_agent_composer {
                 f32::from(AGENTIC_COMPOSER_RADIUS)
             } else {
                 0.0
@@ -2501,7 +2604,8 @@ impl EditorApp {
         }
         prompt_changed |= history_navigated || output.input_changed;
         if history_navigated {
-            ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
+            let prompt_id = scoped_agent_id(agentic_mode, agent_pane, "agent_prompt");
+            ui.memory_mut(|memory| memory.request_focus(prompt_id));
         }
         let mention_query = composer_enabled
             .then(|| agent_mention_query(&self.agent.prompt))
@@ -2555,19 +2659,11 @@ impl EditorApp {
             |ui| {
                 ui.spacing_mut().item_spacing.x = theme::space::SMALL;
                 if let Some(goal) = &self.agent.goal {
-                    let mut goal_detail = goal.objective.clone();
-                    if let Some(iterations) = goal.iterations {
-                        let _ = write!(goal_detail, "\nIterations: {iterations}");
-                    }
-                    if let Some(reason) = &goal.last_reason {
-                        let _ = write!(goal_detail, "\nLast update: {reason}");
-                    }
                     ui.label(
                         RichText::new(format!("Goal: {}", goal.status))
                             .size(theme::typography::MICRO_SIZE)
                             .weak(),
-                    )
-                    .on_hover_text(goal_detail);
+                    );
                     if goal.status == "active"
                         && self
                             .agent
@@ -2597,13 +2693,11 @@ impl EditorApp {
                         goal_action = Some(GoalAction::Clear);
                     }
                 } else if self.agent.goal_actions.iter().any(|action| action == "set")
-                    && ui
-                        .small_button("Goal")
-                        .on_hover_text("Set a persistent session goal")
-                        .clicked()
+                    && ui.small_button("Goal").clicked()
                 {
                     self.agent.prompt = "/goal ".into();
-                    ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
+                    let prompt_id = scoped_agent_id(agentic_mode, agent_pane, "agent_prompt");
+                    ui.memory_mut(|memory| memory.request_focus(prompt_id));
                 }
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     if self.agent.allow_run_everything {
@@ -2615,7 +2709,6 @@ impl EditorApp {
                         let selector = agent_selector_button(
                             ui,
                             if run_everything { "Allow all" } else { "Ask" },
-                            "Permissions",
                         );
                         if selector.clicked() {
                             open_menu = (open_menu.as_ref() != Some(&menu)).then_some(menu.clone());
@@ -2634,7 +2727,7 @@ impl EditorApp {
                             .find(|mode| mode.id == current)
                             .map_or(current, |mode| mode.name.as_str());
                         let menu = AgentMenu::Mode;
-                        let selector = agent_selector_button(ui, current_name, "Mode");
+                        let selector = agent_selector_button(ui, current_name);
                         if selector.clicked() {
                             open_menu = (open_menu.as_ref() != Some(&menu)).then_some(menu.clone());
                             menu_toggled = true;
@@ -2680,7 +2773,6 @@ impl EditorApp {
                                     ui,
                                     None,
                                     &current_name,
-                                    option.description.as_deref().unwrap_or(&option.name),
                                     fast,
                                     f32::INFINITY,
                                 );
@@ -2700,10 +2792,7 @@ impl EditorApp {
                                 {
                                     continue;
                                 }
-                                let selected =
-                                    ui.selectable_label(*current, &option.name).on_hover_text(
-                                        option.description.as_deref().unwrap_or(&option.name),
-                                    );
+                                let selected = ui.selectable_label(*current, &option.name);
                                 if selected.clicked() {
                                     config_changes
                                         .push((option.id.clone(), ConfigValue::Boolean(!current)));
@@ -2720,8 +2809,7 @@ impl EditorApp {
                             RichText::new(format!("{} / {}{cost}", usage.used, usage.size))
                                 .size(theme::typography::MICRO_SIZE)
                                 .weak(),
-                        )
-                        .on_hover_text("Context usage");
+                        );
                     }
                     if let Some(model) = model_config {
                         let mut label = selected_config_name(model).unwrap().into_owned();
@@ -2734,9 +2822,12 @@ impl EditorApp {
                         let menu = AgentMenu::Config(model.id.clone());
                         let selector = agent_config_selector_button(
                             ui,
-                            Some(Id::new("agent_model_selector")),
+                            Some(scoped_agent_id(
+                                agentic_mode,
+                                agent_pane,
+                                "agent_model_selector",
+                            )),
                             &label,
-                            "Model, thinking level, and speed",
                             fast,
                             ui.available_width(),
                         );
@@ -2943,7 +3034,7 @@ impl EditorApp {
                                                         );
                                                     }
                                                     for session in sessions {
-                                                        let (open, remove) = agent_session_row(
+                                                        let (open, remove, _) = agent_session_row(
                                                             ui,
                                                             session,
                                                             self.selected_provider,
@@ -2981,7 +3072,9 @@ impl EditorApp {
                                                         self.agent_prompt_history_index = None;
                                                         self.agent_prompt_history_draft.clear();
                                                         ui.memory_mut(|memory| {
-                                                            memory.request_focus(Id::new(
+                                                            memory.request_focus(scoped_agent_id(
+                                                                agentic_mode,
+                                                                agent_pane,
                                                                 "agent_prompt",
                                                             ));
                                                         });
@@ -3036,7 +3129,9 @@ impl EditorApp {
                                                             &mut self.agent.prompt,
                                                         );
                                                         ui.memory_mut(|memory| {
-                                                            memory.request_focus(Id::new(
+                                                            memory.request_focus(scoped_agent_id(
+                                                                agentic_mode,
+                                                                agent_pane,
                                                                 "agent_prompt",
                                                             ));
                                                         });
@@ -3283,7 +3378,8 @@ impl EditorApp {
 
         if let Some(path) = mention_attach {
             self.attach_agent_files(ui.ctx(), [path]);
-            ui.memory_mut(|memory| memory.request_focus(Id::new("agent_prompt")));
+            let prompt_id = scoped_agent_id(agentic_mode, agent_pane, "agent_prompt");
+            ui.memory_mut(|memory| memory.request_focus(prompt_id));
             ui.ctx().request_repaint();
         }
         if open_file_picker {
@@ -3359,6 +3455,9 @@ impl EditorApp {
         if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
         {
             let _ = controller.send(AgentCommand::NewSession);
+        }
+        if new_pane {
+            self.open_agent_session_pane();
         }
         if let Some(method) = authenticate
             && let Some(controller) = self.agent_controllers.get(&self.selected_provider)

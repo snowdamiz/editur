@@ -273,7 +273,7 @@ impl EditorApp {
                         icon,
                         theme::text().secondary,
                     );
-                    let (branch, hover, counts) = branch_label(&repository.info.branch);
+                    let (branch, counts) = branch_label(&repository.info.branch);
                     let font = theme::typography::small_strong();
                     let branch_width = ui
                         .painter()
@@ -305,8 +305,7 @@ impl EditorApp {
                                 .color(theme::text().primary),
                         )
                         .truncate(),
-                    )
-                    .on_hover_text(hover);
+                    );
                     if counts_width.is_some() {
                         ui.label(
                             RichText::new(counts)
@@ -798,23 +797,15 @@ fn source_control_no_repository(
     initialize.then_some(SourceControlAction::Init)
 }
 
-fn branch_label(branch: &BranchInfo) -> (String, String, String) {
+fn branch_label(branch: &BranchInfo) -> (String, String) {
     match branch {
         BranchInfo::Named {
             name,
-            upstream,
             ahead,
             behind,
-            unborn,
+            ..
         } => (
             name.clone(),
-            if *unborn {
-                "No commits yet".into()
-            } else if let Some(upstream) = upstream {
-                format!("{name} → {upstream}")
-            } else {
-                name.clone()
-            },
             format!(
                 "{}{}",
                 if *ahead > 0 {
@@ -831,7 +822,7 @@ fn branch_label(branch: &BranchInfo) -> (String, String, String) {
             .trim()
             .to_owned(),
         ),
-        BranchInfo::Detached { oid } => (oid.clone(), "Detached HEAD".into(), String::new()),
+        BranchInfo::Detached { oid } => (oid.clone(), String::new()),
     }
 }
 
@@ -987,10 +978,6 @@ fn source_control_row(
     );
     let kind = group_kind(group, entry);
     let word = change_word(kind);
-    let response = response.on_hover_text(entry.orig_path.as_ref().map_or_else(
-        || entry.path.display().to_string(),
-        |original| format!("{} → {}", original.display(), entry.path.display()),
-    ));
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,

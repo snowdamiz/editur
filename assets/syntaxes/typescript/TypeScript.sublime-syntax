@@ -6,6 +6,7 @@ file_extensions:
   - ts
   - mts
   - cts
+  - tsx
 scope: source.ts
 contexts:
   main:

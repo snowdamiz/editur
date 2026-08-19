@@ -9,6 +9,8 @@ file_extensions:
   - inc
   - tmpl
   - tpl
+  - vue
+  - svelte
 first_line_match: (?i)<(!DOCTYPE\s*)?html
 scope: text.html.basic
 contexts:

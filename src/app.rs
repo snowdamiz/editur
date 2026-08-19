@@ -104,7 +104,7 @@ use crate::{
     },
     lsp::{
         Command as LspCommand, CompletionItem, Controller as LspController, DefinitionLocation,
-        HoverContent, PresetId, RequestTag, ServerCapabilities, ServerLaunch, ServerStatus,
+        PresetId, RequestTag, ServerCapabilities, ServerLaunch, ServerStatus,
         catalog as lsp_catalog, preset_for_path,
     },
     markdown,
@@ -322,6 +322,7 @@ const AGENT_TRANSCRIPT_TOP_PADDING: i8 = 14;
 const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
 const AGENTIC_CONTENT_WIDTH: f32 = 860.0;
+const AGENT_PANE_COMPACT_WIDTH: f32 = 480.0;
 const AGENTIC_COMPOSER_RADIUS: u8 = 10;
 const AGENT_EMPTY_STATE_HEIGHT: f32 = 88.0;
 /// Keep the panel flush with the transcript while retaining bottom window
@@ -561,7 +562,6 @@ fn agent_path_link(
         .sense(Sense::click()),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .on_hover_text("Open in editor")
 }
 
 const ASSISTANT_IMAGE_PREVIEW_EDGE: u32 = 640;
@@ -590,8 +590,7 @@ fn assistant_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -
                 .corner_radius(6)
                 .sense(Sense::click()),
         )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("View image");
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     ui.painter().rect_stroke(
         response.rect,
         6,
@@ -665,8 +664,7 @@ fn assistant_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option
                 .corner_radius(8)
                 .sense(Sense::click()),
         )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("View image");
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     ui.painter().rect_stroke(
         response.rect,
         8,
@@ -958,12 +956,13 @@ fn agent_empty_state_rect(region: egui::Rect, agentic_mode: bool) -> egui::Rect 
 
 fn draw_agent_empty_state(
     ui: &mut egui::Ui,
+    id: Id,
     provider: ProviderId,
     project: &str,
     agentic_mode: bool,
 ) {
     let block = agent_empty_state_rect(ui.max_rect(), agentic_mode);
-    let response = ui.interact(block, Id::new("agent_empty_state"), Sense::hover());
+    let response = ui.interact(block, id, Sense::hover());
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Start a task"));
     ui.scope_builder(
@@ -1078,11 +1077,11 @@ fn draw_provider_identity(ui: &mut egui::Ui, provider: ProviderId) {
 }
 
 /// A live provider-branded pulse that follows the latest transcript output.
-fn draw_agent_working(ui: &mut egui::Ui, provider: ProviderId) -> egui::Response {
+fn draw_agent_working(ui: &mut egui::Ui, id: Id, provider: ProviderId) -> egui::Response {
     let provider = provider_descriptor(provider);
     let time = ui.input(|input| input.time);
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 36.0));
-    let response = ui.interact(rect, Id::new("agent_working"), Sense::hover());
+    let response = ui.interact(rect, id, Sense::hover());
     let center = egui::pos2(rect.left() + 14.0, rect.center().y);
     let pulse = (0.5 + 0.5 * (time * std::f64::consts::TAU / 1.8).sin()) as f32;
     ui.painter()
@@ -1121,10 +1120,10 @@ fn draw_agent_working(ui: &mut egui::Ui, provider: ProviderId) -> egui::Response
     response
 }
 
-fn draw_dense_agent_working(ui: &mut egui::Ui) -> egui::Response {
+fn draw_dense_agent_working(ui: &mut egui::Ui, id: Id) -> egui::Response {
     let time = ui.input(|input| input.time);
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
-    let response = ui.interact(rect, Id::new("dense_agent_working"), Sense::hover());
+    let response = ui.interact(rect, id, Sense::hover());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), "Working")
     });
@@ -1217,7 +1216,11 @@ fn draw_provider_selector_identity(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label.clone())
     });
-    response.on_hover_text(label)
+    if show_label {
+        response
+    } else {
+        response.on_hover_text(label)
+    }
 }
 
 fn agent_session_selector_rect(
@@ -1244,9 +1247,7 @@ fn agent_session_selector_rect(
 }
 
 fn draw_agent_session_selector(ui: &mut egui::Ui, rect: egui::Rect, title: &str) -> egui::Response {
-    let response = ui
-        .interact(rect, Id::new("agent_session_selector"), Sense::click())
-        .on_hover_text("Previous sessions");
+    let response = ui.interact(rect, Id::new("agent_session_selector"), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -1505,8 +1506,7 @@ fn agent_collapsing_header(
                         - counts_width
                         - trailing_items as f32 * ui.spacing().item_spacing.x)
                         .max(0.0);
-                    let response = agent_tool_title(ui, id, title_line, title_width, search)
-                        .on_hover_text(title);
+                    let response = agent_tool_title(ui, id, title_line, title_width, search);
                     if has_body && response.clicked() {
                         state.toggle(ui);
                         ui.ctx().request_discard("tool card disclosure changed");
@@ -2158,13 +2158,11 @@ fn draw_agentic_diff_tabs(
                             rect.height(),
                         ));
                         let is_active = index == active;
-                        let response = ui
-                            .interact(
-                                tab,
-                                Id::new(("agentic_diff_tab", &panel.path)),
-                                Sense::click(),
-                            )
-                            .on_hover_text(panel.path.display().to_string());
+                        let response = ui.interact(
+                            tab,
+                            Id::new(("agentic_diff_tab", &panel.path)),
+                            Sense::click(),
+                        );
                         response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::WidgetType::SelectableLabel,
@@ -2532,6 +2530,108 @@ fn agent_toggle_rect(header: egui::Rect) -> egui::Rect {
         egui::pos2(controls_right - 14.0, header.center().y),
         egui::vec2(28.0, header.height()),
     )
+}
+
+fn agent_pane_button_rect(header: egui::Rect, _window_right: f32) -> egui::Rect {
+    #[cfg(target_os = "macos")]
+    let controls_right = header.right() - 3.0;
+    #[cfg(not(target_os = "macos"))]
+    let controls_right = if (header.right() - _window_right).abs() <= 0.5 {
+        header.right() - 3.0 * 46.0
+    } else {
+        header.right() - 3.0
+    };
+    egui::Rect::from_center_size(
+        egui::pos2(controls_right - 14.0, header.center().y),
+        egui::vec2(28.0, header.height()),
+    )
+}
+
+fn agent_pane_close_rect(
+    header: egui::Rect,
+    window_right: f32,
+    has_open_button: bool,
+) -> egui::Rect {
+    agent_pane_button_rect(header, window_right)
+        .translate(egui::vec2(if has_open_button { -28.0 } else { 0.0 }, 0.0))
+}
+
+fn agent_pane_drag_rect(
+    header: egui::Rect,
+    window_right: f32,
+    has_open_button: bool,
+) -> egui::Rect {
+    agent_pane_close_rect(header, window_right, has_open_button).translate(egui::vec2(-28.0, 0.0))
+}
+
+fn draw_agent_pane_controls(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    pane: PaneId,
+    title: &str,
+    has_open_button: bool,
+) -> (bool, bool) {
+    let window_right = ui.ctx().content_rect().right();
+    let close_rect = agent_pane_close_rect(header, window_right, has_open_button);
+    let close = ui
+        .interact(
+            close_rect,
+            Id::new(("agent_close_pane", pane.0)),
+            Sense::click(),
+        )
+        .on_hover_text("Close pane");
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Close pane")
+    });
+    let close_color = if close.hovered() {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    icons::paint(
+        ui.painter(),
+        Icon::Close,
+        egui::Rect::from_center_size(close_rect.center(), egui::Vec2::splat(icons::GRID)),
+        close_color,
+    );
+
+    let drag_rect = agent_pane_drag_rect(header, window_right, has_open_button);
+    let drag = ui
+        .interact(
+            drag_rect,
+            Id::new(("agent_pane_drag", pane.0)),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(
+            if ui
+                .ctx()
+                .is_being_dragged(Id::new(("agent_pane_drag", pane.0)))
+            {
+                CursorIcon::Grabbing
+            } else {
+                CursorIcon::Grab
+            },
+        )
+        .on_hover_text(format!("Move {title} pane"));
+    drag.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Move {title} pane"),
+        )
+    });
+    let drag_color = if drag.hovered() || drag.dragged() {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    for x in [-2.5, 2.5] {
+        for y in [-3.5, 0.0, 3.5] {
+            ui.painter()
+                .circle_filled(drag_rect.center() + egui::vec2(x, y), 1.0, drag_color);
+        }
+    }
+    (close.clicked(), drag.drag_started() || drag.dragged())
 }
 
 fn devin_toggle_rect(header: egui::Rect, agent_open: bool) -> egui::Rect {
@@ -3318,6 +3418,65 @@ impl Default for AgentFind {
     }
 }
 
+struct AgentPaneRuntime {
+    agent_menu: Option<AgentMenu>,
+    agent_menu_popup: Option<egui::Rect>,
+    agent_menu_scroll_y: f32,
+    agent_follow_transcript: bool,
+    agent_prompt_history_index: Option<usize>,
+    agent_prompt_history_draft: String,
+    agent_attachments: Vec<AssistantComposerAttachment>,
+    agent_mentions: Option<Vec<AgentMentionEntry>>,
+    agent_mention_matches: Vec<AgentMentionEntry>,
+    agent_mention_selected: usize,
+    agent_find: AgentFind,
+    agent_transcript_heights: Vec<f32>,
+    agent_transcript_heights_key: (u32, u64, bool, bool, u64),
+    agent_transcript_rendered: usize,
+    agent_drop_hovered: bool,
+    agent_run_everything: Option<bool>,
+    selected_provider: ProviderId,
+    provider_agents: HashMap<ProviderId, AgentState>,
+    provider_menu_anchor: Option<egui::Rect>,
+    agent: AgentState,
+    agent_controllers: HashMap<ProviderId, AgentController>,
+    pending_agent_prompt: bool,
+}
+
+struct AgentPaneDrag {
+    pane: PaneId,
+    title: String,
+}
+
+impl AgentPaneRuntime {
+    fn blank(selected_provider: ProviderId) -> Self {
+        Self {
+            agent_menu: None,
+            agent_menu_popup: None,
+            agent_menu_scroll_y: 0.0,
+            agent_follow_transcript: true,
+            agent_prompt_history_index: None,
+            agent_prompt_history_draft: String::new(),
+            agent_attachments: Vec::new(),
+            agent_mentions: None,
+            agent_mention_matches: Vec::new(),
+            agent_mention_selected: 0,
+            agent_find: AgentFind::default(),
+            agent_transcript_heights: Vec::new(),
+            agent_transcript_heights_key: (0, 0, false, false, 0),
+            agent_transcript_rendered: 0,
+            agent_drop_hovered: false,
+            agent_run_everything: None,
+            selected_provider,
+            provider_agents: HashMap::new(),
+            provider_menu_anchor: None,
+            agent: AgentState::default(),
+            agent_controllers: HashMap::new(),
+            pending_agent_prompt: false,
+        }
+    }
+}
+
 impl Default for PaneFind {
     fn default() -> Self {
         Self {
@@ -3451,22 +3610,6 @@ struct CompletionPopup {
     selected: usize,
     anchor: egui::Rect,
     bounds: egui::Rect,
-}
-
-struct HoverProbe {
-    tag: RequestTag,
-    pointer: egui::Pos2,
-    bounds: egui::Rect,
-    started: Instant,
-    requested: bool,
-}
-
-struct HoverPopup {
-    tag: RequestTag,
-    pointer: egui::Pos2,
-    bounds: egui::Rect,
-    content: HoverContent,
-    markdown: Option<LayoutJob>,
 }
 
 struct DefinitionChooser {
@@ -4076,7 +4219,7 @@ fn assistant_attachment_tile(
         egui::Rect::from_center_size(close, egui::Vec2::splat(icons::GRID * 0.55)),
         theme::text().primary,
     );
-    response.on_hover_text(format!("Remove {}", attachment.file.path().display()))
+    response
 }
 
 fn workspace_file_picker_row(
@@ -4139,7 +4282,7 @@ fn workspace_file_picker_row(
             theme::typography::body(),
             theme::text().primary,
         );
-    response.on_hover_text(entry.path.display().to_string())
+    response
 }
 
 /// A rail shortcut: the Places and Recent rows share this one look.
@@ -4282,10 +4425,7 @@ fn file_picker_breadcrumbs(ui: &mut egui::Ui, directory: &Path) -> Option<PathBu
     let mut navigate = None;
     ui.spacing_mut().item_spacing.x = 0.0;
     if let Some(ancestor) = overflow {
-        if file_picker_breadcrumb_chip(ui, "…", false)
-            .on_hover_text(ancestor.display().to_string())
-            .clicked()
-        {
+        if file_picker_breadcrumb_chip(ui, "…", false).clicked() {
             navigate = Some(ancestor);
         }
         file_picker_breadcrumb_separator(ui);
@@ -4295,7 +4435,7 @@ fn file_picker_breadcrumbs(ui: &mut egui::Ui, directory: &Path) -> Option<PathBu
         let current = index == last;
         let chip = file_picker_breadcrumb_chip(ui, &label, current);
         if !current {
-            if chip.on_hover_text(path.display().to_string()).clicked() {
+            if chip.clicked() {
                 navigate = Some(path);
             }
             file_picker_breadcrumb_separator(ui);
@@ -4396,10 +4536,6 @@ pub struct EditorApp {
     tree_surface: TreeSurface,
     recent_projects: Vec<PathBuf>,
     project_menu: bool,
-    git_workspace_status: Option<crate::projects::GitWorkspaceStatus>,
-    git_workspace_status_rx:
-        Option<std::sync::mpsc::Receiver<Option<crate::projects::GitWorkspaceStatus>>>,
-    git_workspace_status_started: bool,
     /// The previous window was in agent mode when the project switched, so the
     /// replacement starts its providers on the first frame that has a context.
     agent_boot_pending: bool,
@@ -4426,6 +4562,15 @@ pub struct EditorApp {
     terminal_dragging: bool,
     terminal: TerminalPanel,
     agentic_mode: bool,
+    agent_pane_layout: PaneLayout,
+    active_agent_pane: PaneId,
+    agent_pane_picker: Option<PaneId>,
+    agent_pane_runtimes: HashMap<PaneId, AgentPaneRuntime>,
+    agent_pane_close_requested: Option<PaneId>,
+    agent_pane_drag: Option<AgentPaneDrag>,
+    agent_pane_drop: Option<TabDrop>,
+    agent_session_drag: Option<SessionChoice>,
+    agent_session_drop: Option<TabDrop>,
     agentic_diffs: Vec<AgenticDiff>,
     active_agentic_diff: usize,
     agent_sidebar: bool,
@@ -4545,11 +4690,8 @@ pub struct EditorApp {
     lsp_scroll_to: Option<(PathBuf, usize)>,
     lsp_caret: Option<LspCaret>,
     lsp_completion: Option<CompletionPopup>,
-    lsp_hover_probe: Option<HoverProbe>,
-    lsp_hover: Option<HoverPopup>,
     lsp_definitions: Option<DefinitionChooser>,
     lsp_pending_completion: Option<(RequestTag, Option<String>)>,
-    lsp_pending_hover: Option<RequestTag>,
     lsp_pending_definition: Option<RequestTag>,
 }
 
@@ -4604,9 +4746,6 @@ impl EditorApp {
                 .map(|directory| crate::projects::load(&directory))
                 .unwrap_or_default(),
             project_menu: false,
-            git_workspace_status: None,
-            git_workspace_status_rx: None,
-            git_workspace_status_started: false,
             agent_boot_pending: false,
             syntaxes,
             highlighter: Highlighter::new()?,
@@ -4631,6 +4770,15 @@ impl EditorApp {
             terminal_dragging: false,
             terminal: TerminalPanel::default(),
             agentic_mode: false,
+            agent_pane_layout: PaneLayout::default(),
+            active_agent_pane: PaneId(0),
+            agent_pane_picker: None,
+            agent_pane_runtimes: HashMap::new(),
+            agent_pane_close_requested: None,
+            agent_pane_drag: None,
+            agent_pane_drop: None,
+            agent_session_drag: None,
+            agent_session_drop: None,
             agentic_diffs: Vec::new(),
             active_agentic_diff: 0,
             agent_sidebar: false,
@@ -4744,11 +4892,8 @@ impl EditorApp {
             lsp_scroll_to: None,
             lsp_caret: None,
             lsp_completion: None,
-            lsp_hover_probe: None,
-            lsp_hover: None,
             lsp_definitions: None,
             lsp_pending_completion: None,
-            lsp_pending_hover: None,
             lsp_pending_definition: None,
         })
     }
@@ -4772,40 +4917,6 @@ impl EditorApp {
                 ctx.request_repaint();
             }
         });
-    }
-
-    fn start_git_workspace_status(&mut self, ctx: &egui::Context) {
-        if self.git_workspace_status_started {
-            return;
-        }
-        self.git_workspace_status_started = true;
-        if cfg!(test) {
-            return;
-        }
-        let root = self.tree.root.clone();
-        let (send, receive) = std::sync::mpsc::channel();
-        self.git_workspace_status_rx = Some(receive);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = send.send(crate::projects::inspect_git_workspace(&root));
-            ctx.request_repaint();
-        });
-    }
-
-    fn poll_git_workspace_status(&mut self) {
-        let Some(receive) = &self.git_workspace_status_rx else {
-            return;
-        };
-        match receive.try_recv() {
-            Ok(status) => {
-                self.git_workspace_status = status;
-                self.git_workspace_status_rx = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.git_workspace_status_rx = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
     }
 
     /// Hands the update to a fresh `editur update` process, which asks this
@@ -4865,12 +4976,11 @@ impl EditorApp {
             self.agent_boot_pending = false;
             self.open_agent(&ctx);
         }
-        self.poll_git_workspace_status();
         self.flush_git_refresh(&ctx);
         self.poll_git();
-        self.poll_agent(&ctx);
+        let any_agent_active = self.poll_agent_panes(&ctx);
         self.poll_devin(&ctx);
-        if self.agent.active {
+        if any_agent_active {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.shortcuts(&ctx);
@@ -4902,7 +5012,6 @@ impl EditorApp {
 
         let window = root.max_rect();
         if self.agentic_mode {
-            self.start_git_workspace_status(&ctx);
             self.update_agentic_sidebar_resize(&ctx, window);
             self.draw_agentic_workspace(root, window);
             self.draw_dialogs(&ctx);
@@ -5320,14 +5429,103 @@ impl EditorApp {
                 |ui| self.draw_agentic_sessions(ui),
             );
         }
-        root.scope_builder(
-            UiBuilder::new().id_salt("agentic_canvas").max_rect(agent),
-            |ui| {
-                ui.painter()
-                    .rect_filled(ui.max_rect(), 0.0, editor_background());
-                self.draw_agent(ui, ui.max_rect());
-            },
-        );
+        let available_sessions = self.agent.sessions.clone().unwrap_or_default();
+        let agent_panes = self.agent_pane_layout.rects(agent);
+        self.update_agent_session_drag(root.ctx(), &agent_panes);
+        let agent_panes = self.agent_pane_layout.rects(agent);
+        let pane_drag_finished = self.update_agent_pane_drag(root.ctx(), &agent_panes);
+        let agent_panes = self.agent_pane_layout.rects(agent);
+        let selected_pane = self.active_agent_pane;
+        let interacted_pane = (!pane_drag_finished)
+            .then(|| {
+                root.ctx().pointer_hover_pos().and_then(|pointer| {
+                    root.ctx()
+                        .input(|input| {
+                            input.pointer.primary_pressed() || input.pointer.primary_released()
+                        })
+                        .then(|| {
+                            agent_panes
+                                .iter()
+                                .find(|(_, rect)| rect.contains(pointer))
+                                .map(|(pane, _)| *pane)
+                        })
+                        .flatten()
+                })
+            })
+            .flatten();
+        let pane_resize_handles =
+            if self.agent_session_drag.is_none() && self.agent_pane_drag.is_none() {
+                resize_dragged_pane_handle(
+                    root.ctx(),
+                    &mut self.agent_pane_layout,
+                    agent,
+                    "agent_pane_divider",
+                    false,
+                )
+            } else {
+                Vec::new()
+            };
+        for (pane, pane_rect) in agent_panes.iter().copied() {
+            root.scope_builder(
+                UiBuilder::new()
+                    .id_salt(("agentic_canvas", pane.0))
+                    .max_rect(pane_rect),
+                |ui| {
+                    ui.painter()
+                        .rect_filled(ui.max_rect(), 0.0, editor_background());
+                    if self.agent_pane_picker == Some(pane) {
+                        self.draw_agent_session_picker(ui, pane_rect, pane, &available_sessions);
+                    } else if self.activate_agent_session_pane(pane) {
+                        self.draw_agent(ui, pane_rect);
+                    }
+                },
+            );
+        }
+        if let Some(pane) = self.agent_pane_close_requested.take() {
+            self.remove_agent_session_pane(pane);
+        }
+        let restore = interacted_pane
+            .filter(|pane| self.agent_pane_picker != Some(*pane))
+            .unwrap_or(selected_pane);
+        self.activate_agent_session_pane(restore);
+        paint_pane_resize_handles(root, &pane_resize_handles, "agent_pane_divider");
+        if let Some(drop) = self.agent_session_drop {
+            let preview = drop.preview.shrink(4.0);
+            root.painter()
+                .rect_filled(preview, 5.0, theme::subtle(theme::accent()));
+            root.painter().rect_stroke(
+                preview,
+                5.0,
+                egui::Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(drop) = self.agent_pane_drop {
+            let preview = drop.preview.shrink(4.0);
+            root.painter()
+                .rect_filled(preview, 5.0, theme::subtle(theme::accent()));
+            root.painter().rect_stroke(
+                preview,
+                5.0,
+                egui::Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(session) = &self.agent_session_drag {
+            draw_tab_drag_ghost(
+                root.ctx(),
+                session
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or("Untitled session"),
+            );
+            root.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+        if let Some(drag) = &self.agent_pane_drag {
+            draw_tab_drag_ghost(root.ctx(), &drag.title);
+            root.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
         if let Some(rect) = diff_panel {
             let mut selected_tab = None;
             let mut closed_tab = None;
@@ -5451,9 +5649,8 @@ impl EditorApp {
         self.draw_agentic_titlebar(
             root,
             window.with_max_y((window.top() + TITLEBAR_HEIGHT).min(window.bottom())),
-            content,
+            agent,
             sessions,
-            diff_panel.map(|rect| rect.left()),
         );
         if let Some(sessions) = sessions {
             let divider = egui::Rect::from_center_size(
@@ -5473,6 +5670,436 @@ impl EditorApp {
                 sessions.y_range(),
                 resize_divider_stroke(root.ctx(), active),
             );
+        }
+    }
+
+    fn open_agent_session_pane(&mut self) -> Option<PaneId> {
+        if self.agent_pane_picker.is_some() {
+            return None;
+        }
+        let pane = self
+            .agent_pane_layout
+            .split(self.active_agent_pane, DropZone::Right)?;
+        self.agent_pane_picker = Some(pane);
+        Some(pane)
+    }
+
+    fn remove_agent_session_pane(&mut self, pane: PaneId) -> bool {
+        if !self.agent_pane_layout.remove(pane) {
+            return false;
+        }
+        self.agent_pane_runtimes.remove(&pane);
+        if self.agent_pane_picker == Some(pane) {
+            self.agent_pane_picker = None;
+        }
+        if self.active_agent_pane != pane {
+            return true;
+        }
+        let next = self
+            .agent_pane_layout
+            .panes()
+            .into_iter()
+            .find(|pane| self.agent_pane_picker != Some(*pane))
+            .or(self.agent_pane_picker)
+            .expect("a pane remains after removing a split pane");
+        self.active_agent_pane = next;
+        let runtime = self
+            .agent_pane_runtimes
+            .remove(&next)
+            .unwrap_or_else(|| AgentPaneRuntime::blank(self.selected_provider));
+        self.put_agent_pane_runtime(runtime);
+        true
+    }
+
+    fn move_agent_session_pane(
+        &mut self,
+        source: PaneId,
+        target: PaneId,
+        zone: DropZone,
+    ) -> Option<PaneId> {
+        let panes = self.agent_pane_layout.panes();
+        if source == target || !panes.contains(&source) || !panes.contains(&target) {
+            return None;
+        }
+        let runtime = self.agent_pane_runtimes.remove(&source);
+        self.agent_pane_layout.remove(source);
+        let moved = self.agent_pane_layout.split(
+            target,
+            if zone == DropZone::Center {
+                DropZone::Right
+            } else {
+                zone
+            },
+        )?;
+        if self.agent_pane_picker == Some(source) {
+            self.agent_pane_picker = Some(moved);
+        } else if self.active_agent_pane == source {
+            self.active_agent_pane = moved;
+        } else if let Some(runtime) = runtime {
+            self.agent_pane_runtimes.insert(moved, runtime);
+        }
+        Some(moved)
+    }
+
+    fn take_agent_pane_runtime(&mut self) -> AgentPaneRuntime {
+        AgentPaneRuntime {
+            agent_menu: self.agent_menu.take(),
+            agent_menu_popup: self.agent_menu_popup.take(),
+            agent_menu_scroll_y: std::mem::take(&mut self.agent_menu_scroll_y),
+            agent_follow_transcript: std::mem::replace(&mut self.agent_follow_transcript, true),
+            agent_prompt_history_index: self.agent_prompt_history_index.take(),
+            agent_prompt_history_draft: std::mem::take(&mut self.agent_prompt_history_draft),
+            agent_attachments: std::mem::take(&mut self.agent_attachments),
+            agent_mentions: self.agent_mentions.take(),
+            agent_mention_matches: std::mem::take(&mut self.agent_mention_matches),
+            agent_mention_selected: std::mem::take(&mut self.agent_mention_selected),
+            agent_find: std::mem::take(&mut self.agent_find),
+            agent_transcript_heights: std::mem::take(&mut self.agent_transcript_heights),
+            agent_transcript_heights_key: std::mem::replace(
+                &mut self.agent_transcript_heights_key,
+                (0, 0, false, false, 0),
+            ),
+            agent_transcript_rendered: std::mem::take(&mut self.agent_transcript_rendered),
+            agent_drop_hovered: std::mem::take(&mut self.agent_drop_hovered),
+            agent_run_everything: self.agent_run_everything.take(),
+            selected_provider: std::mem::replace(&mut self.selected_provider, ProviderId::Cursor),
+            provider_agents: std::mem::take(&mut self.provider_agents),
+            provider_menu_anchor: self.provider_menu_anchor.take(),
+            agent: std::mem::take(&mut self.agent),
+            agent_controllers: std::mem::take(&mut self.agent_controllers),
+            pending_agent_prompt: std::mem::take(&mut self.pending_agent_prompt),
+        }
+    }
+
+    fn put_agent_pane_runtime(&mut self, runtime: AgentPaneRuntime) {
+        self.agent_menu = runtime.agent_menu;
+        self.agent_menu_popup = runtime.agent_menu_popup;
+        self.agent_menu_scroll_y = runtime.agent_menu_scroll_y;
+        self.agent_follow_transcript = runtime.agent_follow_transcript;
+        self.agent_prompt_history_index = runtime.agent_prompt_history_index;
+        self.agent_prompt_history_draft = runtime.agent_prompt_history_draft;
+        self.agent_attachments = runtime.agent_attachments;
+        self.agent_mentions = runtime.agent_mentions;
+        self.agent_mention_matches = runtime.agent_mention_matches;
+        self.agent_mention_selected = runtime.agent_mention_selected;
+        self.agent_find = runtime.agent_find;
+        self.agent_transcript_heights = runtime.agent_transcript_heights;
+        self.agent_transcript_heights_key = runtime.agent_transcript_heights_key;
+        self.agent_transcript_rendered = runtime.agent_transcript_rendered;
+        self.agent_drop_hovered = runtime.agent_drop_hovered;
+        self.agent_run_everything = runtime.agent_run_everything;
+        self.selected_provider = runtime.selected_provider;
+        self.provider_agents = runtime.provider_agents;
+        self.provider_menu_anchor = runtime.provider_menu_anchor;
+        self.agent = runtime.agent;
+        self.agent_controllers = runtime.agent_controllers;
+        self.pending_agent_prompt = runtime.pending_agent_prompt;
+    }
+
+    fn activate_agent_session_pane(&mut self, pane: PaneId) -> bool {
+        if pane == self.active_agent_pane {
+            return true;
+        }
+        let Some(runtime) = self.agent_pane_runtimes.remove(&pane) else {
+            return false;
+        };
+        let previous_pane = std::mem::replace(&mut self.active_agent_pane, pane);
+        let previous_runtime = self.take_agent_pane_runtime();
+        self.put_agent_pane_runtime(runtime);
+        self.agent_pane_runtimes
+            .insert(previous_pane, previous_runtime);
+        true
+    }
+
+    fn assign_agent_session_pane(&mut self, pane: PaneId, session_id: Option<String>) {
+        if self.agent_pane_picker != Some(pane) {
+            return;
+        }
+        let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        runtime.agent.session_id = session_id;
+        self.agent_pane_picker = None;
+        if self.active_agent_pane == pane {
+            self.put_agent_pane_runtime(runtime);
+        } else {
+            self.agent_pane_runtimes.insert(pane, runtime);
+            self.activate_agent_session_pane(pane);
+        }
+    }
+
+    fn place_agent_session(
+        &mut self,
+        target: PaneId,
+        zone: DropZone,
+        session_id: String,
+    ) -> Option<PaneId> {
+        if self.agent_pane_picker == Some(target) {
+            self.assign_agent_session_pane(target, Some(session_id));
+            return Some(target);
+        }
+        let pane = self.agent_pane_layout.split(
+            target,
+            if zone == DropZone::Center {
+                DropZone::Right
+            } else {
+                zone
+            },
+        )?;
+        let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        runtime.agent.session_id = Some(session_id);
+        self.agent_pane_runtimes.insert(pane, runtime);
+        self.activate_agent_session_pane(pane);
+        Some(pane)
+    }
+
+    fn update_agent_session_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) {
+        if self.agent_session_drag.is_none() {
+            self.agent_session_drop = None;
+            return;
+        }
+        let previous = self.agent_session_drop;
+        self.agent_session_drop = ctx.pointer_hover_pos().and_then(|pointer| {
+            panes.iter().find_map(|(target, rect)| {
+                rect.contains(pointer).then(|| {
+                    let zone = if self.agent_pane_picker == Some(*target) {
+                        DropZone::Center
+                    } else {
+                        let previous = previous
+                            .filter(|drop| drop.target == *target)
+                            .map(|drop| drop.zone);
+                        let zone = stable_tab_drop_zone(*rect, pointer, previous);
+                        if zone == DropZone::Center {
+                            DropZone::Right
+                        } else {
+                            zone
+                        }
+                    };
+                    TabDrop {
+                        target: *target,
+                        zone,
+                        preview: tab_drop_preview(*rect, zone),
+                    }
+                })
+            })
+        });
+        if ctx.input(|input| input.pointer.primary_released()) {
+            let session = self.agent_session_drag.take();
+            let drop = self.agent_session_drop.take();
+            if let (Some(session), Some(drop)) = (session, drop)
+                && self
+                    .place_agent_session(drop.target, drop.zone, session.id)
+                    .is_some()
+            {
+                self.start_provider(self.selected_provider, ctx, false);
+            }
+        } else if !ctx.input(|input| input.pointer.primary_down()) {
+            self.agent_session_drag = None;
+            self.agent_session_drop = None;
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    fn update_agent_pane_drag(
+        &mut self,
+        ctx: &egui::Context,
+        panes: &[(PaneId, egui::Rect)],
+    ) -> bool {
+        let Some(source) = self.agent_pane_drag.as_ref().map(|drag| drag.pane) else {
+            self.agent_pane_drop = None;
+            return false;
+        };
+        let previous = self.agent_pane_drop;
+        self.agent_pane_drop = ctx.pointer_hover_pos().and_then(|pointer| {
+            panes.iter().find_map(|(target, rect)| {
+                (*target != source && rect.contains(pointer)).then(|| {
+                    let previous = previous
+                        .filter(|drop| drop.target == *target)
+                        .map(|drop| drop.zone);
+                    let zone = stable_tab_drop_zone(*rect, pointer, previous);
+                    let zone = if zone == DropZone::Center {
+                        DropZone::Right
+                    } else {
+                        zone
+                    };
+                    TabDrop {
+                        target: *target,
+                        zone,
+                        preview: tab_drop_preview(*rect, zone),
+                    }
+                })
+            })
+        });
+        if ctx.input(|input| input.pointer.primary_released()) {
+            self.agent_pane_drag = None;
+            if let Some(drop) = self.agent_pane_drop.take() {
+                self.move_agent_session_pane(source, drop.target, drop.zone);
+            }
+            true
+        } else if !ctx.input(|input| input.pointer.primary_down()) {
+            self.agent_pane_drag = None;
+            self.agent_pane_drop = None;
+            false
+        } else {
+            ctx.request_repaint();
+            false
+        }
+    }
+
+    fn draw_agent_session_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        pane: PaneId,
+        sessions: &[SessionChoice],
+    ) {
+        let header = assistant_sidebar_header(rect);
+        paint_assistant_header_divider(ui.painter(), header);
+        ui.painter().text(
+            egui::pos2(header.left() + 14.0, header.center().y),
+            Align2::LEFT_CENTER,
+            "Open session",
+            theme::typography::body(),
+            theme::text().primary,
+        );
+        if self.agent_pane_layout.panes().len() > 1 {
+            let (close, dragging) =
+                draw_agent_pane_controls(ui, header, pane, "Open session", false);
+            if close {
+                self.agent_pane_close_requested = Some(pane);
+            }
+            if dragging {
+                self.agent_pane_drag = Some(AgentPaneDrag {
+                    pane,
+                    title: "Open session".into(),
+                });
+            }
+        }
+        let body = egui::Rect::from_min_max(header.left_bottom(), rect.right_bottom());
+        let width = body.width().min(420.0);
+        let content = egui::Rect::from_min_max(
+            egui::pos2(
+                body.center().x - width * 0.5,
+                body.top() + theme::space::XWIDE,
+            ),
+            egui::pos2(body.center().x + width * 0.5, body.bottom()),
+        )
+        .shrink2(egui::vec2(theme::space::WIDE, 0.0));
+        let mut selection = None;
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(("agent_pane_picker", pane.0))
+                .max_rect(content)
+                .layout(Layout::top_down(Align::LEFT)),
+            |ui| {
+                ui.set_width(content.width());
+                ui.label(
+                    RichText::new("SESSION PANE")
+                        .font(theme::typography::micro())
+                        .color(theme::text().muted),
+                );
+                ui.add_space(theme::space::SMALL);
+                let (new_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), theme::control::PRIMARY),
+                    Sense::hover(),
+                );
+                let response = ui.interact(
+                    new_rect,
+                    Id::new(("agent_pane_new", pane.0)),
+                    Sense::click(),
+                );
+                ui.painter().rect_filled(
+                    new_rect,
+                    theme::corner(theme::radius::CONTROL),
+                    if response.hovered() {
+                        theme::state::hover()
+                    } else {
+                        theme::surface().raised
+                    },
+                );
+                icons::paint(
+                    ui.painter(),
+                    Icon::Plus,
+                    egui::Rect::from_center_size(
+                        egui::pos2(new_rect.left() + 18.0, new_rect.center().y),
+                        egui::Vec2::splat(icons::GRID),
+                    ),
+                    theme::accent(),
+                );
+                ui.painter().text(
+                    egui::pos2(new_rect.left() + 34.0, new_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "New session",
+                    theme::typography::strong(),
+                    theme::text().primary,
+                );
+                if response.clicked() {
+                    selection = Some(None);
+                }
+                ui.add_space(theme::space::XWIDE);
+                ui.label(
+                    RichText::new("RECENT SESSIONS")
+                        .font(theme::typography::micro())
+                        .color(theme::text().muted),
+                );
+                ui.add_space(theme::space::SMALL);
+                if sessions.is_empty() {
+                    ui.label(RichText::new("No previous sessions").small().weak());
+                }
+                ScrollArea::vertical()
+                    .id_salt(("agent_pane_sessions", pane.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                        for session in sessions {
+                            let label = session
+                                .title
+                                .as_deref()
+                                .filter(|title| !title.trim().is_empty())
+                                .unwrap_or("Untitled session");
+                            let (row, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), theme::control::ROW),
+                                Sense::hover(),
+                            );
+                            let response = ui.interact(
+                                row,
+                                Id::new(("agent_pane_session", pane.0, &session.id)),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                ui.painter().rect_filled(
+                                    row,
+                                    theme::corner(theme::radius::CONTROL),
+                                    theme::state::hover(),
+                                );
+                            }
+                            ui.painter().text(
+                                egui::pos2(row.left() + theme::space::SMALL, row.center().y),
+                                Align2::LEFT_CENTER,
+                                label,
+                                theme::typography::body(),
+                                if response.hovered() {
+                                    theme::text().primary
+                                } else {
+                                    theme::text().secondary
+                                },
+                            );
+                            if response.clicked() {
+                                selection = Some(Some(session.id.clone()));
+                            }
+                        }
+                    });
+                ui.add_space(theme::space::LARGE);
+                ui.label(
+                    RichText::new("You can also drag a session here from the sidebar.")
+                        .small()
+                        .color(theme::text().muted),
+                );
+            },
+        );
+        if let Some(session_id) = selection {
+            let fresh_session = session_id.is_none();
+            self.assign_agent_session_pane(pane, session_id);
+            self.start_provider(self.selected_provider, ui.ctx(), fresh_session);
         }
     }
 
@@ -5516,19 +6143,14 @@ impl EditorApp {
                     Some(("agentic_add_project", "Add workspace")),
                 );
                 ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                if agentic_project_row(
-                    ui,
-                    &self.tree.root,
-                    true,
-                    self.git_workspace_status.as_ref(),
-                ) {
+                if agentic_project_row(ui, &self.tree.root, true) {
                     switch_to = Some(self.tree.root.clone());
                 }
                 for root in &self.recent_projects {
                     if root == &self.tree.root {
                         continue;
                     }
-                    if agentic_project_row(ui, root, false, None) {
+                    if agentic_project_row(ui, root, false) {
                         switch_to = Some(root.clone());
                     }
                 }
@@ -5557,6 +6179,10 @@ impl EditorApp {
                     ScrollArea::vertical()
                         .id_salt("agentic_session_list")
                         .auto_shrink([false, false])
+                        .scroll_source(
+                            egui::scroll_area::ScrollSource::SCROLL_BAR
+                                | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+                        )
                         .content_margin(egui::Margin {
                             left: 0,
                             right: 14,
@@ -5589,7 +6215,7 @@ impl EditorApp {
                                 for session in sessions {
                                     let selected = self.agent.session_id.as_deref()
                                         == Some(session.id.as_str());
-                                    let (open, remove) = agent_session_row(
+                                    let (open, remove, drag) = agent_session_row(
                                         ui,
                                         session,
                                         self.selected_provider,
@@ -5601,6 +6227,9 @@ impl EditorApp {
                                     }
                                     if remove {
                                         session_remove = Some(session.id.clone());
+                                    }
+                                    if drag {
+                                        self.agent_session_drag = Some(session.clone());
                                     }
                                 }
                             }
@@ -5642,7 +6271,6 @@ impl EditorApp {
         rect: egui::Rect,
         agent: egui::Rect,
         sessions: Option<egui::Rect>,
-        diff_left: Option<f32>,
     ) {
         crate::renderer::mark_retained(
             ui.painter(),
@@ -5661,10 +6289,6 @@ impl EditorApp {
             source_control_button,
             sessions.map(|sessions| sessions.right()),
         );
-        #[cfg(target_os = "macos")]
-        let controls_right = rect.right();
-        #[cfg(not(target_os = "macos"))]
-        let controls_right = rect.right() - 3.0 * 46.0;
         let sidebar_drag_rect = egui::Rect::from_min_max(
             egui::pos2(
                 if cfg!(target_os = "macos") {
@@ -5676,21 +6300,41 @@ impl EditorApp {
             ),
             egui::pos2(agentic_button.left(), rect.bottom()),
         );
-        // The diff tabs own their stretch of the strip, so the window drag
-        // region stops where the panel starts.
-        let drag_right = diff_left.map_or(controls_right, |left| controls_right.min(left));
-        let drag_rect = egui::Rect::from_min_max(
-            egui::pos2(
-                agentic_button.right().max(source_control_button.right()) + 4.0,
-                rect.top(),
-            ),
-            egui::pos2(drag_right, rect.bottom()),
-        );
-        for (region, drag_rect) in [
-            ("agentic_sidebar", sidebar_drag_rect),
-            ("agentic", drag_rect),
-        ] {
-            if let Some(action) = titlebar_drag_action(ui, drag_rect, region) {
+        if let Some(action) = titlebar_drag_action(ui, sidebar_drag_rect, "agentic_sidebar") {
+            self.window_action = Some(action);
+        }
+        for (pane, pane_rect) in self
+            .agent_pane_layout
+            .rects(agent)
+            .into_iter()
+            .filter(|(_, pane)| (pane.top() - agent.top()).abs() <= 0.5)
+        {
+            let header = egui::Rect::from_min_max(
+                egui::pos2(pane_rect.left(), rect.top()),
+                egui::pos2(pane_rect.right(), rect.bottom()),
+            );
+            let drag_left = if (pane_rect.left() - agent.left()).abs() <= 0.5 {
+                agentic_button.right().max(source_control_button.right()) + 4.0
+            } else {
+                header.left() + 4.0
+            };
+            let drag_rect = egui::Rect::from_min_max(
+                egui::pos2(drag_left.min(header.right()), header.top()),
+                egui::pos2(
+                    if self.agent_pane_layout.panes().len() > 1 {
+                        agent_pane_drag_rect(
+                            header,
+                            rect.right(),
+                            self.agent_pane_picker != Some(pane),
+                        )
+                        .left()
+                    } else {
+                        agent_pane_button_rect(header, rect.right()).left()
+                    },
+                    header.bottom(),
+                ),
+            );
+            if let Some(action) = titlebar_drag_action(ui, drag_rect, ("agentic", pane.0)) {
                 self.window_action = Some(action);
             }
         }
@@ -5788,7 +6432,6 @@ impl EditorApp {
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Label, true, hint.clone())
             });
-            response.on_hover_text(hint);
             status_left = rect.left() - theme::space::TIGHT;
         };
         if let Some((errors, warnings)) = diagnostic_counts {
@@ -5822,17 +6465,11 @@ impl EditorApp {
             )
         });
         if let Some(button) = preview_button {
-            let response = ui
-                .interact(
-                    button,
-                    Id::new(("markdown_preview_toggle", pane.0)),
-                    Sense::click(),
-                )
-                .on_hover_text(if preview {
-                    "Return to Markdown source"
-                } else {
-                    "Preview rendered Markdown"
-                });
+            let response = ui.interact(
+                button,
+                Id::new(("markdown_preview_toggle", pane.0)),
+                Sense::click(),
+            );
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
@@ -6279,13 +6916,11 @@ impl EditorApp {
                             let (_, tab) =
                                 ui.allocate_space(egui::vec2(widths[position], rect.height()));
                             let selected = active == Some(*index);
-                            let response = ui
-                                .interact(
-                                    tab,
-                                    Id::new(("file_tab", path_display)),
-                                    Sense::click_and_drag(),
-                                )
-                                .on_hover_text(path_display);
+                            let response = ui.interact(
+                                tab,
+                                Id::new(("file_tab", path_display)),
+                                Sense::click_and_drag(),
+                            );
                             response.widget_info(|| {
                                 egui::WidgetInfo::selected(
                                     egui::WidgetType::SelectableLabel,
@@ -6643,16 +7278,14 @@ impl EditorApp {
     }
 
     fn draw_agentic_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
-        let (label, tooltip) = if self.agentic_mode {
+        let (label, action) = if self.agentic_mode {
             ("IDE", "Switch to IDE")
         } else {
             ("Agent", "Switch to Agent")
         };
-        let response = ui
-            .interact(button, Id::new("agentic_mode_toggle"), Sense::click())
-            .on_hover_text(tooltip);
+        let response = ui.interact(button, Id::new("agentic_mode_toggle"), Sense::click());
         response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), action)
         });
         let color = if response.hovered() {
             theme::text().primary
@@ -7289,15 +7922,14 @@ fn search_hit(results: &SearchResults, index: usize) -> Option<&SearchHit> {
 
 /// A composer selector: a segmented chip rather than bare text with a chevron,
 /// so the thing that opens a menu looks like a control.
-fn agent_selector_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> egui::Response {
-    segment(ui, label, false, Some(Icon::ChevronDown)).on_hover_text(tooltip)
+fn agent_selector_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    segment(ui, label, false, Some(Icon::ChevronDown))
 }
 
 fn agent_config_selector_button(
     ui: &mut egui::Ui,
     id: Option<Id>,
     label: &str,
-    tooltip: &str,
     fast: bool,
     max_width: f32,
 ) -> egui::Response {
@@ -7379,7 +8011,7 @@ fn agent_config_selector_button(
         );
     }
     icons::paint(ui.painter(), Icon::ChevronDown, chevron, color);
-    response.on_hover_text(format!("{tooltip}\n{label}"))
+    response
 }
 
 fn assistant_send_button_colors(ready: bool) -> (Color32, Color32) {
@@ -7771,38 +8403,19 @@ fn agentic_section_header(
 
 /// One project in the agentic rail. The open project is marked selected;
 /// clicking any row asks the app to switch to that root.
-fn agentic_project_row(
-    ui: &mut egui::Ui,
-    root: &Path,
-    selected: bool,
-    status: Option<&crate::projects::GitWorkspaceStatus>,
-) -> bool {
+fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
     let name = root
         .file_name()
         .unwrap_or(root.as_os_str())
         .to_string_lossy();
-    let pull_request = status.and_then(|status| status.pull_request.as_ref());
-    let height = if pull_request.is_some() {
-        44.0
-    } else {
-        theme::control::ROW + theme::space::TIGHT
-    };
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let hover = pull_request.map_or_else(
-        || root.display().to_string(),
-        |pull_request| {
-            format!(
-                "{}\n{}\n{}",
-                root.display(),
-                pull_request.title,
-                pull_request.url
-            )
-        },
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(
+            ui.available_width(),
+            theme::control::ROW + theme::space::TIGHT,
+        ),
+        Sense::hover(),
     );
-    let response = ui
-        .interact(rect, Id::new(("agentic_project", root)), Sense::click())
-        .on_hover_text(hover);
+    let response = ui.interact(rect, Id::new(("agentic_project", root)), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -7823,18 +8436,8 @@ fn agentic_project_row(
             theme::state::hover(),
         );
     }
-    let name_y = pull_request.map_or(rect.center().y, |_| rect.top() + 13.0);
-    icons::paint(
-        ui.painter(),
-        Icon::Folder,
-        egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 16.0, name_y),
-            egui::Vec2::splat(icons::GRID),
-        ),
-        theme::text().secondary,
-    );
     ui.painter().text(
-        egui::pos2(rect.left() + 31.0, name_y),
+        egui::pos2(rect.left() + theme::space::MEDIUM, rect.center().y),
         Align2::LEFT_CENTER,
         name,
         if selected {
@@ -7848,15 +8451,6 @@ fn agentic_project_row(
             theme::text().secondary
         },
     );
-    if let Some(pull_request) = pull_request {
-        ui.painter().text(
-            egui::pos2(rect.left() + 31.0, rect.top() + 30.0),
-            Align2::LEFT_CENTER,
-            pull_request.label(),
-            theme::typography::micro(),
-            theme::accent(),
-        );
-    }
     response.clicked()
 }
 
@@ -7866,7 +8460,7 @@ fn agent_session_row(
     provider: ProviderId,
     selected: bool,
     compact: bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let label = session
         .title
         .as_deref()
@@ -7883,17 +8477,11 @@ fn agent_session_row(
         row.right_bottom(),
     );
     let open = row.with_max_x(remove.left());
-    let details = session.updated_at.as_ref().map_or_else(
-        || session.id.clone(),
-        |updated| format!("{updated}\n{}", session.id),
+    let open_response = ui.interact(
+        open,
+        Id::new(("agent_session_open", &session.id)),
+        Sense::click_and_drag(),
     );
-    let open_response = ui
-        .interact(
-            open,
-            Id::new(("agent_session_open", &session.id)),
-            Sense::click(),
-        )
-        .on_hover_text(details);
     open_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -7957,7 +8545,6 @@ fn agent_session_row(
             Id::new(("agent_session_origin", &session.id, provider.as_str())),
             Sense::hover(),
         )
-        .on_hover_text(&origin_label)
         .widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Label,
@@ -7990,7 +8577,11 @@ fn agent_session_row(
             },
         );
     }
-    (open_response.clicked(), remove_response.clicked())
+    (
+        open_response.clicked(),
+        remove_response.clicked(),
+        open_response.drag_started() || open_response.dragged(),
+    )
 }
 
 fn plain_text_job(text: &str, wrap_width: f32) -> LayoutJob {

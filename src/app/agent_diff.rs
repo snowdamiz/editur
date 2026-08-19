@@ -408,11 +408,9 @@ pub(super) fn draw_agent_changed_files(
                     },
                 );
                 let response = if deleted {
-                    response.on_hover_text(format!("{} was deleted", path.display()))
-                } else {
                     response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(format!("Open diff for {}", path.display()))
+                } else {
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand)
                 };
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(
@@ -599,8 +597,7 @@ pub(super) fn draw_agent_diff(
                                 ))
                                 .sense(Sense::click()),
                             )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(format!("Open {}", path.display()));
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                         path_clicked |= header.clicked();
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(

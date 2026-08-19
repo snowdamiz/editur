@@ -6,9 +6,7 @@ impl EditorApp {
     /// sessions list. Returns which of the row's actions was clicked: opening
     /// settings, or installing a detected update.
     pub(super) fn draw_settings_row(&self, ui: &mut egui::Ui, row: egui::Rect) -> (bool, bool) {
-        let response = ui
-            .interact(row, Id::new("settings_toggle"), Sense::click())
-            .on_hover_text("Open Settings");
+        let response = ui.interact(row, Id::new("settings_toggle"), Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open Settings")
         });

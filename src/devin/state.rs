@@ -596,6 +596,7 @@ pub struct DevinState {
     pub attachment_previews: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     pub error: Option<DevinError>,
     pub busy: bool,
+    pub session_loading: bool,
     #[cfg(debug_assertions)]
     pub preview: bool,
 }
@@ -760,6 +761,7 @@ impl DevinState {
         self.attachment_previews.clear();
         self.error = None;
         self.busy = true;
+        self.session_loading = true;
         self.selected_generation
     }
 
@@ -773,6 +775,7 @@ impl DevinState {
         self.activity_cursor = None;
         self.attachment_previews.clear();
         self.busy = false;
+        self.session_loading = false;
     }
 
     pub fn apply(&mut self, event: DevinEvent) {
@@ -1011,6 +1014,7 @@ impl DevinState {
                 next_cursor,
                 update,
             } if self.is_current(&session_id, generation) => {
+                let history_complete = update != PageUpdate::Refresh && next_cursor.is_none();
                 if update == PageUpdate::Initial {
                     self.activity.clear();
                 }
@@ -1019,6 +1023,9 @@ impl DevinState {
                     .sort_by(|left, right| chronological(&left.timestamp, &right.timestamp));
                 if update != PageUpdate::Refresh {
                     self.activity_cursor = next_cursor;
+                }
+                if history_complete {
+                    self.session_loading = false;
                 }
                 self.error = None;
                 self.busy = false;
@@ -1059,6 +1066,7 @@ impl DevinState {
             DevinEvent::PermissionDenied(error) => {
                 self.error = Some(error);
                 self.busy = false;
+                self.session_loading = false;
             }
             DevinEvent::Failed(error) => {
                 self.connection = if error.retry_after_seconds.is_some() {
@@ -1073,6 +1081,7 @@ impl DevinState {
                 };
                 self.error = Some(error);
                 self.busy = false;
+                self.session_loading = false;
             }
             _ => {}
         }

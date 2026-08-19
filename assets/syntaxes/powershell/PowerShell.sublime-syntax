@@ -1,0 +1,94 @@
+%YAML 1.2
+---
+name: PowerShell
+file_extensions: [ps1, psm1, psd1]
+scope: source.powershell
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - match: '(?i:\b(function|filter|workflow)\s+([a-z_][\w-]*))'
+      captures:
+        1: storage.type.function.powershell
+        2: entity.name.function.powershell
+    - match: '(?i:\b(?:class|configuration|data|enum)\b)'
+      scope: storage.type.powershell
+    - match: '(?i:\b(?:begin|break|catch|continue|do|dynamicparam|else|elseif|end|exit|finally|for|foreach|from|if|in|param|process|return|switch|throw|trap|try|until|using|while)\b)'
+      scope: keyword.control.powershell
+    - match: '(?i:\$(?:true|false|null)\b)'
+      scope: constant.language.powershell
+    - match: '(?i:(?<![\w-])-(?:and|as|band|bor|bxor|ceq|cge|cgt|cle|clike|clt|cmatch|cne|cnotlike|cnotmatch|contains|creplace|csplit|eq|f|ge|gt|icontains|ieq|ige|igt|ile|ilike|ilt|imatch|in|ine|inotcontains|inotlike|inotmatch|ireplace|is|isnot|isplit|join|le|like|lt|match|ne|not|notcontains|notin|notlike|notmatch|or|replace|shl|shr|split|xor)\b)'
+      scope: keyword.operator.powershell
+    - match: '\[[^\]\r\n]+\]'
+      scope: storage.type.powershell
+    - match: '\$(?:\{[^}\r\n]+\}|[\w:?^]+)'
+      scope: variable.other.powershell
+    - match: '(?i:\b[A-Z]+-[A-Z][\w-]*\b)'
+      scope: support.function.powershell
+    - match: '(?<![\w-])-[A-Za-z][\w-]*'
+      scope: variable.parameter.powershell
+    - match: '\b(?:0x[\h]+|\d+(?:\.\d+)?)\b'
+      scope: constant.numeric.powershell
+
+  comments:
+    - match: '<#'
+      scope: punctuation.definition.comment.begin.powershell
+      push:
+        - meta_scope: comment.block.powershell
+        - match: '#>'
+          scope: punctuation.definition.comment.end.powershell
+          pop: true
+    - match: '#.*$'
+      scope: comment.line.number-sign.powershell
+
+  strings:
+    - match: '@"(?=\s*$)'
+      scope: punctuation.definition.string.begin.powershell
+      push: double-here-string
+    - match: "@'(?=\\s*$)"
+      scope: punctuation.definition.string.begin.powershell
+      push: single-here-string
+    - match: '"'
+      scope: punctuation.definition.string.begin.powershell
+      push: double-string
+    - match: "'"
+      scope: punctuation.definition.string.begin.powershell
+      push: single-string
+
+  interpolation:
+    - match: '`.'
+      scope: constant.character.escape.powershell
+    - match: '\$(?:\{[^}\r\n]+\}|[\w:?^]+)'
+      scope: variable.other.powershell
+
+  double-string:
+    - meta_scope: string.quoted.double.powershell
+    - include: interpolation
+    - match: '"'
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+    - match: '$'
+      pop: true
+
+  single-string:
+    - meta_scope: string.quoted.single.powershell
+    - match: "''"
+      scope: constant.character.escape.powershell
+    - match: "'"
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+    - match: '$'
+      pop: true
+
+  double-here-string:
+    - meta_scope: string.quoted.double.powershell
+    - match: '^\s*"@'
+      scope: punctuation.definition.string.end.powershell
+      pop: true
+    - include: interpolation
+
+  single-here-string:
+    - meta_scope: string.quoted.single.powershell
+    - match: "^\\s*'@"
+      scope: punctuation.definition.string.end.powershell
+      pop: true

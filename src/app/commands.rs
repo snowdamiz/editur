@@ -422,7 +422,6 @@ impl EditorApp {
             KeybindingCommand::EditorTriggerSuggest => {
                 if let Some(tag) = self.active_request_tag() {
                     self.lsp_completion = None;
-                    self.lsp_hover = None;
                     self.lsp_pending_completion = Some((tag, None));
                     self.lsp_sync_needed = true;
                 }
@@ -471,9 +470,6 @@ impl EditorApp {
         self.tabs[index].highlight_cache.valid = false;
         self.lsp_sync_needed = true;
         self.lsp_completion = None;
-        self.lsp_hover = None;
-        self.lsp_hover_probe = None;
-        self.lsp_pending_hover = None;
         self.cursor = self.tabs[index]
             .buffer
             .line_column(self.tabs[index].editor_surface.cursor());
@@ -511,7 +507,6 @@ impl EditorApp {
             return;
         }
         self.lsp_completion = None;
-        self.lsp_hover = None;
         if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
             tab.markdown_preview = false;
             tab.agent_diff = None;
@@ -528,7 +523,6 @@ impl EditorApp {
 
     pub(super) fn open_project_search(&mut self, ctx: &egui::Context) {
         self.lsp_completion = None;
-        self.lsp_hover = None;
         self.lsp_definitions = None;
         self.search_open = true;
         if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
@@ -907,21 +901,12 @@ impl EditorApp {
             }
             return down || up || enter || tab || escape;
         }
-        if self.lsp_hover.is_some()
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape))
-        {
-            self.lsp_hover = None;
-            self.lsp_hover_probe = None;
-            return true;
-        }
         false
     }
 
     pub(super) fn open_settings(&mut self) {
         self.settings_open = true;
         self.lsp_completion = None;
-        self.lsp_hover = None;
-        self.lsp_hover_probe = None;
         self.lsp_definitions = None;
     }
 
@@ -966,8 +951,6 @@ impl EditorApp {
             tab.highlight_cache.valid = false;
             self.cursor = tab.buffer.line_column(tab.editor_surface.cursor());
             self.lsp_sync_needed = true;
-            self.lsp_hover = None;
-            self.lsp_hover_probe = None;
             self.lsp_caret = None;
         }
     }

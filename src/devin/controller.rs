@@ -15,7 +15,7 @@ use super::{
     normalize,
     state::{
         Attachment, AutomationCatalog, ConnectionState, DevinError, DevinEvent, DevinResourceKind,
-        DevinSection, PageUpdate, RepositoryState, SessionFilters, StatusCategory,
+        DevinSection, PageUpdate, RepositoryState, SessionFilters, SessionSummary, StatusCategory,
     },
     transport::{
         ENDPOINT, InteractAction, McpTransport, TransportError, V3Method, encode_path_segment,
@@ -154,7 +154,6 @@ pub enum ResourceMutation {
 pub enum DevinCommand {
     SetVisible(bool),
     RefreshSessions,
-    LoadMoreSessions,
     SetSessionFilters(SessionFilters),
     SelectSession {
         session_id: String,
@@ -286,7 +285,6 @@ struct Worker {
     credentials: Option<Credentials>,
     transport: Option<McpTransport>,
     selected: Option<SelectedSession>,
-    sessions_cursor: Option<String>,
     session_filters: SessionFilters,
     schedule: PollSchedule,
     repository_resolved: bool,
@@ -311,7 +309,6 @@ impl Worker {
             credentials: None,
             transport: None,
             selected: None,
-            sessions_cursor: None,
             session_filters: SessionFilters::default(),
             schedule: PollSchedule::new(Instant::now()),
             repository_resolved: false,
@@ -347,10 +344,7 @@ impl Worker {
             }
             DevinCommand::RefreshSessions => {
                 self.schedule.set_visible(true, Instant::now());
-                self.run_request(|worker| worker.refresh_sessions(false));
-            }
-            DevinCommand::LoadMoreSessions => {
-                self.run_request(|worker| worker.refresh_sessions(true))
+                self.run_request(Worker::refresh_sessions);
             }
             DevinCommand::SetSessionFilters(filters) => {
                 if !valid_session_filters(&filters) {
@@ -358,9 +352,8 @@ impl Worker {
                     return;
                 }
                 self.session_filters = filters.clone();
-                self.sessions_cursor = None;
                 self.emit(DevinEvent::FiltersChanged(filters));
-                self.run_request(|worker| worker.refresh_sessions(false));
+                self.run_request(Worker::refresh_sessions);
             }
             DevinCommand::SelectSession {
                 session_id,
@@ -601,7 +594,6 @@ impl Worker {
                     .and_then(|credentials| {
                         self.emit(DevinEvent::OrganizationSwitching);
                         self.selected = None;
-                        self.sessions_cursor = None;
                         self.fetched_previews.clear();
                         self.connect(credentials.clone())?;
                         if credentials.source() == super::credentials::CredentialSource::Keyring {
@@ -617,7 +609,6 @@ impl Worker {
             DevinCommand::Disconnect => {
                 self.transport = None;
                 self.selected = None;
-                self.sessions_cursor = None;
                 self.schedule.set_visible(false, Instant::now());
                 match Credentials::delete() {
                     Ok(()) => {
@@ -640,7 +631,7 @@ impl Worker {
         }
         let now = Instant::now();
         if self.schedule.due_sessions(now) {
-            if let Err(error) = self.refresh_sessions(false) {
+            if let Err(error) = self.refresh_sessions() {
                 self.request_failed(error);
                 return;
             }
@@ -1408,20 +1399,16 @@ impl Worker {
         let mut transport = self.open_transport(credentials.clone())?;
         self.emit(DevinEvent::CapabilitiesChanged(transport.capabilities()));
         self.emit(DevinEvent::OrganizationSelected(transport.org_id().into()));
-        let result = transport.search(None)?;
-        let payload = normalize::tool_payload(result).map_err(TransportError::Protocol)?;
-        let (sessions, next_cursor, total, has_next) =
-            normalize::sessions(&payload).map_err(TransportError::Protocol)?;
+        let (sessions, total) = search_all_sessions(&mut transport, &self.session_filters)?;
         credentials.save().map_err(TransportError::Protocol)?;
-        self.sessions_cursor = next_cursor.clone();
         self.transport = Some(transport);
         self.emit(DevinEvent::CredentialsChanged(Some(source)));
         self.emit(DevinEvent::ConnectionChanged(ConnectionState::Connected));
         self.emit(DevinEvent::SessionsLoaded {
             sessions,
-            next_cursor,
+            next_cursor: None,
             total,
-            has_next,
+            has_next: false,
             append: false,
         });
         Ok(())
@@ -1435,25 +1422,15 @@ impl Worker {
         }
     }
 
-    fn refresh_sessions(&mut self, append: bool) -> Result<(), TransportError> {
-        let cursor = append
-            .then_some(self.sessions_cursor.as_deref())
-            .flatten()
-            .map(str::to_owned);
+    fn refresh_sessions(&mut self) -> Result<(), TransportError> {
         let filters = self.session_filters.clone();
-        let result = self
-            .ensure_connected()?
-            .search_with(cursor.as_deref(), &filters)?;
-        let payload = normalize::tool_payload(result).map_err(TransportError::Protocol)?;
-        let (sessions, next_cursor, total, has_next) =
-            normalize::sessions(&payload).map_err(TransportError::Protocol)?;
-        self.sessions_cursor = next_cursor.clone();
+        let (sessions, total) = search_all_sessions(self.ensure_connected()?, &filters)?;
         self.emit(DevinEvent::SessionsLoaded {
             sessions,
-            next_cursor,
+            next_cursor: None,
             total,
-            has_next,
-            append,
+            has_next: false,
+            append: false,
         });
         Ok(())
     }
@@ -1521,8 +1498,8 @@ impl Worker {
             detail,
         });
         self.load_message_pages(update)?;
-        self.load_event_pages(update)?;
         self.fetch_attachment_previews(&selected, previews);
+        self.load_event_pages(update)?;
         Ok(())
     }
 
@@ -1838,9 +1815,9 @@ impl Worker {
         {
             self.emit(DevinEvent::SessionsLoaded {
                 sessions,
-                next_cursor: self.sessions_cursor.clone(),
+                next_cursor: None,
                 total: None,
-                has_next: self.sessions_cursor.is_some(),
+                has_next: false,
                 append: true,
             });
         }
@@ -1894,7 +1871,7 @@ impl Worker {
             session_id: Some(selected.id),
         });
         self.refresh_selected()?;
-        self.refresh_sessions(false)
+        self.refresh_sessions()
     }
 
     fn resolve_repository(&mut self) {
@@ -1974,6 +1951,40 @@ impl Worker {
         if self.events.send(event).is_ok() {
             (self.wake)();
         }
+    }
+}
+
+fn search_all_sessions(
+    transport: &mut McpTransport,
+    filters: &SessionFilters,
+) -> Result<(Vec<SessionSummary>, Option<usize>), TransportError> {
+    let mut sessions = Vec::new();
+    let mut session_ids = HashSet::new();
+    let mut cursors = HashSet::new();
+    let mut cursor = None;
+    let mut total = None;
+    loop {
+        let result = transport.search_with(cursor.as_deref(), filters)?;
+        let payload = normalize::tool_payload(result).map_err(TransportError::Protocol)?;
+        let (page, next_cursor, page_total, has_next) =
+            normalize::sessions(&payload).map_err(TransportError::Protocol)?;
+        sessions.extend(
+            page.into_iter()
+                .filter(|session| session_ids.insert(session.id.clone())),
+        );
+        total = total.or(page_total);
+        if !has_next {
+            return Ok((sessions, total));
+        }
+        let next_cursor = next_cursor.ok_or_else(|| {
+            TransportError::Protocol("Devin session pagination omitted its cursor".into())
+        })?;
+        if !cursors.insert(next_cursor.clone()) {
+            return Err(TransportError::Protocol(
+                "Devin session pagination repeated a cursor".into(),
+            ));
+        }
+        cursor = Some(next_cursor);
     }
 }
 
@@ -2614,6 +2625,54 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
+    fn refreshing_sessions_fetches_every_page() {
+        let (endpoint, requests, stop, server) = fake_mcp_server();
+        let (event_tx, event_rx) = mpsc::sync_channel(16);
+        let mut worker =
+            super::Worker::new(std::env::temp_dir(), endpoint, event_tx, Arc::new(|| {}));
+        let credentials = super::super::credentials::Credentials::new(
+            "cog_test-only".into(),
+            None,
+            super::super::credentials::CredentialSource::Environment,
+        )
+        .unwrap();
+        worker.connect(credentials).unwrap();
+
+        worker.refresh_sessions().unwrap();
+        let mut state = super::super::state::DevinState::default();
+        event_rx.try_iter().for_each(|event| state.apply(event));
+
+        let search_arguments = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.split("\r\n\r\n").nth(1))
+            .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+            .filter(|body| body["params"]["name"] == "devin_session_search")
+            .map(|body| body["params"]["arguments"].clone())
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-1", "session-2"]
+        );
+        assert_eq!(
+            search_arguments,
+            [
+                json!({"limit":100}),
+                json!({"limit":100,"cursor":"session-next"})
+            ]
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
     fn fake_mcp_drives_the_complete_interactive_session_flow() {
         let (endpoint, requests, stop, server) = fake_mcp_server();
         let (event_tx, event_rx) = mpsc::sync_channel(64);
@@ -2722,7 +2781,7 @@ mod tests {
                 state.messages.len(),
                 state.activity.len()
             ),
-            (1, 2, 2)
+            (2, 2, 2)
         );
         assert_eq!(state.resources.insights.items.len(), 1);
         assert_eq!(
@@ -2753,7 +2812,7 @@ mod tests {
             .unwrap()
             .expect("DEVIN_API_KEY is required");
         worker.connect(credentials).unwrap();
-        worker.refresh_sessions(false).unwrap();
+        worker.refresh_sessions().unwrap();
         let session = event_rx
             .try_iter()
             .find_map(|event| match event {
@@ -3672,7 +3731,18 @@ mod tests {
             });
         }
         let structured = match name {
-            "devin_session_search" => json!({"sessions":[fake_session()],"next_cursor":null}),
+            "devin_session_search" => {
+                let second_page = arguments["cursor"] == "session-next";
+                let mut session = fake_session();
+                if second_page {
+                    session["session_id"] = json!("session-2");
+                    session["title"] = json!("Second fake session");
+                }
+                json!({
+                    "sessions": [session],
+                    "next_cursor": (!second_page).then_some("session-next")
+                })
+            }
             "devin_session_create" => json!({"sessions":[fake_session()]}),
             "list_available_repos" => json!({"repositories":["editur/editor"]}),
             "read_wiki_structure" => json!({"topics":[{"title":"Overview"}]}),

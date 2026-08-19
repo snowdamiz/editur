@@ -1,7 +1,7 @@
 %YAML 1.2
 ---
 name: Markdown
-file_extensions: [md, markdown, mdown, mkd, README, CHANGELOG]
+file_extensions: [md, mdx, markdown, mdown, mkd, README, CHANGELOG]
 scope: text.html.markdown
 contexts:
   main:

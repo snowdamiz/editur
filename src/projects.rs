@@ -5,10 +5,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
 };
-
-use serde::Deserialize;
 
 const PROJECTS_FILE: &str = "projects.json";
 /// A switcher longer than this stops being a shortcut, so older roots fall off.
@@ -16,97 +13,6 @@ pub const MAX_RECENT_PROJECTS: usize = 10;
 /// Ten paths cannot legitimately need more than this; anything bigger is not
 /// our file.
 const MAX_PROJECTS_BYTES: u64 = 64 * 1024;
-const MAX_GIT_METADATA_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GitWorkspaceStatus {
-    pub branch: String,
-    pub pull_request: Option<PullRequestStatus>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PullRequestStatus {
-    pub number: u64,
-    pub title: String,
-    pub url: String,
-    pub state: String,
-    pub is_draft: bool,
-    #[serde(default)]
-    pub review_decision: String,
-    #[serde(default)]
-    pub merge_state_status: String,
-}
-
-impl PullRequestStatus {
-    pub(crate) fn label(&self) -> String {
-        let status = if self.is_draft {
-            "Draft"
-        } else if self.state == "MERGED" {
-            "Merged"
-        } else if self.state == "CLOSED" {
-            "Closed"
-        } else if self.review_decision == "CHANGES_REQUESTED" {
-            "Changes requested"
-        } else if self.merge_state_status == "DIRTY" {
-            "Conflicts"
-        } else if self.review_decision == "APPROVED" {
-            "Ready"
-        } else {
-            "Open"
-        };
-        format!("PR #{} · {status}", self.number)
-    }
-}
-
-pub(crate) fn inspect_git_workspace(root: &Path) -> Option<GitWorkspaceStatus> {
-    let mut git = Command::new("git");
-    git.args(["-C"])
-        .arg(root)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let output = command_output(&mut git)?;
-    if !output.status.success() {
-        return None;
-    }
-    let branch = String::from_utf8(output.stdout)
-        .ok()
-        .map(|branch| branch.trim().to_owned())
-        .filter(|branch| !branch.is_empty())?;
-    let mut gh = Command::new("gh");
-    gh.args([
-        "pr",
-        "view",
-        "--json",
-        "number,title,url,state,isDraft,reviewDecision,mergeStateStatus",
-    ])
-    .current_dir(root)
-    .env("GH_PROMPT_DISABLED", "1");
-    let pull_request = command_output(&mut gh)
-        .filter(|output| output.status.success())
-        .and_then(|output| parse_pull_request(&output.stdout));
-    Some(GitWorkspaceStatus {
-        branch,
-        pull_request,
-    })
-}
-
-fn command_output(command: &mut Command) -> Option<std::process::Output> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command.output().ok()
-}
-
-fn parse_pull_request(bytes: &[u8]) -> Option<PullRequestStatus> {
-    if bytes.len() > MAX_GIT_METADATA_BYTES {
-        return None;
-    }
-    serde_json::from_slice(bytes).ok()
-}
-
 /// Recently opened project roots, most recent first. Roots that no longer
 /// exist as directories are skipped so the switcher never offers a dead
 /// folder.
@@ -159,53 +65,8 @@ fn write_atomic(data_dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RECENT_PROJECTS, inspect_git_workspace, load, parse_pull_request, remember};
-    use std::{fs, process::Command};
-
-    #[test]
-    fn git_workspace_inspection_reports_the_branch_and_skips_plain_folders() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let plain = temp.path().join("plain");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&plain).unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet", "--initial-branch", "agent-workspace"])
-                .current_dir(&workspace)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        assert_eq!(
-            inspect_git_workspace(&workspace)
-                .as_ref()
-                .map(|workspace| workspace.branch.as_str()),
-            Some("agent-workspace")
-        );
-        assert_eq!(inspect_git_workspace(&plain), None);
-    }
-
-    #[test]
-    fn pull_request_status_uses_ghs_current_branch_json() {
-        let pull_request = parse_pull_request(
-            br#"{
-                "number":42,
-                "title":"Attach sessions to worktrees",
-                "url":"https://github.com/editur/editur/pull/42",
-                "state":"OPEN",
-                "isDraft":false,
-                "reviewDecision":"APPROVED",
-                "mergeStateStatus":"CLEAN"
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(pull_request.number, 42);
-        assert_eq!(pull_request.label(), "PR #42 · Ready");
-        assert_eq!(pull_request.url, "https://github.com/editur/editur/pull/42");
-    }
+    use super::{MAX_RECENT_PROJECTS, load, remember};
+    use std::fs;
 
     #[test]
     fn remember_orders_most_recent_first_and_dedups() {

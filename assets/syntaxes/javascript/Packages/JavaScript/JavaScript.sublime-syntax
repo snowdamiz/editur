@@ -4,6 +4,9 @@
 name: JavaScript
 file_extensions:
   - js
+  - mjs
+  - cjs
+  - jsx
   - htc
 first_line_match: ^#!\s*/.*\b(node|js)\b
 scope: source.js

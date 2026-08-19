@@ -627,7 +627,7 @@ impl AgentController {
     pub fn start(provider: ProviderId, project_root: PathBuf) -> Self {
         Self::start_launch(
             provider,
-            managed_session_startup(provider, &project_root, None),
+            managed_session_startup(provider, &project_root, None, false),
             project_root,
             Launch::Managed,
             Arc::new(|| {}),
@@ -638,11 +638,12 @@ impl AgentController {
         provider: ProviderId,
         project_root: PathBuf,
         preferred_session: Option<String>,
+        fresh_session: bool,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self::start_launch(
             provider,
-            managed_session_startup(provider, &project_root, preferred_session),
+            managed_session_startup(provider, &project_root, preferred_session, fresh_session),
             project_root,
             Launch::Managed,
             Arc::new(wake),
@@ -674,6 +675,26 @@ impl AgentController {
                 active_session: None,
                 editur_sessions,
                 preferred_session: None,
+                fresh_session: false,
+            },
+            project_root,
+            Launch::Process(AcpAgentConfig::new(command).args(args)),
+            Arc::new(|| {}),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_process_fresh(project_root: PathBuf, command: PathBuf, args: Vec<String>) -> Self {
+        let history = Some(project_root.join(".editur-test-hidden-sessions-cursor.json"));
+        let editur_sessions = Some(project_root.join(".editur-test-sessions-cursor.json"));
+        Self::start_launch(
+            ProviderId::Cursor,
+            SessionStartup {
+                history,
+                active_session: None,
+                editur_sessions,
+                preferred_session: None,
+                fresh_session: true,
             },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
@@ -697,6 +718,7 @@ impl AgentController {
                 active_session: None,
                 editur_sessions,
                 preferred_session: Some(preferred_session),
+                fresh_session: false,
             },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
@@ -786,6 +808,7 @@ struct SessionStartup {
     active_session: Option<PathBuf>,
     editur_sessions: Option<PathBuf>,
     preferred_session: Option<String>,
+    fresh_session: bool,
 }
 
 #[derive(Clone)]
@@ -1217,6 +1240,7 @@ async fn run_connection(
     let mut hidden_sessions = HiddenSessions::load(session_startup.history);
     let mut editur_sessions = EditurSessions::load(session_startup.editur_sessions);
     let preferred_session = session_startup.preferred_session;
+    let fresh_session = session_startup.fresh_session;
     let session_notifications = SessionNotificationGate::default();
     agent_client_protocol::Client
         .builder()
@@ -1501,6 +1525,7 @@ async fn run_connection(
                     &hidden_sessions.ids,
                     &mut editur_sessions,
                     preferred_session.as_deref(),
+                    fresh_session,
                     &session_notifications,
                     supports_close,
                 )
@@ -1636,6 +1661,7 @@ async fn run_connection(
                                 &hidden_sessions.ids,
                                 &mut editur_sessions,
                                 preferred_session.as_deref(),
+                                fresh_session,
                                 &session_notifications,
                                 supports_close,
                             )
@@ -2277,6 +2303,7 @@ async fn run_connection(
                                 &hidden_sessions.ids,
                                 &mut editur_sessions,
                                 preferred_session.as_deref(),
+                                fresh_session,
                                 &session_notifications,
                                 supports_close,
                             )
@@ -3001,6 +3028,7 @@ async fn start_session(
     hidden_sessions: &HashSet<String>,
     editur_sessions: &mut EditurSessions,
     preferred_session: Option<&str>,
+    fresh_session: bool,
     session_notifications: &SessionNotificationGate,
     supports_close: bool,
 ) -> agent_client_protocol::Result<(SessionId, Vec<SessionChoice>)> {
@@ -3017,9 +3045,14 @@ async fn start_session(
     } else {
         Vec::new()
     };
-    if let Some(session) = preferred_session
-        .and_then(|id| sessions.iter().find(|session| session.id == id))
-        .or_else(|| sessions.first())
+    let restore = if fresh_session {
+        None
+    } else {
+        preferred_session
+            .and_then(|id| sessions.iter().find(|session| session.id == id))
+            .or_else(|| sessions.first())
+    };
+    if let Some(session) = restore
         && let Ok(session_id) = load_session(
             connection,
             project_root,
@@ -3229,6 +3262,7 @@ fn managed_session_startup(
     provider: ProviderId,
     project_root: &Path,
     preferred_session: Option<String>,
+    fresh_session: bool,
 ) -> SessionStartup {
     let history = session_history_path(provider, project_root);
     let active_session = crate::data_dir()
@@ -3237,13 +3271,17 @@ fn managed_session_startup(
     let editur_sessions = crate::data_dir()
         .ok()
         .map(|directory| editur_sessions_path_in(&directory, provider, project_root));
-    let preferred_session =
-        preferred_session.or_else(|| active_session.as_deref().and_then(load_active_session));
+    let preferred_session = if fresh_session {
+        None
+    } else {
+        preferred_session.or_else(|| active_session.as_deref().and_then(load_active_session))
+    };
     SessionStartup {
         history,
         active_session,
         editur_sessions,
         preferred_session,
+        fresh_session,
     }
 }
 

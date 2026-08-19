@@ -440,19 +440,14 @@ impl EditorApp {
                     .show(ui, |ui| {
                         ui.set_width(width - 12.0);
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        if agentic_project_row(
-                            ui,
-                            &self.tree.root,
-                            true,
-                            self.git_workspace_status.as_ref(),
-                        ) {
+                        if agentic_project_row(ui, &self.tree.root, true) {
                             switch_to = Some(self.tree.root.clone());
                         }
                         for project in &self.recent_projects {
                             if project == &self.tree.root {
                                 continue;
                             }
-                            if agentic_project_row(ui, project, false, None) {
+                            if agentic_project_row(ui, project, false) {
                                 switch_to = Some(project.clone());
                             }
                         }
@@ -471,9 +466,8 @@ impl EditorApp {
                             egui::vec2(ui.available_width(), 30.0),
                             Sense::hover(),
                         );
-                        let open = ui
-                            .interact(rect, Id::new("project_switcher_browse"), Sense::click())
-                            .on_hover_text("Choose a project folder");
+                        let open =
+                            ui.interact(rect, Id::new("project_switcher_browse"), Sense::click());
                         open.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::WidgetType::Button,
@@ -1164,56 +1158,6 @@ impl EditorApp {
         if vim_enabled && !output.inserted_text.is_empty() {
             vim.record_insert_text(&output.inserted_text);
         }
-        let mut diagnostic_at_pointer = false;
-        if let Some(character) = output.hovered_character
-            && let Some(state) = diagnostics
-        {
-            let byte = buffer.byte_index(character);
-            if let Some(diagnostic) = state.diagnostics.iter().find(|diagnostic| {
-                if diagnostic.range.is_empty() {
-                    diagnostic.range.start == byte
-                } else {
-                    diagnostic.range.contains(&byte)
-                }
-            }) && let Some(pointer) = ui.ctx().pointer_hover_pos()
-            {
-                diagnostic_at_pointer = true;
-                let severity = match diagnostic.severity {
-                    crate::lsp::DiagnosticSeverity::Error => "Error",
-                    crate::lsp::DiagnosticSeverity::Warning => "Warning",
-                    crate::lsp::DiagnosticSeverity::Information => "Information",
-                    crate::lsp::DiagnosticSeverity::Hint => "Hint",
-                };
-                let details = [diagnostic.source.as_deref(), diagnostic.code.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                egui::Area::new(Id::new(("diagnostic_hover", &buffer.path)))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(pointer + egui::vec2(12.0, 16.0))
-                    .show(ui.ctx(), |ui| {
-                        egui::Frame::new()
-                            .fill(theme::surface().raised)
-                            .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
-                            .corner_radius(7)
-                            .inner_margin(egui::Margin::same(10))
-                            .show(ui, |ui| {
-                                ui.set_max_width(420.0);
-                                ui.label(
-                                    RichText::new(if details.is_empty() {
-                                        severity.to_owned()
-                                    } else {
-                                        format!("{severity} · {details}")
-                                    })
-                                    .strong()
-                                    .color(diagnostic_color(diagnostic.severity)),
-                                );
-                                ui.label(&diagnostic.message);
-                            });
-                    });
-            }
-        }
         let activate_pane = !active_pane
             && (output.response.has_focus()
                 || output.response.clicked()
@@ -1240,9 +1184,6 @@ impl EditorApp {
             cache.valid = false;
             self.lsp_sync_needed = true;
             self.lsp_completion = None;
-            self.lsp_hover = None;
-            self.lsp_hover_probe = None;
-            self.lsp_pending_hover = None;
             if let Some(trigger) = output.last_inserted.map(|character| character.to_string())
                 && preset_for_path(&buffer.path).is_some_and(|(preset, _)| {
                     matches!(
@@ -1294,68 +1235,6 @@ impl EditorApp {
             }
             if output.response.clicked() {
                 self.lsp_completion = None;
-            }
-            let pointer_interrupted = output.changed
-                || output.scrolled
-                || output.response.clicked()
-                || output.response.dragged()
-                || ui.input(|input| {
-                    input.pointer.any_click()
-                        || input
-                            .events
-                            .iter()
-                            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
-                });
-            let hover_supported = preset_for_path(&buffer.path).is_some_and(|(preset, _)| {
-                matches!(
-                    self.lsp_status.get(&preset.id),
-                    Some(ServerStatus::Ready(capabilities)) if capabilities.hover
-                )
-            });
-            if pointer_interrupted || !hover_supported || diagnostic_at_pointer {
-                self.lsp_hover_probe = None;
-                self.lsp_hover = None;
-                self.lsp_pending_hover = None;
-            } else if let (Some(character), Some(pointer)) =
-                (output.hovered_character, ui.ctx().pointer_hover_pos())
-            {
-                let tag = RequestTag {
-                    path: buffer.path.clone(),
-                    revision: buffer.revision,
-                    cursor: character,
-                };
-                let same = self.lsp_hover_probe.as_ref().is_some_and(|probe| {
-                    probe.tag == tag && probe.pointer.distance(pointer) <= 0.5
-                });
-                if !same {
-                    self.lsp_hover_probe = Some(HoverProbe {
-                        tag,
-                        pointer,
-                        bounds: ui.max_rect(),
-                        started: Instant::now(),
-                        requested: false,
-                    });
-                    self.lsp_hover = None;
-                    self.lsp_pending_hover = None;
-                    ui.ctx().request_repaint_after(Duration::from_millis(400));
-                } else if let Some(probe) = self.lsp_hover_probe.as_mut()
-                    && !probe.requested
-                {
-                    let elapsed = probe.started.elapsed();
-                    if elapsed >= Duration::from_millis(400) {
-                        probe.requested = true;
-                        self.lsp_pending_hover = Some(probe.tag.clone());
-                        self.lsp_sync_needed = true;
-                        ui.ctx().request_repaint();
-                    } else {
-                        ui.ctx()
-                            .request_repaint_after(Duration::from_millis(400) - elapsed);
-                    }
-                }
-            } else {
-                self.lsp_hover_probe = None;
-                self.lsp_hover = None;
-                self.lsp_pending_hover = None;
             }
             self.cursor = buffer.line_column(output.cursor);
             let bracket_pair_key = (buffer.revision, output.cursor);
@@ -1774,7 +1653,6 @@ impl EditorApp {
                                 label,
                                 active_place == Some(index),
                             )
-                            .on_hover_text(path.display().to_string())
                             .clicked()
                             {
                                 navigate = Some(path.clone());
@@ -1800,7 +1678,6 @@ impl EditorApp {
                                     &name,
                                     picker.directory == *path,
                                 )
-                                .on_hover_text(path.display().to_string())
                                 .clicked()
                                 {
                                     navigate = Some(path.clone());
@@ -1898,10 +1775,7 @@ impl EditorApp {
                     |ui| {
                         ui.spacing_mut().item_spacing.x = theme::space::MEDIUM;
                         ui.shrink_clip_rect(ui.max_rect());
-                        if file_picker_check_row(ui, "Hidden files", picker.show_hidden)
-                            .on_hover_text("Show entries that start with a dot")
-                            .clicked()
-                        {
+                        if file_picker_check_row(ui, "Hidden files", picker.show_hidden).clicked() {
                             picker.show_hidden = !picker.show_hidden;
                             picker.cursor = None;
                         }

@@ -103,6 +103,26 @@ impl Highlighter {
                 FontStyle::empty(),
             ),
             (
+                "entity.name.function, support.function, variable",
+                color(roles.macro_name),
+                FontStyle::empty(),
+            ),
+            (
+                "constant.numeric, constant.language",
+                color(roles.escape),
+                FontStyle::empty(),
+            ),
+            (
+                "text.html entity.name.tag",
+                color(roles.keyword),
+                FontStyle::empty(),
+            ),
+            (
+                "text.html entity.other.attribute-name",
+                color(roles.declared_type),
+                FontStyle::empty(),
+            ),
+            (
                 "constant.character.escape",
                 color(roles.escape),
                 FontStyle::empty(),
@@ -335,6 +355,29 @@ fn color(color: Color32) -> Color {
 mod tests {
     use super::*;
 
+    fn highlighted(path: &str, source: &str) -> LayoutJob {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        Highlighter::new()
+            .unwrap()
+            .highlight_job(
+                source,
+                syntaxes.detect(Path::new(path), false),
+                syntaxes.set(),
+                800.0,
+            )
+            .unwrap()
+    }
+
+    fn token_color(job: &LayoutJob, source: &str, token: &str) -> Color32 {
+        let offset = source.find(token).unwrap();
+        job.sections
+            .iter()
+            .find(|section| section.byte_range.contains(&offset.into()))
+            .unwrap()
+            .format
+            .color
+    }
+
     #[test]
     fn detects_previously_optional_syntaxes_without_installing_packages() {
         let syntaxes = SyntaxManager::built_in().unwrap();
@@ -376,6 +419,47 @@ mod tests {
             syntaxes.detect(Path::new("main.rs"), true).name,
             "Plain Text"
         );
+    }
+
+    #[test]
+    fn detects_web_component_extensions() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        for (path, expected) in [
+            ("index.html", "HTML"),
+            ("component.jsx", "JavaScript"),
+            ("component.tsx", "TypeScript"),
+            ("component.astro", "Astro"),
+            ("component.vue", "HTML"),
+            ("component.svelte", "HTML"),
+            ("module.mjs", "JavaScript"),
+            ("config.cjs", "JavaScript"),
+        ] {
+            assert_eq!(
+                syntaxes.detect(Path::new(path), false).name,
+                expected,
+                "wrong built-in syntax for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_common_modern_extensions() {
+        let syntaxes = SyntaxManager::built_in().unwrap();
+        for (path, expected) in [
+            ("script.ps1", "PowerShell"),
+            ("module.psm1", "PowerShell"),
+            ("manifest.psd1", "PowerShell"),
+            ("styles.scss", "CSS"),
+            ("styles.less", "CSS"),
+            ("README.mdx", "Markdown"),
+            ("settings.jsonc", "JSON"),
+        ] {
+            assert_eq!(
+                syntaxes.detect(Path::new(path), false).name,
+                expected,
+                "wrong built-in syntax for {path}"
+            );
+        }
     }
 
     #[test]
@@ -494,6 +578,92 @@ mod tests {
         let keyword = color_at(source.rfind("pub").unwrap());
         assert_ne!(string, keyword);
         assert_eq!(keyword, theme::syntax().keyword);
+    }
+
+    #[test]
+    fn rust_lifetimes_and_character_literals_do_not_leak() {
+        let source = "fn borrow<'a>(value: &'a str) -> &'a str { value }\nconst TICK: char = '`';\npub fn after() {}\n";
+        let job = highlighted("main.rs", source);
+
+        assert_eq!(token_color(&job, source, "'`'"), theme::syntax().string);
+        assert_eq!(token_color(&job, source, "pub"), theme::syntax().keyword);
+    }
+
+    #[test]
+    fn highlights_html_like_tags_and_attributes() {
+        let source = "<main class=\"shell\">Hello</main>\n";
+        for path in [
+            "index.html",
+            "component.astro",
+            "component.vue",
+            "component.svelte",
+        ] {
+            let job = highlighted(path, source);
+            let foreground = token_color(&job, source, "Hello");
+            assert_ne!(
+                token_color(&job, source, "main"),
+                foreground,
+                "missing tag color for {path}"
+            );
+            assert_ne!(
+                token_color(&job, source, "class"),
+                foreground,
+                "missing attribute color for {path}"
+            );
+            assert_eq!(token_color(&job, source, "shell"), theme::syntax().string);
+        }
+    }
+
+    #[test]
+    fn highlights_astro_frontmatter() {
+        let source = "---\nconst title = \"Hello\";\n---\n<h1>{title}</h1>\n";
+        let job = highlighted("component.astro", source);
+
+        assert_ne!(
+            token_color(&job, source, "const"),
+            token_color(&job, source, "title")
+        );
+        assert_eq!(token_color(&job, source, "Hello"), theme::syntax().string);
+        assert_ne!(
+            token_color(&job, source, "h1"),
+            token_color(&job, source, "title")
+        );
+    }
+
+    #[test]
+    fn highlights_javascript_and_typescript_in_component_files() {
+        let source = "export const view = <Card title=\"Hello\" />;\n";
+        for path in ["component.jsx", "component.tsx"] {
+            let job = highlighted(path, source);
+            assert_eq!(token_color(&job, source, "export"), theme::syntax().keyword);
+            assert_eq!(token_color(&job, source, "Hello"), theme::syntax().string);
+        }
+    }
+
+    #[test]
+    fn highlights_representative_powershell_constructs() {
+        let source = "param([string]$Name)\n# comment\nWrite-Host \"Hello $Name\"\n$Count = 42\n";
+        let job = highlighted("script.ps1", source);
+
+        assert_eq!(token_color(&job, source, "param"), theme::syntax().keyword);
+        assert_eq!(
+            token_color(&job, source, "string"),
+            theme::syntax().declared_type
+        );
+        assert_eq!(
+            token_color(&job, source, "Write-Host"),
+            theme::syntax().macro_name
+        );
+        assert_eq!(token_color(&job, source, "Hello"), theme::syntax().string);
+        assert_eq!(
+            token_color(&job, source, "comment"),
+            theme::syntax().comment
+        );
+        assert_eq!(
+            token_color(&job, source, "$Count"),
+            theme::syntax().macro_name
+        );
+        assert_eq!(token_color(&job, source, "42"), theme::syntax().escape);
     }
 
     #[test]

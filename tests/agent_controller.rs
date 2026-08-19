@@ -673,6 +673,26 @@ fn reconnecting_restores_the_newest_project_session() {
 }
 
 #[test]
+fn fresh_start_ignores_existing_project_sessions() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process_fresh(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+    );
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "fake-session"),
+    );
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Event::ActiveSessionChanged(id) if id == "newest-session"
+    )));
+}
+
+#[test]
 fn session_history_distinguishes_provider_sessions_from_editur_sessions() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(

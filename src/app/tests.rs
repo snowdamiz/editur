@@ -59,6 +59,16 @@ fn click_response(
     }])
 }
 
+fn finish_devin_initial_load(app: &mut EditorApp, session_id: &str, generation: u64) {
+    app.devin_state.apply(DevinEvent::ActivityLoaded {
+        session_id: session_id.into(),
+        generation,
+        activity: Vec::new(),
+        next_cursor: None,
+        update: crate::devin::PageUpdate::History,
+    });
+}
+
 #[test]
 fn composer_mentions_only_use_the_active_at_token() {
     assert_eq!(
@@ -2005,6 +2015,61 @@ fn devin_home_groups_waiting_sessions_first_at_minimum_width() {
 }
 
 #[test]
+fn devin_home_never_offers_manual_session_pagination() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    app.devin_state.apply(DevinEvent::SessionsLoaded {
+        sessions: vec![crate::devin::SessionSummary {
+            id: "session-1".into(),
+            title: "First session".into(),
+            category: StatusCategory::Active,
+            ..Default::default()
+        }],
+        next_cursor: Some("session-next".into()),
+        total: Some(2),
+        has_next: true,
+        append: false,
+    });
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Load more sessions"))
+    );
+}
+
+#[test]
 fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
     fn text_rect(shape: &Shape, matches: &dyn Fn(&str) -> bool) -> Option<Rect> {
         match shape {
@@ -2238,6 +2303,7 @@ fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
             }),
         },
     });
+    finish_devin_initial_load(&mut app, "waiting", generation);
     let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
     let panel_left = window.right() - app.devin_sidebar_width;
     let context = theme::test_context();
@@ -2407,6 +2473,136 @@ fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
 }
 
 #[test]
+fn devin_detail_waits_for_complete_initial_history_before_revealing_the_stream() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let summary = crate::devin::SessionSummary {
+        id: "large-session".into(),
+        title: "Large session".into(),
+        status: "running".into(),
+        category: StatusCategory::Active,
+        ..Default::default()
+    };
+    app.devin_sidebar = true;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+    app.devin_state.sessions.push(summary.clone());
+    let context = theme::test_context();
+    let input = |events| RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 720.0),
+        )),
+        events,
+        ..RawInput::default()
+    };
+    let sessions = context.run_ui(input(Vec::new()), |root| app.ui(root));
+    let session = sessions
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "Large session"))
+        .expect("session row");
+    let _ = context.run_ui(
+        input(vec![
+            Event::PointerMoved(session.center()),
+            Event::PointerButton {
+                pos: session.center(),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]),
+        |root| app.ui(root),
+    );
+    let _ = context.run_ui(
+        input(vec![Event::PointerButton {
+            pos: session.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]),
+        |root| app.ui(root),
+    );
+    assert_eq!(app.devin_view, DevinView::Detail);
+    let generation = app.devin_state.selected_generation;
+    app.devin_state.apply(DevinEvent::SessionLoaded {
+        session_id: summary.id.clone(),
+        generation,
+        detail: crate::devin::SessionDetail {
+            summary,
+            ..Default::default()
+        },
+    });
+    app.devin_state.apply(DevinEvent::MessagesLoaded {
+        session_id: "large-session".into(),
+        generation,
+        messages: vec![crate::devin::DevinMessage {
+            id: "newest".into(),
+            timestamp: "2026-08-18T12:00:00Z".into(),
+            role: "devin".into(),
+            text: "Newest message".into(),
+            attachment_ids: Vec::new(),
+        }],
+        next_cursor: None,
+        update: crate::devin::PageUpdate::History,
+    });
+
+    let partial = context.run_ui(input(Vec::new()), |root| app.ui(root));
+    assert!(
+        partial
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Loading Devin session"))
+    );
+    assert!(
+        !partial
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Newest message"))
+    );
+
+    app.devin_state.apply(DevinEvent::ActivityLoaded {
+        session_id: "large-session".into(),
+        generation,
+        activity: Vec::new(),
+        next_cursor: None,
+        update: crate::devin::PageUpdate::Initial,
+    });
+    let complete = context.run_ui(input(Vec::new()), |root| app.ui(root));
+    assert!(
+        complete
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Newest message"))
+    );
+}
+
+#[test]
 fn suspended_devin_detail_keeps_the_composer_inside_the_sidebar() {
     fn contains_text(shape: &Shape, expected: &str) -> bool {
         match shape {
@@ -2448,6 +2644,7 @@ fn suspended_devin_detail_keeps_the_composer_inside_the_sidebar() {
             ..Default::default()
         },
     });
+    finish_devin_initial_load(&mut app, "suspended", generation);
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 520.0));
     let context = theme::test_context();
     let output = context.run_ui(
@@ -3416,6 +3613,7 @@ fn devin_attachments_render_like_the_agent_composer_and_prompt() {
         next_cursor: None,
         update: crate::devin::PageUpdate::Initial,
     });
+    finish_devin_initial_load(&mut app, "waiting", generation);
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
     let output = context.run_ui(
@@ -3563,6 +3761,7 @@ fn waiting_devin_detail_focuses_the_composer_and_labels_remote_activity() {
         next_cursor: Some("next".into()),
         update: crate::devin::PageUpdate::Initial,
     });
+    finish_devin_initial_load(&mut app, "waiting", generation);
     let context = theme::test_context();
     for id in [
         Id::new(("devin_activity_group", "remote")),
@@ -3680,6 +3879,7 @@ fn devin_composer_grows_with_multiline_messages() {
             ..Default::default()
         },
     });
+    finish_devin_initial_load(&mut app, "active", generation);
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
     let output = context.run_ui(
@@ -5877,7 +6077,7 @@ fn a_composer_selector_reads_as_a_control_rather_than_as_bare_text() {
                 ..RawInput::default()
             },
             |ui| {
-                rect = Some(agent_selector_button(ui, "Ask", "Permissions").rect);
+                rect = Some(agent_selector_button(ui, "Ask").rect);
             },
         );
         (output, rect.unwrap())
@@ -5900,9 +6100,21 @@ fn a_composer_selector_reads_as_a_control_rather_than_as_bare_text() {
             _ => false,
         }
     }
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
     let context = theme::test_context();
+    context.all_styles_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+        style.interaction.show_tooltips_only_when_still = false;
+    });
     let idle = draw(&context, None);
     let hovered = draw(&context, Some(pos2(10.0, 15.0)));
+    let hovered_again = draw(&context, Some(pos2(10.0, 15.0)));
     let text = |output: &egui::FullOutput| {
         output
             .shapes
@@ -5928,6 +6140,14 @@ fn a_composer_selector_reads_as_a_control_rather_than_as_bare_text() {
             .iter()
             .any(|shape| hover_surface(&shape.shape, hovered.1)),
         "a hovered selector has to show that it is a control"
+    );
+    assert!(
+        hovered_again
+            .0
+            .shapes
+            .iter()
+            .all(|shape| !has_text(&shape.shape, "Permissions")),
+        "a labeled selector must not repeat itself in a tooltip"
     );
     assert!(
         idle.1.height() == theme::control::COMPACT,
@@ -9640,6 +9860,7 @@ fn dropping_an_image_over_the_devin_composer_stages_it_for_send() {
             ..Default::default()
         },
     });
+    finish_devin_initial_load(&mut app, "active", generation);
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
     let _ = context.run_ui(
@@ -13977,7 +14198,7 @@ fn agentic_session_rail_lists_workspaces_before_sessions() {
 }
 
 #[test]
-fn agentic_workspace_row_shows_its_pull_request_without_the_branch() {
+fn agentic_workspace_row_only_contains_the_project_name() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -13986,68 +14207,8 @@ fn agentic_workspace_row_shows_its_pull_request_without_the_branch() {
     })
     .unwrap();
     app.agentic_mode = true;
-    app.git_workspace_status = Some(crate::projects::GitWorkspaceStatus {
-        branch: "codex/session-workspaces".into(),
-        pull_request: Some(crate::projects::PullRequestStatus {
-            number: 42,
-            title: "Attach sessions to worktrees".into(),
-            url: "https://github.com/editur/editur/pull/42".into(),
-            state: "OPEN".into(),
-            is_draft: false,
-            review_decision: "APPROVED".into(),
-            merge_state_status: "CLEAN".into(),
-        }),
-    });
-    let output = theme::test_context().run_ui(
-        RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(1_000.0, 700.0),
-            )),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
-    fn has_text(shape: &Shape, expected: &str) -> bool {
-        match shape {
-            Shape::Text(text) => text.galley.text() == expected,
-            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
-            _ => false,
-        }
-    }
-
-    for expected in ["WORKSPACES", "PR #42 · Ready"] {
-        assert!(
-            output
-                .shapes
-                .iter()
-                .any(|shape| has_text(&shape.shape, expected)),
-            "missing {expected:?}"
-        );
-    }
-    assert!(
-        output
-            .shapes
-            .iter()
-            .all(|shape| !has_text(&shape.shape, "codex/session-workspaces"))
-    );
-}
-
-#[test]
-fn agentic_workspace_branch_is_not_rendered_or_reserved() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut app = EditorApp::new(OpenTarget {
-        root: temp.path().canonicalize().unwrap(),
-        file: None,
-        create: false,
-    })
-    .unwrap();
-    app.agentic_mode = true;
-    app.git_workspace_status = Some(crate::projects::GitWorkspaceStatus {
-        branch: "heads/release".into(),
-        pull_request: None,
-    });
     let root = app.tree.root.clone();
+    let name = root.file_name().unwrap().to_string_lossy().into_owned();
     let context = theme::test_context();
     let output = context.run_ui(
         RawInput {
@@ -14057,26 +14218,34 @@ fn agentic_workspace_branch_is_not_rendered_or_reserved() {
             )),
             ..RawInput::default()
         },
-        |ui| app.ui(ui),
+        |root| app.ui(root),
     );
     let row = context
         .read_response(Id::new(("agentic_project", root)))
         .expect("selected workspace row")
         .rect;
-    fn has_text(shape: &Shape, expected: &str) -> bool {
+    fn collect_row_content(shape: &Shape, row: Rect, text: &mut Vec<String>, has_path: &mut bool) {
         match shape {
-            Shape::Text(text) => text.galley.text() == expected,
-            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
-            _ => false,
+            Shape::Text(label) if row.contains(label.visual_bounding_rect().center()) => {
+                text.push(label.galley.text().into());
+            }
+            Shape::Path(path) if row.contains(path.visual_bounding_rect().center()) => {
+                *has_path = true;
+            }
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .for_each(|shape| collect_row_content(shape, row, text, has_path)),
+            _ => {}
         }
     }
+    let mut text = Vec::new();
+    let mut has_path = false;
+    output.shapes.iter().for_each(|shape| {
+        collect_row_content(&shape.shape, row, &mut text, &mut has_path);
+    });
 
-    assert!(
-        output
-            .shapes
-            .iter()
-            .all(|shape| !has_text(&shape.shape, "heads/release"))
-    );
+    assert_eq!(text, [name]);
+    assert!(!has_path, "workspace row still contains an icon");
     assert_eq!(row.height(), theme::control::ROW + theme::space::TIGHT);
 }
 
@@ -15266,4 +15435,542 @@ fn vim_operator_scope_updates_between_events_in_one_frame() {
 
     assert_eq!(app.tabs[0].buffer.text, "X two");
     assert_eq!(app.tabs[0].vim.mode(), crate::vim::VimMode::Normal);
+}
+
+#[test]
+fn agentic_pane_button_opens_an_empty_session_pane() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+
+    let pane = app.open_agent_session_pane().expect("new agent pane");
+
+    assert_eq!(app.agent_pane_layout.panes().len(), 2);
+    assert_eq!(app.agent_pane_picker, Some(pane));
+}
+
+#[test]
+fn agentic_header_exposes_the_session_pane_action() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: screen,
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    let button = context
+        .read_response(Id::new("agent_new_pane"))
+        .expect("agent pane button");
+    assert!(button.rect.center().x > 800.0);
+}
+
+#[test]
+fn agentic_header_pane_action_opens_the_chooser() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+
+    let _ = click_response(&context, &mut draw, Id::new("agent_new_pane"));
+
+    assert_eq!(app.agent_pane_layout.panes().len(), 2);
+    assert!(app.agent_pane_picker.is_some());
+}
+
+#[test]
+fn empty_agent_pane_offers_a_new_or_existing_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "existing-session".into(),
+        title: Some("Existing work".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    let pane = app.open_agent_session_pane().unwrap();
+    let context = theme::test_context();
+
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1200.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(
+        context
+            .read_response(Id::new(("agent_pane_new", pane.0)))
+            .is_some()
+    );
+    assert!(
+        context
+            .read_response(Id::new(("agent_pane_session", pane.0, "existing-session")))
+            .is_some()
+    );
+}
+
+#[test]
+fn agent_panes_keep_independent_session_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent.session_id = Some("first-session".into());
+    app.agent.title = Some("First session".into());
+    let pane = app.open_agent_session_pane().unwrap();
+
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+    app.agent.title = Some("Second session".into());
+    assert_eq!(app.agent.session_id.as_deref(), Some("second-session"));
+
+    assert!(app.activate_agent_session_pane(PaneId(0)));
+    assert_eq!(app.agent.session_id.as_deref(), Some("first-session"));
+    assert_eq!(app.agent.title.as_deref(), Some("First session"));
+
+    assert!(app.activate_agent_session_pane(pane));
+    assert_eq!(app.agent.session_id.as_deref(), Some("second-session"));
+    assert_eq!(app.agent.title.as_deref(), Some("Second session"));
+}
+
+#[test]
+fn agentic_session_panes_render_their_own_conversations() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.title = Some("First session".into());
+    let pane = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.title = Some("Second session".into());
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1200.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let painted = |expected: &str| {
+        output.shapes.iter().any(|shape| match &shape.shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            _ => false,
+        })
+    };
+
+    assert!(painted("First session"));
+    assert!(painted("Second session"));
+}
+
+#[test]
+fn dropping_a_sidebar_session_into_the_empty_pane_assigns_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let pane = app.open_agent_session_pane().unwrap();
+
+    let assigned = app.place_agent_session(pane, DropZone::Center, "dragged-session".into());
+
+    assert_eq!(assigned, Some(pane));
+    assert_eq!(app.agent_pane_picker, None);
+    assert_eq!(app.active_agent_pane, pane);
+    assert_eq!(app.agent.session_id.as_deref(), Some("dragged-session"));
+}
+
+#[test]
+fn agentic_sidebar_session_rows_start_a_pane_drag() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "drag-me".into(),
+        title: Some("Drag me".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+    let row = context
+        .read_response(Id::new(("agent_session_open", "drag-me")))
+        .unwrap()
+        .rect;
+    let pointer = row.center();
+    let _ = draw(vec![
+        Event::PointerMoved(pointer),
+        Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let _ = draw(vec![Event::PointerMoved(pointer + Vec2::new(20.0, 0.0))]);
+
+    assert_eq!(
+        app.agent_session_drag
+            .as_ref()
+            .map(|session| session.id.as_str()),
+        Some("drag-me"),
+        "response after move: {:?}",
+        context.read_response(Id::new(("agent_session_open", "drag-me")))
+    );
+}
+
+#[test]
+fn removing_an_agent_session_pane_keeps_the_other_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent.session_id = Some("first-session".into());
+    let pane = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+
+    assert!(app.remove_agent_session_pane(pane));
+
+    assert_eq!(app.agent_pane_layout.panes(), vec![PaneId(0)]);
+    assert_eq!(app.active_agent_pane, PaneId(0));
+    assert_eq!(app.agent.session_id.as_deref(), Some("first-session"));
+}
+
+#[test]
+fn removing_the_active_pane_keeps_the_empty_pane_usable() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let picker = app.open_agent_session_pane().unwrap();
+
+    assert!(app.remove_agent_session_pane(PaneId(0)));
+    app.assign_agent_session_pane(picker, Some("remaining-session".into()));
+
+    assert_eq!(app.active_agent_pane, picker);
+    assert_eq!(app.agent_pane_picker, None);
+    assert_eq!(app.agent.session_id.as_deref(), Some("remaining-session"));
+}
+
+#[test]
+fn moving_an_agent_session_pane_preserves_its_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent.session_id = Some("first-session".into());
+    let second = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(second, Some("second-session".into()));
+    assert!(app.activate_agent_session_pane(PaneId(0)));
+
+    let moved = app
+        .move_agent_session_pane(PaneId(0), second, DropZone::Right)
+        .expect("moved pane");
+
+    assert_eq!(app.agent_pane_layout.panes(), vec![second, moved]);
+    assert_eq!(app.active_agent_pane, moved);
+    assert_eq!(app.agent.session_id.as_deref(), Some("first-session"));
+}
+
+#[test]
+fn agent_session_panes_have_a_close_button() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    let pane = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+
+    let _ = click_response(&context, &mut draw, Id::new(("agent_close_pane", pane.0)));
+
+    assert_eq!(app.agent_pane_layout.panes(), vec![PaneId(0)]);
+}
+
+#[test]
+fn agent_session_pane_headers_start_a_drag() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    let pane = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+    let handle = context
+        .read_response(Id::new(("agent_pane_drag", pane.0)))
+        .expect("pane drag handle")
+        .rect;
+    let pointer = handle.center();
+    let _ = draw(vec![
+        Event::PointerMoved(pointer),
+        Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let _ = draw(vec![Event::PointerMoved(pointer + Vec2::new(20.0, 0.0))]);
+
+    assert_eq!(
+        app.agent_pane_drag.as_ref().map(|drag| drag.pane),
+        Some(pane)
+    );
+}
+
+#[test]
+fn dropping_an_agent_session_pane_header_repositions_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    let second = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(second, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: screen,
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(Vec::new());
+    let source = context
+        .read_response(Id::new(("agent_pane_drag", PaneId(0).0)))
+        .expect("pane drag handle")
+        .rect
+        .center();
+    let target = pos2(990.0, 350.0);
+    let _ = draw(vec![
+        Event::PointerMoved(source),
+        Event::PointerButton {
+            pos: source,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let _ = draw(vec![Event::PointerMoved(source + Vec2::new(20.0, 0.0))]);
+    let _ = draw(vec![Event::PointerMoved(target)]);
+    let _ = draw(vec![Event::PointerButton {
+        pos: target,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    }]);
+
+    let panes = app.agent_pane_layout.panes();
+    assert_eq!(panes[0], second);
+    assert_ne!(panes[1], PaneId(0));
+}
+
+#[test]
+fn narrow_agent_session_panes_use_the_sidebar_composer_style() {
+    fn floating_composers(shape: &Shape) -> usize {
+        match shape {
+            Shape::Rect(rect)
+                if rect.fill == super::agentic_composer_fill()
+                    && rect.corner_radius.nw == super::AGENTIC_COMPOSER_RADIUS =>
+            {
+                1
+            }
+            Shape::Vec(shapes) => shapes.iter().map(floating_composers).sum(),
+            _ => 0,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.sidebar = false;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    let second = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(second, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp, width| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(width, 700.0))),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let wide = draw(&mut app, 1_200.0);
+    assert_eq!(
+        wide.shapes
+            .iter()
+            .map(|shape| floating_composers(&shape.shape))
+            .sum::<usize>(),
+        2
+    );
+
+    let narrow = draw(&mut app, 800.0);
+    assert_eq!(
+        narrow
+            .shapes
+            .iter()
+            .map(|shape| floating_composers(&shape.shape))
+            .sum::<usize>(),
+        0
+    );
 }

@@ -323,9 +323,8 @@ impl TerminalPanel {
                 for (position, (index, id, title)) in tabs.iter().enumerate() {
                     let (_, tab) = ui.allocate_space(egui::vec2(TAB_WIDTH, rect.height()));
                     let selected = active == Some(*id);
-                    let response = ui
-                        .interact(tab, Id::new(("terminal_tab", id)), Sense::click_and_drag())
-                        .on_hover_text(title);
+                    let response =
+                        ui.interact(tab, Id::new(("terminal_tab", id)), Sense::click_and_drag());
                     response.widget_info(|| {
                         egui::WidgetInfo::selected(
                             egui::WidgetType::SelectableLabel,

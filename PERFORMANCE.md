@@ -44,7 +44,7 @@ Measured 2026-08-10 on the same Apple M4 reference machine. Run `cargo run --rel
 | Stripped arm64 binary | 11,108,768 bytes | 12,872,976 bytes (+1,764,208) / <30 MiB | Pass |
 | Idle with unsupported `README.md` | Existing caret/render cadence | No LSP controller, child, or periodic LSP repaint | Pass by construction |
 
-The pinned `lsp-types 0.97.0` addition introduced two lockfile packages (`lsp-types` and `fluent-uri`); its first incremental dependency check completed in 6.34 seconds. A supported document retains one last-sent UTF-8 snapshot. Unsupported and >5 MiB documents create no controller. Controller events wake the UI; only the 400 ms hover deadline and a full bounded command queue schedule an LSP retry frame.
+The pinned `lsp-types 0.97.0` addition introduced two lockfile packages (`lsp-types` and `fluent-uri`); its first incremental dependency check completed in 6.34 seconds. A supported document retains one last-sent UTF-8 snapshot. Unsupported and >5 MiB documents create no controller. Controller events wake the UI; only a full bounded command queue schedules an LSP retry frame.
 
 The project build directory reached about 18.5 GiB during development. Only this project's `target/debug/incremental` artifacts were cleared; after the verified release build, `target` was 4.9 GiB. All five native macOS arm64 protocol smokes are recorded under `release/lsp-smoke/`; the real-server UI checks and native Linux and Windows matrices remain release-approval requirements.
 

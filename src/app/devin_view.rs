@@ -125,7 +125,6 @@ enum DevinUiAction {
     ConfirmOrganizationSwitch(String),
     Reconnect,
     Refresh,
-    LoadMoreSessions,
     Select(String),
     Create,
     SendMessage,
@@ -311,9 +310,8 @@ impl EditorApp {
             DevinView::Detail => {
                 back(ui, action);
                 // The session's status lives here as the list's dot language,
-                // between the chevron and the title, with the detail on hover
-                // — not as a chip-and-caption stack pushing the transcript
-                // down.
+                // between the chevron and the title — not as a chip-and-caption
+                // stack pushing the transcript down.
                 if connected_surface && let Some(summary) = self.selected_devin_summary() {
                     let status = semantic_status(summary);
                     let color = devin_status_dot_color(summary.category);
@@ -330,8 +328,6 @@ impl EditorApp {
                             ),
                         )
                     });
-                    hover
-                        .on_hover_text(summary.status_detail.as_deref().unwrap_or(&summary.status));
                     ui.add_space(theme::space::TIGHT);
                 }
                 let title = self
@@ -1055,14 +1051,11 @@ impl EditorApp {
                             selectable_content_row(ui, selected, 0.0, |ui| {
                                 ui.horizontal(|ui| {
                                     let color = devin_status_dot_color(session.category);
-                                    let (dot, hover) = ui.allocate_exact_size(
+                                    let (dot, _) = ui.allocate_exact_size(
                                         egui::Vec2::splat(14.0),
                                         Sense::hover(),
                                     );
                                     ui.painter().circle_filled(dot.center(), 4.0, color);
-                                    hover.on_hover_text(
-                                        session.status_detail.as_deref().unwrap_or(&session.status),
-                                    );
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = theme::space::HAIR;
                                         let reserved = pr_width
@@ -1146,12 +1139,6 @@ impl EditorApp {
                         *action = Some(DevinUiAction::Select(session.id.clone()));
                     }
                     row_ids.push(response.id);
-                }
-                if self.devin_state.sessions_has_next
-                    && self.devin_state.sessions_cursor.is_some()
-                    && ui.button("Load more sessions").clicked()
-                {
-                    *action = Some(DevinUiAction::LoadMoreSessions);
                 }
                 if self.devin_state.last_created_batch.len() > 1
                     && self.devin_state.capabilities.has("devin_session_gather")
@@ -1333,9 +1320,8 @@ impl EditorApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(theme::space::SNUG);
-                let advanced = ui
-                    .selectable_label(self.devin_advanced.open, "Advanced options")
-                    .on_hover_text("Session metadata, batch, output, and permission-gated options");
+                let advanced =
+                    ui.selectable_label(self.devin_advanced.open, "Advanced options");
                 if advanced.clicked() {
                     self.devin_advanced.open = !self.devin_advanced.open;
                 }
@@ -1531,7 +1517,7 @@ impl EditorApp {
             }
             return;
         };
-        if self.devin_state.busy && self.devin_state.detail.is_none() {
+        if self.devin_state.session_loading {
             draw_assistant_connecting(
                 ui,
                 "Loading Devin session",
@@ -2737,6 +2723,7 @@ impl EditorApp {
                 return;
             }
             DevinUiAction::Back => {
+                self.devin_state.session_loading = false;
                 self.devin_view = DevinView::Sessions;
                 self.devin_focus_list = true;
                 return;
@@ -2863,7 +2850,6 @@ impl EditorApp {
                 }
                 Some(DevinCommand::RefreshSessions)
             }
-            DevinUiAction::LoadMoreSessions => Some(DevinCommand::LoadMoreSessions),
             DevinUiAction::Select(session_id) => {
                 #[cfg(debug_assertions)]
                 if self.devin_state.preview {
@@ -3804,9 +3790,7 @@ fn devin_attachment_pill(
         theme::text().secondary,
     );
     if linked {
-        response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Open attachment")
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
         response
     }

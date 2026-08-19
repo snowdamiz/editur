@@ -41,7 +41,7 @@ contexts:
           scope: constant.character.escape.rust
         - match: '"'
           pop: true
-    - match: "b?'"
+    - match: "b?'(?=(?:\\\\.|[^\\\\'\\n])')"
       push:
         - meta_scope: string.quoted.single.rust
         - match: '\\.'

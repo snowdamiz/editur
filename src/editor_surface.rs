@@ -74,7 +74,6 @@ pub struct EditorOutput {
     pub cursor: usize,
     pub changed: bool,
     pub caret_rect: Option<Rect>,
-    pub hovered_character: Option<usize>,
     pub last_inserted: Option<char>,
     pub inserted_text: String,
     pub scrolled: bool,
@@ -631,10 +630,6 @@ impl EditorSurface {
             cursor: self.cursor,
             changed,
             caret_rect: self.cursor_rect(content),
-            hovered_character: ui
-                .input(|input| input.pointer.hover_pos())
-                .filter(|pointer| editor_rect.contains(*pointer))
-                .map(|pointer| self.character_at(pointer, content)),
             last_inserted,
             inserted_text,
             scrolled: scrolling || horizontal_scrolling,

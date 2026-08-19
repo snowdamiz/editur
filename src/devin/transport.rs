@@ -358,10 +358,6 @@ impl McpTransport {
         Err(TransportError::Offline)
     }
 
-    pub(super) fn search(&mut self, cursor: Option<&str>) -> Result<Value, TransportError> {
-        self.search_with(cursor, &SessionFilters::default())
-    }
-
     pub(super) fn search_with(
         &mut self,
         cursor: Option<&str>,
@@ -1562,7 +1558,9 @@ mod tests {
             .unwrap()
             .expect("DEVIN_API_KEY is required");
         let mut transport = super::McpTransport::connect(credentials).unwrap();
-        let result = transport.search(None).unwrap();
+        let result = transport
+            .search_with(None, &super::SessionFilters::default())
+            .unwrap();
         let payload = crate::devin::normalize::tool_payload(result).unwrap();
         let (sessions, _, total, _) = crate::devin::normalize::sessions(&payload).unwrap();
 
