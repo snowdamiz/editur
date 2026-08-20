@@ -578,6 +578,7 @@ pub struct DevinState {
     pub workspace_boundary: Option<String>,
     pub resources: DevinResources,
     pub sessions: Vec<SessionSummary>,
+    pub sessions_revision: u64,
     pub sessions_cursor: Option<String>,
     pub sessions_total: Option<usize>,
     pub sessions_has_next: bool,
@@ -587,9 +588,13 @@ pub struct DevinState {
     pub selected_generation: u64,
     pub detail: Option<SessionDetail>,
     pub messages: Vec<DevinMessage>,
-    pub messages_cursor: Option<String>,
+    pub messages_revision: u64,
     pub activity: Vec<Activity>,
-    pub activity_cursor: Option<String>,
+    pub activity_revision: u64,
+    #[doc(hidden)]
+    pub message_ids: HashSet<String>,
+    #[doc(hidden)]
+    pub activity_ids: HashSet<String>,
     /// Downloaded bytes for the selected session's image attachments, keyed by
     /// attachment id, so the transcript can paint the same previews the Agent
     /// paints for local prompt images.
@@ -597,167 +602,19 @@ pub struct DevinState {
     pub error: Option<DevinError>,
     pub busy: bool,
     pub session_loading: bool,
-    #[cfg(debug_assertions)]
-    pub preview: bool,
 }
 
 impl DevinState {
-    #[cfg(debug_assertions)]
-    pub(crate) fn seed_preview(&mut self) {
-        *self = Self {
-            connection: ConnectionState::Connected,
-            credential_source: Some(CredentialSource::Environment),
-            repository: RepositoryState::Suggested("openai/editur".into()),
-            workspace_boundary: Some(
-                "Preview data only — no remote Devin session is running.".into(),
-            ),
-            sessions: preview_sessions(),
-            last_sessions_refresh: Some(Instant::now()),
-            preview: true,
-            ..Self::default()
-        };
-        self.select_preview("preview-passkeys".into());
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn select_preview(&mut self, session_id: String) -> bool {
-        if !self.preview {
-            return false;
-        }
-        let Some(summary) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-        else {
-            return false;
-        };
-        let generation = self.select(session_id.clone());
-        self.apply(DevinEvent::SessionLoaded {
-            session_id: session_id.clone(),
-            generation,
-            detail: SessionDetail {
-                summary,
-                attachments: vec![
-                    Attachment {
-                        id: "preview-design".into(),
-                        name: "passkey-flow.png".into(),
-                        media_type: Some("image/png".into()),
-                        size: Some(248_320),
-                        url: Some("https://app.devin.ai/".into()),
-                    },
-                    Attachment {
-                        id: "preview-log".into(),
-                        name: "test-results.txt".into(),
-                        media_type: Some("text/plain".into()),
-                        size: Some(8_192),
-                        url: None,
-                    },
-                ],
-                pull_requests: vec![PullRequest {
-                    id: "preview-pr".into(),
-                    title: "Add passkey sign-in and recovery flow".into(),
-                    url: "https://github.com/openai/editur/pull/42".into(),
-                    status: Some("Ready for review".into()),
-                }],
-                children: vec![ChildSession {
-                    id: "preview-tests".into(),
-                    title: "Run cross-platform auth tests".into(),
-                    status: "working".into(),
-                }],
-                usage: Some(Usage {
-                    acus: Some(3.72),
-                    limit: Some(10.0),
-                }),
-            },
-        });
-        self.apply(DevinEvent::MessagesLoaded {
-            session_id: session_id.clone(),
-            generation,
-            messages: vec![
-                DevinMessage {
-                    id: "preview-message-1".into(),
-                    timestamp: "2026-08-15T23:42:00Z".into(),
-                    role: "user".into(),
-                    text: "Add passkey authentication and keep email recovery as a fallback."
-                        .into(),
-                    attachment_ids: vec!["preview-design".into()],
-                },
-                DevinMessage {
-                    id: "preview-message-2".into(),
-                    timestamp: "2026-08-15T23:48:00Z".into(),
-                    role: "devin".into(),
-                    text: "I mapped the existing auth flow and implemented **WebAuthn** registration and sign-in in `src/auth/passkeys.rs`. The focused tests pass.".into(),
-                    attachment_ids: vec!["preview-log".into()],
-                },
-                DevinMessage {
-                    id: "preview-message-3".into(),
-                    timestamp: "2026-08-16T00:05:00Z".into(),
-                    role: "devin".into(),
-                    text: "Should recovery codes be required during enrollment, or can users add them later from settings?".into(),
-                    attachment_ids: Vec::new(),
-                },
-            ],
-            next_cursor: None,
-            update: PageUpdate::Initial,
-        });
-        self.apply(DevinEvent::AttachmentFetched {
-            session_id: session_id.clone(),
-            generation,
-            attachment_id: "preview-design".into(),
-            bytes: preview_image_bytes(),
-        });
-        self.apply(DevinEvent::ActivityLoaded {
-            session_id,
-            generation,
-            activity: vec![
-                Activity {
-                    id: "preview-activity-1".into(),
-                    timestamp: "2026-08-15T23:45:00Z".into(),
-                    category: "shell".into(),
-                    summary: "Inspected the authentication tests".into(),
-                    details: Some(
-                        "Found the existing session boundary and recovery coverage.".into(),
-                    ),
-                    path: Some("tests/auth.rs".into()),
-                    command: Some("cargo test auth".into()),
-                    ..Activity::default()
-                },
-                Activity {
-                    id: "preview-activity-2".into(),
-                    timestamp: "2026-08-15T23:54:00Z".into(),
-                    category: "code".into(),
-                    summary: "Implemented passkey registration".into(),
-                    details: Some("Added challenge validation and credential persistence.".into()),
-                    path: Some("src/auth/passkeys.rs".into()),
-                    ..Activity::default()
-                },
-                Activity {
-                    id: "preview-activity-3".into(),
-                    timestamp: "2026-08-16T00:02:00Z".into(),
-                    category: "browser".into(),
-                    summary: "Verified the sign-in flow".into(),
-                    details: Some(
-                        "Registration, sign-in, and fallback recovery all completed.".into(),
-                    ),
-                    url: Some("https://app.devin.ai/".into()),
-                    ..Activity::default()
-                },
-            ],
-            next_cursor: None,
-            update: PageUpdate::Initial,
-        });
-        true
-    }
-
     pub fn select(&mut self, session_id: String) -> u64 {
         self.selected_generation = self.selected_generation.wrapping_add(1);
         self.selected_session = Some(session_id);
         self.detail = None;
         self.messages.clear();
-        self.messages_cursor = None;
+        self.messages_revision = self.messages_revision.wrapping_add(1);
+        self.message_ids.clear();
         self.activity.clear();
-        self.activity_cursor = None;
+        self.activity_revision = self.activity_revision.wrapping_add(1);
+        self.activity_ids.clear();
         self.attachment_previews.clear();
         self.error = None;
         self.busy = true;
@@ -770,9 +627,11 @@ impl DevinState {
         self.selected_session = None;
         self.detail = None;
         self.messages.clear();
-        self.messages_cursor = None;
+        self.messages_revision = self.messages_revision.wrapping_add(1);
+        self.message_ids.clear();
         self.activity.clear();
-        self.activity_cursor = None;
+        self.activity_revision = self.activity_revision.wrapping_add(1);
+        self.activity_ids.clear();
         self.attachment_previews.clear();
         self.busy = false;
         self.session_loading = false;
@@ -789,6 +648,7 @@ impl DevinState {
                     self.organizations.clear();
                     self.selected_org_id = None;
                     self.sessions.clear();
+                    self.bump_sessions_revision();
                     self.filters = SessionFilters::default();
                     self.sessions_cursor = None;
                     self.sessions_total = None;
@@ -810,6 +670,7 @@ impl DevinState {
             }
             DevinEvent::OrganizationSwitching => {
                 self.sessions.clear();
+                self.bump_sessions_revision();
                 self.filters = SessionFilters::default();
                 self.sessions_cursor = None;
                 self.sessions_total = None;
@@ -946,6 +807,7 @@ impl DevinState {
                 } else {
                     self.sessions = sessions;
                 }
+                self.bump_sessions_revision();
                 self.sessions_cursor = next_cursor;
                 if total.is_some() || !append {
                     self.sessions_total = total;
@@ -964,6 +826,7 @@ impl DevinState {
                 } else {
                     self.sessions.insert(0, session);
                 }
+                self.bump_sessions_revision();
                 self.busy = false;
                 self.error = None;
             }
@@ -983,6 +846,7 @@ impl DevinState {
                     .find(|summary| summary.id == session_id)
                 {
                     *summary = detail.summary.clone();
+                    self.bump_sessions_revision();
                 }
                 self.detail = Some(detail);
                 self.error = None;
@@ -992,17 +856,27 @@ impl DevinState {
                 session_id,
                 generation,
                 messages,
-                next_cursor,
+                next_cursor: _,
                 update,
             } if self.is_current(&session_id, generation) => {
+                let cleared = update == PageUpdate::Initial && !self.messages.is_empty();
                 if update == PageUpdate::Initial {
                     self.messages.clear();
+                    self.message_ids.clear();
                 }
-                append_unique(&mut self.messages, messages, |message| message.id.as_str());
-                self.messages
-                    .sort_by(|left, right| chronological(&left.timestamp, &right.timestamp));
-                if update != PageUpdate::Refresh {
-                    self.messages_cursor = next_cursor;
+                if self.message_ids.len() < self.messages.len() {
+                    self.message_ids
+                        .extend(self.messages.iter().map(|message| message.id.clone()));
+                }
+                let changed = merge_chronological(
+                    &mut self.messages,
+                    messages,
+                    &mut self.message_ids,
+                    |message| message.id.as_str(),
+                    |message| message.timestamp.as_str(),
+                );
+                if cleared || changed {
+                    self.messages_revision = self.messages_revision.wrapping_add(1);
                 }
                 self.error = None;
                 self.busy = false;
@@ -1014,17 +888,27 @@ impl DevinState {
                 next_cursor,
                 update,
             } if self.is_current(&session_id, generation) => {
-                let history_complete = update != PageUpdate::Refresh && next_cursor.is_none();
+                let history_complete = next_cursor.is_none();
+                let cleared = update == PageUpdate::Initial && !self.activity.is_empty();
                 if update == PageUpdate::Initial {
                     self.activity.clear();
+                    self.activity_ids.clear();
                 }
-                append_unique(&mut self.activity, activity, |event| event.id.as_str());
-                self.activity
-                    .sort_by(|left, right| chronological(&left.timestamp, &right.timestamp));
-                if update != PageUpdate::Refresh {
-                    self.activity_cursor = next_cursor;
+                if self.activity_ids.len() < self.activity.len() {
+                    self.activity_ids
+                        .extend(self.activity.iter().map(|event| event.id.clone()));
                 }
-                if history_complete {
+                let changed = merge_chronological(
+                    &mut self.activity,
+                    activity,
+                    &mut self.activity_ids,
+                    |event| event.id.as_str(),
+                    |event| event.timestamp.as_str(),
+                );
+                if cleared || changed {
+                    self.activity_revision = self.activity_revision.wrapping_add(1);
+                }
+                if self.session_loading && history_complete {
                     self.session_loading = false;
                 }
                 self.error = None;
@@ -1090,6 +974,10 @@ impl DevinState {
     fn is_current(&self, session_id: &str, generation: u64) -> bool {
         self.selected_session.as_deref() == Some(session_id)
             && self.selected_generation == generation
+    }
+
+    fn bump_sessions_revision(&mut self) {
+        self.sessions_revision = self.sessions_revision.wrapping_add(1);
     }
 }
 
@@ -1232,127 +1120,93 @@ fn resource_kind_has_items(resources: &DevinResources, kind: DevinResourceKind) 
     }
 }
 
-/// A small generated PNG so the preview session's image attachment renders a
-/// real thumbnail without shipping a fixture.
-#[cfg(debug_assertions)]
-fn preview_image_bytes() -> std::sync::Arc<[u8]> {
-    let mut pixels = image::RgbaImage::new(48, 48);
-    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
-        *pixel = image::Rgba([36 + (x * 3) as u8, 48 + (y * 2) as u8, 112, 255]);
+pub(crate) fn parse_timestamp_seconds(value: &str) -> Option<i64> {
+    parse_timestamp_nanos(value).map(|timestamp| (timestamp / 1_000_000_000) as i64)
+}
+
+fn parse_timestamp_nanos(value: &str) -> Option<i128> {
+    if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() {
+            return None;
+        }
+        return Some(if number > 10_000_000_000.0 {
+            (number * 1_000_000.0) as i128
+        } else {
+            (number * 1_000_000_000.0) as i128
+        });
     }
-    let mut bytes = Vec::new();
-    let _ = image::DynamicImage::ImageRgba8(pixels).write_to(
-        &mut std::io::Cursor::new(&mut bytes),
-        image::ImageFormat::Png,
-    );
-    bytes.into()
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let suffix = value.get(19..)?;
+    let fraction_digits = suffix
+        .strip_prefix('.')
+        .map(|suffix| suffix.bytes().take_while(u8::is_ascii_digit).take(9));
+    let fraction = fraction_digits
+        .map(|digits| {
+            let mut value = 0_i128;
+            let mut count = 0;
+            for digit in digits {
+                value = value * 10 + i128::from(digit - b'0');
+                count += 1;
+            }
+            value * 10_i128.pow(9 - count)
+        })
+        .unwrap_or_default();
+    let zone = suffix
+        .strip_prefix('.')
+        .map_or(suffix, |suffix| suffix.trim_start_matches(char::is_numeric));
+    let offset = match zone.as_bytes() {
+        [] | [b'Z'] => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+            let hours = i64::from((h1 - b'0') * 10 + (h2 - b'0'));
+            let minutes = i64::from((m1 - b'0') * 10 + (m2 - b'0'));
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let seconds = hours * 3_600 + minutes * 60;
+            if *sign == b'+' { seconds } else { -seconds }
+        }
+        _ => return None,
+    };
+    Some(
+        i128::from(
+            days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+                - offset,
+        ) * 1_000_000_000
+            + fraction,
+    )
 }
 
-#[cfg(debug_assertions)]
-fn preview_sessions() -> Vec<SessionSummary> {
-    vec![
-        SessionSummary {
-            id: "preview-passkeys".into(),
-            title: "Add passkey authentication".into(),
-            prompt: Some("Implement passkeys with an email recovery fallback.".into()),
-            status: "blocked".into(),
-            status_detail: Some("Waiting for your recovery-code decision".into()),
-            category: StatusCategory::Waiting,
-            origin: Some("slack".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-15T23:40:00Z".into()),
-            updated_at: Some("2026-08-16T00:05:00Z".into()),
-            url: Some("https://app.devin.ai/sessions/preview-passkeys".into()),
-            pull_request_count: 1,
-            tags: vec!["auth".into(), "frontend".into()],
-            ..SessionSummary::default()
-        },
-        SessionSummary {
-            id: "preview-tests".into(),
-            title: "Run cross-platform auth tests".into(),
-            prompt: Some("Verify the new auth flow on macOS, Windows, and Linux.".into()),
-            status: "working".into(),
-            status_detail: Some("Running the Windows test matrix".into()),
-            category: StatusCategory::Active,
-            origin: Some("editur".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-15T23:51:00Z".into()),
-            updated_at: Some("2026-08-16T00:08:00Z".into()),
-            parent_session_id: Some("preview-passkeys".into()),
-            url: Some("https://app.devin.ai/sessions/preview-tests".into()),
-            tags: vec!["tests".into()],
-            ..SessionSummary::default()
-        },
-        SessionSummary {
-            id: "preview-docs".into(),
-            title: "Document the plugin API".into(),
-            prompt: Some("Write a migration guide for plugin authors.".into()),
-            status: "sleeping".into(),
-            status_detail: Some("Sleeping until new instructions arrive".into()),
-            category: StatusCategory::Sleeping,
-            origin: Some("web".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-14T14:20:00Z".into()),
-            updated_at: Some("2026-08-15T21:14:00Z".into()),
-            url: Some("https://app.devin.ai/sessions/preview-docs".into()),
-            tags: vec!["docs".into()],
-            ..SessionSummary::default()
-        },
-        SessionSummary {
-            id: "preview-release".into(),
-            title: "Prepare v0.2 release".into(),
-            prompt: Some("Cut the release and draft release notes.".into()),
-            status: "finished".into(),
-            status_detail: Some("Release published successfully".into()),
-            category: StatusCategory::Completed,
-            origin: Some("editur".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-13T17:10:00Z".into()),
-            updated_at: Some("2026-08-14T02:32:00Z".into()),
-            url: Some("https://app.devin.ai/sessions/preview-release".into()),
-            pull_request_count: 2,
-            tags: vec!["release".into()],
-            ..SessionSummary::default()
-        },
-        SessionSummary {
-            id: "preview-ci".into(),
-            title: "Repair flaky Linux CI".into(),
-            prompt: Some("Find and fix the intermittent Linux failure.".into()),
-            status: "failed".into(),
-            status_detail: Some("Runner lost network access".into()),
-            category: StatusCategory::Failed,
-            origin: Some("slack".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-12T19:06:00Z".into()),
-            updated_at: Some("2026-08-12T20:41:00Z".into()),
-            url: Some("https://app.devin.ai/sessions/preview-ci".into()),
-            tags: vec!["ci".into()],
-            ..SessionSummary::default()
-        },
-        SessionSummary {
-            id: "preview-archived".into(),
-            title: "Prototype command palette".into(),
-            prompt: Some("Explore a compact command palette interaction.".into()),
-            status: "finished".into(),
-            status_detail: Some("Prototype complete".into()),
-            category: StatusCategory::Completed,
-            origin: Some("web".into()),
-            repository: Some("openai/editur".into()),
-            created_at: Some("2026-08-01T15:00:00Z".into()),
-            updated_at: Some("2026-08-02T18:26:00Z".into()),
-            archived: true,
-            url: Some("https://app.devin.ai/sessions/preview-archived".into()),
-            tags: vec!["prototype".into()],
-            ..SessionSummary::default()
-        },
-    ]
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
-fn chronological(left: &str, right: &str) -> std::cmp::Ordering {
-    match (left.parse::<f64>(), right.parse::<f64>()) {
-        (Ok(left), Ok(right)) => left
-            .partial_cmp(&right)
-            .unwrap_or(std::cmp::Ordering::Equal),
+pub(crate) fn chronological_timestamp(left: &str, right: &str) -> std::cmp::Ordering {
+    match (parse_timestamp_nanos(left), parse_timestamp_nanos(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
         _ => left.cmp(right),
     }
 }
@@ -1368,4 +1222,72 @@ fn append_unique<T>(target: &mut Vec<T>, incoming: Vec<T>, id: impl Fn(&T) -> &s
             .into_iter()
             .filter(|item| known.insert(id(item).to_owned())),
     );
+}
+
+fn merge_chronological<T>(
+    target: &mut Vec<T>,
+    mut incoming: Vec<T>,
+    known: &mut HashSet<String>,
+    id: impl Fn(&T) -> &str,
+    timestamp: impl Fn(&T) -> &str,
+) -> bool {
+    incoming.retain(|item| known.insert(id(item).to_owned()));
+    if incoming.is_empty() {
+        return false;
+    }
+    incoming.sort_by(|left, right| chronological_timestamp(timestamp(left), timestamp(right)));
+    let mut left = std::mem::take(target).into_iter().peekable();
+    let mut right = incoming.into_iter().peekable();
+    target.reserve(left.len() + right.len());
+    while let (Some(existing), Some(added)) = (left.peek(), right.peek()) {
+        if chronological_timestamp(timestamp(existing), timestamp(added))
+            != std::cmp::Ordering::Greater
+        {
+            target.push(left.next().expect("peeked existing item"));
+        } else {
+            target.push(right.next().expect("peeked added item"));
+        }
+    }
+    target.extend(left);
+    target.extend(right);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paginated_messages_are_ordered_by_time_across_timestamp_formats() {
+        let mut state = DevinState::default();
+        let generation = state.select("session".into());
+        let message = |id: &str, timestamp: &str| DevinMessage {
+            id: id.into(),
+            timestamp: timestamp.into(),
+            ..Default::default()
+        };
+        state.apply(DevinEvent::MessagesLoaded {
+            session_id: "session".into(),
+            generation,
+            messages: vec![message("later", "10")],
+            next_cursor: Some("next".into()),
+            update: PageUpdate::Initial,
+        });
+        state.apply(DevinEvent::MessagesLoaded {
+            session_id: "session".into(),
+            generation,
+            messages: vec![message("earlier", "1970-01-01T00:00:02Z")],
+            next_cursor: None,
+            update: PageUpdate::History,
+        });
+
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+    }
 }

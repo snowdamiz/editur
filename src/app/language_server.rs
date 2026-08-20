@@ -1,5 +1,11 @@
 use super::*;
 
+const MAX_LSP_EVENTS_PER_FRAME: usize = 32;
+
+fn lsp_event_batch<T>(events: &std::sync::mpsc::Receiver<T>) -> Vec<T> {
+    events.try_iter().take(MAX_LSP_EVENTS_PER_FRAME).collect()
+}
+
 impl EditorApp {
     pub(super) fn server_launch(&self, preset: PresetId) -> ServerLaunch {
         if !self.settings.language_servers.enabled {
@@ -81,9 +87,7 @@ impl EditorApp {
             .iter()
             .enumerate()
             .filter(|tab| {
-                tab.1.git_diff.is_none()
-                    && !tab.1.buffer.large_file_warning
-                    && tab.1.buffer.text.len() <= LARGE_FILE_BYTES
+                !tab.1.buffer.large_file_warning && tab.1.buffer.text.len() <= LARGE_FILE_BYTES
             })
             .filter_map(|(index, tab)| {
                 let (preset, language_id) = preset_for_path(&tab.buffer.path)?;
@@ -288,10 +292,10 @@ impl EditorApp {
         });
         let presets = self.lsp_controllers.keys().copied().collect::<Vec<_>>();
         for preset in presets {
-            let events = self.lsp_controllers[&preset]
-                .events()
-                .try_iter()
-                .collect::<Vec<_>>();
+            let events = lsp_event_batch(self.lsp_controllers[&preset].events());
+            if events.len() == MAX_LSP_EVENTS_PER_FRAME {
+                ctx.request_repaint();
+            }
             for event in events {
                 match event {
                     crate::lsp::Event::StateChanged(status) => {
@@ -580,5 +584,20 @@ impl EditorApp {
             self.lsp_definitions = None;
             self.navigate_to_definition(locations[index].clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn lsp_event_batch_leaves_excess_work_for_the_next_frame() {
+        let (sender, events) = std::sync::mpsc::sync_channel(64);
+        for event in 0..33 {
+            sender.send(event).unwrap();
+        }
+
+        let batch = super::lsp_event_batch(&events);
+
+        assert_eq!((batch.len(), events.try_iter().count()), (32, 1));
     }
 }

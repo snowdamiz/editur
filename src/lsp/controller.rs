@@ -577,7 +577,7 @@ fn start_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_process_tree(&mut command);
+    crate::configure_process_tree(&mut command);
     #[cfg(windows)]
     let (_, job) = crate::agent::new_windows_job()?;
     let mut child = command
@@ -1544,13 +1544,13 @@ fn fail_process(events: &Events, process: &mut Option<Process>, error: String) {
 }
 
 fn abort_child(child: &mut Child) {
-    terminate_process_tree(child);
+    crate::terminate_process_tree(child);
     let _ = child.wait();
 }
 
 fn terminate_and_join(mut process: Process) {
     process.reader_running.store(false, Ordering::Release);
-    terminate_process_tree(&mut process.child);
+    crate::terminate_process_tree(&mut process.child);
     #[cfg(windows)]
     drop(process.job.take());
     let _ = process.child.wait();
@@ -1600,29 +1600,4 @@ fn debug_wire(direction: &str, method: &str, id: Option<u64>) {
             eprintln!("editur: LSP {direction} {method}");
         }
     }
-}
-
-#[cfg(unix)]
-fn configure_process_tree(command: &mut ProcessCommand) {
-    use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_process_tree(_command: &mut ProcessCommand) {}
-
-#[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    unsafe {
-        kill(-(child.id() as i32), 9);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn terminate_process_tree(child: &mut Child) {
-    let _ = child.kill();
 }

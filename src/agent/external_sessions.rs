@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{BufRead as _, BufReader, Read as _},
+    io::{BufRead, BufReader, Read as _},
     path::{Path, PathBuf},
     sync::Arc,
     time::UNIX_EPOCH,
@@ -13,6 +13,8 @@ use rusqlite::{Connection, OpenFlags, params};
 use super::provider::ProviderId;
 
 const MAX_TRANSCRIPT_EVENTS: usize = 4_096;
+const MAX_EXTERNAL_RECORD_BYTES: usize = 24 * 1024 * 1024;
+const MAX_EXTERNAL_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HANDOFF_BYTES: usize = 64 * 1024;
 const MAX_CURSOR_BUBBLE_BYTES: usize = 1024 * 1024;
 const MAX_EXTERNAL_DIFF_BYTES: usize = 16 * 1024 * 1024;
@@ -20,6 +22,100 @@ const MAX_EXTERNAL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTERNAL_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CURSOR_IMAGE_FILES: usize = 65_536;
 const EXTERNAL_ID_PREFIX: &str = "external:";
+
+struct BoundedLines<R> {
+    reader: R,
+    scanned: usize,
+    max_record: usize,
+    max_total: usize,
+    finished: bool,
+}
+
+impl<R: BufRead> BoundedLines<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            scanned: 0,
+            max_record: MAX_EXTERNAL_RECORD_BYTES,
+            max_total: MAX_EXTERNAL_TRANSCRIPT_BYTES,
+            finished: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(reader: R, max_record: usize, max_total: usize) -> Self {
+        Self {
+            reader,
+            scanned: 0,
+            max_record,
+            max_total,
+            finished: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for BoundedLines<R> {
+    type Item = Result<String, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let mut line = Vec::new();
+        loop {
+            let (chunk_len, consumed, newline) = match self.reader.fill_buf() {
+                Ok([]) => {
+                    self.finished = true;
+                    if line.is_empty() {
+                        return None;
+                    }
+                    (0, 0, true)
+                }
+                Ok(buffer) => match buffer.iter().position(|byte| *byte == b'\n') {
+                    Some(index) => (index, index + 1, true),
+                    None => (buffer.len(), buffer.len(), false),
+                },
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(format!("cannot read external transcript: {error}")));
+                }
+            };
+            if self.scanned.saturating_add(consumed) > self.max_total {
+                self.finished = true;
+                return Some(Err(format!(
+                    "external transcript exceeds the {} byte scan limit",
+                    self.max_total
+                )));
+            }
+            if line.len().saturating_add(chunk_len) > self.max_record {
+                self.finished = true;
+                return Some(Err(format!(
+                    "external transcript record exceeds the {} byte limit",
+                    self.max_record
+                )));
+            }
+            if chunk_len > 0 {
+                let buffer = self.reader.fill_buf().expect("buffer was read above");
+                line.extend_from_slice(&buffer[..chunk_len]);
+            }
+            self.reader.consume(consumed);
+            self.scanned += consumed;
+            if newline {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Some(
+                    String::from_utf8(line)
+                        .map_err(|_| "external transcript contains a non-UTF-8 record".to_owned()),
+                );
+            }
+        }
+    }
+}
+
+fn bounded_lines(file: File) -> BoundedLines<BufReader<File>> {
+    BoundedLines::new(BufReader::new(file))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalMessage {
@@ -702,16 +798,20 @@ fn cursor_tool(
     let diffs = cursor_diff(&paths, output_value.as_ref(), content)
         .into_iter()
         .collect();
+    let kind = external_tool_kind(&name);
+    let output = output_value
+        .as_ref()
+        .and_then(|output| external_tool_output(output, kind.as_deref()));
     Some(ExternalTool {
         id,
-        kind: external_tool_kind(&name),
+        kind,
         name,
         status: tool
             .get("status")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         input: input_value.as_ref().and_then(external_json),
-        output: output_value.as_ref().and_then(external_tool_output),
+        output,
         paths,
         diffs,
     })
@@ -741,14 +841,16 @@ fn cursor_diff(
 }
 
 struct CursorContentCache<'a> {
-    connection: &'a Connection,
+    query: Option<rusqlite::Statement<'a>>,
     values: HashMap<String, Option<Arc<str>>>,
 }
 
 impl<'a> CursorContentCache<'a> {
     fn new(connection: &'a Connection) -> Self {
         Self {
-            connection,
+            query: connection
+                .prepare("SELECT CAST(value AS TEXT) FROM cursorDiskKV WHERE key = ?1 LIMIT 1")
+                .ok(),
             values: HashMap::new(),
         }
     }
@@ -761,13 +863,9 @@ impl<'a> CursorContentCache<'a> {
             return value.clone();
         }
         let value = self
-            .connection
-            .query_row(
-                "SELECT CAST(value AS TEXT) FROM cursorDiskKV WHERE key = ?1 LIMIT 1",
-                [id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
+            .query
+            .as_mut()
+            .and_then(|query| query.query_row([id], |row| row.get::<_, String>(0)).ok())
             .filter(|value| value.len() <= MAX_EXTERNAL_DIFF_BYTES)
             .map(Arc::from);
         self.values.insert(id.to_owned(), value.clone());
@@ -790,7 +888,10 @@ fn decoded_json_value(value: &serde_json::Value) -> Option<serde_json::Value> {
     }
 }
 
-fn external_tool_output(value: &serde_json::Value) -> Option<String> {
+fn external_tool_output(value: &serde_json::Value, kind: Option<&str>) -> Option<String> {
+    if kind == Some("Task") {
+        return external_json(value);
+    }
     if let Some(text) = value.as_str() {
         return Some(bounded_external_text(text));
     }
@@ -806,7 +907,7 @@ fn external_tool_output(value: &serde_json::Value) -> Option<String> {
     }
     value
         .get("output")
-        .and_then(external_tool_output)
+        .and_then(|output| external_tool_output(output, None))
         .or_else(|| external_json(value))
 }
 
@@ -868,27 +969,42 @@ fn external_base64_image(
     })
 }
 
+pub(crate) fn is_subagent_tool_name(name: &str) -> bool {
+    let name = name
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    matches!(
+        name.as_slice(),
+        b"task" | b"taskv2" | b"agent" | b"spawnagent" | b"spawnagents"
+    )
+}
+
 fn external_tool_kind(name: &str) -> Option<String> {
-    let name = name.to_ascii_lowercase();
+    let normalized = name.to_ascii_lowercase();
     Some(
-        if matches!(
-            name.as_str(),
-            "task" | "agent" | "spawn_agent" | "spawnagent" | "spawn_agents"
-        ) {
+        if is_subagent_tool_name(name) {
             "Task"
-        } else if name.contains("read") {
+        } else if normalized.contains("read") {
             "Read"
-        } else if name.contains("edit") || name.contains("replace") || name.contains("write") {
+        } else if normalized.contains("edit")
+            || normalized.contains("replace")
+            || normalized.contains("write")
+        {
             "Edit"
-        } else if name.contains("terminal")
-            || name.contains("shell")
-            || name.contains("exec")
-            || name == "bash"
+        } else if normalized.contains("terminal")
+            || normalized.contains("shell")
+            || normalized.contains("exec")
+            || normalized == "bash"
         {
             "Execute"
-        } else if name.contains("search") || name.contains("grep") || name.contains("glob") {
+        } else if normalized.contains("search")
+            || normalized.contains("grep")
+            || normalized.contains("glob")
+        {
             "Search"
-        } else if name.contains("fetch") {
+        } else if normalized.contains("fetch") {
             "Fetch"
         } else {
             return None;
@@ -943,8 +1059,8 @@ fn visit_cursor_transcript(
         .map_err(|error| format!("cannot read external session {}: {error}", path.display()))?;
     let mut last = None;
     let mut count = 0;
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
+    for line in bounded_lines(file) {
+        let line = line?;
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -975,8 +1091,8 @@ fn codex_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
     let mut tools = HashMap::new();
     let mut pending_user_images = Vec::new();
     let mut image_bytes = 0;
-    for line in BufReader::new(file).lines().take(MAX_TRANSCRIPT_EVENTS) {
-        let Ok(line) = line else { continue };
+    for line in bounded_lines(file).take(MAX_TRANSCRIPT_EVENTS) {
+        let line = line?;
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1093,7 +1209,9 @@ fn codex_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
                         else {
                             continue;
                         };
-                        tool.output = payload.get("output").and_then(external_tool_output);
+                        tool.output = payload
+                            .get("output")
+                            .and_then(|output| external_tool_output(output, tool.kind.as_deref()));
                         tool.status.get_or_insert_with(|| "completed".into());
                     }
                     _ => {}
@@ -1205,8 +1323,8 @@ fn claude_summary(
     let mut matching_id = false;
     let mut title = None;
     let mut first_user = None;
-    for line in BufReader::new(file).lines().take(MAX_TRANSCRIPT_EVENTS) {
-        let Ok(line) = line else { continue };
+    for line in bounded_lines(file).take(MAX_TRANSCRIPT_EVENTS) {
+        let line = line?;
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1241,8 +1359,8 @@ fn claude_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
     let mut messages = Vec::new();
     let mut tools = HashMap::new();
     let mut image_bytes = 0;
-    for line in BufReader::new(file).lines().take(MAX_TRANSCRIPT_EVENTS) {
-        let Ok(line) = line else { continue };
+    for line in bounded_lines(file).take(MAX_TRANSCRIPT_EVENTS) {
+        let line = line?;
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1353,7 +1471,9 @@ fn claude_transcript(path: &Path) -> Result<Vec<ExternalMessage>, String> {
                     else {
                         continue;
                     };
-                    tool.output = part.get("content").and_then(external_tool_output);
+                    tool.output = part
+                        .get("content")
+                        .and_then(|output| external_tool_output(output, tool.kind.as_deref()));
                     let failed =
                         part.get("is_error").and_then(serde_json::Value::as_bool) == Some(true);
                     if failed {
@@ -1463,16 +1583,40 @@ mod tests {
         CursorContentCache, ExternalMessage, ExternalSession, MAX_HANDOFF_BYTES, TranscriptFormat,
         claude_project_directory, claude_transcript, codex_transcript, cursor_database_transcript,
         cursor_project_directory, discover_claude, discover_codex, discover_cursor,
-        external_tool_kind,
+        external_tool_kind, external_tool_output,
     };
 
     #[test]
     fn provider_subagent_names_restore_as_tasks_without_matching_task_management() {
-        for name in ["task", "Agent", "spawn_agent", "spawnAgent", "spawn_agents"] {
+        for name in [
+            "task",
+            "Task V2",
+            "task_v2",
+            "task-v2",
+            "Agent",
+            "spawn_agent",
+            "spawnAgent",
+            "spawn_agents",
+        ] {
             assert_eq!(external_tool_kind(name).as_deref(), Some("Task"), "{name}");
         }
         assert_eq!(external_tool_kind("TaskCreate"), None);
         assert_eq!(external_tool_kind("TaskUpdate"), None);
+    }
+
+    #[test]
+    fn subagent_results_preserve_metadata_for_the_structured_card() {
+        let result = serde_json::json!({
+            "agentId": "agent-1",
+            "durationMs": 900,
+            "output": "No issues found",
+        });
+        let output = external_tool_output(&result, Some("Task")).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            result
+        );
     }
 
     #[test]
@@ -1877,6 +2021,50 @@ mod tests {
             super::cursor_transcript(&transcript_path).unwrap().len(),
             4_100
         );
+    }
+
+    #[test]
+    fn cursor_jsonl_transcript_rejects_one_oversized_record() {
+        let fixture = tempdir().unwrap();
+        let transcript_path = fixture.path().join("oversized.jsonl");
+        fs::write(
+            &transcript_path,
+            serde_json::json!({
+                "role": "assistant",
+                "message": {"content": "x".repeat(24 * 1024 * 1024 + 1)},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = super::cursor_transcript(&transcript_path).unwrap_err();
+        assert!(error.contains("record exceeds"), "{error}");
+    }
+
+    #[test]
+    fn bounded_lines_rejects_total_bytes_and_an_unterminated_record() {
+        let mut lines = super::BoundedLines::with_limits(
+            std::io::BufReader::new(std::io::Cursor::new(b"one\ntwo\nthree\n")),
+            16,
+            8,
+        );
+        assert_eq!(lines.next().unwrap().unwrap(), "one");
+        assert_eq!(lines.next().unwrap().unwrap(), "two");
+        assert!(lines.next().unwrap().unwrap_err().contains("scan limit"));
+
+        let mut lines = super::BoundedLines::with_limits(
+            std::io::BufReader::new(std::io::Cursor::new(b"oversized")),
+            4,
+            32,
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .contains("record exceeds")
+        );
+        assert!(lines.next().is_none());
     }
 
     #[test]

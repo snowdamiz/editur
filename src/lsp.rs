@@ -273,7 +273,36 @@ pub fn discover_executable(command: &str, path: Option<&OsStr>) -> Result<Option
                     .join(candidate)
             };
             match std::fs::metadata(&candidate) {
-                Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+                Ok(metadata) if metadata.is_file() => {
+                    if command == "rust-analyzer" {
+                        let rustup = candidate.with_file_name(if cfg!(windows) {
+                            "rustup.exe"
+                        } else {
+                            "rustup"
+                        });
+                        let is_rustup_proxy = matches!(
+                            (
+                                std::fs::canonicalize(&candidate),
+                                std::fs::canonicalize(&rustup)
+                            ),
+                            (Ok(candidate), Ok(rustup)) if candidate == rustup
+                        );
+                        if is_rustup_proxy
+                            && !std::process::Command::new(&rustup)
+                                .args(["which", command])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status()
+                                .map_err(|error| {
+                                    format!("cannot query {}: {error}", rustup.display())
+                                })?
+                                .success()
+                        {
+                            continue;
+                        }
+                    }
+                    return Ok(Some(candidate));
+                }
                 Ok(_) => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
@@ -655,6 +684,25 @@ mod tests {
                 Some(&path),
             )
             .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_proxy_without_an_installed_rust_analyzer_is_skipped() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let rustup = directory.path().join("rustup");
+        std::fs::write(&rustup, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&rustup).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&rustup, permissions).unwrap();
+        symlink("rustup", directory.path().join("rust-analyzer")).unwrap();
+
+        assert_eq!(
+            discover_executable("rust-analyzer", Some(directory.path().as_os_str())).unwrap(),
             None
         );
     }

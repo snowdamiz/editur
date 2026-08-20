@@ -16,6 +16,17 @@ pub struct DiskFingerprint {
     pub hash: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TextEdit {
+    pub start_character: usize,
+    pub start_byte: usize,
+    pub deleted_characters: usize,
+    pub deleted_bytes: usize,
+    pub inserted_characters: usize,
+    pub inserted_bytes: usize,
+    pub inserted_line_starts: Vec<(usize, usize)>,
+}
+
 #[derive(Debug)]
 pub struct Buffer {
     pub path: PathBuf,
@@ -95,6 +106,55 @@ impl Buffer {
         (self.line_starts, self.line_byte_starts, self.character_len) = line_index(&self.text);
     }
 
+    pub(crate) fn mark_changed_with_edits(&mut self, edits: &[TextEdit]) {
+        if edits.is_empty() {
+            self.mark_changed();
+            return;
+        }
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        for edit in edits {
+            self.apply_edit(edit);
+        }
+    }
+
+    fn apply_edit(&mut self, edit: &TextEdit) {
+        let deleted_end = edit.start_character + edit.deleted_characters;
+        let first_removed = self
+            .line_starts
+            .partition_point(|start| *start <= edit.start_character);
+        let after_removed = self
+            .line_starts
+            .partition_point(|start| *start <= deleted_end);
+        self.line_starts.drain(first_removed..after_removed);
+        self.line_byte_starts.drain(first_removed..after_removed);
+
+        for start in &mut self.line_starts[first_removed..] {
+            *start = shift_index(*start, edit.inserted_characters, edit.deleted_characters);
+        }
+        for start in &mut self.line_byte_starts[first_removed..] {
+            *start = shift_index(*start, edit.inserted_bytes, edit.deleted_bytes);
+        }
+
+        self.line_starts.splice(
+            first_removed..first_removed,
+            edit.inserted_line_starts
+                .iter()
+                .map(|(character, _)| edit.start_character + character),
+        );
+        self.line_byte_starts.splice(
+            first_removed..first_removed,
+            edit.inserted_line_starts
+                .iter()
+                .map(|(_, byte)| edit.start_byte + byte),
+        );
+        self.character_len = shift_index(
+            self.character_len,
+            edit.inserted_characters,
+            edit.deleted_characters,
+        );
+    }
+
     pub fn line_column(&self, character_offset: usize) -> (usize, usize) {
         let offset = character_offset.min(self.character_len);
         let line = self
@@ -125,6 +185,15 @@ impl Buffer {
             .map_or(self.text.len(), |(index, _)| byte_start + index)
     }
 
+    pub(crate) fn vim_parts(&mut self) -> (&mut String, &[usize], &[usize], usize) {
+        (
+            &mut self.text,
+            &self.line_starts,
+            &self.line_byte_starts,
+            self.character_len,
+        )
+    }
+
     pub fn mark_saved(&mut self, path: &Path, fingerprint: DiskFingerprint) {
         self.path = path.to_path_buf();
         self.fingerprint = Some(fingerprint);
@@ -144,6 +213,10 @@ fn line_index(text: &str) -> (Vec<usize>, Vec<usize>, usize) {
         }
     }
     (starts, byte_starts, characters)
+}
+
+fn shift_index(index: usize, inserted: usize, deleted: usize) -> usize {
+    index.saturating_sub(deleted).saturating_add(inserted)
 }
 
 #[cfg(test)]
@@ -208,6 +281,52 @@ mod tests {
                 .map(|character| buffer.byte_index(character))
                 .collect::<Vec<_>>(),
             [0, 2, 4, 5, 6, 10, 11]
+        );
+    }
+
+    #[test]
+    fn incremental_edit_keeps_unicode_line_and_byte_indexes_exact() {
+        let mut buffer = Buffer::from_bytes(
+            PathBuf::from("indexed.txt"),
+            "αβ\nhello\nworld".as_bytes().to_vec(),
+            fingerprint(18),
+        )
+        .unwrap();
+        buffer.text.replace_range(6..11, "i\nthere\n");
+        buffer.mark_changed_with_edits(&[TextEdit {
+            start_character: 4,
+            start_byte: 6,
+            deleted_characters: 5,
+            deleted_bytes: 5,
+            inserted_characters: 8,
+            inserted_bytes: 8,
+            inserted_line_starts: vec![(2, 2), (8, 8)],
+        }]);
+        let rebuilt = Buffer::from_bytes(
+            PathBuf::from("rebuilt.txt"),
+            buffer.text.as_bytes().to_vec(),
+            fingerprint(buffer.text.len() as u64),
+        )
+        .unwrap();
+
+        assert_eq!(
+            (
+                buffer.line_count(),
+                buffer.character_len(),
+                (0..=buffer.character_len())
+                    .map(|character| (buffer.line_column(character), buffer.byte_index(character)))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                rebuilt.line_count(),
+                rebuilt.character_len(),
+                (0..=rebuilt.character_len())
+                    .map(|character| (
+                        rebuilt.line_column(character),
+                        rebuilt.byte_index(character)
+                    ))
+                    .collect::<Vec<_>>(),
+            )
         );
     }
 }

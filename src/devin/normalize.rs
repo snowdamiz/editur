@@ -247,18 +247,17 @@ pub(super) fn messages(value: &Value) -> Result<(Vec<DevinMessage>, Option<Strin
                     })
                     .take(MAX_ITEMS)
                     .collect::<Vec<_>>();
+            let (raw_text, embedded_ids) = attachment_markers(&raw_text);
+            for id in embedded_ids {
+                if attachment_ids.len() == MAX_ITEMS {
+                    break;
+                }
+                if !attachment_ids.contains(&id) {
+                    attachment_ids.push(id);
+                }
+            }
             let text = if role.eq_ignore_ascii_case("user") {
-                slack_handoff(&raw_text).map_or(raw_text, |(text, embedded_ids)| {
-                    for id in embedded_ids {
-                        if attachment_ids.len() == MAX_ITEMS {
-                            break;
-                        }
-                        if !attachment_ids.contains(&id) {
-                            attachment_ids.push(id);
-                        }
-                    }
-                    text
-                })
+                slack_handoff(&raw_text).unwrap_or(raw_text)
             } else {
                 raw_text
             };
@@ -295,7 +294,40 @@ fn internal_prompt(role: &str, text: &str) -> bool {
         && text.contains("\nbranch and pr requirements")
 }
 
-fn slack_handoff(text: &str) -> Option<(String, Vec<String>)> {
+fn attachment_markers(text: &str) -> (String, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let id = line
+            .trim()
+            .strip_prefix("ATTACHMENT:\"")
+            .and_then(|url| url.strip_suffix('"'))
+            .and_then(|url| url.strip_prefix("https://app.devin.ai/attachments/"))
+            .and_then(|path| path.split_once('/'))
+            .and_then(|(id, name)| {
+                (!id.is_empty()
+                    && !name.is_empty()
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+                .then_some(id)
+            });
+        if let Some(id) = id {
+            if ids.len() < MAX_ITEMS && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_owned());
+            }
+        } else {
+            lines.push(line);
+        }
+    }
+    if ids.is_empty() {
+        (text.to_owned(), ids)
+    } else {
+        (lines.join("\n").trim_end().to_owned(), ids)
+    }
+}
+
+fn slack_handoff(text: &str) -> Option<String> {
     let latest = text
         .strip_prefix("SYSTEM:\n<latest_message>\n")?
         .split_once("\n</latest_message>")?
@@ -309,25 +341,7 @@ fn slack_handoff(text: &str) -> Option<(String, Vec<String>)> {
     if message.is_empty() {
         return None;
     }
-    let attachment_ids = text
-        .lines()
-        .filter_map(|line| {
-            let url = line
-                .trim()
-                .strip_prefix("ATTACHMENT:\"")?
-                .strip_suffix('"')?;
-            let path = url.strip_prefix("https://app.devin.ai/attachments/")?;
-            let (id, name) = path.split_once('/')?;
-            (!id.is_empty()
-                && !name.is_empty()
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-            .then(|| id.to_owned())
-        })
-        .take(MAX_ITEMS)
-        .collect();
-    Some((message.to_owned(), attachment_ids))
+    Some(message.to_owned())
 }
 
 pub(super) fn activity(value: &Value) -> Result<(Vec<Activity>, Option<String>), String> {
@@ -1060,6 +1074,27 @@ mod tests {
             messages[0].attachment_ids,
             ["535f062f-2cce-47f1-88e9-ce4872a4bc98"]
         );
+    }
+
+    #[test]
+    fn plain_attachment_markers_become_inline_message_attachments() {
+        let payload = serde_json::json!({
+            "items": [{
+                "event_id": "event-attachments",
+                "source": "user",
+                "created_at": 1786880434,
+                "message": concat!(
+                    "Please compare these screenshots.\n\n",
+                    "ATTACHMENT:\"https://app.devin.ai/attachments/image-one/first.png\"\n",
+                    "ATTACHMENT:\"https://app.devin.ai/attachments/image-two/second.jpg\""
+                )
+            }]
+        });
+
+        let (messages, _) = super::messages(&payload).unwrap();
+
+        assert_eq!(messages[0].text, "Please compare these screenshots.");
+        assert_eq!(messages[0].attachment_ids, ["image-one", "image-two"]);
     }
 
     #[test]

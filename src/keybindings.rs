@@ -1653,41 +1653,43 @@ impl Resolver {
         repeated: bool,
         now: Duration,
     ) -> ResolveResult {
-        let mut matches = self
-            .rules
-            .iter()
-            .filter(|binding| {
-                binding
-                    .rule
-                    .platform
-                    .is_none_or(|platform| platform == self.platform)
-                    && (binding.rule.scope == Scope::Global || scopes.contains(&binding.rule.scope))
-                    && !(binding.source == BindingSource::BuiltIn
-                        && binding.rule.scope == Scope::Global
-                        && scopes.contains(&Scope::Terminal)
-                        && binding
-                            .rule
-                            .sequence
-                            .first()
-                            .is_some_and(|stroke| terminal_control(stroke, self.platform)))
-                    && self.pending.len() <= binding.rule.sequence.len()
+        let mut matched = false;
+        let mut best = None;
+        for binding in self.rules.iter().filter(|binding| {
+            binding
+                .rule
+                .platform
+                .is_none_or(|platform| platform == self.platform)
+                && (binding.rule.scope == Scope::Global || scopes.contains(&binding.rule.scope))
+                && !(binding.source == BindingSource::BuiltIn
+                    && binding.rule.scope == Scope::Global
+                    && scopes.contains(&Scope::Terminal)
                     && binding
                         .rule
                         .sequence
-                        .iter()
-                        .zip(&self.pending)
-                        .all(|(expected, actual)| expected.matches(*actual, self.platform))
-            })
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+                        .first()
+                        .is_some_and(|stroke| terminal_control(stroke, self.platform)))
+                && self.pending.len() <= binding.rule.sequence.len()
+                && binding
+                    .rule
+                    .sequence
+                    .iter()
+                    .zip(&self.pending)
+                    .all(|(expected, actual)| expected.matches(*actual, self.platform))
+        }) {
+            matched = true;
+            if binding.rule.sequence.len() != self.pending.len() {
+                continue;
+            }
+            let rank = rule_rank(binding, scopes);
+            if best.is_none_or(|(_, best_rank)| rank < best_rank) {
+                best = Some((binding, rank));
+            }
+        }
+        if !matched {
             return ResolveResult::default();
         }
-        matches.sort_by_key(|binding| rule_rank(binding, scopes));
-        if let Some(binding) = matches
-            .iter()
-            .find(|binding| binding.rule.sequence.len() == self.pending.len())
-            .copied()
-        {
+        if let Some((binding, _)) = best {
             let command = Command::from_id(&binding.rule.command).expect("rules were validated");
             self.clear_pending();
             return ResolveResult {

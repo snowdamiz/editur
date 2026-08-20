@@ -4,13 +4,13 @@ use super::*;
 use crate::devin::{Activity, DevinMessage, SessionSummary};
 
 const DEVIN_WEB: &str = "https://app.devin.ai/";
-const MAX_DEVIN_BATCH_SESSIONS: usize = 10;
+const DEVIN_SESSION_GROUP_HEIGHT: f32 = 24.0;
+const DEVIN_SESSION_ROW_HEIGHT: f32 = 44.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(super) enum DevinView {
     #[default]
     Sessions,
-    Filters,
     Create,
     Detail,
     Section(DevinSection),
@@ -24,62 +24,18 @@ pub(super) enum DevinScope {
     Archived,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DevinStreamItem {
+    Message(usize),
+    Activity(usize),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct PendingDevinMessage {
     text: String,
     attachments: Vec<PromptAttachment>,
     failed: bool,
     confirmed: bool,
-}
-
-pub(super) struct DevinAdvancedDraft {
-    pub(super) open: bool,
-    title: String,
-    mode: String,
-    playbook_id: String,
-    child_playbook_id: String,
-    knowledge_ids: String,
-    tags: String,
-    max_acu_limit: String,
-    platform: String,
-    resumable: bool,
-    session_links: String,
-    structured_output_schema: String,
-    structured_output_required: bool,
-    secret_ids: String,
-    session_secret_key: String,
-    session_secret_value: String,
-    create_as_user_id: String,
-    bypass_approval: bool,
-    batch_count: usize,
-    parent_session_id: String,
-}
-
-impl Default for DevinAdvancedDraft {
-    fn default() -> Self {
-        Self {
-            open: false,
-            title: String::new(),
-            mode: String::new(),
-            playbook_id: String::new(),
-            child_playbook_id: String::new(),
-            knowledge_ids: String::new(),
-            tags: String::new(),
-            max_acu_limit: String::new(),
-            platform: String::new(),
-            resumable: true,
-            session_links: String::new(),
-            structured_output_schema: String::new(),
-            structured_output_required: false,
-            secret_ids: String::new(),
-            session_secret_key: String::new(),
-            session_secret_value: String::new(),
-            create_as_user_id: String::new(),
-            bypass_approval: false,
-            batch_count: 1,
-            parent_session_id: String::new(),
-        }
-    }
 }
 
 impl DevinScope {
@@ -113,20 +69,14 @@ pub(super) enum DevinLifecycle {
 
 enum DevinUiAction {
     Close,
-    #[cfg(debug_assertions)]
-    SeedPreview,
     Back,
     NewSession,
-    OpenFilters,
-    ApplyFilters,
-    ClearFilters,
     Connect,
     ConfirmDisconnect,
     ConfirmOrganizationSwitch(String),
     Reconnect,
     Refresh,
     Select(String),
-    Create,
     SendMessage,
     RetryMessage,
     OpenSection(DevinSection),
@@ -184,6 +134,23 @@ fn devin_header_button(
 }
 
 impl EditorApp {
+    #[cfg(test)]
+    pub(super) fn benchmark_draw_devin_sessions(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+        self.draw_devin_sessions(ui, &mut action);
+    }
+
+    #[cfg(test)]
+    pub(super) fn benchmark_draw_devin_stream(&mut self, ui: &mut egui::Ui) {
+        self.devin_stream_culling = true;
+        let mut action = None;
+        ScrollArea::vertical()
+            .id_salt("benchmark_devin_stream")
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.draw_devin_stream(ui, &mut action));
+    }
+
     pub(super) fn draw_devin_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         draw_assistant_sidebar_surface(ui, rect);
@@ -219,6 +186,16 @@ impl EditorApp {
             |ui| {
                 ui.set_width(ui.available_width());
                 if self.devin_needs_connect_card() {
+                    if self.devin_state.connection == DevinConnectionState::Connecting {
+                        draw_assistant_connecting(
+                            ui,
+                            "Connecting to Devin",
+                            "Validating credentials…",
+                            None,
+                            paint_devin_icon,
+                        );
+                        return;
+                    }
                     ScrollArea::vertical()
                         .id_salt("devin_connect_scroll")
                         .auto_shrink([false, false])
@@ -230,9 +207,9 @@ impl EditorApp {
                 self.draw_devin_connection_banner(ui, &mut action);
                 match self.devin_view {
                     DevinView::Sessions => self.draw_devin_sessions(ui, &mut action),
-                    DevinView::Filters => self.draw_devin_filters(ui, &mut action),
-                    DevinView::Create => self.draw_devin_create(ui, &mut action),
-                    DevinView::Detail => self.draw_devin_detail(ui, &mut action),
+                    DevinView::Create | DevinView::Detail => {
+                        self.draw_devin_detail(ui, &mut action)
+                    }
                     DevinView::Section(section) => {
                         self.draw_devin_section(ui, section, &mut action)
                     }
@@ -299,10 +276,6 @@ impl EditorApp {
                 ui.add_space(14.0);
                 ui.label(header_title("Devin"))
             }
-            DevinView::Filters => {
-                back(ui, action);
-                ui.label(header_title("Session filters"))
-            }
             DevinView::Create => {
                 back(ui, action);
                 ui.label(header_title("New session"))
@@ -349,7 +322,7 @@ impl EditorApp {
                 // — `add_sized` would center it in the leftover header width —
                 // capped so it truncates before the open button and the
                 // trailing chrome.
-                let mut trailing = if cfg!(debug_assertions) { 88.0 } else { 60.0 };
+                let mut trailing = 60.0;
                 if pull_request.is_some() {
                     trailing += button_size.x + theme::space::TIGHT;
                 }
@@ -407,18 +380,6 @@ impl EditorApp {
             {
                 *action = Some(DevinUiAction::Close);
             }
-            #[cfg(debug_assertions)]
-            if devin_header_button(
-                ui,
-                "devin_seed_preview",
-                Icon::Sparkle,
-                "Seed Devin preview data",
-                button_size,
-            )
-            .clicked()
-            {
-                *action = Some(DevinUiAction::SeedPreview);
-            }
             match self.devin_view {
                 DevinView::Sessions if connected_surface => {
                     if ui
@@ -449,17 +410,6 @@ impl EditorApp {
                     .clicked()
                     {
                         *action = Some(DevinUiAction::Refresh);
-                    }
-                    if devin_header_button(
-                        ui,
-                        "devin_filters",
-                        Icon::Search,
-                        "Filter Devin sessions",
-                        button_size,
-                    )
-                    .clicked()
-                    {
-                        *action = Some(DevinUiAction::OpenFilters);
                     }
                 }
                 DevinView::Detail if connected_surface => {
@@ -503,7 +453,6 @@ impl EditorApp {
                     }
                 }
                 DevinView::Sessions
-                | DevinView::Filters
                 | DevinView::Detail
                 | DevinView::Create
                 | DevinView::Section(_) => {}
@@ -559,7 +508,7 @@ impl EditorApp {
                 }
                 ui.separator();
                 ui.hyperlink_to("Open Devin web app", DEVIN_WEB);
-                if self.devin_state.credential_source == Some(CredentialSource::Keyring) {
+                if self.devin_state.credential_source == Some(CredentialSource::Stored) {
                     ui.separator();
                     if ui.button("Disconnect…").clicked() {
                         *action = Some(DevinUiAction::ConfirmDisconnect);
@@ -811,17 +760,6 @@ impl EditorApp {
                 {
                     *action = Some(DevinUiAction::Connect);
                 }
-                if connecting {
-                    ui.add_space(theme::space::MEDIUM);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new("Validating credentials…")
-                                .font(theme::typography::small())
-                                .color(theme::text().muted),
-                        );
-                    });
-                }
             });
         });
     }
@@ -889,7 +827,7 @@ impl EditorApp {
             |ui| {
                 let selected_scope = self.devin_scope;
                 let mut next_scope = selected_scope;
-                settings_combo_box(
+                let scope = settings_combo_box(
                     ui,
                     "devin_scope_select",
                     150.0,
@@ -907,12 +845,14 @@ impl EditorApp {
                     self.devin_list_cursor = 0;
                     self.devin_focus_list = true;
                 }
-                ui.add(
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), scope.rect.height()),
                     TextEdit::singleline(&mut self.devin_filter)
                         .id(Id::new("devin_filter"))
                         .font(theme::typography::body())
                         .hint_text(devin_field_hint("Filter sessions…"))
-                        .margin(egui::Margin::symmetric(10, 7))
+                        .vertical_align(Align::Center)
+                        .margin(egui::Margin::symmetric(11, 7))
                         .desired_width(ui.available_width()),
                 );
             },
@@ -934,22 +874,31 @@ impl EditorApp {
         }
         ui.add_space(theme::space::SMALL);
 
-        let ids = visible_session_ids(
-            &self.devin_state.sessions,
+        let cache_key = (
+            self.devin_state.sessions_revision,
             self.devin_scope,
-            &self.devin_filter,
-        )
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-        self.devin_list_cursor = self.devin_list_cursor.min(ids.len().saturating_sub(1));
+            self.devin_filter.clone(),
+        );
+        if self.devin_visible_sessions_key.as_ref() != Some(&cache_key) {
+            self.devin_visible_session_indices = visible_session_indices(
+                &self.devin_state.sessions,
+                self.devin_scope,
+                &self.devin_filter,
+            )
+            .into();
+            self.devin_visible_sessions_key = Some(cache_key);
+        }
+        let session_indices = Arc::clone(&self.devin_visible_session_indices);
+        self.devin_list_cursor = self
+            .devin_list_cursor
+            .min(session_indices.len().saturating_sub(1));
         let mut row_ids = Vec::new();
         let mut focused_row = None;
         ScrollArea::vertical()
             .id_salt("devin_sessions_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if ids.is_empty() {
+                if session_indices.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(theme::space::WIDE);
                         let loading = self.devin_state.last_sessions_refresh.is_none()
@@ -997,28 +946,33 @@ impl EditorApp {
                     return;
                 }
                 let mut previous_group = None;
-                for (index, session_id) in ids.iter().enumerate() {
-                    let Some(session) = self
-                        .devin_state
-                        .sessions
-                        .iter()
-                        .find(|session| &session.id == session_id)
-                    else {
-                        continue;
-                    };
+                for (index, session_index) in session_indices.iter().enumerate() {
+                    let session = &self.devin_state.sessions[*session_index];
                     let group = session_group(session);
                     if previous_group != Some(group.0) {
-                        if previous_group.is_some() {
-                            ui.add_space(theme::space::SNUG);
+                        if devin_session_row_is_visible(ui, DEVIN_SESSION_GROUP_HEIGHT) {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), DEVIN_SESSION_GROUP_HEIGHT),
+                                Layout::bottom_up(Align::Min),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(group.1)
+                                            .size(theme::typography::MICRO_SIZE)
+                                            .strong()
+                                            .color(theme::text().muted),
+                                    );
+                                },
+                            );
+                        } else {
+                            devin_reserve_session_row(ui, DEVIN_SESSION_GROUP_HEIGHT);
                         }
-                        ui.label(
-                            RichText::new(group.1)
-                                .size(theme::typography::MICRO_SIZE)
-                                .strong()
-                                .color(theme::text().muted),
-                        );
-                        ui.add_space(theme::space::HAIR);
                         previous_group = Some(group.0);
+                    }
+                    if !devin_session_row_is_visible(ui, DEVIN_SESSION_ROW_HEIGHT)
+                        && index != self.devin_list_cursor
+                    {
+                        devin_reserve_session_row(ui, DEVIN_SESSION_ROW_HEIGHT);
+                        continue;
                     }
                     let selected =
                         self.devin_state.selected_session.as_deref() == Some(session.id.as_str());
@@ -1045,60 +999,64 @@ impl EditorApp {
                     let pr_width = (session.pull_request_count > 0).then(|| chip_width(ui, "PR"));
                     let response = ui
                         .push_id(("devin_session", &session.id), |ui| {
-                            // Content-sized: two text lines plus the frame
-                            // margin, rather than a fixed height that leaves
-                            // dead space under short rows.
-                            selectable_content_row(ui, selected, 0.0, |ui| {
-                                ui.horizontal(|ui| {
-                                    let color = devin_status_dot_color(session.category);
-                                    let (dot, _) = ui.allocate_exact_size(
-                                        egui::Vec2::splat(14.0),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(dot.center(), 4.0, color);
-                                    ui.vertical(|ui| {
-                                        ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                                        let reserved = pr_width
-                                            .map_or(0.0, |width| width + theme::space::SMALL);
-                                        ui.set_width((ui.available_width() - reserved).max(48.0));
-                                        let row_title = RichText::new(title)
-                                            .font(theme::typography::strong())
-                                            .color(theme::text().primary);
-                                        ui.add(Label::new(row_title).truncate());
-                                        ui.add(
-                                            Label::new(
-                                                RichText::new(format!(
-                                                    "{}{}{}{}",
-                                                    status,
-                                                    if relative.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        format!(" · {relative}")
-                                                    },
-                                                    session
-                                                        .origin
-                                                        .as_deref()
-                                                        .map(|origin| format!(
-                                                            " · {}",
-                                                            origin_label(origin)
-                                                        ))
-                                                        .unwrap_or_default(),
-                                                    session
-                                                        .repository
-                                                        .as_deref()
-                                                        .map(|repository| format!(
-                                                            " · {repository}"
-                                                        ))
-                                                        .unwrap_or_default(),
-                                                ))
-                                                .small()
-                                                .color(theme::text().muted),
-                                            )
-                                            .truncate(),
+                            selectable_content_row(
+                                ui,
+                                selected,
+                                DEVIN_SESSION_ROW_HEIGHT - 2.0 * theme::space::SNUG,
+                                |ui| {
+                                    ui.horizontal(|ui| {
+                                        let color = devin_status_dot_color(session.category);
+                                        let (dot, _) = ui.allocate_exact_size(
+                                            egui::Vec2::splat(14.0),
+                                            Sense::hover(),
                                         );
+                                        ui.painter().circle_filled(dot.center(), 4.0, color);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                                            let reserved = pr_width
+                                                .map_or(0.0, |width| width + theme::space::SMALL);
+                                            ui.set_width(
+                                                (ui.available_width() - reserved).max(48.0),
+                                            );
+                                            let row_title = RichText::new(title)
+                                                .font(theme::typography::strong())
+                                                .color(theme::text().primary);
+                                            ui.add(Label::new(row_title).truncate());
+                                            ui.add(
+                                                Label::new(
+                                                    RichText::new(format!(
+                                                        "{}{}{}{}",
+                                                        status,
+                                                        if relative.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            format!(" · {relative}")
+                                                        },
+                                                        session
+                                                            .origin
+                                                            .as_deref()
+                                                            .map(|origin| format!(
+                                                                " · {}",
+                                                                origin_label(origin)
+                                                            ))
+                                                            .unwrap_or_default(),
+                                                        session
+                                                            .repository
+                                                            .as_deref()
+                                                            .map(|repository| format!(
+                                                                " · {repository}"
+                                                            ))
+                                                            .unwrap_or_default(),
+                                                    ))
+                                                    .small()
+                                                    .color(theme::text().muted),
+                                                )
+                                                .truncate(),
+                                            );
+                                        });
                                     });
-                                });
-                            })
+                                },
+                            )
                         })
                         .inner;
                     if let Some(width) = pr_width {
@@ -1133,12 +1091,15 @@ impl EditorApp {
                     if response.has_focus() {
                         focused_row = Some(index);
                     }
+                    if self.devin_focus_list && index == self.devin_list_cursor {
+                        response.scroll_to_me(Some(Align::Center));
+                    }
                     if response.clicked()
                         || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
                     {
                         *action = Some(DevinUiAction::Select(session.id.clone()));
                     }
-                    row_ids.push(response.id);
+                    row_ids.push((index, response.id));
                 }
                 if self.devin_state.last_created_batch.len() > 1
                     && self.devin_state.capabilities.has("devin_session_gather")
@@ -1154,7 +1115,10 @@ impl EditorApp {
             });
 
         if self.devin_focus_list {
-            if let Some(id) = row_ids.get(self.devin_list_cursor).copied() {
+            if let Some(id) = row_ids
+                .iter()
+                .find_map(|(index, id)| (*index == self.devin_list_cursor).then_some(*id))
+            {
                 ui.memory_mut(|memory| memory.request_focus(id));
             } else {
                 ui.memory_mut(|memory| memory.request_focus(Id::new("devin_filter")));
@@ -1166,13 +1130,20 @@ impl EditorApp {
                 i32::from(input.key_pressed(Key::ArrowDown))
                     - i32::from(input.key_pressed(Key::ArrowUp))
             });
-            if movement != 0 && !row_ids.is_empty() {
+            if movement != 0 && !session_indices.is_empty() {
                 self.devin_list_cursor = if movement > 0 {
-                    (index + 1).min(row_ids.len() - 1)
+                    (index + 1).min(session_indices.len() - 1)
                 } else {
                     index.saturating_sub(1)
                 };
-                ui.memory_mut(|memory| memory.request_focus(row_ids[self.devin_list_cursor]));
+                if let Some(id) = row_ids
+                    .iter()
+                    .find_map(|(index, id)| (*index == self.devin_list_cursor).then_some(*id))
+                {
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                } else {
+                    self.devin_focus_list = true;
+                }
             }
             if let Some(text) = ui.input(|input| {
                 input.events.iter().find_map(|event| match event {
@@ -1188,336 +1159,25 @@ impl EditorApp {
         }
     }
 
-    fn draw_devin_filters(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
-        ScrollArea::vertical()
-            .id_salt("devin_server_filters")
-            .show(ui, |ui| {
-                for (label, value, hint) in [
-                    (
-                        "Origin",
-                        &mut self.devin_server_filters.origin,
-                        "web, slack, api…",
-                    ),
-                    (
-                        "Repository",
-                        &mut self.devin_server_filters.repository,
-                        "owner/repository",
-                    ),
-                    (
-                        "Playbook ID",
-                        &mut self.devin_server_filters.playbook_id,
-                        "playbook-…",
-                    ),
-                    (
-                        "Schedule ID",
-                        &mut self.devin_server_filters.schedule_id,
-                        "schedule-…",
-                    ),
-                    ("User ID", &mut self.devin_server_filters.user_id, "user-…"),
-                    (
-                        "Parent session ID",
-                        &mut self.devin_server_filters.parent_session_id,
-                        "session-…",
-                    ),
-                    (
-                        "Category",
-                        &mut self.devin_server_filters.category,
-                        "Category",
-                    ),
-                    (
-                        "Status",
-                        &mut self.devin_server_filters.status,
-                        "running, exit…",
-                    ),
-                    (
-                        "Created after",
-                        &mut self.devin_server_filters.created_after,
-                        "RFC 3339 timestamp",
-                    ),
-                    (
-                        "Created before",
-                        &mut self.devin_server_filters.created_before,
-                        "RFC 3339 timestamp",
-                    ),
-                    (
-                        "Updated after",
-                        &mut self.devin_server_filters.updated_after,
-                        "RFC 3339 timestamp",
-                    ),
-                    (
-                        "Updated before",
-                        &mut self.devin_server_filters.updated_before,
-                        "RFC 3339 timestamp",
-                    ),
-                ] {
-                    ui.label(
-                        RichText::new(label)
-                            .font(theme::typography::small_strong())
-                            .color(theme::text().secondary),
-                    );
-                    ui.add(
-                        TextEdit::singleline(value)
-                            .hint_text(devin_field_hint(hint))
-                            .desired_width(f32::INFINITY),
-                    );
-                }
-                ui.label(
-                    RichText::new("Tags")
-                        .font(theme::typography::small_strong())
-                        .color(theme::text().secondary),
-                );
-                ui.add(
-                    TextEdit::singleline(&mut self.devin_filter_tags)
-                        .hint_text(devin_field_hint("Comma-separated tags"))
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(theme::space::SMALL);
-                ui.horizontal(|ui| {
-                    if ui.button("Apply filters").clicked() {
-                        *action = Some(DevinUiAction::ApplyFilters);
-                    }
-                    if ui.button("Clear").clicked() {
-                        *action = Some(DevinUiAction::ClearFilters);
-                    }
-                });
-            });
-    }
-
-    fn draw_devin_create(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
-        let field_label = |text: &str| {
-            RichText::new(text)
-                .font(theme::typography::small_strong())
-                .color(theme::text().secondary)
-        };
-        ScrollArea::vertical()
-            .id_salt("devin_create_scroll")
-            .show(ui, |ui| {
-                ui.label(field_label("Repository"));
-                let repository = ui.add_enabled(
-                    !self.devin_state.busy,
-                    TextEdit::singleline(&mut self.devin_repository)
-                        .id(Id::new("devin_repository"))
-                        .font(theme::typography::body())
-                        .hint_text(devin_field_hint("owner/repository"))
-                        .desired_width(f32::INFINITY),
-                );
-                if matches!(self.devin_state.repository, RepositoryState::SelectionRequired) {
-                    ui.label(
-                        RichText::new("The current Git origin could not be mapped; choose a repository explicitly.")
-                            .font(theme::typography::small())
-                            .color(theme::ink(theme::semantic().warning)),
-                    );
-                }
-                ui.add_space(theme::space::SNUG);
-                ui.label(field_label("Prompt"));
-                let prompt = ui.add_enabled(
-                    !self.devin_state.busy,
-                    TextEdit::multiline(&mut self.devin_create_prompt)
-                        .id(Id::new("devin_create_prompt"))
-                        .font(theme::typography::body())
-                        .hint_text(devin_field_hint("Describe the task for Devin…"))
-                        .desired_rows(8)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(theme::space::SNUG);
-                let advanced =
-                    ui.selectable_label(self.devin_advanced.open, "Advanced options");
-                if advanced.clicked() {
-                    self.devin_advanced.open = !self.devin_advanced.open;
-                }
-                if self.devin_advanced.open {
-                    ui.indent("devin_advanced_fields", |ui| {
-                        ui.label(field_label("Title"));
-                        ui.add(
-                            TextEdit::singleline(&mut self.devin_advanced.title)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(field_label("Mode"));
-                            let selected = if self.devin_advanced.mode.is_empty() {
-                                "Default"
-                            } else {
-                                &self.devin_advanced.mode
-                            }
-                            .to_owned();
-                            settings_combo_box(ui, "devin_mode", 120.0, &selected, |ui| {
-                                for mode in ["", "normal", "fast", "lite", "ultra", "fusion"] {
-                                    let label = if mode.is_empty() { "Default" } else { mode };
-                                    if settings_combo_choice(
-                                        ui,
-                                        label,
-                                        self.devin_advanced.mode == mode,
-                                    ) {
-                                        self.devin_advanced.mode = mode.into();
-                                    }
-                                }
-                            });
-                            ui.label(field_label("Batch"));
-                            ui.add(
-                                egui::DragValue::new(&mut self.devin_advanced.batch_count)
-                                    .range(1..=MAX_DEVIN_BATCH_SESSIONS),
-                            );
-                        });
-                        for (label, value, hint) in [
-                            ("Playbook ID", &mut self.devin_advanced.playbook_id, "playbook-…"),
-                            (
-                                "Child playbook ID",
-                                &mut self.devin_advanced.child_playbook_id,
-                                "playbook-…",
-                            ),
-                            (
-                                "Knowledge IDs",
-                                &mut self.devin_advanced.knowledge_ids,
-                                "Comma-separated IDs",
-                            ),
-                            ("Tags", &mut self.devin_advanced.tags, "Comma-separated tags"),
-                            (
-                                "Maximum ACUs",
-                                &mut self.devin_advanced.max_acu_limit,
-                                "Optional positive number",
-                            ),
-                            ("Platform", &mut self.devin_advanced.platform, "Optional platform"),
-                            (
-                                "Session links",
-                                &mut self.devin_advanced.session_links,
-                                "Comma-separated session IDs",
-                            ),
-                            (
-                                "Organization secret IDs",
-                                &mut self.devin_advanced.secret_ids,
-                                "Comma-separated IDs",
-                            ),
-                            (
-                                "Create as user ID",
-                                &mut self.devin_advanced.create_as_user_id,
-                                "Permission required",
-                            ),
-                        ] {
-                            ui.label(field_label(label));
-                            ui.add(
-                                TextEdit::singleline(value)
-                                    .hint_text(devin_field_hint(hint))
-                                    .desired_width(f32::INFINITY),
-                            );
-                        }
-                        ui.checkbox(&mut self.devin_advanced.resumable, "Resumable session");
-                        ui.checkbox(
-                            &mut self.devin_advanced.bypass_approval,
-                            "Bypass approval (permission required)",
-                        );
-                        ui.label(field_label("Structured output JSON Schema"));
-                        ui.add(
-                            TextEdit::multiline(&mut self.devin_advanced.structured_output_schema)
-                                .font(theme::typography::code_small())
-                                .desired_rows(5)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.checkbox(
-                            &mut self.devin_advanced.structured_output_required,
-                            "Structured output required",
-                        );
-                        ui.label(field_label("Ephemeral session secret"));
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                TextEdit::singleline(&mut self.devin_advanced.session_secret_key)
-                                    .hint_text(devin_field_hint("Name")),
-                            );
-                            ui.add(
-                                TextEdit::singleline(&mut self.devin_advanced.session_secret_value)
-                                    .password(true)
-                                    .hint_text(devin_field_hint("Value")),
-                            );
-                        });
-                        ui.label(
-                            RichText::new("The value is cleared as soon as the request is submitted and is never retained for retry.")
-                                .font(theme::typography::small())
-                                .color(theme::text().muted),
-                        );
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Attach files").clicked() {
-                        self.open_devin_file_picker();
-                    }
-                    for attachment in &self.devin_attachments {
-                        chip(
-                            ui,
-                            &attachment
-                                .file
-                                .path()
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                        );
-                    }
-                });
-                if self.devin_focus_create {
-                    if self.devin_repository.is_empty() {
-                        repository.request_focus();
-                    } else {
-                        prompt.request_focus();
-                    }
-                    self.devin_focus_create = false;
-                }
-                ui.add_space(theme::space::TIGHT);
-                ui.add(
-                    Label::new(
-                        RichText::new(self.devin_state.workspace_boundary.as_deref().unwrap_or(
-                            "Devin works from the remote repository. Local uncommitted or unpushed changes are not visible to it.",
-                        ))
-                            .font(theme::typography::small())
-                            .color(theme::text().muted),
-                    )
-                    .wrap(),
-                );
-                if let Some(error) = self.devin_state.error.as_ref() {
-                    ui.add_space(theme::space::SNUG);
-                    devin_callout(ui, &error.message, theme::semantic().danger);
-                }
-                let can_create = !self.devin_state.busy
-                    && !self.devin_repository.trim().is_empty()
-                    && !self.devin_create_prompt.trim().is_empty();
-                ui.add_space(theme::space::SMALL);
-                ui.horizontal(|ui| {
-                    let (fill, color) = assistant_send_button_colors(can_create);
-                    let create = egui::Button::new(
-                        RichText::new("Create session").strong().color(color),
-                    )
-                    .fill(fill)
-                    .stroke(egui::Stroke::NONE)
-                    .corner_radius(5)
-                    .min_size(egui::vec2(0.0, 30.0));
-                    if ui.add_enabled(can_create, create).clicked() {
-                        *action = Some(DevinUiAction::Create);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        *action = Some(DevinUiAction::Back);
-                    }
-                    if self.devin_state.busy && self.devin_creating {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new("Creating session…")
-                                .font(theme::typography::small())
-                                .color(theme::text().muted),
-                        );
-                    }
-                });
-            });
-    }
-
     fn draw_devin_detail(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
-        let Some(summary) = self.selected_devin_summary().cloned() else {
-            ui.label(
-                RichText::new("This Devin session is no longer available.")
-                    .font(theme::typography::body())
-                    .color(theme::text().muted),
-            );
-            if ui.button("Back to sessions").clicked() {
-                *action = Some(DevinUiAction::Back);
-            }
-            return;
+        let creating = self.devin_view == DevinView::Create;
+        let summary = if creating {
+            None
+        } else {
+            let Some(summary) = self.selected_devin_summary().cloned() else {
+                ui.label(
+                    RichText::new("This Devin session is no longer available.")
+                        .font(theme::typography::body())
+                        .color(theme::text().muted),
+                );
+                if ui.button("Back to sessions").clicked() {
+                    *action = Some(DevinUiAction::Back);
+                }
+                return;
+            };
+            Some(summary)
         };
-        if self.devin_state.session_loading {
+        if !creating && self.devin_state.session_loading {
             draw_assistant_connecting(
                 ui,
                 "Loading Devin session",
@@ -1527,11 +1187,13 @@ impl EditorApp {
             );
             return;
         }
-        let terminal = summary.archived
-            || matches!(
-                summary.category,
-                StatusCategory::Completed | StatusCategory::Failed
-            );
+        let terminal = summary.as_ref().is_some_and(|summary| {
+            summary.archived
+                || matches!(
+                    summary.category,
+                    StatusCategory::Completed | StatusCategory::Failed
+                )
+        });
         let composer_enabled = !terminal && !self.devin_state.busy;
         let mut composer_height = if terminal {
             56.0
@@ -1567,15 +1229,28 @@ impl EditorApp {
         }
         let stream_height = (ui.available_height() - composer_height).max(100.0);
         ScrollArea::vertical()
-            .id_salt(("devin_stream", &summary.id))
+            .id_salt((
+                "devin_stream",
+                summary
+                    .as_ref()
+                    .map_or("new", |summary| summary.id.as_str()),
+            ))
             .stick_to_bottom(true)
             .max_height(stream_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.draw_devin_detail_summary(ui);
-                self.draw_devin_stream(ui, action);
+                if creating {
+                    if let Some(error) = self.devin_state.error.as_ref() {
+                        devin_callout(ui, &error.message, theme::semantic().danger);
+                    }
+                } else {
+                    self.draw_devin_detail_summary(ui);
+                    self.draw_devin_stream(ui, action);
+                }
             });
-        if summary.category == StatusCategory::WaitingApproval {
+        if let Some(summary) = summary.as_ref()
+            && summary.category == StatusCategory::WaitingApproval
+        {
             let url = summary.url.as_deref().unwrap_or(DEVIN_WEB);
             devin_callout(
                 ui,
@@ -1586,6 +1261,7 @@ impl EditorApp {
             return;
         }
         if terminal {
+            let summary = summary.as_ref().expect("terminal session has a summary");
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new(if summary.archived {
@@ -1602,7 +1278,10 @@ impl EditorApp {
             });
             return;
         }
-        let hint = if summary.category == StatusCategory::Sleeping {
+        let hint = if summary
+            .as_ref()
+            .is_some_and(|summary| summary.category == StatusCategory::Sleeping)
+        {
             "Message Devin — sending will wake this session"
         } else {
             "Message Devin"
@@ -1615,9 +1294,16 @@ impl EditorApp {
             egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
         ui.add_space(theme::space::SMALL);
+        let has_message =
+            !self.devin_message.trim().is_empty() || !self.devin_attachments.is_empty();
         let can_send = composer_enabled
-            && (!self.devin_message.trim().is_empty() || !self.devin_attachments.is_empty());
-        let focus = self.devin_focus_detail && summary.category == StatusCategory::Waiting;
+            && has_message
+            && (!creating || !self.devin_repository.trim().is_empty());
+        let focus = self.devin_focus_detail
+            && (creating
+                || summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.category == StatusCategory::Waiting));
         self.devin_focus_detail = false;
         let output = (AssistantComposer {
             panel: ui
@@ -1680,25 +1366,6 @@ impl EditorApp {
                     .unwrap_or("Analysis is still being generated."),
             );
         }
-        if !detail.attachments.is_empty() {
-            ui.add_space(theme::space::SNUG);
-            ui.label(
-                RichText::new("ATTACHMENTS")
-                    .size(theme::typography::MICRO_SIZE)
-                    .strong()
-                    .color(theme::text().muted),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for attachment in &detail.attachments {
-                    let response = devin_attachment_pill(ui, attachment);
-                    if response.clicked()
-                        && let Some(url) = attachment.url.as_deref()
-                    {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    }
-                }
-            });
-        }
         if let Some(output) = summary.structured_output.as_ref() {
             let output = devin_json_preview(output);
             ui.add_space(theme::space::SNUG);
@@ -1722,26 +1389,28 @@ impl EditorApp {
     }
 
     fn draw_devin_stream(&mut self, ui: &mut egui::Ui, action: &mut Option<DevinUiAction>) {
-        #[derive(Clone, Copy)]
-        enum Kind {
-            Message(usize),
-            Activity(usize),
+        let stream_key = (
+            self.devin_state.selected_generation,
+            self.devin_state.messages_revision,
+            self.devin_state.activity_revision,
+        );
+        if self.devin_stream_key != Some(stream_key) {
+            self.devin_stream =
+                merged_devin_stream(&self.devin_state.messages, &self.devin_state.activity).into();
+            self.devin_stream_key = Some(stream_key);
         }
-        let mut stream = self
-            .devin_state
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(index, message)| (message.timestamp.as_str(), Kind::Message(index)))
-            .chain(
-                self.devin_state
-                    .activity
-                    .iter()
-                    .enumerate()
-                    .map(|(index, event)| (event.timestamp.as_str(), Kind::Activity(index))),
-            )
-            .collect::<Vec<_>>();
-        stream.sort_by(|left, right| chronological_timestamp(left.0, right.0));
+        let stream = Arc::clone(&self.devin_stream);
+        let heights_key = (
+            ui.available_width().round().to_bits(),
+            theme::paint_appearance(ui.pixels_per_point()),
+            stream_key.0,
+            stream_key.1,
+            stream_key.2,
+        );
+        if self.devin_stream_heights_key != heights_key {
+            self.devin_stream_heights = vec![f32::NAN; stream.len()];
+            self.devin_stream_heights_key = heights_key;
+        }
         if stream.is_empty() && self.devin_pending_message.is_none() {
             ui.label(
                 RichText::new("No conversation or remote activity yet.")
@@ -1749,26 +1418,48 @@ impl EditorApp {
                     .color(theme::text().muted),
             );
         }
+        let clip = ui.clip_rect();
+        self.devin_stream_rendered = 0;
         let mut index = 0;
         while index < stream.len() {
             if index > 0 {
                 ui.add_space(theme::space::SMALL);
             }
-            match stream[index].1 {
-                Kind::Message(message) => {
-                    self.draw_devin_message(ui, &self.devin_state.messages[message], action);
-                    index += 1;
-                }
-                Kind::Activity(_) => {
-                    let start = index;
-                    while index < stream.len() && matches!(stream[index].1, Kind::Activity(_)) {
-                        index += 1;
+            let start = index;
+            let end = match stream[index] {
+                DevinStreamItem::Message(_) => index + 1,
+                DevinStreamItem::Activity(_) => {
+                    let mut end = index + 1;
+                    while end < stream.len() && matches!(stream[end], DevinStreamItem::Activity(_))
+                    {
+                        end += 1;
                     }
-                    let Kind::Activity(first) = stream[start].1 else {
+                    end
+                }
+            };
+            let item_top = ui.cursor().top();
+            let cached_height = self.devin_stream_heights[start];
+            if self.devin_stream_culling
+                && cached_height.is_finite()
+                && (item_top + cached_height < clip.top() - AGENT_CULL_MARGIN
+                    || item_top > clip.bottom() + AGENT_CULL_MARGIN)
+            {
+                ui.add_space(cached_height);
+                index = end;
+                continue;
+            }
+            self.devin_stream_rendered += 1;
+            match stream[index] {
+                DevinStreamItem::Message(message) => {
+                    self.draw_devin_message(ui, &self.devin_state.messages[message], action);
+                    index = end;
+                }
+                DevinStreamItem::Activity(_) => {
+                    let DevinStreamItem::Activity(first) = stream[start] else {
                         unreachable!()
                     };
                     let group_id = self.devin_state.activity[first].id.as_str();
-                    let count = index - start;
+                    let count = end - start;
                     // The Agent transcript's dense work anatomy: one disclosure
                     // row over per-action tool rows, so grouped remote work
                     // reads exactly like grouped local work.
@@ -1781,15 +1472,17 @@ impl EditorApp {
                         false,
                     );
                     if open {
-                        for (_, kind) in &stream[start..index] {
-                            let Kind::Activity(activity) = kind else {
+                        for kind in &stream[start..end] {
+                            let DevinStreamItem::Activity(activity) = kind else {
                                 continue;
                             };
                             draw_devin_activity(ui, &self.devin_state.activity[*activity], action);
                         }
                     }
+                    index = end;
                 }
             }
+            self.devin_stream_heights[start] = ui.cursor().top() - item_top;
         }
         if let Some(pending) = self.devin_pending_message.as_ref() {
             if !stream.is_empty() {
@@ -2708,20 +2401,6 @@ impl EditorApp {
                 self.execute_keybinding(KeybindingCommand::AppToggleDevinSidebar, None, ctx);
                 return;
             }
-            #[cfg(debug_assertions)]
-            DevinUiAction::SeedPreview => {
-                self.devin_controller = None;
-                self.devin_state.seed_preview();
-                self.devin_view = DevinView::Sessions;
-                self.devin_scope = DevinScope::Active;
-                self.devin_filter.clear();
-                self.devin_list_cursor = 0;
-                self.devin_focus_list = true;
-                self.devin_pending_message = None;
-                self.devin_pending_lifecycle = None;
-                ctx.request_repaint();
-                return;
-            }
             DevinUiAction::Back => {
                 self.devin_state.session_loading = false;
                 self.devin_view = DevinView::Sessions;
@@ -2729,29 +2408,14 @@ impl EditorApp {
                 return;
             }
             DevinUiAction::NewSession => {
+                self.devin_state.clear_selection();
                 self.devin_view = DevinView::Create;
-                self.devin_focus_create = true;
+                self.devin_message.clear();
+                self.devin_attachments.clear();
+                self.devin_parent_session_id = None;
+                self.devin_focus_detail = true;
                 self.devin_state.error = None;
                 return;
-            }
-            DevinUiAction::OpenFilters => {
-                self.devin_server_filters = self.devin_state.filters.clone();
-                self.devin_filter_tags = self.devin_server_filters.tags.join(", ");
-                self.devin_view = DevinView::Filters;
-                return;
-            }
-            DevinUiAction::ApplyFilters => {
-                self.devin_server_filters.tags = split_devin_values(&self.devin_filter_tags);
-                self.devin_view = DevinView::Sessions;
-                Some(DevinCommand::SetSessionFilters(
-                    self.devin_server_filters.clone(),
-                ))
-            }
-            DevinUiAction::ClearFilters => {
-                self.devin_server_filters = SessionFilters::default();
-                self.devin_filter_tags.clear();
-                self.devin_view = DevinView::Sessions;
-                Some(DevinCommand::SetSessionFilters(SessionFilters::default()))
             }
             DevinUiAction::OpenSection(section) => {
                 self.devin_view = DevinView::Section(section);
@@ -2798,10 +2462,12 @@ impl EditorApp {
                 self.devin_state.last_created_batch.clone(),
             )),
             DevinUiAction::LaunchChild(parent_session_id) => {
+                self.devin_state.clear_selection();
                 self.devin_view = DevinView::Create;
-                self.devin_advanced.open = true;
-                self.devin_advanced.parent_session_id = parent_session_id;
-                self.devin_focus_create = true;
+                self.devin_message.clear();
+                self.devin_attachments.clear();
+                self.devin_parent_session_id = Some(parent_session_id);
+                self.devin_focus_detail = true;
                 return;
             }
             DevinUiAction::LoadBlueprint(blueprint_id) => {
@@ -2851,13 +2517,6 @@ impl EditorApp {
                 Some(DevinCommand::RefreshSessions)
             }
             DevinUiAction::Select(session_id) => {
-                #[cfg(debug_assertions)]
-                if self.devin_state.preview {
-                    self.devin_state.select_preview(session_id);
-                    self.devin_view = DevinView::Detail;
-                    self.devin_focus_detail = true;
-                    return;
-                }
                 let generation = self.devin_state.select(session_id.clone());
                 self.devin_view = DevinView::Detail;
                 self.devin_focus_detail = true;
@@ -2866,81 +2525,22 @@ impl EditorApp {
                     generation,
                 })
             }
-            DevinUiAction::Create => {
-                let max_acu_limit = if self.devin_advanced.max_acu_limit.trim().is_empty() {
-                    None
-                } else {
-                    let Ok(limit) = self.devin_advanced.max_acu_limit.trim().parse::<u64>() else {
-                        self.show_error("Maximum ACUs must be a positive whole number".into());
-                        return;
-                    };
-                    Some(limit)
-                };
-                let structured_output_schema = if self
-                    .devin_advanced
-                    .structured_output_schema
-                    .trim()
-                    .is_empty()
-                {
-                    None
-                } else {
-                    let Ok(schema) =
-                        serde_json::from_str(self.devin_advanced.structured_output_schema.trim())
-                    else {
-                        self.show_error("Structured output must be valid JSON Schema".into());
-                        return;
-                    };
-                    Some(schema)
-                };
-                let has_secret_name = !self.devin_advanced.session_secret_key.trim().is_empty();
-                let has_secret_value = !self.devin_advanced.session_secret_value.is_empty();
-                if has_secret_name != has_secret_value {
-                    self.show_error("Enter both the ephemeral secret name and value".into());
-                    return;
-                }
-                let session_secrets = (has_secret_name && has_secret_value)
-                    .then(|| SecretInput {
-                        key: self.devin_advanced.session_secret_key.trim().into(),
-                        value: std::mem::take(&mut self.devin_advanced.session_secret_value),
-                        kind: "key-value".into(),
-                    })
-                    .into_iter()
-                    .collect();
+            DevinUiAction::SendMessage if self.devin_view == DevinView::Create => {
                 self.devin_state.busy = true;
                 self.devin_state.error = None;
-                self.devin_creating = true;
                 Some(DevinCommand::CreateSession(CreateSessionRequest {
                     repositories: split_devin_values(&self.devin_repository),
-                    prompt: self.devin_create_prompt.trim().into(),
-                    title: optional_devin_value(&self.devin_advanced.title),
-                    mode: optional_devin_value(&self.devin_advanced.mode),
-                    playbook_id: optional_devin_value(&self.devin_advanced.playbook_id),
-                    child_playbook_id: optional_devin_value(&self.devin_advanced.child_playbook_id),
-                    knowledge_ids: split_devin_values(&self.devin_advanced.knowledge_ids),
-                    tags: {
-                        let mut tags = split_devin_values(&self.devin_advanced.tags);
-                        if !tags.iter().any(|tag| tag == "editur") {
-                            tags.push("editur".into());
-                        }
-                        tags
-                    },
-                    max_acu_limit,
-                    platform: optional_devin_value(&self.devin_advanced.platform),
-                    resumable: Some(self.devin_advanced.resumable),
-                    session_links: split_devin_values(&self.devin_advanced.session_links),
-                    structured_output_schema,
-                    structured_output_required: self.devin_advanced.structured_output_required,
-                    secret_ids: split_devin_values(&self.devin_advanced.secret_ids),
-                    session_secrets,
-                    create_as_user_id: optional_devin_value(&self.devin_advanced.create_as_user_id),
-                    bypass_approval: self.devin_advanced.bypass_approval,
-                    parent_session_id: optional_devin_value(&self.devin_advanced.parent_session_id),
+                    prompt: self.devin_message.trim().into(),
+                    tags: vec!["editur".into()],
+                    resumable: Some(true),
+                    parent_session_id: self.devin_parent_session_id.clone(),
                     attachments: self
                         .devin_attachments
                         .iter()
                         .map(|attachment| attachment.file.clone())
                         .collect(),
-                    batch_count: self.devin_advanced.batch_count,
+                    batch_count: 1,
+                    ..Default::default()
                 }))
             }
             DevinUiAction::SendMessage => {
@@ -3011,16 +2611,10 @@ impl EditorApp {
     }
 
     pub(super) fn open_devin(&mut self, ctx: &egui::Context) {
-        #[cfg(debug_assertions)]
-        if self.devin_state.preview {
-            return;
-        }
         self.ensure_devin_controller(ctx);
         match self.devin_view {
             DevinView::Sessions => self.devin_focus_list = true,
-            DevinView::Filters => {}
-            DevinView::Create => self.devin_focus_create = true,
-            DevinView::Detail => self.devin_focus_detail = true,
+            DevinView::Create | DevinView::Detail => self.devin_focus_detail = true,
             DevinView::Section(_) => {}
         }
         if let Some(controller) = self.devin_controller.as_ref() {
@@ -3066,9 +2660,9 @@ impl EditorApp {
                     self.devin_pending_lifecycle = None;
                 }
                 DevinEvent::SessionCreated(session) => {
-                    self.devin_creating = false;
-                    self.devin_create_prompt.clear();
+                    self.devin_message.clear();
                     self.devin_attachments.clear();
+                    self.devin_parent_session_id = None;
                     select_created = Some(session.id.clone());
                 }
                 DevinEvent::BatchCreated(session_ids) if session_ids.len() > 1 => {
@@ -3175,7 +2769,6 @@ impl EditorApp {
                     }
                 }
                 DevinEvent::Failed(error) | DevinEvent::PermissionDenied(error) => {
-                    self.devin_creating = false;
                     if let Some(pending) = self
                         .devin_pending_message
                         .as_mut()
@@ -3219,28 +2812,30 @@ impl EditorApp {
     }
 }
 
-fn visible_sessions<'a>(
-    sessions: &'a [SessionSummary],
+fn visible_session_indices(
+    sessions: &[SessionSummary],
     scope: DevinScope,
     query: &str,
-) -> Vec<&'a SessionSummary> {
+) -> Vec<usize> {
     let query = query.trim().to_ascii_lowercase();
-    let mut sessions = sessions
+    let mut indices = sessions
         .iter()
+        .enumerate()
         .filter(|session| match scope {
             DevinScope::Active => {
-                !session.archived
+                !session.1.archived
                     && matches!(
-                        session.category,
+                        session.1.category,
                         StatusCategory::Active
                             | StatusCategory::Waiting
                             | StatusCategory::WaitingApproval
                     )
             }
             DevinScope::All => true,
-            DevinScope::Archived => session.archived,
+            DevinScope::Archived => session.1.archived,
         })
         .filter(|session| {
+            let session = session.1;
             query.is_empty()
                 || [
                     Some(session.title.as_str()),
@@ -3251,14 +2846,26 @@ fn visible_sessions<'a>(
                 .flatten()
                 .any(|value| value.to_ascii_lowercase().contains(&query))
         })
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
+    indices.sort_by(|left, right| {
+        let left = &sessions[*left];
+        let right = &sessions[*right];
         session_group(left)
             .0
             .cmp(&session_group(right).0)
             .then_with(|| right.updated_at.cmp(&left.updated_at))
     });
-    sessions
+    indices
+}
+
+fn devin_session_row_is_visible(ui: &egui::Ui, height: f32) -> bool {
+    let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height));
+    ui.clip_rect().expand(height).intersects(row)
+}
+
+fn devin_reserve_session_row(ui: &mut egui::Ui, height: f32) {
+    ui.allocate_space(egui::vec2(ui.available_width(), height));
 }
 
 fn split_devin_values(value: &str) -> Vec<String> {
@@ -3456,14 +3063,15 @@ fn devin_scopes() -> [DevinScope; 3] {
     [DevinScope::Active, DevinScope::All, DevinScope::Archived]
 }
 
+#[cfg(test)]
 fn visible_session_ids<'a>(
     sessions: &'a [SessionSummary],
     scope: DevinScope,
     query: &str,
 ) -> Vec<&'a str> {
-    visible_sessions(sessions, scope, query)
+    visible_session_indices(sessions, scope, query)
         .into_iter()
-        .map(|session| session.id.as_str())
+        .map(|index| sessions[index].id.as_str())
         .collect()
 }
 
@@ -3564,77 +3172,23 @@ fn compact_duration(seconds: u64) -> String {
     }
 }
 
-fn parse_timestamp_seconds(value: &str) -> Option<i64> {
-    parse_timestamp_nanos(value).map(|timestamp| (timestamp / 1_000_000_000) as i64)
-}
-
-fn parse_timestamp_nanos(value: &str) -> Option<i128> {
-    if let Ok(number) = value.parse::<f64>() {
-        if !number.is_finite() {
-            return None;
-        }
-        return Some(if number > 10_000_000_000.0 {
-            (number * 1_000_000.0) as i128
+fn merged_devin_stream(messages: &[DevinMessage], activity: &[Activity]) -> Vec<DevinStreamItem> {
+    let mut stream = Vec::with_capacity(messages.len() + activity.len());
+    let (mut message, mut event) = (0, 0);
+    while message < messages.len() && event < activity.len() {
+        if chronological_timestamp(&messages[message].timestamp, &activity[event].timestamp)
+            != std::cmp::Ordering::Greater
+        {
+            stream.push(DevinStreamItem::Message(message));
+            message += 1;
         } else {
-            (number * 1_000_000_000.0) as i128
-        });
+            stream.push(DevinStreamItem::Activity(event));
+            event += 1;
+        }
     }
-    let bytes = value.as_bytes();
-    if bytes.len() < 19 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    let hour = number(11..13)?;
-    let minute = number(14..16)?;
-    let second = number(17..19)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let fraction = value
-        .get(19..)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .map(|suffix| suffix.bytes().take_while(u8::is_ascii_digit).take(9))
-        .map(|digits| {
-            let mut value = 0_i128;
-            let mut count = 0;
-            for digit in digits {
-                value = value * 10 + i128::from(digit - b'0');
-                count += 1;
-            }
-            value * 10_i128.pow(9 - count)
-        })
-        .unwrap_or_default();
-    Some(
-        i128::from(
-            days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second,
-        ) * 1_000_000_000
-            + fraction,
-    )
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-fn chronological_timestamp(left: &str, right: &str) -> std::cmp::Ordering {
-    match (parse_timestamp_nanos(left), parse_timestamp_nanos(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
+    stream.extend((message..messages.len()).map(DevinStreamItem::Message));
+    stream.extend((event..activity.len()).map(DevinStreamItem::Activity));
+    stream
 }
 
 /// One remote action as the Agent's dense tool row: the summary as the title,
@@ -3889,8 +3443,6 @@ fn devin_text_field_focused(ctx: &egui::Context) -> bool {
             "devin_api_key",
             "devin_org_id",
             "devin_filter",
-            "devin_repository",
-            "devin_create_prompt",
             "devin_prompt",
             "devin_resource_query",
             "devin_resource_filter",
@@ -3962,5 +3514,59 @@ mod tests {
             chronological_timestamp("2", "1970-01-01T00:00:10Z"),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn conversation_stream_linearly_merges_messages_and_activity() {
+        let messages = [
+            DevinMessage {
+                timestamp: "1".into(),
+                ..DevinMessage::default()
+            },
+            DevinMessage {
+                timestamp: "3".into(),
+                ..DevinMessage::default()
+            },
+        ];
+        let activity = [
+            Activity {
+                timestamp: "2".into(),
+                ..Activity::default()
+            },
+            Activity {
+                timestamp: "4".into(),
+                ..Activity::default()
+            },
+        ];
+
+        assert_eq!(
+            merged_devin_stream(&messages, &activity),
+            vec![
+                DevinStreamItem::Message(0),
+                DevinStreamItem::Activity(0),
+                DevinStreamItem::Message(1),
+                DevinStreamItem::Activity(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_view_submits_the_composer_as_a_new_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = EditorApp::new(OpenTarget {
+            root: temp.path().canonicalize().unwrap(),
+            file: None,
+            create: false,
+        })
+        .unwrap();
+        app.devin_view = DevinView::Create;
+        app.devin_repository = "owner/repository".into();
+        app.devin_message = "Build the feature".into();
+
+        app.apply_devin_ui_action(DevinUiAction::SendMessage, &theme::test_context());
+
+        assert!(app.devin_state.busy);
+        assert!(app.devin_pending_message.is_none());
+        assert_eq!(app.devin_message, "Build the feature");
     }
 }

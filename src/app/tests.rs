@@ -12,27 +12,28 @@ use super::{
     DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId, PaneLayout,
     PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection, TAB_CLOSE,
     TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
-    TabDrop, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, WorkspaceFilePicker,
+    TabDrop, ToolOutput, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, WorkspaceFilePicker,
     agent_at_bottom, agent_collapsing_header, agent_diff_cache_count, agent_diff_preview,
     agent_empty_state_rect, agent_mention_matches, agent_mention_query, agent_menu_rect,
-    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_toggle_rect,
-    assistant_composer_content, assistant_composer_height, assistant_dense_disclosure_row,
-    assistant_dense_tool, assistant_markdown_galley, assistant_send_button_colors,
-    build_agent_diff, cached_agent_diff, child_path, collect_agent_mentions, completion_word_range,
-    copy_tree_entry, defer_resize, diagnostic_highlighted_job,
-    disable_transient_egui_debug_overlays, draw_agent_changed_files, draw_agent_diff,
-    draw_editor_empty_state, draw_provider_selector_identity, draw_sidebar_toggle_icon,
-    draw_tab_drag_ghost, editor_background, editor_column_content, editor_watermark_color,
-    file_result_job, file_tree_toggle_rect, find_highlighted_job, install_repaint_wake,
-    launch_in_current_process, load_assistant_image_preview_bytes, match_bracket_pair, match_spans,
-    model_display_name, next_find_match, pane_header_and_content, plain_text_job, presentation_job,
-    project_chooser_ui, provider_selector_visible, repaint_deadline,
-    repaint_delay_after_texture_update, resize_divider_stroke, run_everything_state,
-    search_group_header, search_needs_polling, search_selection_after_navigation,
-    settings_ui_scale_slider, should_show_project_chooser, skip_transition_render,
-    slash_command_query, split_agent_sidebar, split_agentic_diff, split_agentic_workspace,
-    split_bottom_panel, split_pane_content, split_workspace, split_workspace_with_devin,
-    stable_tab_drop_zone, tab_width, terminal_toggle_rect, unique_copy_path,
+    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_session_row,
+    agent_toggle_rect, agentic_project_row, assistant_composer_content, assistant_composer_height,
+    assistant_dense_disclosure_row, assistant_dense_tool, assistant_markdown_galley,
+    assistant_send_button_colors, build_agent_diff, cached_agent_diff, child_path,
+    collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
+    diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
+    draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
+    draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
+    editor_watermark_color, file_result_job, file_tree_toggle_rect, find_highlighted_job,
+    install_repaint_wake, launch_in_current_process, load_assistant_image_bytes,
+    match_bracket_pair, match_spans, model_display_name, next_find_match, pane_header_and_content,
+    plain_text_job, presentation_job, project_chooser_ui, provider_selector_visible,
+    repaint_deadline, repaint_delay_after_texture_update, resize_divider_stroke,
+    run_everything_state, search_group_header, search_needs_polling,
+    search_selection_after_navigation, settings_ui_scale_slider, should_show_project_chooser,
+    skip_transition_render, slash_command_query, split_agent_sidebar, split_agentic_diff,
+    split_agentic_workspace, split_bottom_panel, split_pane_content, split_workspace,
+    split_workspace_with_devin, stable_tab_drop_zone, tab_width, terminal_toggle_rect,
+    unique_copy_path,
 };
 use std::collections::HashMap;
 
@@ -125,7 +126,7 @@ fn composer_mention_menu_uses_compact_rows_without_bottom_slack() {
     });
     let transcript = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 400.0));
     let anchor = Rect::from_min_size(pos2(0.0, 390.0), Vec2::new(100.0, 10.0));
-    let popup = agent_menu_rect(transcript, anchor, 5, row_height, 4.0);
+    let popup = agent_menu_rect(transcript, anchor, 5, row_height, 4.0, 280.0);
 
     assert_eq!(row_height, super::AGENT_MENTION_ROW_HEIGHT);
     assert_eq!(popup.height(), 8.0 + 5.0 * row_height);
@@ -788,7 +789,7 @@ fn devin_settings_offer_disconnect_for_stored_credentials() {
     app.settings_open = true;
     app.settings_section = SettingsSection::Devin;
     app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
-        CredentialSource::Keyring,
+        CredentialSource::Stored,
     )));
     app.devin_state.apply(DevinEvent::ConnectionChanged(
         DevinConnectionState::Connected,
@@ -1648,7 +1649,6 @@ fn devin_sidebar_command_hides_but_does_not_reset_the_local_agent() {
     .unwrap();
     app.agent_sidebar = true;
     app.agent.prompt = "local draft".into();
-    app.devin_state.seed_preview();
 
     app.execute_keybinding(
         crate::keybindings::Command::AppToggleDevinSidebar,
@@ -1670,7 +1670,7 @@ fn agent_sidebar_command_hides_but_does_not_reset_devin() {
     })
     .unwrap();
     app.devin_sidebar = true;
-    app.devin_create_prompt = "remote draft".into();
+    app.devin_message = "remote draft".into();
 
     app.execute_keybinding(
         crate::keybindings::Command::AppToggleAgentSidebar,
@@ -1679,7 +1679,7 @@ fn agent_sidebar_command_hides_but_does_not_reset_devin() {
     );
 
     assert!(!app.devin_sidebar && app.agent_sidebar);
-    assert_eq!(app.devin_create_prompt, "remote draft");
+    assert_eq!(app.devin_message, "remote draft");
 }
 
 #[test]
@@ -1844,6 +1844,57 @@ fn devin_sidebar_renders_a_keyboard_operable_authentication_state() {
 }
 
 #[test]
+fn devin_credential_validation_uses_the_centered_loading_state() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connecting,
+    ));
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    for expected in ["Connecting to Devin", "Validating credentials…"] {
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, expected)),
+            "missing centered loading copy {expected:?}"
+        );
+    }
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "API key")),
+        "credential fields remain visible while validation is running"
+    );
+}
+
+#[test]
 fn devin_login_fields_accept_normal_clipboard_paste() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -1887,60 +1938,6 @@ fn devin_login_fields_accept_normal_clipboard_paste() {
     context.memory_mut(|memory| memory.request_focus(Id::new("devin_api_key")));
     let _ = context.run_ui(paste("cog_settings"), |root| app.ui(root));
     assert_eq!(app.devin_api_key, "cog_settings");
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn devin_preview_button_seeds_a_complete_connected_account() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut app = EditorApp::new(OpenTarget {
-        root: temp.path().canonicalize().unwrap(),
-        file: None,
-        create: false,
-    })
-    .unwrap();
-    app.devin_sidebar = true;
-    let context = theme::test_context();
-    let input = || RawInput {
-        screen_rect: Some(Rect::from_min_size(
-            pos2(0.0, 0.0),
-            Vec2::new(1100.0, 760.0),
-        )),
-        ..RawInput::default()
-    };
-    // Scoped so the closure's borrow of `app` ends before the assertions.
-    {
-        let mut draw = |events| context.run_ui(RawInput { events, ..input() }, |root| app.ui(root));
-        let _ = draw(Vec::new());
-        let _ = click_response(&context, &mut draw, Id::new("devin_seed_preview"));
-    }
-
-    assert_eq!(app.devin_state.connection, DevinConnectionState::Connected);
-    assert_eq!(
-        app.devin_state.credential_source,
-        Some(CredentialSource::Environment)
-    );
-    assert!(app.devin_state.sessions.len() >= 6);
-    assert!(
-        app.devin_state
-            .sessions
-            .iter()
-            .any(|session| session.archived)
-    );
-    assert!(app.devin_state.detail.is_some());
-    assert!(!app.devin_state.messages.is_empty());
-    assert!(!app.devin_state.activity.is_empty());
-    assert!(
-        app.devin_state
-            .detail
-            .as_ref()
-            .is_some_and(|detail| !detail.attachments.is_empty()
-                && !detail.pull_requests.is_empty()
-                && !detail.children.is_empty()
-                && detail.usage.is_some())
-    );
-    assert_eq!(app.devin_view, DevinView::Sessions);
-    assert!(app.devin_controller.is_none());
 }
 
 #[test]
@@ -2220,7 +2217,7 @@ fn devin_home_footer_holds_freshness_and_overflow_and_nothing_clips() {
 }
 
 #[test]
-fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
+fn devin_detail_keeps_secondary_metadata_out_of_the_transcript() {
     fn text_rect(shape: &Shape, matches: &dyn Fn(&str) -> bool) -> Option<Rect> {
         match shape {
             Shape::Text(text) if matches(text.galley.text()) => {
@@ -2320,18 +2317,11 @@ fn devin_detail_exposes_current_status_metadata_and_every_remote_artifact() {
         };
         let output = draw(Vec::new());
 
-        for expected in ["verification.log", "\"result\": \"ready\""] {
-            assert!(
-                output
-                    .shapes
-                    .iter()
-                    .any(
-                        |shape| text_rect(&shape.shape, &|text| text.contains(expected)).is_some()
-                    ),
-                "session detail should render {expected}"
-            );
-        }
+        assert!(output.shapes.iter().any(|shape| {
+            text_rect(&shape.shape, &|text| text.contains("\"result\": \"ready\"")).is_some()
+        }));
         for hidden_until_requested in [
+            "verification.log",
             "waiting_for_user",
             "Needs you",
             "openai/editur",
@@ -2590,8 +2580,23 @@ fn devin_detail_waits_for_complete_initial_history_before_revealing_the_stream()
         session_id: "large-session".into(),
         generation,
         activity: Vec::new(),
-        next_cursor: None,
+        next_cursor: Some("event-next".into()),
         update: crate::devin::PageUpdate::Initial,
+    });
+    let partial = context.run_ui(input(Vec::new()), |root| app.ui(root));
+    assert!(
+        partial
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Loading Devin session")),
+        "the transcript became visible before the last activity page"
+    );
+    app.devin_state.apply(DevinEvent::ActivityLoaded {
+        session_id: "large-session".into(),
+        generation,
+        activity: Vec::new(),
+        next_cursor: None,
+        update: crate::devin::PageUpdate::History,
     });
     let complete = context.run_ui(input(Vec::new()), |root| app.ui(root));
     assert!(
@@ -2599,6 +2604,39 @@ fn devin_detail_waits_for_complete_initial_history_before_revealing_the_stream()
             .shapes
             .iter()
             .any(|shape| has_text(&shape.shape, "Newest message"))
+    );
+}
+
+#[test]
+fn devin_history_never_offers_manual_pagination() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(360.0, 200.0))),
+            ..RawInput::default()
+        },
+        |ui| app.benchmark_draw_devin_stream(ui),
+    );
+
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Load older history"))
     );
 }
 
@@ -2680,7 +2718,7 @@ fn suspended_devin_detail_keeps_the_composer_inside_the_sidebar() {
 }
 
 #[test]
-fn every_devin_resource_and_advanced_session_view_has_a_focused_sidebar_route() {
+fn every_devin_resource_view_has_a_focused_sidebar_route() {
     fn has_text(shape: &Shape, expected: &str) -> bool {
         match shape {
             Shape::Text(text) => text.galley.text().contains(expected),
@@ -2742,23 +2780,60 @@ fn every_devin_resource_and_advanced_session_view_has_a_focused_sidebar_route() 
             "{section:?} should expose {expected}"
         );
     }
+}
 
-    app.devin_view = DevinView::Filters;
-    assert!(
-        draw(&mut app)
-            .shapes
-            .iter()
-            .any(|shape| has_text(&shape.shape, "Apply filters"))
-    );
+#[test]
+fn new_devin_session_uses_the_regular_chat_composer() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
 
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.devin_sidebar = true;
     app.devin_view = DevinView::Create;
-    app.devin_advanced.open = true;
+    app.devin_state.apply(DevinEvent::ConnectionChanged(
+        DevinConnectionState::Connected,
+    ));
+    app.devin_state.apply(DevinEvent::CredentialsChanged(Some(
+        CredentialSource::Environment,
+    )));
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
     assert!(
-        draw(&mut app)
+        output
             .shapes
             .iter()
-            .any(|shape| has_text(&shape.shape, "Mode"))
+            .any(|shape| has_text(&shape.shape, "Message Devin"))
     );
+    for dedicated_form_label in ["Repository", "Prompt", "Advanced options", "Create session"] {
+        assert!(
+            !output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, dedicated_form_label)),
+            "new session still renders {dedicated_form_label:?}"
+        );
+    }
 }
 
 #[test]
@@ -2798,6 +2873,23 @@ fn every_devin_select_uses_the_shared_control_height() {
             .min_by(|left, right| left.area().total_cmp(&right.area()))
             .unwrap_or_else(|| panic!("missing select surface for {label:?}"))
     }
+    fn label_layout(output: &egui::FullOutput, label: &str) -> (Rect, f32) {
+        fn find(shape: &Shape, label: &str) -> Option<(Rect, f32)> {
+            match shape {
+                Shape::Text(text) if text.galley.text() == label => Some((
+                    Rect::from_min_size(text.pos, text.galley.size()),
+                    text.galley.job.sections[0].format.font_id.size,
+                )),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, label))
+            .unwrap_or_else(|| panic!("missing control label {label:?}"))
+    }
 
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -2831,11 +2923,17 @@ fn every_devin_select_uses_the_shared_control_height() {
     ));
     let output = context.run_ui(input(), |root| app.ui(root));
     let scope = control_rect(&output, "Active sessions");
+    let filter = control_rect(&output, "Filter sessions…");
+    let (scope_text, _) = label_layout(&output, "Active sessions");
+    let (filter_text, filter_text_size) = label_layout(&output, "Filter sessions…");
 
-    app.devin_view = DevinView::Create;
-    app.devin_advanced.open = true;
-    let output = context.run_ui(input(), |root| app.ui(root));
-    let mode = control_rect(&output, "Default");
+    assert_eq!(filter.height(), scope.height());
+    assert_eq!(
+        filter_text.left() - filter.left(),
+        scope_text.left() - scope.left()
+    );
+    assert_eq!(filter_text_size, theme::typography::BODY_SIZE);
+    assert!((filter_text.center().y - filter.center().y).abs() <= 0.5);
 
     app.devin_view = DevinView::Section(crate::devin::DevinSection::Integrations);
     let output = context.run_ui(input(), |root| app.ui(root));
@@ -2843,7 +2941,6 @@ fn every_devin_select_uses_the_shared_control_height() {
 
     for (name, rect) in [
         ("organization", organization),
-        ("mode", mode),
         ("integrations", integrations),
     ] {
         assert_eq!(
@@ -3365,17 +3462,12 @@ fn devin_header_wears_the_agent_chrome() {
         .read_response(Id::new("devin_lifecycle_menu"))
         .expect("lifecycle menu")
         .rect;
-    #[cfg(debug_assertions)]
-    {
-        let seed = context
-            .read_response(Id::new("devin_seed_preview"))
-            .expect("seed button")
-            .rect;
-        assert_eq!(seed.right(), close.left());
-        assert_eq!(lifecycle.right(), seed.left());
-    }
-    #[cfg(not(debug_assertions))]
     assert_eq!(lifecycle.right(), close.left());
+    assert!(
+        context
+            .read_response(Id::new("devin_seed_preview"))
+            .is_none()
+    );
 
     // Session home: the title reads 14 px in from the left, like the Agent's,
     // and the new-session and refresh buttons pack against the trailing set.
@@ -3404,22 +3496,8 @@ fn devin_header_wears_the_agent_chrome() {
         .expect("refresh button")
         .rect;
     assert_eq!(refresh.right(), plus.left());
-    #[cfg(debug_assertions)]
-    {
-        let seed = context
-            .read_response(Id::new("devin_seed_preview"))
-            .expect("seed button")
-            .rect;
-        assert_eq!(plus.right(), seed.left());
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let close = context
-            .read_response(Id::new("devin_close"))
-            .expect("close button")
-            .rect;
-        assert_eq!(plus.right(), close.left());
-    }
+    assert_eq!(plus.right(), close.left());
+    assert!(context.read_response(Id::new("devin_filters")).is_none());
 }
 
 #[test]
@@ -3622,6 +3700,14 @@ fn devin_attachments_render_like_the_agent_composer_and_prompt() {
             ..RawInput::default()
         },
         |root| app.ui(root),
+    );
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .all(|shape| text_rect(&shape.shape, &|text| text == "ATTACHMENTS").is_none()),
+        "session attachments must render only on their transcript turn"
     );
 
     let prompt = output
@@ -5362,6 +5448,198 @@ fn dense_work_summary_combines_edits_exploration_commands_and_diff_totals() {
 }
 
 #[test]
+fn dense_work_clusters_stop_at_subagent_cards() {
+    use std::collections::{HashMap, VecDeque};
+
+    let tool = |id: &str, title: &str, kind: &str, detail| {
+        TranscriptItem::Tool(ToolActivity {
+            id: id.into(),
+            title: Some(title.into()),
+            status: Some("Completed".into()),
+            kind: Some(kind.into()),
+            paths: Vec::new(),
+            detail,
+        })
+    };
+    let transcript = VecDeque::from([
+        tool("read", "Read", "Read", None),
+        tool(
+            "task",
+            "Subagent: Inspect the renderer",
+            "Task",
+            Some(ToolDetail {
+                input: None,
+                content: vec![ToolOutput::Task {
+                    description: "Inspect the renderer".into(),
+                    prompt: "Find the work grouping code".into(),
+                    subagent_type: "explore".into(),
+                    model: None,
+                    agent_id: None,
+                    agents: Vec::new(),
+                    path: None,
+                    activity: None,
+                    duration_ms: None,
+                }],
+                output: None,
+            }),
+        ),
+        tool("edit", "Edit src/app.rs", "Edit", None),
+    ]);
+
+    let clusters = super::dense_agent_work_clusters(&transcript, &HashMap::new(), None);
+
+    assert_eq!(clusters[0].as_ref().unwrap().label, "Explored 1 file");
+    assert!(clusters[1].is_none());
+    assert_eq!(clusters[2].as_ref().unwrap().label, "Edited app.rs");
+}
+
+#[test]
+fn dense_thought_opens_its_content_in_one_click() {
+    fn text_count(shape: &Shape, expected: &str) -> usize {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => 1,
+            Shape::Vec(shapes) => shapes.iter().map(|shape| text_count(shape, expected)).sum(),
+            _ => 0,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.settings.appearance.dense_agent = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::User("Plan this".into()));
+    app.agent.transcript.push_back(TranscriptItem::Thought(
+        "Inspect the existing UI first".into(),
+    ));
+    let context = theme::test_context();
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 760.0),
+                )),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(Vec::new());
+    let expanded = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, false)));
+
+    assert_eq!(
+        expanded
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, "Thought"))
+            .sum::<usize>(),
+        1,
+        "one disclosure should expose the thought without a nested Thought row"
+    );
+    assert_eq!(
+        expanded
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, "Inspect the existing UI first"))
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
+fn dense_thoughts_in_mixed_work_clusters_keep_their_own_toggle() {
+    fn text_count(shape: &Shape, expected: &str) -> usize {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => 1,
+            Shape::Vec(shapes) => shapes.iter().map(|shape| text_count(shape, expected)).sum(),
+            _ => 0,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.settings.appearance.dense_agent = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::User("Plan this".into()));
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "read-ui".into(),
+            title: Some("Read src/app.rs".into()),
+            status: Some("Completed".into()),
+            kind: Some("Read".into()),
+            paths: Vec::new(),
+            detail: None,
+        }));
+    app.agent.transcript.push_back(TranscriptItem::Thought(
+        "Compare the existing sidebar patterns".into(),
+    ));
+    let context = theme::test_context();
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1_000.0, 760.0),
+                )),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(Vec::new());
+    let cluster = click_response(&context, &mut draw, Id::new(("dense_agent_work", 1, false)));
+    assert_eq!(
+        cluster
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, "Thought"))
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        cluster
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, "Compare the existing sidebar patterns"))
+            .sum::<usize>(),
+        0
+    );
+
+    let thought = click_response(&context, &mut draw, Id::new(("dense_agent_thought", 2)));
+    assert_eq!(
+        thought
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, "Compare the existing sidebar patterns"))
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
 fn dense_work_summary_is_one_bold_inline_hover_target() {
     fn text(shape: &Shape, expected: &str) -> Option<(Rect, egui::FontFamily, Color32)> {
         match shape {
@@ -6646,6 +6924,157 @@ fn tool_card_toggle_settles_layout_before_the_frame_is_presented() {
 }
 
 #[test]
+fn terminal_tool_output_combines_streamed_chunks_without_raw_metadata() {
+    let tool = ToolActivity {
+        id: "build".into(),
+        title: Some("Run Terminal Command V2".into()),
+        status: Some("InProgress".into()),
+        kind: Some("Execute".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: Some(
+                serde_json::json!({
+                    "command": "cargo build",
+                    "cwd": "/project",
+                    "options": { "timeout": 300000 }
+                })
+                .to_string(),
+            ),
+            content: vec![
+                ToolOutput::Terminal("terminal-1".into()),
+                ToolOutput::Log {
+                    label: "Terminal output".into(),
+                    text: "Compiling editur\n".into(),
+                },
+                ToolOutput::Log {
+                    label: "Terminal output".into(),
+                    text: "Finished dev\n".into(),
+                },
+            ],
+            output: None,
+        }),
+    };
+
+    assert_eq!(
+        super::agent_terminal_output(&tool).as_deref(),
+        Some("Compiling editur\nFinished dev\n")
+    );
+}
+
+#[test]
+fn terminal_tool_output_extracts_stdout_from_raw_provider_results() {
+    let tool = ToolActivity {
+        id: "build".into(),
+        title: Some("Run command".into()),
+        status: Some("Completed".into()),
+        kind: Some("Execute".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: Some("cargo build".into()),
+            content: Vec::new(),
+            output: Some(
+                serde_json::json!({ "stdout": "Finished dev\n", "exitCode": 0 }).to_string(),
+            ),
+        }),
+    };
+
+    assert_eq!(
+        super::agent_terminal_output(&tool).as_deref(),
+        Some("Finished dev\n")
+    );
+}
+
+#[test]
+fn expanded_command_rows_render_ansi_terminal_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "build".into(),
+            title: Some("Run Terminal Command V2".into()),
+            status: Some("InProgress".into()),
+            kind: Some("Execute".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: Some(
+                    serde_json::json!({
+                        "command": "cargo build",
+                        "cwd": "/project",
+                        "options": { "timeout": 300000 }
+                    })
+                    .to_string(),
+                ),
+                content: vec![ToolOutput::Log {
+                    label: "Terminal output".into(),
+                    text: "Compiling editur\n\x1b[31mfailed\x1b[0m\n".into(),
+                }],
+                output: None,
+            }),
+        }));
+    app.agent_find.query = "Compiling".into();
+    app.agent_find.matches = vec![0];
+    app.agent_find.dirty = false;
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 720.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    fn text_color(shape: &Shape, needle: &str) -> Option<Color32> {
+        match shape {
+            Shape::Text(text) => {
+                let offset = text.galley.text().find(needle)?;
+                text.galley
+                    .job
+                    .sections
+                    .iter()
+                    .find(|section| section.byte_range.contains(&offset.into()))
+                    .map(|section| section.format.color)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_color(shape, needle)),
+            _ => None,
+        }
+    }
+    fn contains(shape: &Shape, needle: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(needle),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, needle)),
+            _ => false,
+        }
+    }
+
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains(&shape.shape, "$ cargo build"))
+    );
+    assert_eq!(
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| text_color(&shape.shape, "failed")),
+        Some(theme::color::ansi()[1])
+    );
+    assert!(output.shapes.iter().all(|shape| {
+        !contains(&shape.shape, "Terminal output") && !contains(&shape.shape, "\u{1b}[31m")
+    }));
+}
+
+#[test]
 fn transcript_following_does_not_treat_one_pixel_short_as_the_bottom() {
     assert!(!agent_at_bottom(999.0, 1_000.0));
 }
@@ -7058,7 +7487,7 @@ fn read_and_edit_tool_cards_do_not_repeat_their_paths_in_the_body() {
 }
 
 #[test]
-fn subagent_cards_are_distinct_and_collapse_their_prompt() {
+fn subagent_cards_show_only_useful_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -7118,12 +7547,251 @@ fn subagent_cards_are_distinct_and_collapse_their_prompt() {
         collect_text(&shape.shape, &mut texts);
     }
 
-    assert!(texts.contains("Subagent: Review changes"), "{texts}");
-    assert!(texts.contains("SUBAGENT"), "{texts}");
-    assert!(texts.contains("reviewer · gpt-5 · 1.2 s"), "{texts}");
+    assert!(!texts.contains("Subagent: Review changes"), "{texts}");
+    assert_eq!(texts.matches("Review changes").count(), 1, "{texts}");
+    assert!(!texts.contains("SUBAGENT"), "{texts}");
+    assert!(texts.contains("GPT 5 · 1.2 s"), "{texts}");
     assert!(texts.contains("Running"), "{texts}");
-    assert!(texts.contains("Prompt"), "{texts}");
+    assert!(!texts.contains("Prompt"), "{texts}");
+    assert!(!texts.contains("agent-9"), "{texts}");
     assert!(!texts.contains("dig through the auth flow"), "{texts}");
+}
+
+#[test]
+fn dense_subagents_are_standalone_cards_outside_collapsed_work() {
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+    fn dark_card_containing(shape: &Shape, point: Pos2) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.fill == theme::surface().input && rect.rect.contains(point),
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| dark_card_containing(shape, point)),
+            _ => false,
+        }
+    }
+    fn has_accent_rail(shape: &Shape, card: Rect) -> bool {
+        match shape {
+            Shape::LineSegment { points, stroke } => {
+                stroke.color == theme::accent()
+                    && (points[0].x - points[1].x).abs() < 0.5
+                    && points[0].x < card.left() + 4.0
+                    && (points[1].y - points[0].y).abs() > card.height() * 0.5
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_accent_rail(shape, card)),
+            _ => false,
+        }
+    }
+    fn completion_check(shape: &Shape, card: Rect) -> bool {
+        match shape {
+            Shape::Path(path) => {
+                path.points.len() == 3
+                    && path.stroke.color
+                        == egui::epaint::ColorMode::Solid(theme::ink(theme::semantic().success))
+                    && path
+                        .points
+                        .iter()
+                        .all(|point| card.contains(*point) && point.x > card.center().x)
+                    && path.visual_bounding_rect().center().y > card.center().y
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| completion_check(shape, card)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.settings.appearance.dense_agent = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "read".into(),
+            title: Some("Read src/app.rs".into()),
+            status: Some("Completed".into()),
+            kind: Some("Read".into()),
+            paths: Vec::new(),
+            detail: None,
+        }));
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "task".into(),
+            title: Some("Subagent: Inspect the renderer".into()),
+            status: Some("Completed".into()),
+            kind: Some("Task".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: None,
+                content: vec![ToolOutput::Task {
+                    description: "Inspect the renderer".into(),
+                    prompt: "Find the work grouping code".into(),
+                    subagent_type: "explore".into(),
+                    model: Some("gpt-5".into()),
+                    agent_id: None,
+                    agents: Vec::new(),
+                    path: None,
+                    activity: None,
+                    duration_ms: None,
+                }],
+                output: None,
+            }),
+        }));
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1_000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    let title = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "Inspect the renderer"))
+        .expect("subagent card should stay visible when the adjacent work cluster is collapsed");
+    let model = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "GPT 5"))
+        .expect("model label");
+    let card = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            Shape::Rect(rect)
+                if rect.fill == theme::surface().input && rect.rect.contains(title.center()) =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .expect("dark subagent card");
+    assert!(card.height() <= 104.0, "card is still too tall: {card:?}");
+    let title_model_gap = model.top() - title.bottom();
+    assert!(
+        (0.0..=6.0).contains(&title_model_gap),
+        "title/model gap should be tight, got {title_model_gap}"
+    );
+    assert!(theme::surface().input.r() < theme::surface().raised.r());
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| dark_card_containing(&shape.shape, title.center()))
+    );
+    assert!(
+        !output
+            .shapes
+            .iter()
+            .any(|shape| has_accent_rail(&shape.shape, card))
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| completion_check(&shape.shape, card))
+    );
+}
+
+#[test]
+fn completed_subagent_cards_show_useful_metadata_and_output() {
+    fn collect_text(shape: &Shape, texts: &mut String) {
+        match shape {
+            Shape::Text(text) => {
+                texts.push_str(text.galley.text());
+                texts.push('\n');
+            }
+            Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect_text(shape, texts)),
+            _ => {}
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .push_back(TranscriptItem::Tool(ToolActivity {
+            id: "task-v2".into(),
+            title: Some("Subagent: Explore sidebar".into()),
+            status: Some("Completed".into()),
+            kind: Some("Task".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: None,
+                content: vec![
+                    ToolOutput::Task {
+                        description: "Explore sidebar".into(),
+                        prompt: "Find the terminal toggle.".into(),
+                        subagent_type: "explore".into(),
+                        model: Some("cursor-grok-4.5-high-fast".into()),
+                        agent_id: Some("agent-9".into()),
+                        agents: Vec::new(),
+                        path: None,
+                        activity: None,
+                        duration_ms: None,
+                    },
+                    ToolOutput::Text("Found the toggle in workspace_view.rs".into()),
+                ],
+                output: None,
+            }),
+        }));
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1_000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let mut texts = String::new();
+    output
+        .shapes
+        .iter()
+        .for_each(|shape| collect_text(&shape.shape, &mut texts));
+
+    for expected in [
+        "Explore sidebar",
+        "Cursor Grok 4.5 High Fast",
+        "Output",
+        "Found the toggle in workspace_view.rs",
+    ] {
+        assert!(texts.contains(expected), "missing {expected:?} in {texts}");
+    }
+    assert!(!texts.contains("Subagent: Explore sidebar"), "{texts}");
+    assert!(!texts.contains("SUBAGENT"), "{texts}");
+    assert!(!texts.contains("Done"), "{texts}");
+    assert!(!texts.contains("agent-9"), "{texts}");
+    assert!(!texts.contains("Completed"), "{texts}");
+    assert!(!texts.contains("Prompt"), "{texts}");
+    assert!(!texts.contains("Find the terminal toggle."), "{texts}");
 }
 
 #[test]
@@ -7339,6 +8007,52 @@ fn changed_file_diffs_open_the_side_panel_in_agentic_mode() {
 }
 
 #[test]
+fn agentic_diff_can_open_a_file_larger_than_the_retained_baseline_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("large.txt");
+    fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root,
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+
+    app.open_agent_diff(path.clone());
+
+    let panel = app.agentic_diffs.first().expect("large diff panel opens");
+    assert_eq!(panel.path, path);
+    assert_eq!(panel.text.len(), 2 * 1024 * 1024);
+}
+
+#[test]
+fn agentic_diff_refresh_exposes_an_oversized_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("growing.txt");
+    fs::write(&path, "small\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root,
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.open_agent_diff(path.clone());
+    fs::write(&path, vec![b'x'; 5 * 1024 * 1024]).unwrap();
+
+    app.refresh_agentic_diff_paths(&std::collections::HashSet::from([path]));
+
+    let error = app.agentic_diffs[0]
+        .error
+        .as_deref()
+        .expect("refresh error is visible in the panel");
+    assert!(error.contains("too large"), "{error}");
+}
+
+#[test]
 fn missing_changed_file_does_not_open_its_retained_agent_diff() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -7550,6 +8264,7 @@ fn the_agentic_diff_panel_renders_beside_the_conversation() {
         path: root.join("lib.rs"),
         baseline: Some("old\n".to_owned()),
         text: "new\n".to_owned(),
+        error: None,
     });
     let output = theme::test_context().run_ui(
         RawInput {
@@ -9506,10 +10221,11 @@ fn dropping_an_image_over_the_composer_shows_a_square_thumbnail() {
 fn embedded_session_image_bytes_decode_to_a_thumbnail() {
     let context = theme::test_context();
 
-    let preview = load_assistant_image_preview_bytes(
+    let preview = load_assistant_image_bytes(
         &context,
         "detected-session-image",
         include_bytes!("../../assets/icons/editur.png"),
+        super::ASSISTANT_IMAGE_PREVIEW_EDGE,
     );
 
     assert!(preview.is_some());
@@ -9527,6 +10243,28 @@ fn prompt_image_square_uses_a_center_crop() {
     assert_eq!(
         portrait,
         Rect::from_min_max(pos2(0.0, 0.25), pos2(1.0, 0.75))
+    );
+}
+
+#[test]
+fn lightbox_image_uploads_stay_within_a_renderer_safe_edge() {
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::new(2_500, 2))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+
+    let texture = load_assistant_image_bytes(
+        &theme::test_context(),
+        "wide-lightbox",
+        encoded.get_ref(),
+        super::ASSISTANT_IMAGE_LIGHTBOX_EDGE,
+    )
+    .expect("large image preview");
+
+    assert!(
+        texture.size().into_iter().max().unwrap() <= 2_048,
+        "lightbox upload is too large for a stable shared Metal texture: {:?}",
+        texture.size()
     );
 }
 
@@ -10897,7 +11635,7 @@ fn agent_menu_hugs_its_selector_without_wasted_bottom_space() {
         pos2(content.left(), content.bottom() - 30.0),
         Vec2::new(76.0, 30.0),
     );
-    let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT, 8.0);
+    let menu = agent_menu_rect(transcript, selector, 3, AGENT_MENU_ROW_HEIGHT, 8.0, 280.0);
 
     assert_eq!(
         content.bottom(),
@@ -11017,6 +11755,24 @@ fn composer_combines_model_and_thinking_in_one_selector() {
                 ConfigValueChoice {
                     id: "true".into(),
                     name: "On".into(),
+                    description: None,
+                },
+            ],
+        },
+        ConfigChoice {
+            id: "context_window".into(),
+            name: "Context length".into(),
+            description: None,
+            value: ConfigValue::Select("300k".into()),
+            options: vec![
+                ConfigValueChoice {
+                    id: "200k".into(),
+                    name: "200K".into(),
+                    description: None,
+                },
+                ConfigValueChoice {
+                    id: "300k".into(),
+                    name: "300K".into(),
                     description: None,
                 },
             ],
@@ -11146,6 +11902,13 @@ fn composer_combines_model_and_thinking_in_one_selector() {
             .iter()
             .all(|shape| text_rect(&shape.shape, "Fast").is_none())
     );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .all(|shape| text_rect(&shape.shape, "300K").is_none()),
+        "context length should live inside the model menu"
+    );
     let model_selector = context
         .read_response(Id::new("agent_model_selector"))
         .expect("model selector")
@@ -11195,13 +11958,26 @@ fn composer_combines_model_and_thinking_in_one_selector() {
     app.agent_menu = Some(super::AgentMenu::Config("model".into()));
     let output = draw(&mut app);
     let popup = app.agent_menu_popup.expect("model and thinking menu");
-    for label in ["Model", "Thinking", "Effort", "Speed", "Auto", "Extra High"] {
+    for label in [
+        "Model",
+        "Thinking",
+        "Effort",
+        "Speed",
+        "Context length",
+        "300K",
+        "Auto",
+        "Extra High",
+    ] {
         let row = output
             .shapes
             .iter()
             .find_map(|shape| text_rect(&shape.shape, label))
             .unwrap_or_else(|| panic!("missing {label} in combined menu"));
-        assert!(popup.contains(row.center()));
+        assert!(
+            popup.contains(row.center()),
+            "{label} at {:?} escaped popup {popup:?}",
+            row.center()
+        );
     }
     for header in ["Effort", "Speed", "Model"] {
         assert_eq!(
@@ -11372,7 +12148,7 @@ fn agent_history_menu_lists_restorable_sessions() {
 }
 
 #[test]
-fn agent_history_marks_only_sessions_started_outside_editur_with_the_provider() {
+fn agent_history_does_not_show_session_origin_provider_icons() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -11419,7 +12195,7 @@ fn agent_history_marks_only_sessions_started_outside_editur_with_the_provider() 
                 "provider-session",
                 "codex",
             )))
-            .is_some()
+            .is_none()
     );
     assert!(
         context
@@ -11914,6 +12690,21 @@ fn finds_every_case_insensitive_ascii_match_for_palette_highlighting() {
         [0..5, 6..11, 12..17]
     );
     assert!(match_spans("Cargo", "").is_empty());
+}
+
+#[test]
+fn case_insensitive_match_spans_stays_fast_for_repetitive_absent_queries() {
+    let text = "a".repeat(1_000_000);
+    let query = format!("{}b", "a".repeat(8_191));
+    let started = Instant::now();
+
+    let spans = match_spans(&text, &query);
+
+    assert!(
+        spans.is_empty() && started.elapsed() < Duration::from_secs(1),
+        "repetitive search took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -13110,7 +13901,7 @@ fn editor_pane_does_not_paint_over_the_window_right_or_bottom_border() {
 }
 
 #[test]
-fn source_control_and_explorer_commands_share_one_pane_aware_sidebar_slot() {
+fn source_control_toggle_returns_to_files_without_collapsing_the_sidebar() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -13136,14 +13927,6 @@ fn source_control_and_explorer_commands_share_one_pane_aware_sidebar_slot() {
         None,
         &context,
     );
-    assert!(!app.sidebar);
-    assert_eq!(app.sidebar_pane, super::SidebarPane::SourceControl);
-
-    app.execute_keybinding(
-        crate::keybindings::Command::ViewToggleExplorer,
-        None,
-        &context,
-    );
     assert!(app.sidebar);
     assert_eq!(app.sidebar_pane, super::SidebarPane::Files);
 
@@ -13152,6 +13935,7 @@ fn source_control_and_explorer_commands_share_one_pane_aware_sidebar_slot() {
         None,
         &context,
     );
+    assert!(!app.sidebar);
     app.execute_keybinding(
         crate::keybindings::Command::ViewToggleSidebar,
         None,
@@ -13177,7 +13961,7 @@ fn titlebar_buttons_order_files_terminal_source_control_then_agent() {
 }
 
 #[test]
-fn git_diff_tabs_are_read_only_keyed_by_area_and_refresh_in_place() {
+fn git_diff_preview_refreshes_in_place_without_creating_tabs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -13195,9 +13979,8 @@ fn git_diff_tabs_are_read_only_keyed_by_area_and_refresh_in_place() {
         new: "new\n".into(),
         generation: 1,
     });
-    assert_eq!(app.tabs.len(), 1);
-    assert!(app.tabs[0].git_diff.is_some());
-    assert!(!app.tabs[0].buffer.dirty);
+    assert!(app.tabs.is_empty());
+    assert!(app.git_diff.is_some());
 
     app.open_git_diff(crate::git::controller::GitEvent::Diff {
         repository: root.clone(),
@@ -13207,9 +13990,8 @@ fn git_diff_tabs_are_read_only_keyed_by_area_and_refresh_in_place() {
         new: "newer\n".into(),
         generation: 2,
     });
-    assert_eq!(app.tabs.len(), 1);
     assert_eq!(
-        app.tabs[0].git_diff.as_ref().map(|diff| diff.new.as_str()),
+        app.git_diff.as_ref().map(|diff| diff.new.as_str()),
         Some("newer\n")
     );
 
@@ -13221,7 +14003,47 @@ fn git_diff_tabs_are_read_only_keyed_by_area_and_refresh_in_place() {
         new: "newer\n".into(),
         generation: 2,
     });
-    assert_eq!(app.tabs.len(), 2);
+    assert!(app.tabs.is_empty());
+    assert_eq!(
+        app.git_diff.as_ref().map(|diff| diff.area),
+        Some(crate::git::controller::DiffArea::Staged)
+    );
+}
+
+#[test]
+fn git_diff_preview_does_not_render_editor_tabs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let file = root.join("open.rs");
+    std::fs::write(&file, "fn open() {}\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: Some(file.clone()),
+        create: false,
+    })
+    .unwrap();
+    app.open_git_diff(crate::git::controller::GitEvent::Diff {
+        repository: root,
+        path: "changed.rs".into(),
+        area: crate::git::controller::DiffArea::Worktree,
+        old: Some("fn old() {}\n".into()),
+        new: "fn new() {}\n".into(),
+        generation: 1,
+    });
+    let context = theme::test_context();
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 700.0))),
+            ..RawInput::default()
+        },
+        |ui| app.ui(ui),
+    );
+
+    assert!(
+        context
+            .read_response(Id::new(("file_tab", file.display().to_string())))
+            .is_none()
+    );
 }
 
 #[test]
@@ -13665,6 +14487,35 @@ fn opening_files_keeps_dirty_buffers_and_reuses_existing_tabs() {
 }
 
 #[test]
+fn agent_tool_updates_reconcile_only_the_reported_open_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let first = root.join("first.rs");
+    let second = root.join("second.rs");
+    fs::write(&first, "one\n").unwrap();
+    fs::write(&second, "two\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root,
+        file: Some(first.clone()),
+        create: false,
+    })
+    .unwrap();
+    app.request(PendingAction::Open(second.clone()));
+    fs::write(&first, "one changed\n").unwrap();
+    fs::write(&second, "two changed\n").unwrap();
+
+    app.reconcile_open_paths(&std::collections::HashSet::from([first.clone()]));
+
+    assert_eq!(
+        app.tabs
+            .iter()
+            .map(|tab| (tab.buffer.path.clone(), tab.buffer.text.clone()))
+            .collect::<Vec<_>>(),
+        vec![(first, "one changed\n".into()), (second, "two\n".into())]
+    );
+}
+
+#[test]
 fn dirty_tab_close_waits_for_an_explicit_discard() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("current.rs");
@@ -13818,6 +14669,83 @@ fn file_tree_toggle_collapses_the_tree_without_overlapping_tabs() {
 
     assert!(!app.sidebar);
     assert!(tab.left() >= agentic_button.right());
+}
+
+#[test]
+fn session_sidebar_toggle_stays_in_agentic_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.sidebar_pane = super::SidebarPane::SourceControl;
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(Vec::new());
+    let _ = click_response(&context, &mut draw, Id::new("file_tree_toggle"));
+
+    assert!(app.agentic_mode);
+    assert!(!app.sidebar);
+}
+
+#[test]
+fn collapsed_agentic_session_title_starts_after_view_controls() {
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.sidebar = false;
+    app.agent.title = Some("Landing Page Maker".into());
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let mode = context
+        .read_response(Id::new("agentic_mode_toggle"))
+        .expect("agentic mode toggle")
+        .rect;
+    let title = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "Landing Page Maker"))
+        .expect("session title");
+
+    assert!(title.left() >= mode.right() + theme::space::SMALL);
 }
 
 #[test]
@@ -14247,6 +15175,59 @@ fn agentic_workspace_row_only_contains_the_project_name() {
     assert_eq!(text, [name]);
     assert!(!has_path, "workspace row still contains an icon");
     assert_eq!(row.height(), theme::control::ROW + theme::space::TIGHT);
+}
+
+#[test]
+fn agentic_workspace_rows_match_session_typography() {
+    fn text_style(shape: &Shape, expected: &str) -> Option<(egui::FontId, Color32)> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                let format = &text.galley.job.sections[0].format;
+                Some((format.font_id.clone(), format.color))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_style(shape, expected)),
+            _ => None,
+        }
+    }
+
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        agentic_project_row(ui, Path::new("/Selected workspace"), true);
+        agentic_project_row(ui, Path::new("/Other workspace"), false);
+        agent_session_row(
+            ui,
+            &SessionChoice {
+                id: "selected-session".into(),
+                title: Some("Selected session".into()),
+                updated_at: None,
+                started_in_editur: true,
+            },
+            true,
+            true,
+            &[],
+        );
+        agent_session_row(
+            ui,
+            &SessionChoice {
+                id: "other-session".into(),
+                title: Some("Other session".into()),
+                updated_at: None,
+                started_in_editur: true,
+            },
+            false,
+            true,
+            &[],
+        );
+    });
+    let find = |expected| {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| text_style(&shape.shape, expected))
+            .unwrap_or_else(|| panic!("missing {expected:?}"))
+    };
+
+    assert_eq!(find("Selected workspace"), find("Selected session"));
+    assert_eq!(find("Other workspace"), find("Other session"));
 }
 
 #[test]
@@ -15642,6 +16623,99 @@ fn dropping_a_sidebar_session_into_the_empty_pane_assigns_it() {
     assert_eq!(app.agent_pane_picker, None);
     assert_eq!(app.active_agent_pane, pane);
     assert_eq!(app.agent.session_id.as_deref(), Some("dragged-session"));
+}
+
+#[test]
+fn assigning_a_session_pane_keeps_the_loaded_sidebar_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "dragged-session".into(),
+        title: Some("Drag me".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    let pane = app.open_agent_session_pane().unwrap();
+
+    app.assign_agent_session_pane(pane, Some("dragged-session".into()));
+
+    assert!(app.agent.history_available);
+    assert_eq!(
+        app.agent.sessions.as_ref().map(Vec::len),
+        Some(1),
+        "the shared session rail must not flash back to its loading state"
+    );
+}
+
+#[test]
+fn open_agent_sessions_show_matching_pane_badges() {
+    fn text_count(shape: &Shape, expected: &str) -> usize {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => 1,
+            Shape::Vec(shapes) => shapes.iter().map(|shape| text_count(shape, expected)).sum(),
+            _ => 0,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.session_id = Some("first-session".into());
+    app.agent.title = Some("First session".into());
+    app.agent.sessions = Some(vec![
+        SessionChoice {
+            id: "first-session".into(),
+            title: Some("First session".into()),
+            updated_at: None,
+            started_in_editur: true,
+        },
+        SessionChoice {
+            id: "second-session".into(),
+            title: Some("Second session".into()),
+            updated_at: None,
+            started_in_editur: true,
+        },
+    ]);
+    let pane = app.open_agent_session_pane().unwrap();
+    app.assign_agent_session_pane(pane, Some("second-session".into()));
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.title = Some("Second session".into());
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1200.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let count = |expected| {
+        output
+            .shapes
+            .iter()
+            .map(|shape| text_count(&shape.shape, expected))
+            .sum::<usize>()
+    };
+
+    assert_eq!(count("P1"), 2, "pane header and matching session row");
+    assert_eq!(count("P2"), 2, "pane header and matching session row");
 }
 
 #[test]

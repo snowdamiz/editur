@@ -254,6 +254,7 @@ fn search_documents_while(
     }
     let mut needle = query.to_owned();
     needle.make_ascii_lowercase();
+    let content_matcher = AsciiCaseInsensitiveMatcher::new(query).ok();
 
     let mut files = BinaryHeap::with_capacity(FILE_RESULT_LIMIT + 1);
     for (index, document) in documents.iter().enumerate() {
@@ -291,7 +292,10 @@ fn search_documents_while(
         let Some(content) = document.content.as_ref() else {
             continue;
         };
-        if let Some(offset) = find_ascii_case_insensitive(content.as_bytes(), needle.as_bytes()) {
+        if let Some(offset) = content_matcher
+            .as_ref()
+            .and_then(|matcher| matcher.find(content.as_bytes()))
+        {
             let (line, preview) = line_preview(content, offset);
             results.contents.push(SearchHit {
                 path: document.path.clone(),
@@ -307,10 +311,19 @@ fn search_documents_while(
     Some(results)
 }
 
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|candidate| candidate.eq_ignore_ascii_case(needle))
+struct AsciiCaseInsensitiveMatcher(regex::bytes::Regex);
+
+impl AsciiCaseInsensitiveMatcher {
+    fn new(literal: &str) -> Result<Self, regex::Error> {
+        let pattern = regex::escape(literal);
+        let mut builder = regex::bytes::RegexBuilder::new(&pattern);
+        builder.case_insensitive(true).unicode(false);
+        builder.build().map(Self)
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.0.find(haystack).map(|found| found.start())
+    }
 }
 
 fn filename_score(document: &IndexedFile, needle: &str) -> Option<u8> {
@@ -355,9 +368,16 @@ fn line_preview(content: &str, offset: usize) -> (usize, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchController, index_root, search_documents};
+    use super::{AsciiCaseInsensitiveMatcher, SearchController, index_root, search_documents};
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn content_matcher_reports_byte_offsets_and_only_folds_ascii_case() {
+        let matcher = AsciiCaseInsensitiveMatcher::new("needle").unwrap();
+
+        assert_eq!(matcher.find("é NEEDLE".as_bytes()), Some(3));
+    }
 
     #[test]
     fn project_index_stays_idle_until_the_first_nonempty_query() {

@@ -3,9 +3,12 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+pub const MAX_EDITABLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OpenTarget {
@@ -32,8 +35,7 @@ impl fmt::Display for SaveError {
 impl std::error::Error for SaveError {}
 
 pub fn load_buffer(path: &Path) -> Result<Buffer, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes = read_file_bounded(path, MAX_EDITABLE_FILE_BYTES)?;
     let metadata = fs::metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     let fingerprint = fingerprint_from(&metadata, &bytes);
@@ -41,8 +43,7 @@ pub fn load_buffer(path: &Path) -> Result<Buffer, String> {
 }
 
 pub fn disk_fingerprint(path: &Path) -> Result<DiskFingerprint, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes = read_file_bounded(path, MAX_EDITABLE_FILE_BYTES)?;
     let metadata = fs::metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     Ok(fingerprint_from(&metadata, &bytes))
@@ -66,8 +67,7 @@ pub fn reconcile_buffer(buffer: &mut Buffer) -> Result<ReconcileOutcome, String>
         return Ok(ReconcileOutcome::Unchanged);
     }
     let path = buffer.path.clone();
-    let bytes =
-        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes = read_file_bounded(&path, MAX_EDITABLE_FILE_BYTES)?;
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     let fingerprint = fingerprint_from(&metadata, &bytes);
@@ -87,6 +87,37 @@ fn fingerprint_from(metadata: &fs::Metadata, bytes: &[u8]) -> DiskFingerprint {
         modified: metadata.modified().ok(),
         hash: Sha256::digest(bytes).into(),
     }
+}
+
+pub(crate) fn read_utf8_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
+    String::from_utf8(read_file_bounded(path, max_bytes)?)
+        .map_err(|_| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn read_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{} is too large to open (limit: {} MiB)",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{} is too large to open (limit: {} MiB)",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
 }
 
 pub fn safe_save(buffer: &mut Buffer, destination: &Path) -> Result<(), SaveError> {
@@ -264,24 +295,48 @@ pub(crate) fn unique_copy_path(source: &Path, directory: &Path) -> Result<PathBu
 }
 
 pub(crate) fn copy_tree_entry(source: &Path, destination: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!("cannot copy symlink {}", source.display()));
+    if destination.exists() {
+        return Err(format!("{} already exists", destination.display()));
     }
-    if metadata.is_file() {
-        fs::copy(source, destination)
-            .map(|_| ())
-            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
-        return Ok(());
-    }
-    fs::create_dir(destination)
-        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("cannot read {}: {error}", source.display()))?
-    {
-        let entry = entry.map_err(|error| format!("cannot read {}: {error}", source.display()))?;
-        copy_tree_entry(&entry.path(), &destination.join(entry.file_name()))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".editur-copy-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("cannot stage copy in {}: {error}", parent.display()))?;
+    let staged = staging.path().join("entry");
+    copy_tree_entry_into(source, &staged)?;
+    fs::rename(&staged, destination)
+        .map_err(|error| format!("cannot finish copy to {}: {error}", destination.display()))
+}
+
+fn copy_tree_entry_into(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    while let Some((source, destination)) = pending.pop() {
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("cannot copy symlink {}", source.display()));
+        }
+        if metadata.is_file() {
+            fs::copy(&source, &destination)
+                .map(|_| ())
+                .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+            continue;
+        }
+        if !metadata.is_dir() {
+            return Err(format!("cannot copy special file {}", source.display()));
+        }
+        fs::create_dir(&destination)
+            .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+        for entry in fs::read_dir(&source)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+        {
+            let entry =
+                entry.map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+            pending.push((entry.path(), destination.join(entry.file_name())));
+        }
     }
     Ok(())
 }
@@ -294,24 +349,48 @@ pub(crate) fn child_path(directory: &Path, name: &str) -> Result<PathBuf, String
     }
 }
 
-pub(crate) fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+pub(crate) fn reveal_in_file_manager(
+    path: &Path,
+    complete: impl FnOnce(Result<(), String>) + Send + 'static,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg("-R").arg(path).status();
+    let child = Command::new("open").arg("-R").arg(path).spawn();
     #[cfg(target_os = "windows")]
-    let status = Command::new("explorer").arg("/select,").arg(path).status();
+    let child = Command::new("explorer").arg("/select,").arg(path).spawn();
     #[cfg(target_os = "linux")]
-    let status = Command::new("xdg-open")
+    let child = Command::new("xdg-open")
         .arg(if path.is_dir() {
             path
         } else {
             path.parent().unwrap_or(path)
         })
-        .status();
-    let status = status.map_err(|error| format!("cannot open the file manager: {error}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| "the file manager could not reveal the selected path".into())
+        .spawn();
+    let child = child.map_err(|error| format!("cannot open the file manager: {error}"))?;
+    std::thread::spawn(move || {
+        complete(wait_for_file_manager(child, Duration::from_secs(10)));
+    });
+    Ok(())
+}
+
+fn wait_for_file_manager(mut child: Child, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("file manager exited with {status}")),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                child.kill().map_err(|error| {
+                    format!("file manager did not respond and could not be stopped: {error}")
+                })?;
+                let _ = child.wait();
+                return Err("file manager did not respond".into());
+            }
+            Err(error) => return Err(format!("cannot wait for the file manager: {error}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +398,50 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_manager_wait_reports_failure_and_timeout() {
+        let child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let error = wait_for_file_manager(child, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("exited"), "{error}");
+
+        let child = Command::new("sh").args(["-c", "sleep 10"]).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let error = wait_for_file_manager(child, std::time::Duration::from_millis(20)).unwrap_err();
+        assert!(error.contains("did not respond"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_tree_copy_leaves_no_partial_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("good.txt"), "copied").unwrap();
+        symlink(source.join("good.txt"), source.join("link.txt")).unwrap();
+
+        let error = copy_tree_entry(&source, &destination).unwrap_err();
+
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn load_buffer_rejects_files_above_the_editor_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("huge.txt");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+
+        let error = load_buffer(&path).unwrap_err();
+
+        assert!(error.contains("too large"), "{error}");
+    }
 
     #[test]
     fn resolves_file_directory_and_new_path_roots() {

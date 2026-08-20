@@ -4,7 +4,8 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -30,7 +31,9 @@ const LIST_POLL: Duration = Duration::from_secs(20);
 const TERMINAL_POLL: Duration = Duration::from_secs(30);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_RESOURCE_BODY_BYTES: usize = 512 * 1024;
-const MAX_PREVIEW_FETCHES: usize = 8;
+// ponytail: keep one selection under 64 MiB; add viewport-driven fetching if
+// sessions regularly exceed that ceiling.
+const MAX_PREVIEW_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_SESSIONS: usize = 10;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -208,6 +211,7 @@ pub enum DevinCommand {
 pub struct DevinController {
     commands: SyncSender<DevinCommand>,
     events: Receiver<DevinEvent>,
+    shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -223,13 +227,18 @@ impl DevinController {
     ) -> Self {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
             .name("editur-devin".into())
-            .spawn(move || Worker::new(project_root, endpoint, event_tx, wake).run(command_rx))
+            .spawn(move || {
+                Worker::new(project_root, endpoint, event_tx, wake).run(command_rx, worker_shutdown)
+            })
             .expect("failed to start Editur Devin controller thread");
         Self {
             commands: command_tx,
             events: event_rx,
+            shutdown,
             worker: Some(worker),
         }
     }
@@ -247,26 +256,12 @@ impl DevinController {
 
 impl Drop for DevinController {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         let Some(worker) = self.worker.take() else {
             return;
         };
-        loop {
-            match self.commands.try_send(DevinCommand::Shutdown) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => break,
-                Err(TrySendError::Full(_)) => {
-                    self.events.try_iter().for_each(drop);
-                    if worker.is_finished() {
-                        break;
-                    }
-                    thread::park_timeout(Duration::from_millis(1));
-                }
-            }
-        }
-        while !worker.is_finished() {
-            self.events.try_iter().for_each(drop);
-            thread::park_timeout(Duration::from_millis(1));
-        }
-        let _ = worker.join();
+        let _ = self.commands.try_send(DevinCommand::Shutdown);
+        crate::reap_worker("editur-devin-reaper", worker);
     }
 }
 
@@ -317,8 +312,8 @@ impl Worker {
         }
     }
 
-    fn run(mut self, commands: Receiver<DevinCommand>) {
-        loop {
+    fn run(mut self, commands: Receiver<DevinCommand>, shutdown: Arc<AtomicBool>) {
+        while !shutdown.load(Ordering::Acquire) {
             let now = Instant::now();
             let received = match self.schedule.wait(now) {
                 Some(wait) => commands.recv_timeout(wait),
@@ -559,7 +554,7 @@ impl Worker {
                 let connected = Credentials::new(
                     api_key,
                     org_id,
-                    super::credentials::CredentialSource::Keyring,
+                    super::credentials::CredentialSource::Stored,
                 )
                 .map_err(TransportError::Protocol)
                 .and_then(|credentials| self.connect_and_store(credentials));
@@ -596,7 +591,7 @@ impl Worker {
                         self.selected = None;
                         self.fetched_previews.clear();
                         self.connect(credentials.clone())?;
-                        if credentials.source() == super::credentials::CredentialSource::Keyring {
+                        if credentials.source() == super::credentials::CredentialSource::Stored {
                             credentials.save().map_err(TransportError::Protocol)?;
                         }
                         Ok(())
@@ -1504,51 +1499,37 @@ impl Worker {
     }
 
     fn load_message_pages(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+        let mut next = self.load_message_page(update, None)?;
         if update == PageUpdate::Refresh {
-            self.load_message_page(update, None)?;
             return Ok(());
         }
-        let mut cursors = HashSet::new();
-        let mut cursor = None;
-        let mut page_update = update;
-        loop {
-            let Some(next_cursor) = self.load_message_page(page_update, cursor.as_deref())? else {
-                return Ok(());
-            };
-            if !cursors.insert(next_cursor.clone()) {
+        let mut seen = HashSet::new();
+        while let Some(cursor) = next {
+            if !seen.insert(cursor.clone()) {
                 return Err(TransportError::Protocol(
                     "Devin message pagination repeated a cursor".into(),
                 ));
             }
-            cursor = Some(next_cursor);
-            if update == PageUpdate::Initial {
-                page_update = PageUpdate::History;
-            }
+            next = self.load_message_page(PageUpdate::History, Some(&cursor))?;
         }
+        Ok(())
     }
 
     fn load_event_pages(&mut self, update: PageUpdate) -> Result<(), TransportError> {
+        let mut next = self.load_event_page(update, None)?;
         if update == PageUpdate::Refresh {
-            self.load_event_page(update, None)?;
             return Ok(());
         }
-        let mut cursors = HashSet::new();
-        let mut cursor = None;
-        let mut page_update = update;
-        loop {
-            let Some(next_cursor) = self.load_event_page(page_update, cursor.as_deref())? else {
-                return Ok(());
-            };
-            if !cursors.insert(next_cursor.clone()) {
+        let mut seen = HashSet::new();
+        while let Some(cursor) = next {
+            if !seen.insert(cursor.clone()) {
                 return Err(TransportError::Protocol(
                     "Devin event pagination repeated a cursor".into(),
                 ));
             }
-            cursor = Some(next_cursor);
-            if update == PageUpdate::Initial {
-                page_update = PageUpdate::History;
-            }
+            next = self.load_event_page(PageUpdate::History, Some(&cursor))?;
         }
+        Ok(())
     }
 
     /// Downloads image attachments so the transcript can paint the same
@@ -1560,7 +1541,8 @@ impl Worker {
         selected: &SelectedSession,
         previews: Vec<(String, String)>,
     ) {
-        for (attachment_id, name) in previews.into_iter().take(MAX_PREVIEW_FETCHES) {
+        let mut loaded_bytes = 0_usize;
+        for (attachment_id, name) in previews {
             if !self.fetched_previews.insert(attachment_id.clone()) {
                 continue;
             }
@@ -1570,6 +1552,10 @@ impl Worker {
             else {
                 continue;
             };
+            if loaded_bytes.saturating_add(bytes.len()) > MAX_PREVIEW_BYTES {
+                break;
+            }
+            loaded_bytes += bytes.len();
             self.emit(DevinEvent::AttachmentFetched {
                 session_id: selected.id.clone(),
                 generation: selected.generation,
@@ -2975,7 +2961,7 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
-    fn background_refresh_reuses_cached_session_history() {
+    fn background_refresh_does_not_fetch_older_history() {
         let (endpoint, requests, stop, server) = fake_mcp_server();
         let (event_tx, _event_rx) = mpsc::sync_channel(64);
         let mut worker =
@@ -3023,7 +3009,7 @@ mod tests {
                 "GET /v3/organizations/org-fixture/sessions/session-1/messages?first=100&after=message-next HTTP/1.1",
                 "GET /v3/organizations/org-fixture/sessions/session-1/messages?first=100 HTTP/1.1",
             ],
-            "polling should refresh the current page without refetching cached history"
+            "initial load should fetch all pages while polling refreshes only the current page"
         );
         assert_eq!(
             event_arguments,
@@ -3032,13 +3018,13 @@ mod tests {
                 json!({"session_id":"session-1","action":"list","limit":100,"after":"event-next"}),
                 json!({"session_id":"session-1","action":"list","limit":100}),
             ],
-            "polling should refresh current actions without refetching cached action history"
+            "initial load should fetch all actions while polling refreshes only the current page"
         );
     }
 
     #[cfg(feature = "network")]
     #[test]
-    fn selecting_a_session_fetches_every_conversation_and_action_page() {
+    fn selecting_a_session_loads_the_complete_history() {
         let (endpoint, requests, stop, server) = fake_mcp_server();
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let mut worker =
@@ -3061,8 +3047,6 @@ mod tests {
         worker.load_selected().unwrap();
         event_rx.try_iter().for_each(|event| state.apply(event));
 
-        stop.store(true, Ordering::Relaxed);
-        server.join().unwrap();
         assert_eq!(
             state
                 .messages
@@ -3071,6 +3055,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["message-1", "message-2"]
         );
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
         assert_eq!(
             state
                 .activity
@@ -3079,7 +3065,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["event-1", "event-2"]
         );
-        assert!(state.messages_cursor.is_none() && state.activity_cursor.is_none());
         let requests = requests.lock().unwrap();
         assert!(requests.iter().any(|request| {
             request.contains("/sessions/session-1/messages?first=100&after=message-next")

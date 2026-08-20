@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 mod agent_diff;
@@ -28,8 +28,7 @@ mod workspace_view;
 use agent_diff::*;
 use agent_text::*;
 use devin_view::{
-    DevinAdvancedDraft, DevinLifecycle, DevinResourceDraft, DevinScope, DevinView,
-    PendingDevinMessage,
+    DevinLifecycle, DevinResourceDraft, DevinScope, DevinStreamItem, DevinView, PendingDevinMessage,
 };
 use layout::*;
 use settings_ui::*;
@@ -45,7 +44,7 @@ use runtime::{
 
 use egui::{
     Align, Align2, Color32, CursorIcon, Id, Key, Label, Layout, RichText, ScrollArea, Sense,
-    TextEdit, TextFormat, UiBuilder, ViewportId, text::LayoutJob,
+    TextEdit, TextFormat, UiBuilder, ViewportId, cache::CacheTrait, text::LayoutJob,
 };
 use winit::{
     application::ApplicationHandler,
@@ -79,7 +78,8 @@ use crate::{
     devin::{
         ConnectionState as DevinConnectionState, CreateSessionRequest, CredentialSource,
         CrudAction, DevinCommand, DevinController, DevinEvent, DevinSection, DevinState, LoadState,
-        RepositoryState, ResourceMutation, SecretInput, SessionFilters, StatusCategory,
+        RepositoryState, ResourceMutation, SecretInput, StatusCategory, chronological_timestamp,
+        parse_timestamp_seconds,
     },
     dialog::{Dialog, Outcome, Severity},
     editor_surface::{
@@ -87,7 +87,8 @@ use crate::{
     },
     file_io::{
         OpenTarget, ReconcileOutcome, SaveError, child_path, copy_tree_entry, load_buffer,
-        reconcile_buffer, resolve_target, reveal_in_file_manager, safe_save, unique_copy_path,
+        read_utf8_bounded, reconcile_buffer, resolve_target, reveal_in_file_manager, safe_save,
+        unique_copy_path,
     },
     git::{
         controller::{DiffArea, GitCommand, GitController, GitEvent},
@@ -126,7 +127,7 @@ use crate::{
     tree_surface::{TreeRow, TreeSurface},
     vim::{
         ExCommand, SearchDirection as VimSearchDirection, VimMode, VimRequest, VimSession,
-        VimState, parse_ex,
+        VimState, VimTextIndex, parse_ex,
     },
 };
 
@@ -523,6 +524,57 @@ fn tool_contains_diff(tool: &crate::agent::controller::ToolActivity) -> bool {
     })
 }
 
+fn agent_terminal_output(tool: &crate::agent::controller::ToolActivity) -> Option<String> {
+    let detail = tool.detail.as_ref()?;
+    let terminal = agent_tool_is_terminal(tool);
+    let mut output = String::new();
+    for content in &detail.content {
+        match content {
+            ToolOutput::Log { label, text } if label.eq_ignore_ascii_case("Terminal output") => {
+                output.push_str(text);
+            }
+            ToolOutput::Text(text) if terminal => output.push_str(text),
+            _ => {}
+        }
+    }
+    if output.is_empty()
+        && let Some(raw) = detail.output.as_deref()
+    {
+        output = serde_json::from_str::<serde_json::Value>(raw).map_or_else(
+            |_| raw.to_owned(),
+            |value| match value {
+                serde_json::Value::String(text) => text,
+                serde_json::Value::Object(fields) => {
+                    ["stdout", "stderr", "output", "content", "text"]
+                        .into_iter()
+                        .filter_map(|key| fields.get(key).and_then(serde_json::Value::as_str))
+                        .collect()
+                }
+                _ => String::new(),
+            },
+        );
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn agent_tool_is_terminal(tool: &crate::agent::controller::ToolActivity) -> bool {
+    tool.command().is_some()
+        || tool
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Execute"))
+        || tool.detail.as_ref().is_some_and(|detail| {
+            detail.content.iter().any(|content| {
+                matches!(content, ToolOutput::Terminal(_))
+                    || matches!(
+                        content,
+                        ToolOutput::Log { label, .. }
+                            if label.eq_ignore_ascii_case("Terminal output")
+                    )
+            })
+        })
+}
+
 /// A tool card counts as a subagent when the ACP tool call advertised the
 /// `Task` kind or when a `cursor/task` notification supplied task content.
 fn tool_is_subagent(tool: &crate::agent::controller::ToolActivity) -> bool {
@@ -567,6 +619,11 @@ fn agent_path_link(
 const ASSISTANT_IMAGE_PREVIEW_EDGE: u32 = 640;
 const ASSISTANT_IMAGE_LIGHTBOX_EDGE: u32 = 4_096;
 const ASSISTANT_IMAGE_PREVIEW_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const ASSISTANT_IMAGE_CACHE_MAX_ENTRIES: usize = 64;
+const ASSISTANT_IMAGE_CACHE_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+const ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES: u64 = 300;
+const ASSISTANT_IMAGE_PATH_RECHECK: Duration = Duration::from_secs(1);
+const AGENTIC_DIFF_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const ASSISTANT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(240.0, 180.0);
 const ASSISTANT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0);
 
@@ -574,6 +631,252 @@ const ASSISTANT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0)
 enum AssistantImagePreview {
     Unavailable,
     Loaded(egui::TextureHandle),
+}
+
+#[derive(Clone, Copy)]
+enum AssistantImageCacheKey<'a> {
+    Bytes {
+        ctx: &'a egui::Context,
+        data: &'a [u8],
+        identity: usize,
+        max_edge: u32,
+    },
+    Path {
+        ctx: &'a egui::Context,
+        path: &'a Path,
+        modified: Option<SystemTime>,
+        len: u64,
+        max_edge: u32,
+    },
+}
+
+impl Hash for AssistantImageCacheKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Bytes {
+                identity,
+                data,
+                max_edge,
+                ..
+            } => {
+                0_u8.hash(state);
+                identity.hash(state);
+                data.len().hash(state);
+                max_edge.hash(state);
+            }
+            Self::Path {
+                path,
+                modified,
+                len,
+                max_edge,
+                ..
+            } => {
+                1_u8.hash(state);
+                path.hash(state);
+                modified.hash(state);
+                len.hash(state);
+                max_edge.hash(state);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct AssistantImageCache {
+    generation: u64,
+    entries: HashMap<u64, (u64, usize, AssistantImagePreview)>,
+}
+
+impl AssistantImageCache {
+    fn get(&mut self, key: u64) -> Option<AssistantImagePreview> {
+        let (generation, _, preview) = self.entries.get_mut(&key)?;
+        *generation = self.generation;
+        Some(preview.clone())
+    }
+
+    fn insert(&mut self, key: u64, preview: AssistantImagePreview) {
+        let bytes = match &preview {
+            AssistantImagePreview::Unavailable => 0,
+            AssistantImagePreview::Loaded(texture) => texture.size()[0]
+                .saturating_mul(texture.size()[1])
+                .saturating_mul(4),
+        };
+        self.entries.insert(key, (self.generation, bytes, preview));
+        while self.entries.len() > ASSISTANT_IMAGE_CACHE_MAX_ENTRIES
+            || self
+                .entries
+                .values()
+                .fold(0_usize, |total, (_, bytes, _)| total.saturating_add(*bytes))
+                > ASSISTANT_IMAGE_CACHE_MAX_DECODED_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (generation, _, _))| generation)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+impl CacheTrait for AssistantImageCache {
+    fn update(&mut self) {
+        let generation = self.generation;
+        self.entries.retain(|_, (used_generation, _, _)| {
+            generation.saturating_sub(*used_generation) <= ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES
+        });
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Default)]
+struct AssistantImagePathCache {
+    generation: u64,
+    entries: HashMap<(PathBuf, u32), AssistantImagePathEntry>,
+}
+
+type AssistantImagePathEntry = (u64, Instant, Option<SystemTime>, u64);
+
+impl AssistantImagePathCache {
+    fn fingerprint_at(
+        &mut self,
+        path: &Path,
+        max_edge: u32,
+        now: Instant,
+    ) -> (Option<SystemTime>, u64) {
+        let key = (path.to_path_buf(), max_edge);
+        if !self.entries.contains_key(&key) {
+            if self.entries.len() >= ASSISTANT_IMAGE_CACHE_MAX_ENTRIES
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (generation, _, _, _))| generation)
+                    .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+            let (modified, len) = assistant_image_path_fingerprint(path);
+            self.entries
+                .insert(key.clone(), (self.generation, now, modified, len));
+        }
+        let (generation, checked, modified, len) = self.entries.get_mut(&key).unwrap();
+        *generation = self.generation;
+        if now.saturating_duration_since(*checked) >= ASSISTANT_IMAGE_PATH_RECHECK {
+            (*modified, *len) = assistant_image_path_fingerprint(path);
+            *checked = now;
+        }
+        (*modified, *len)
+    }
+}
+
+impl CacheTrait for AssistantImagePathCache {
+    fn update(&mut self) {
+        let generation = self.generation;
+        self.entries.retain(|_, (used_generation, _, _, _)| {
+            generation.saturating_sub(*used_generation) <= ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES
+        });
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn assistant_image_path_fingerprint(path: &Path) -> (Option<SystemTime>, u64) {
+    let metadata = fs::metadata(path).ok();
+    (
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        metadata.as_ref().map_or(0, fs::Metadata::len),
+    )
+}
+
+fn load_cached_assistant_image(key: AssistantImageCacheKey<'_>) -> AssistantImagePreview {
+    let loaded = match key {
+        AssistantImageCacheKey::Bytes {
+            ctx,
+            data,
+            identity,
+            max_edge,
+        } => load_assistant_image_bytes(
+            ctx,
+            &format!(
+                "{}_{identity:x}_{}",
+                if max_edge == ASSISTANT_IMAGE_PREVIEW_EDGE {
+                    "agent_embedded_image"
+                } else {
+                    "agent_image_lightbox"
+                },
+                data.len()
+            ),
+            data,
+            max_edge,
+        ),
+        AssistantImageCacheKey::Path {
+            ctx,
+            path,
+            max_edge,
+            ..
+        } => load_assistant_image_path(ctx, path, max_edge),
+    };
+    loaded.map_or(
+        AssistantImagePreview::Unavailable,
+        AssistantImagePreview::Loaded,
+    )
+}
+
+fn cached_assistant_image(key: AssistantImageCacheKey<'_>) -> Option<egui::TextureHandle> {
+    let ctx = match key {
+        AssistantImageCacheKey::Bytes { ctx, .. } | AssistantImageCacheKey::Path { ctx, .. } => ctx,
+    };
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let hash = hasher.finish();
+    let preview = ctx
+        .memory_mut(|memory| memory.caches.cache::<AssistantImageCache>().get(hash))
+        .unwrap_or_else(|| {
+            let preview = load_cached_assistant_image(key);
+            ctx.memory_mut(|memory| {
+                memory
+                    .caches
+                    .cache::<AssistantImageCache>()
+                    .insert(hash, preview.clone());
+            });
+            preview
+        });
+    match preview {
+        AssistantImagePreview::Unavailable => None,
+        AssistantImagePreview::Loaded(texture) => Some(texture),
+    }
+}
+
+fn cached_assistant_image_path(
+    ctx: &egui::Context,
+    path: &Path,
+    max_edge: u32,
+) -> Option<egui::TextureHandle> {
+    let (modified, len) = ctx.memory_mut(|memory| {
+        memory
+            .caches
+            .cache::<AssistantImagePathCache>()
+            .fingerprint_at(path, max_edge, Instant::now())
+    });
+    cached_assistant_image(AssistantImageCacheKey::Path {
+        ctx,
+        path,
+        modified,
+        len,
+        max_edge,
+    })
 }
 
 fn assistant_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> egui::Response {
@@ -622,25 +925,12 @@ fn assistant_embedded_image_texture(
     ui: &mut egui::Ui,
     data: &Arc<[u8]>,
 ) -> Option<egui::TextureHandle> {
-    let cache_id = Id::new(("agent_embedded_image", data.as_ptr() as usize, data.len()));
-    let cached = ui.data(|state| state.get_temp::<AssistantImagePreview>(cache_id));
-    let cached = cached.unwrap_or_else(|| {
-        let name = format!(
-            "agent_embedded_image_{:x}_{}",
-            data.as_ptr() as usize,
-            data.len()
-        );
-        let loaded = load_assistant_image_preview_bytes(ui.ctx(), &name, data).map_or(
-            AssistantImagePreview::Unavailable,
-            AssistantImagePreview::Loaded,
-        );
-        ui.data_mut(|state| state.insert_temp(cache_id, loaded.clone()));
-        loaded
-    });
-    match cached {
-        AssistantImagePreview::Unavailable => None,
-        AssistantImagePreview::Loaded(texture) => Some(texture),
-    }
+    cached_assistant_image(AssistantImageCacheKey::Bytes {
+        ctx: ui.ctx(),
+        data,
+        identity: data.as_ptr() as usize,
+        max_edge: ASSISTANT_IMAGE_PREVIEW_EDGE,
+    })
 }
 
 fn assistant_embedded_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option<egui::Response> {
@@ -674,27 +964,11 @@ fn assistant_prompt_image_preview(ui: &mut egui::Ui, data: &Arc<[u8]>) -> Option
     Some(response)
 }
 
-/// Inline preview for a generated image. The decode happens once on first
-/// expand and is cached (including failures) so a frame never re-reads disk.
+/// Inline preview for a generated image. Visible previews are cached between
+/// frames and invalidated when the file changes.
 fn agent_generated_image_preview(ui: &mut egui::Ui, path: &Path) -> Option<egui::Response> {
-    let cache_id = Id::new(("agent_generated_image", path));
-    let cached = ui.data(|data| data.get_temp::<AssistantImagePreview>(cache_id));
-    let cached = cached.unwrap_or_else(|| {
-        let loaded = load_assistant_image_preview(ui.ctx(), path).map_or(
-            AssistantImagePreview::Unavailable,
-            AssistantImagePreview::Loaded,
-        );
-        ui.data_mut(|data| data.insert_temp(cache_id, loaded.clone()));
-        loaded
-    });
-    match cached {
-        AssistantImagePreview::Unavailable => None,
-        AssistantImagePreview::Loaded(texture) => Some(assistant_image_thumbnail(ui, &texture)),
-    }
-}
-
-fn load_assistant_image_preview(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-    load_assistant_image_path(ctx, path, ASSISTANT_IMAGE_PREVIEW_EDGE)
+    let texture = cached_assistant_image_path(ui.ctx(), path, ASSISTANT_IMAGE_PREVIEW_EDGE)?;
+    Some(assistant_image_thumbnail(ui, &texture))
 }
 
 fn load_assistant_image_path(
@@ -711,14 +985,6 @@ fn load_assistant_image_path(
         .with_guessed_format()
         .ok()?;
     decode_assistant_image_preview(ctx, path.display().to_string(), reader, max_edge)
-}
-
-fn load_assistant_image_preview_bytes(
-    ctx: &egui::Context,
-    name: &str,
-    bytes: &[u8],
-) -> Option<egui::TextureHandle> {
-    load_assistant_image_bytes(ctx, name, bytes, ASSISTANT_IMAGE_PREVIEW_EDGE)
 }
 
 fn load_assistant_image_bytes(
@@ -742,6 +1008,7 @@ fn decode_assistant_image_preview<R: BufRead + Seek>(
     mut reader: image::ImageReader<R>,
     max_edge: u32,
 ) -> Option<egui::TextureHandle> {
+    let max_edge = max_edge.min(ctx.input(|input| input.max_texture_side) as u32);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
@@ -1582,6 +1849,185 @@ fn agent_collapsing_header(
     });
 }
 
+#[expect(clippy::too_many_arguments)]
+fn agent_subagent_card(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    title: &str,
+    subtitle: Option<&str>,
+    status: Option<&str>,
+    width: f32,
+    search: Option<(&str, Option<usize>)>,
+    has_body: bool,
+    add_body: impl FnOnce(&mut egui::Ui),
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    if has_body && search.is_some() {
+        state.set_open(true);
+    }
+    let frame = egui::Frame::new()
+        .fill(theme::surface().input)
+        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .corner_radius(8);
+    let content_width = (width - frame.total_margin().sum().x).max(0.0);
+    let card = frame.show(ui, |ui| {
+        ui.set_width(content_width);
+        let subtitle = subtitle.filter(|subtitle| !subtitle.is_empty());
+        let (header, response) = ui.allocate_exact_size(
+            egui::vec2(content_width, if subtitle.is_some() { 46.0 } else { 40.0 }),
+            if has_body {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        if has_body && response.clicked() {
+            state.toggle(ui);
+            ui.ctx().request_discard("subagent card disclosure changed");
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                if has_body {
+                    egui::WidgetType::CollapsingHeader
+                } else {
+                    egui::WidgetType::Label
+                },
+                ui.is_enabled(),
+                state.is_open(),
+                title,
+            )
+        });
+
+        let text_left = header.left() + 28.0;
+
+        let (status_label, status_color) = match status.unwrap_or_default() {
+            "Completed" => ("", theme::ink(theme::semantic().success)),
+            "InProgress" | "Pending" => ("Running", theme::accent()),
+            "Failed" => ("Failed", theme::ink(theme::semantic().danger)),
+            "Cancelled" => ("Cancelled", theme::text().muted),
+            _ => ("", theme::text().muted),
+        };
+        let status = ui.painter().layout_no_wrap(
+            status_label.into(),
+            theme::typography::small_strong(),
+            status_color,
+        );
+        let chevron_width = if has_body { 20.0 } else { 0.0 };
+        let status_right = header.right() - chevron_width;
+        let title_right = if status_label.is_empty() {
+            status_right
+        } else {
+            status_right - status.size().x - theme::space::SMALL
+        };
+        let mut title_job = agent_text_job(
+            title,
+            (title_right - text_left).max(0.0),
+            theme::typography::strong(),
+            theme::text().primary,
+            search,
+        );
+        title_job.wrap.max_rows = 1;
+        title_job.wrap.overflow_character = Some('…');
+        let title = ui.painter().layout_job(title_job);
+        let title_height = title.size().y;
+        let subtitle = subtitle.map(|subtitle| {
+            let mut job = agent_text_job(
+                subtitle,
+                (title_right - text_left).max(0.0),
+                theme::typography::small(),
+                theme::text().muted,
+                search,
+            );
+            job.wrap.max_rows = 1;
+            job.wrap.overflow_character = Some('…');
+            ui.painter().layout_job(job)
+        });
+        let text_height = title_height
+            + subtitle
+                .as_ref()
+                .map_or(0.0, |subtitle| 3.0 + subtitle.size().y);
+        let text_top = header.center().y - text_height * 0.5;
+        let title_center_y = text_top + title_height * 0.5;
+
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(header.left() + 9.0, title_center_y),
+            egui::Vec2::splat(icons::GRID),
+        );
+        icons::paint(ui.painter(), Icon::Robot, icon, theme::accent());
+        if !status_label.is_empty() {
+            ui.painter().galley(
+                egui::pos2(
+                    status_right - status.size().x,
+                    title_center_y - status.size().y * 0.5,
+                ),
+                status.clone(),
+                status_color,
+            );
+        }
+        if has_body {
+            icons::paint(
+                ui.painter(),
+                if state.is_open() {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                egui::Rect::from_center_size(
+                    egui::pos2(header.right() - 7.0, title_center_y),
+                    egui::Vec2::splat(icons::GRID * 0.7),
+                ),
+                theme::text().muted,
+            );
+        }
+        ui.painter().galley(
+            egui::pos2(text_left, text_top),
+            title,
+            theme::text().primary,
+        );
+        if let Some(subtitle) = subtitle {
+            ui.painter().galley(
+                egui::pos2(text_left, text_top + title_height + 3.0),
+                subtitle,
+                theme::text().muted,
+            );
+        }
+        if response.has_focus() {
+            icons::focus_ring(ui.painter(), header, 6);
+        }
+
+        if has_body {
+            state.show_body_unindented(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 28,
+                        right: 24,
+                        top: 0,
+                        bottom: 2,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        add_body(ui);
+                    });
+            });
+        }
+        state.store(ui.ctx());
+    });
+    if status == Some("Completed") {
+        icons::paint(
+            ui.painter(),
+            Icon::Check,
+            egui::Rect::from_center_size(
+                card.response.rect.right_bottom() - egui::vec2(13.0, 13.0),
+                egui::Vec2::splat(14.0),
+            ),
+            theme::ink(theme::semantic().success),
+        );
+    }
+}
+
 fn assistant_dense_disclosure_row(
     ui: &mut egui::Ui,
     id: Id,
@@ -1699,16 +2145,15 @@ struct DenseAgentWorkCluster {
 }
 
 fn dense_agent_work_item(item: &TranscriptItem) -> bool {
-    matches!(
-        item,
-        TranscriptItem::Thought(_) | TranscriptItem::Plan(_) | TranscriptItem::Tool(_)
-    ) || matches!(
-        item,
-        TranscriptItem::Content {
-            role: ContentRole::Thought,
-            ..
-        }
-    )
+    matches!(item, TranscriptItem::Thought(_) | TranscriptItem::Plan(_))
+        || matches!(
+            item,
+            TranscriptItem::Content {
+                role: ContentRole::Thought,
+                ..
+            }
+        )
+        || matches!(item, TranscriptItem::Tool(tool) if !tool_is_subagent(tool))
 }
 
 fn dense_agent_gap_after_item(
@@ -2634,6 +3079,22 @@ fn draw_agent_pane_controls(
     (close.clicked(), drag.drag_started() || drag.dragged())
 }
 
+fn draw_agent_pane_badge(ui: &mut egui::Ui, rect: egui::Rect, number: usize, id: Id) {
+    let label = format!("P{number}");
+    ui.interact(rect, id, Sense::hover()).widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label.clone())
+    });
+    ui.painter()
+        .rect_filled(rect, rect.height() * 0.5, theme::accent());
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme::typography::micro(),
+        theme::text().on_accent,
+    );
+}
+
 fn devin_toggle_rect(header: egui::Rect, agent_open: bool) -> egui::Rect {
     let agent = agent_toggle_rect(header);
     if agent_open {
@@ -2740,9 +3201,11 @@ fn agent_menu_rect(
     item_count: usize,
     row_height: f32,
     vertical_padding: f32,
+    max_content_height: f32,
 ) -> egui::Rect {
     let width = AGENT_MENU_WIDTH.min((transcript.width() - 12.0).max(1.0));
-    let desired_height = 2.0 * vertical_padding + (item_count as f32 * row_height).min(280.0);
+    let desired_height =
+        2.0 * vertical_padding + (item_count as f32 * row_height).min(max_content_height);
     let bottom = anchor.top() - 4.0;
     let height = desired_height.min((bottom - transcript.top() - 8.0).max(1.0));
     let left = anchor.left().clamp(
@@ -3004,9 +3467,10 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                             new_text,
                         } => {
                             let _ = writeln!(text, "{}", path.display());
-                            for line in &build_agent_diff(old_text.as_deref(), new_text).lines {
-                                let _ = writeln!(text, "{}", line.text);
+                            if let Some(old_text) = old_text {
+                                let _ = writeln!(text, "{old_text}");
                             }
+                            let _ = writeln!(text, "{new_text}");
                         }
                         ToolOutput::Terminal(id) => {
                             let _ = writeln!(text, "Terminal {id}");
@@ -3358,13 +3822,14 @@ struct GalleyKey {
 type MarkdownLayoutCache = Option<((u64, u32, u64), Arc<egui::Galley>)>;
 
 #[derive(Clone)]
-struct GitDiffTab {
+struct GitDiffPreview {
     repository: PathBuf,
     path: PathBuf,
     area: DiffArea,
     old: Option<String>,
     new: String,
     generation: u64,
+    content_revision: u64,
     unsaved_editor_changes: bool,
 }
 
@@ -3379,7 +3844,6 @@ struct FileTab {
     /// against the live buffer) instead of the editor. `None` inside means
     /// the agent created the file, so every line shows as added.
     agent_diff: Option<Option<String>>,
-    git_diff: Option<GitDiffTab>,
     vim: VimState,
 }
 
@@ -3499,6 +3963,7 @@ struct AgenticDiff {
     path: PathBuf,
     baseline: Option<String>,
     text: String,
+    error: Option<String>,
 }
 
 struct AssistantComposerAttachment {
@@ -3644,6 +4109,9 @@ struct WorkspaceFilePicker {
     purpose: FilePickerPurpose,
     directory: PathBuf,
     entries: Vec<TreeEntry>,
+    entries_revision: u64,
+    visible_key: Option<(u64, FilePickerPurpose, bool, String)>,
+    visible_indices: Arc<[usize]>,
     selected: HashSet<PathBuf>,
     query: String,
     focus_search: bool,
@@ -3680,6 +4148,9 @@ impl WorkspaceFilePicker {
             purpose: FilePickerPurpose::AttachFiles,
             directory,
             entries,
+            entries_revision: 0,
+            visible_key: None,
+            visible_indices: Arc::from([]),
             selected: HashSet::new(),
             query: String::new(),
             focus_search: true,
@@ -3704,6 +4175,7 @@ impl WorkspaceFilePicker {
         };
         self.directory = directory;
         self.entries = entries;
+        self.entries_revision = self.entries_revision.wrapping_add(1);
         self.query.clear();
         self.focus_search = true;
         self.cursor = None;
@@ -3755,6 +4227,7 @@ impl WorkspaceFilePicker {
         match read_directory(&self.directory) {
             Ok(entries) => {
                 self.entries = entries;
+                self.entries_revision = self.entries_revision.wrapping_add(1);
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
@@ -3768,6 +4241,30 @@ impl WorkspaceFilePicker {
         }
     }
 
+    fn visible_entry_indices(&mut self) -> Arc<[usize]> {
+        let query = self.query.trim().to_lowercase();
+        let key = (self.entries_revision, self.purpose, self.show_hidden, query);
+        if self.visible_key.as_ref() != Some(&key) {
+            self.visible_indices = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_dir || self.purpose == FilePickerPurpose::AttachFiles)
+                .filter(|(_, entry)| {
+                    self.show_hidden || !entry.name.to_string_lossy().starts_with('.')
+                })
+                .filter(|(_, entry)| {
+                    key.3.is_empty() || entry.name.to_string_lossy().to_lowercase().contains(&key.3)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+                .into();
+            self.visible_key = Some(key);
+        }
+        Arc::clone(&self.visible_indices)
+    }
+
+    #[cfg(test)]
     fn visible_entries(&self) -> Vec<TreeEntry> {
         let query = self.query.trim().to_lowercase();
         self.entries
@@ -4518,7 +5015,6 @@ impl FileTab {
             markdown_preview: false,
             markdown_layout: None,
             agent_diff: None,
-            git_diff: None,
             vim: VimState::default(),
         }
     }
@@ -4554,6 +5050,7 @@ pub struct EditorApp {
     sidebar_width: f32,
     sidebar_dragging: bool,
     git_state: GitState,
+    git_diff: Option<GitDiffPreview>,
     git_controller: Option<GitController>,
     git_refresh_at: Option<Instant>,
     git_discard: Option<GitDiscardRequest>,
@@ -4586,21 +5083,24 @@ pub struct EditorApp {
     devin_view: DevinView,
     devin_scope: DevinScope,
     devin_filter: String,
-    devin_server_filters: SessionFilters,
-    devin_filter_tags: String,
+    devin_visible_sessions_key: Option<(u64, DevinScope, String)>,
+    devin_visible_session_indices: Arc<[usize]>,
+    devin_stream_key: Option<(u64, u64, u64)>,
+    devin_stream: Arc<[DevinStreamItem]>,
+    devin_stream_heights_key: (u32, u64, u64, u64, u64),
+    devin_stream_heights: Vec<f32>,
+    devin_stream_rendered: usize,
+    devin_stream_culling: bool,
     devin_resource_query: String,
     devin_resource_filter: String,
-    devin_advanced: DevinAdvancedDraft,
     devin_resource_draft: DevinResourceDraft,
     devin_tags: String,
     devin_activity_query: String,
     devin_list_cursor: usize,
     devin_focus_list: bool,
-    devin_focus_create: bool,
     devin_focus_detail: bool,
     devin_repository: String,
-    devin_create_prompt: String,
-    devin_creating: bool,
+    devin_parent_session_id: Option<String>,
     devin_message: String,
     devin_attachments: Vec<AssistantComposerAttachment>,
     devin_drop_hovered: bool,
@@ -4649,6 +5149,8 @@ pub struct EditorApp {
     scm_focused: bool,
     tree_prompt: Option<TreePrompt>,
     tree_delete: Option<PathBuf>,
+    tree_copy_result: Arc<std::sync::Mutex<Option<Result<PathBuf, String>>>>,
+    tree_copying: bool,
     tree_clipboard: Option<TreeClipboard>,
     cursor: (usize, usize),
     pending: Option<PendingAction>,
@@ -4666,7 +5168,7 @@ pub struct EditorApp {
     settings_drafts: HashMap<PresetId, (String, String)>,
     update_check_started: bool,
     update_available: Arc<std::sync::atomic::AtomicBool>,
-    update_error: Arc<std::sync::Mutex<Option<String>>>,
+    background_error: Arc<std::sync::Mutex<Option<String>>>,
     keybinding_resolver: Resolver,
     keybinding_filter: KeybindingFilter,
     keybinding_category: Option<String>,
@@ -4762,6 +5264,7 @@ impl EditorApp {
             sidebar_width: 248.0,
             sidebar_dragging: false,
             git_state: GitState::default(),
+            git_diff: None,
             git_controller: None,
             git_refresh_at: None,
             git_discard: None,
@@ -4794,21 +5297,24 @@ impl EditorApp {
             devin_view: DevinView::default(),
             devin_scope: DevinScope::default(),
             devin_filter: String::new(),
-            devin_server_filters: SessionFilters::default(),
-            devin_filter_tags: String::new(),
+            devin_visible_sessions_key: None,
+            devin_visible_session_indices: Arc::from([]),
+            devin_stream_key: None,
+            devin_stream: Arc::from([]),
+            devin_stream_heights_key: (0, 0, 0, 0, 0),
+            devin_stream_heights: Vec::new(),
+            devin_stream_rendered: 0,
+            devin_stream_culling: !cfg!(test),
             devin_resource_query: String::new(),
             devin_resource_filter: String::new(),
-            devin_advanced: DevinAdvancedDraft::default(),
             devin_resource_draft: DevinResourceDraft::default(),
             devin_tags: String::new(),
             devin_activity_query: String::new(),
             devin_list_cursor: 0,
             devin_focus_list: false,
-            devin_focus_create: false,
             devin_focus_detail: false,
             devin_repository: String::new(),
-            devin_create_prompt: String::new(),
-            devin_creating: false,
+            devin_parent_session_id: None,
             devin_message: String::new(),
             devin_attachments: Vec::new(),
             devin_drop_hovered: false,
@@ -4851,6 +5357,8 @@ impl EditorApp {
             scm_focused: false,
             tree_prompt: None,
             tree_delete: None,
+            tree_copy_result: Arc::new(std::sync::Mutex::new(None)),
+            tree_copying: false,
             tree_clipboard: None,
             cursor: (1, 1),
             pending: None,
@@ -4863,7 +5371,7 @@ impl EditorApp {
             settings_open: false,
             update_check_started: false,
             update_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            update_error: Arc::new(std::sync::Mutex::new(None)),
+            background_error: Arc::new(std::sync::Mutex::new(None)),
             settings_section: SettingsSection::LanguageServers,
             settings_search: String::new(),
             settings,
@@ -4927,7 +5435,7 @@ impl EditorApp {
             Ok(child) => child,
             Err(error) => return self.show_error(error),
         };
-        let slot = Arc::clone(&self.update_error);
+        let slot = Arc::clone(&self.background_error);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let Ok(output) = child.wait_with_output() else {
@@ -4965,12 +5473,24 @@ impl EditorApp {
         let ctx = root.ctx().clone();
         self.start_update_check(&ctx);
         if let Some(error) = self
-            .update_error
+            .background_error
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
         {
             self.show_error(error);
+        }
+        let tree_copy = self
+            .tree_copy_result
+            .lock()
+            .ok()
+            .and_then(|mut result| result.take());
+        if let Some(result) = tree_copy {
+            self.tree_copying = false;
+            match result {
+                Ok(path) => self.refresh_tree(Some(path)),
+                Err(error) => self.show_error(error),
+            }
         }
         if self.agent_boot_pending {
             self.agent_boot_pending = false;
@@ -5587,7 +6107,9 @@ impl EditorApp {
                                     .color(theme::text().muted),
                             );
                             ui.label(
-                                RichText::new(if panel.baseline.is_some() {
+                                RichText::new(if panel.error.is_some() {
+                                    "UNAVAILABLE"
+                                } else if panel.baseline.is_some() {
                                     "MODIFIED"
                                 } else {
                                     "NEW FILE"
@@ -5603,16 +6125,22 @@ impl EditorApp {
                             .id_salt("agentic_diff_content")
                             .max_rect(rect.with_min_y(strip.bottom().min(rect.bottom()))),
                         |ui| {
-                            draw_agent_diff_body(
-                                ui,
-                                diff_id,
-                                &panel.path,
-                                &diff,
-                                panel.baseline.as_deref(),
-                                &panel.text,
-                                &self.highlighter,
-                                &self.syntaxes,
-                            );
+                            if let Some(error) = &panel.error {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(RichText::new(error).color(theme::text().muted));
+                                });
+                            } else {
+                                draw_agent_diff_body(
+                                    ui,
+                                    diff_id,
+                                    &panel.path,
+                                    &diff,
+                                    panel.baseline.as_deref(),
+                                    &panel.text,
+                                    &self.highlighter,
+                                    &self.syntaxes,
+                                );
+                            }
                         },
                     );
                 },
@@ -5755,10 +6283,7 @@ impl EditorApp {
             agent_mention_selected: std::mem::take(&mut self.agent_mention_selected),
             agent_find: std::mem::take(&mut self.agent_find),
             agent_transcript_heights: std::mem::take(&mut self.agent_transcript_heights),
-            agent_transcript_heights_key: std::mem::replace(
-                &mut self.agent_transcript_heights_key,
-                (0, 0, false, false, 0),
-            ),
+            agent_transcript_heights_key: std::mem::take(&mut self.agent_transcript_heights_key),
             agent_transcript_rendered: std::mem::take(&mut self.agent_transcript_rendered),
             agent_drop_hovered: std::mem::take(&mut self.agent_drop_hovered),
             agent_run_everything: self.agent_run_everything.take(),
@@ -5816,6 +6341,8 @@ impl EditorApp {
             return;
         }
         let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        runtime.agent.history_available = self.agent.history_available;
+        runtime.agent.sessions = self.agent.sessions.clone();
         runtime.agent.session_id = session_id;
         self.agent_pane_picker = None;
         if self.active_agent_pane == pane {
@@ -5845,10 +6372,38 @@ impl EditorApp {
             },
         )?;
         let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        runtime.agent.history_available = self.agent.history_available;
+        runtime.agent.sessions = self.agent.sessions.clone();
         runtime.agent.session_id = Some(session_id);
         self.agent_pane_runtimes.insert(pane, runtime);
         self.activate_agent_session_pane(pane);
         Some(pane)
+    }
+
+    fn agent_session_panes(&self) -> HashMap<String, Vec<usize>> {
+        let panes = self.agent_pane_layout.panes();
+        if panes.len() < 2 {
+            return HashMap::new();
+        }
+        let mut sessions = HashMap::<String, Vec<usize>>::new();
+        for (index, pane) in panes.into_iter().enumerate() {
+            let session_id = if pane == self.active_agent_pane {
+                self.agent.session_id.as_deref()
+            } else {
+                self.agent_pane_runtimes.get(&pane).and_then(|runtime| {
+                    (runtime.selected_provider == self.selected_provider)
+                        .then_some(runtime.agent.session_id.as_deref())
+                        .flatten()
+                })
+            };
+            if let Some(session_id) = session_id {
+                sessions
+                    .entry(session_id.to_owned())
+                    .or_default()
+                    .push(index + 1);
+            }
+        }
+        sessions
     }
 
     fn update_agent_session_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) {
@@ -5954,14 +6509,26 @@ impl EditorApp {
     ) {
         let header = assistant_sidebar_header(rect);
         paint_assistant_header_divider(ui.painter(), header);
+        let mut title_x = header.left() + 14.0;
+        let panes = self.agent_pane_layout.panes();
+        if panes.len() > 1
+            && let Some(index) = panes.iter().position(|candidate| *candidate == pane)
+        {
+            let badge = egui::Rect::from_center_size(
+                egui::pos2(title_x + 14.0, header.center().y),
+                egui::vec2(28.0, 18.0),
+            );
+            draw_agent_pane_badge(ui, badge, index + 1, Id::new(("agent_pane_badge", pane.0)));
+            title_x = badge.right() + theme::space::SMALL;
+        }
         ui.painter().text(
-            egui::pos2(header.left() + 14.0, header.center().y),
+            egui::pos2(title_x, header.center().y),
             Align2::LEFT_CENTER,
             "Open session",
             theme::typography::body(),
             theme::text().primary,
         );
-        if self.agent_pane_layout.panes().len() > 1 {
+        if panes.len() > 1 {
             let (close, dragging) =
                 draw_agent_pane_controls(ui, header, pane, "Open session", false);
             if close {
@@ -6117,6 +6684,7 @@ impl EditorApp {
         let mut add_project = false;
         let mut switch_to = None;
         let mut sessions_top = content.top();
+        let session_panes = self.agent_session_panes();
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agentic_session_content")
@@ -6213,14 +6781,19 @@ impl EditorApp {
                             Some(sessions) => {
                                 ui.spacing_mut().item_spacing.y = theme::space::HAIR;
                                 for session in sessions {
-                                    let selected = self.agent.session_id.as_deref()
-                                        == Some(session.id.as_str());
+                                    let pane_numbers = session_panes
+                                        .get(&session.id)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default();
+                                    let selected = !pane_numbers.is_empty()
+                                        || self.agent.session_id.as_deref()
+                                            == Some(session.id.as_str());
                                     let (open, remove, drag) = agent_session_row(
                                         ui,
                                         session,
-                                        self.selected_provider,
                                         selected,
                                         true,
+                                        pane_numbers,
                                     );
                                     if open {
                                         session_load = Some(session.id.clone());
@@ -6339,7 +6912,7 @@ impl EditorApp {
             }
         }
         if self.draw_file_tree_toggle(ui, file_tree_button) {
-            self.execute_keybinding(KeybindingCommand::ViewToggleExplorer, None, ui.ctx());
+            self.execute_keybinding(KeybindingCommand::ViewToggleSidebar, None, ui.ctx());
             self.sidebar_dragging = false;
         }
         if self.draw_terminal_toggle(ui, terminal_button) {
@@ -6377,6 +6950,9 @@ impl EditorApp {
             );
         } else {
             ui.painter().rect_filled(rect, 0.0, editor_background());
+        }
+        if self.git_diff.is_some() && pane == self.active_pane {
+            return (tabs_left, controls_right);
         }
         let active = self
             .pane_active_tabs
@@ -7143,8 +7719,12 @@ impl EditorApp {
     }
 
     fn draw_file_tree_toggle(&self, ui: &mut egui::Ui, button: egui::Rect) -> bool {
-        let active = self.sidebar && self.sidebar_pane == SidebarPane::Files;
-        let label = if active {
+        let active = self.sidebar && (self.agentic_mode || self.sidebar_pane == SidebarPane::Files);
+        let label = if self.agentic_mode && active {
+            "Hide Sessions"
+        } else if self.agentic_mode {
+            "Show Sessions"
+        } else if active {
             "Hide File Tree"
         } else {
             "Show File Tree"
@@ -7392,39 +7972,20 @@ impl EditorApp {
         let Some(source) = self.assistant_image_lightbox.clone() else {
             return;
         };
-        let cache_id = match &source {
-            AssistantImageSource::Bytes(data) => Id::new((
-                "agent_image_lightbox_bytes",
-                data.as_ptr() as usize,
-                data.len(),
-            )),
-            AssistantImageSource::Path(path) => Id::new(("agent_image_lightbox_path", path)),
-        };
-        let cached = ctx.data(|data| data.get_temp::<AssistantImagePreview>(cache_id));
-        let preview = cached.unwrap_or_else(|| {
-            let loaded = match &source {
-                AssistantImageSource::Bytes(data) => load_assistant_image_bytes(
+        let texture = match &source {
+            AssistantImageSource::Bytes(data) => {
+                cached_assistant_image(AssistantImageCacheKey::Bytes {
                     ctx,
-                    &format!(
-                        "agent_image_lightbox_{:x}_{}",
-                        data.as_ptr() as usize,
-                        data.len()
-                    ),
                     data,
-                    ASSISTANT_IMAGE_LIGHTBOX_EDGE,
-                ),
-                AssistantImageSource::Path(path) => {
-                    load_assistant_image_path(ctx, path, ASSISTANT_IMAGE_LIGHTBOX_EDGE)
-                }
-            };
-            let preview = loaded.map_or(
-                AssistantImagePreview::Unavailable,
-                AssistantImagePreview::Loaded,
-            );
-            ctx.data_mut(|data| data.insert_temp(cache_id, preview.clone()));
-            preview
-        });
-        let AssistantImagePreview::Loaded(texture) = preview else {
+                    identity: data.as_ptr() as usize,
+                    max_edge: ASSISTANT_IMAGE_LIGHTBOX_EDGE,
+                })
+            }
+            AssistantImageSource::Path(path) => {
+                cached_assistant_image_path(ctx, path, ASSISTANT_IMAGE_LIGHTBOX_EDGE)
+            }
+        };
+        let Some(texture) = texture else {
             self.assistant_image_lightbox = None;
             return;
         };
@@ -8079,6 +8640,18 @@ fn is_effort_config(id: &str, name: &str) -> bool {
     id.to_ascii_lowercase().contains("effort") || name.to_ascii_lowercase().contains("effort")
 }
 
+fn is_context_config(id: &str, name: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    matches!(
+        id.as_str(),
+        "context" | "context_length" | "context_window" | "max_context_tokens"
+    ) || (name.contains("context")
+        && ["length", "window", "token"]
+            .iter()
+            .any(|term| name.contains(term)))
+}
+
 fn is_fast_config(option: &ConfigChoice) -> bool {
     let named = [option.id.as_str(), option.name.as_str()]
         .iter()
@@ -8441,9 +9014,9 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
         Align2::LEFT_CENTER,
         name,
         if selected {
-            theme::typography::small_strong()
+            theme::typography::strong()
         } else {
-            theme::typography::small()
+            theme::typography::body()
         },
         if selected || response.hovered() {
             theme::text().primary
@@ -8457,9 +9030,9 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
 fn agent_session_row(
     ui: &mut egui::Ui,
     session: &SessionChoice,
-    provider: ProviderId,
     selected: bool,
     compact: bool,
+    pane_numbers: &[usize],
 ) -> (bool, bool, bool) {
     let label = session
         .title
@@ -8532,33 +9105,28 @@ fn agent_session_row(
     };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     let text_padding = theme::space::SMALL;
-    let origin_width = if session.started_in_editur { 0.0 } else { 18.0 };
-    if !session.started_in_editur {
-        let descriptor = provider_descriptor(provider);
-        let icon = egui::Rect::from_center_size(
-            egui::pos2(open.left() + text_padding + 6.0, open.center().y),
-            egui::vec2(12.0, 14.0),
+    let mut badge_right = remove.left() - theme::space::TIGHT;
+    for number in pane_numbers.iter().rev() {
+        let badge = egui::Rect::from_center_size(
+            egui::pos2(badge_right - 14.0, open.center().y),
+            egui::vec2(28.0, 18.0),
         );
-        let origin_label = format!("Started in {}", descriptor.display_name);
-        ui.interact(
-            icon,
-            Id::new(("agent_session_origin", &session.id, provider.as_str())),
-            Sense::hover(),
-        )
-        .widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Label,
-                ui.is_enabled(),
-                origin_label.clone(),
-            )
-        });
-        paint_provider_icon(ui.painter(), icon, descriptor.icon, theme::text().muted);
+        draw_agent_pane_badge(
+            ui,
+            badge,
+            *number,
+            Id::new(("agent_session_pane_badge", &session.id, number)),
+        );
+        badge_right = badge.left() - theme::space::TIGHT;
     }
     ui.painter()
-        .with_clip_rect(open.shrink2(egui::vec2(theme::space::TIGHT, 0.0)))
+        .with_clip_rect(
+            open.with_max_x(badge_right)
+                .shrink2(egui::vec2(theme::space::TIGHT, 0.0)),
+        )
         .galley(
             egui::pos2(
-                open.left() + text_padding + origin_width,
+                open.left() + text_padding,
                 open.center().y - galley.size().y * 0.5,
             ),
             galley,
@@ -9059,9 +9627,7 @@ fn presentation_job<'a>(
     bracket_overlay.unwrap_or(base)
 }
 
-/// Non-overlapping, ASCII-case-insensitive matches. Compares byte windows in
-/// place: this runs for every diff row during a search, so the two lowercase
-/// String copies the obvious version makes are too expensive.
+/// Non-overlapping, ASCII-case-insensitive matches in linear time.
 fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     if query.is_empty() || query.len() > text.len() {
@@ -9069,13 +9635,30 @@ fn match_spans(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     }
     let text = text.as_bytes();
     let query = query.as_bytes();
-    let mut cursor = 0;
-    while cursor + query.len() <= text.len() {
-        if text[cursor..cursor + query.len()].eq_ignore_ascii_case(query) {
-            spans.push(cursor..cursor + query.len());
-            cursor += query.len();
-        } else {
-            cursor += 1;
+
+    let mut prefix = vec![0; query.len()];
+    for index in 1..query.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && !query[index].eq_ignore_ascii_case(&query[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if query[index].eq_ignore_ascii_case(&query[matched]) {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut matched = 0;
+    for (index, byte) in text.iter().enumerate() {
+        while matched > 0 && !byte.eq_ignore_ascii_case(&query[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if byte.eq_ignore_ascii_case(&query[matched]) {
+            matched += 1;
+        }
+        if matched == query.len() {
+            spans.push(index + 1 - query.len()..index + 1);
+            matched = 0;
         }
     }
     spans
@@ -9092,5 +9675,7 @@ fn settings_preset_matches(preset: &crate::lsp::Preset, query: &str) -> bool {
         || preset.id.as_str().contains(query)
 }
 
+#[cfg(test)]
+mod performance;
 #[cfg(test)]
 mod tests;

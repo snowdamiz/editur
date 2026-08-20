@@ -264,6 +264,7 @@ pub(super) fn agent_diff_needed_lines(lines: &[AgentDiffLine]) -> (Vec<usize>, V
 
 #[derive(Clone, Default)]
 struct AgentDiffCache {
+    revision: Option<u64>,
     old_text: Option<String>,
     new_text: String,
     diff: Option<Arc<AgentDiff>>,
@@ -280,18 +281,46 @@ pub(super) fn cached_agent_diff(
     old_text: Option<&str>,
     new_text: &str,
 ) -> Arc<AgentDiff> {
+    cached_agent_diff_inner(ui, id, None, old_text, new_text)
+}
+
+pub(super) fn cached_agent_diff_revision(
+    ui: &mut egui::Ui,
+    id: Id,
+    revision: u64,
+    old_text: Option<&str>,
+    new_text: &str,
+) -> Arc<AgentDiff> {
+    cached_agent_diff_inner(ui, id, Some(revision), old_text, new_text)
+}
+
+fn cached_agent_diff_inner(
+    ui: &mut egui::Ui,
+    id: Id,
+    revision: Option<u64>,
+    old_text: Option<&str>,
+    new_text: &str,
+) -> Arc<AgentDiff> {
     let cache_id = id.with("model");
     let stale = ui.data_mut(|data| {
         let cache = data.get_temp_mut_or_default::<AgentDiffCache>(cache_id);
-        cache.diff.is_none() || cache.old_text.as_deref() != old_text || cache.new_text != new_text
+        cache.diff.is_none()
+            || revision.map_or_else(
+                || cache.old_text.as_deref() != old_text || cache.new_text != new_text,
+                |revision| cache.revision != Some(revision),
+            )
     });
     if stale {
         let diff = Arc::new(build_agent_diff(old_text, new_text));
         ui.data_mut(|data| {
             let cache = data.get_temp_mut_or_default::<AgentDiffCache>(cache_id);
-            cache.old_text = old_text.map(str::to_owned);
+            cache.revision = revision;
             cache.new_text.clear();
-            cache.new_text.push_str(new_text);
+            cache.old_text = None;
+            if revision.is_none() {
+                cache.old_text = old_text.map(str::to_owned);
+                cache.new_text.push_str(new_text);
+            }
             cache.diff = Some(diff);
         });
     }

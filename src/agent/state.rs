@@ -20,7 +20,7 @@ const MAX_TRANSCRIPT_ITEMS: usize = 2_048;
 const TRANSCRIPT_PAGE_ITEMS: usize = 256;
 const MAX_CHANGED_PATHS: usize = 4_096;
 const MAX_CHOICES: usize = 128;
-const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
 const MAX_BASELINE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -123,6 +123,7 @@ impl TranscriptArchive {
 
 struct SessionLoadBackup {
     transcript: VecDeque<TranscriptItem>,
+    transcript_bytes: usize,
     transcript_records: VecDeque<Option<ArchivedTranscriptItem>>,
     transcript_archive: TranscriptArchive,
     changed_paths: HashMap<PathBuf, FileChange>,
@@ -145,6 +146,7 @@ pub struct AgentState {
     pub goal_actions: Vec<String>,
     pub prompt: String,
     pub transcript: VecDeque<TranscriptItem>,
+    transcript_bytes: usize,
     transcript_records: VecDeque<Option<ArchivedTranscriptItem>>,
     transcript_archive: TranscriptArchive,
     transcript_streaming: bool,
@@ -192,6 +194,7 @@ impl Default for AgentState {
             goal_actions: Vec::new(),
             prompt: String::new(),
             transcript: VecDeque::new(),
+            transcript_bytes: 0,
             transcript_records: VecDeque::new(),
             transcript_archive: TranscriptArchive::default(),
             transcript_streaming: false,
@@ -233,26 +236,32 @@ impl AgentState {
     }
 
     pub fn decide_permission(&mut self, request_id: u64, option_id: &str) -> bool {
-        let Some(card) = self.transcript.iter_mut().find_map(|item| match item {
-            TranscriptItem::Permission(card) if card.request_id == request_id => Some(card),
-            _ => None,
-        }) else {
+        let Some(index) = self.transcript.iter().position(
+            |item| matches!(item, TranscriptItem::Permission(card) if card.request_id == request_id),
+        ) else {
+            return false;
+        };
+        let before = item_size(&self.transcript[index]);
+        let TranscriptItem::Permission(card) = &mut self.transcript[index] else {
             return false;
         };
         if card.selected.is_some() || !card.options.iter().any(|option| option.id == option_id) {
             return false;
         }
         card.selected = Some(option_id.to_owned());
+        let after = item_size(&self.transcript[index]);
+        self.replace_transcript_bytes(before, after);
         true
     }
 
     pub fn answer_interaction(&mut self, request_id: u64) -> bool {
-        let Some(card) = self.transcript.iter_mut().find_map(|item| match item {
-            TranscriptItem::Interaction(card) if card.request.request_id == request_id => {
-                Some(card)
-            }
-            _ => None,
-        }) else {
+        let Some(index) = self.transcript.iter().position(
+            |item| matches!(item, TranscriptItem::Interaction(card) if card.request.request_id == request_id),
+        ) else {
+            return false;
+        };
+        let before = item_size(&self.transcript[index]);
+        let TranscriptItem::Interaction(card) = &mut self.transcript[index] else {
             return false;
         };
         if card.answered {
@@ -264,6 +273,8 @@ impl AgentState {
             }
         }
         card.answered = true;
+        let after = item_size(&self.transcript[index]);
+        self.replace_transcript_bytes(before, after);
         true
     }
 
@@ -306,6 +317,7 @@ impl AgentState {
                 self.session_ready = true;
                 self.active = false;
                 self.transcript.clear();
+                self.transcript_bytes = 0;
                 self.transcript_records.clear();
                 self.transcript_archive = TranscriptArchive::default();
                 self.transcript_streaming = false;
@@ -334,6 +346,7 @@ impl AgentState {
             Event::SessionLoading { title } => {
                 self.session_load_backup = Some(SessionLoadBackup {
                     transcript: std::mem::take(&mut self.transcript),
+                    transcript_bytes: std::mem::take(&mut self.transcript_bytes),
                     transcript_records: std::mem::take(&mut self.transcript_records),
                     transcript_archive: std::mem::take(&mut self.transcript_archive),
                     changed_paths: std::mem::take(&mut self.changed_paths),
@@ -355,6 +368,7 @@ impl AgentState {
             Event::SessionLoadFailed => {
                 if let Some(backup) = self.session_load_backup.take() {
                     self.transcript = backup.transcript;
+                    self.transcript_bytes = backup.transcript_bytes;
                     self.transcript_records = backup.transcript_records;
                     self.transcript_archive = backup.transcript_archive;
                     self.changed_paths = backup.changed_paths;
@@ -391,6 +405,7 @@ impl AgentState {
                 self.session_ready = false;
                 self.active = false;
                 self.transcript.clear();
+                self.transcript_bytes = 0;
                 self.transcript_records.clear();
                 self.transcript_archive = TranscriptArchive::default();
                 self.changed_paths.clear();
@@ -407,6 +422,7 @@ impl AgentState {
                     self.session_ready = true;
                     self.active = false;
                     self.transcript.clear();
+                    self.transcript_bytes = 0;
                     self.transcript_records.clear();
                     self.transcript_archive = TranscriptArchive::default();
                     self.changed_paths.clear();
@@ -479,22 +495,42 @@ impl AgentState {
             }
             Event::AssistantDelta(text) => {
                 let text = bounded(text);
-                if let Some(TranscriptItem::Assistant(current)) = self.transcript.back_mut()
-                    && current.len() < MAX_ITEM_BYTES
-                    && !current.ends_with('…')
-                {
+                let current = self.transcript.len().checked_sub(1).filter(|index| {
+                    matches!(
+                        &self.transcript[*index],
+                        TranscriptItem::Assistant(current)
+                            if current.len() < MAX_ITEM_BYTES && !current.ends_with('…')
+                    )
+                });
+                if let Some(index) = current {
+                    let before = item_size(&self.transcript[index]);
+                    let TranscriptItem::Assistant(current) = &mut self.transcript[index] else {
+                        unreachable!();
+                    };
                     append_bounded(current, &text);
+                    let after = item_size(&self.transcript[index]);
+                    self.replace_transcript_bytes(before, after);
                 } else {
                     self.push(TranscriptItem::Assistant(text));
                 }
             }
             Event::ThoughtDelta(text) => {
                 let text = bounded(text);
-                if let Some(TranscriptItem::Thought(current)) = self.transcript.back_mut()
-                    && current.len() < MAX_ITEM_BYTES
-                    && !current.ends_with('…')
-                {
+                let current = self.transcript.len().checked_sub(1).filter(|index| {
+                    matches!(
+                        &self.transcript[*index],
+                        TranscriptItem::Thought(current)
+                            if current.len() < MAX_ITEM_BYTES && !current.ends_with('…')
+                    )
+                });
+                if let Some(index) = current {
+                    let before = item_size(&self.transcript[index]);
+                    let TranscriptItem::Thought(current) = &mut self.transcript[index] else {
+                        unreachable!();
+                    };
                     append_bounded(current, &text);
+                    let after = item_size(&self.transcript[index]);
+                    self.replace_transcript_bytes(before, after);
                 } else {
                     self.push(TranscriptItem::Thought(text));
                 }
@@ -506,7 +542,7 @@ impl AgentState {
             Event::PlanUpdated(plan) => {
                 let plan = plan
                     .into_iter()
-                    .take(MAX_TRANSCRIPT_ITEMS)
+                    .take(MAX_CHOICES)
                     .map(|item| PlanItem {
                         content: bounded(item.content),
                         status: bounded(item.status),
@@ -518,13 +554,17 @@ impl AgentState {
                     .rev()
                     .position(|item| matches!(item, TranscriptItem::User(_)))
                     .map_or(0, |distance| self.transcript.len() - distance);
-                if let Some(TranscriptItem::Plan(current)) = self
+                if let Some(index) = self
                     .transcript
-                    .iter_mut()
+                    .iter()
                     .skip(turn_start)
-                    .find(|item| matches!(item, TranscriptItem::Plan(_)))
+                    .position(|item| matches!(item, TranscriptItem::Plan(_)))
+                    .map(|index| turn_start + index)
                 {
-                    *current = plan;
+                    let before = item_size(&self.transcript[index]);
+                    self.transcript[index] = TranscriptItem::Plan(plan);
+                    let after = item_size(&self.transcript[index]);
+                    self.replace_transcript_bytes(before, after);
                 } else {
                     self.push(TranscriptItem::Plan(plan));
                 }
@@ -562,9 +602,13 @@ impl AgentState {
                         })
                     })
                     .collect::<Vec<_>>();
-                if let Some(TranscriptItem::Tool(current)) = self.transcript.iter_mut().rev().find(
+                if let Some(index) = self.transcript.iter().rposition(
                     |item| matches!(item, TranscriptItem::Tool(current) if current.id == tool.id),
                 ) {
+                    let before = item_size(&self.transcript[index]);
+                    let TranscriptItem::Tool(current) = &mut self.transcript[index] else {
+                        unreachable!();
+                    };
                     if let Some(title) = tool.title {
                         current.title = Some(bounded(title));
                     }
@@ -595,6 +639,16 @@ impl AgentState {
                                     .iter()
                                     .find(|content| matches!(content, ToolOutput::Task { .. }))
                                     .cloned();
+                                let subagent_logs = if task.is_some() {
+                                    current
+                                        .content
+                                        .iter()
+                                        .filter(|content| matches!(content, ToolOutput::Log { .. }))
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
                                 current.content = detail.content;
                                 if let Some(task) = task
                                     && !current
@@ -604,6 +658,24 @@ impl AgentState {
                                 {
                                     current.content.insert(0, task);
                                 }
+                                if current
+                                    .content
+                                    .iter()
+                                    .any(|content| matches!(content, ToolOutput::Task { .. }))
+                                {
+                                    let missing_logs = subagent_logs
+                                        .into_iter()
+                                        .filter(|old| {
+                                            let ToolOutput::Log { label, .. } = old else {
+                                                return false;
+                                            };
+                                            !current.content.iter().any(|new| {
+                                                matches!(new, ToolOutput::Log { label: current, .. } if current == label)
+                                            })
+                                        })
+                                        .collect();
+                                    merge_tool_logs(&mut current.content, missing_logs);
+                                }
                             }
                             if detail.output.is_some() {
                                 current.output = detail.output;
@@ -612,6 +684,8 @@ impl AgentState {
                             current.detail = Some(detail);
                         }
                     }
+                    let after = item_size(&self.transcript[index]);
+                    self.replace_transcript_bytes(before, after);
                 } else {
                     self.push(TranscriptItem::Tool(tool));
                 }
@@ -710,8 +784,16 @@ impl AgentState {
     }
 
     fn push(&mut self, item: TranscriptItem) {
+        self.transcript_bytes = self.transcript_bytes.saturating_add(item_size(&item));
         self.transcript.push_back(item);
         self.transcript_records.push_back(None);
+    }
+
+    fn replace_transcript_bytes(&mut self, before: usize, after: usize) {
+        self.transcript_bytes = self
+            .transcript_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
     }
 
     fn trim(&mut self) {
@@ -722,16 +804,14 @@ impl AgentState {
 
     fn trim_from_front(&mut self, keep_one: bool) -> Result<(), String> {
         self.sync_transcript_records();
-        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
         while self.transcript.len() > usize::from(keep_one)
-            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES)
+            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS
+                || self.transcript_bytes > MAX_TRANSCRIPT_BYTES)
         {
             if !self.front_can_be_archived() {
                 break;
             }
-            let size = self.transcript.front().map_or(0, item_size);
             self.archive_front()?;
-            bytes = bytes.saturating_sub(size);
         }
         Ok(())
     }
@@ -741,8 +821,7 @@ impl AgentState {
             return true;
         }
         match self.transcript.front() {
-            Some(TranscriptItem::Plan(_))
-            | Some(TranscriptItem::Permission(PermissionCard { selected: None, .. }))
+            Some(TranscriptItem::Permission(PermissionCard { selected: None, .. }))
             | Some(TranscriptItem::Interaction(InteractionCard {
                 answered: false, ..
             })) => false,
@@ -773,6 +852,7 @@ impl AgentState {
             };
             match self.transcript_archive.load(record) {
                 Ok(item) => {
+                    self.transcript_bytes = self.transcript_bytes.saturating_add(item_size(&item));
                     self.transcript.push_front(item);
                     self.transcript_records.push_front(Some(record));
                 }
@@ -797,6 +877,7 @@ impl AgentState {
             };
             match self.transcript_archive.load(record) {
                 Ok(item) => {
+                    self.transcript_bytes = self.transcript_bytes.saturating_add(item_size(&item));
                     self.transcript.push_back(item);
                     self.transcript_records.push_back(Some(record));
                 }
@@ -823,6 +904,7 @@ impl AgentState {
     }
 
     fn archive_front(&mut self) -> Result<(), String> {
+        let size = self.transcript.front().map_or(0, item_size);
         let record = match self.transcript_records.front().copied().flatten() {
             Some(record) => record,
             None => self
@@ -831,11 +913,13 @@ impl AgentState {
         };
         self.transcript.pop_front();
         self.transcript_records.pop_front();
+        self.transcript_bytes = self.transcript_bytes.saturating_sub(size);
         self.transcript_archive.earlier.push(record);
         Ok(())
     }
 
     fn archive_back(&mut self) -> Result<(), String> {
+        let size = self.transcript.back().map_or(0, item_size);
         let record = match self.transcript_records.back().copied().flatten() {
             Some(record) => record,
             None => self
@@ -844,18 +928,17 @@ impl AgentState {
         };
         self.transcript.pop_back();
         self.transcript_records.pop_back();
+        self.transcript_bytes = self.transcript_bytes.saturating_sub(size);
         self.transcript_archive.later.push(record);
         Ok(())
     }
 
     fn trim_from_back(&mut self) -> Result<(), String> {
-        let mut bytes = self.transcript.iter().map(item_size).sum::<usize>();
         while self.transcript.len() > 1
-            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES)
+            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS
+                || self.transcript_bytes > MAX_TRANSCRIPT_BYTES)
         {
-            let size = self.transcript.back().map_or(0, item_size);
             self.archive_back()?;
-            bytes = bytes.saturating_sub(size);
         }
         Ok(())
     }
@@ -864,11 +947,19 @@ impl AgentState {
     /// tool still pending or in progress can never complete and would show
     /// "Running" forever.
     fn finalize_running_tools(&mut self, status: &str) {
-        for item in &mut self.transcript {
-            if let TranscriptItem::Tool(tool) = item
+        for index in 0..self.transcript.len() {
+            let before = item_size(&self.transcript[index]);
+            let changed = if let TranscriptItem::Tool(tool) = &mut self.transcript[index]
                 && matches!(tool.status.as_deref(), Some("Pending" | "InProgress"))
             {
                 tool.status = Some(status.to_owned());
+                true
+            } else {
+                false
+            };
+            if changed {
+                let after = item_size(&self.transcript[index]);
+                self.replace_transcript_bytes(before, after);
             }
         }
     }

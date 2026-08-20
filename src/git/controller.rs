@@ -3,13 +3,14 @@ use std::{
     fs,
     io::{Read, Write as _},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::status::{
@@ -19,6 +20,7 @@ use super::status::{
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
 const DIFF_LIMIT: usize = 4 * 1024 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum DiffArea {
@@ -85,6 +87,7 @@ pub enum GitEvent {
 pub struct GitController {
     commands: SyncSender<GitCommand>,
     events: Receiver<GitEvent>,
+    shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -93,13 +96,18 @@ impl GitController {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
         let wake = Arc::new(wake);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
             .name("editur-git".into())
-            .spawn(move || Worker::new(workspace_root, event_tx, wake).run(command_rx))
+            .spawn(move || {
+                Worker::new(workspace_root, event_tx, wake, worker_shutdown).run(command_rx)
+            })
             .expect("failed to start Editur Git controller thread");
         Self {
             commands: command_tx,
             events: event_rx,
+            shutdown,
             worker: Some(worker),
         }
     }
@@ -117,26 +125,12 @@ impl GitController {
 
 impl Drop for GitController {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         let Some(worker) = self.worker.take() else {
             return;
         };
-        loop {
-            match self.commands.try_send(GitCommand::Shutdown) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => break,
-                Err(TrySendError::Full(_)) => {
-                    self.events.try_iter().for_each(drop);
-                    if worker.is_finished() {
-                        break;
-                    }
-                    thread::park_timeout(Duration::from_millis(1));
-                }
-            }
-        }
-        while !worker.is_finished() {
-            self.events.try_iter().for_each(drop);
-            thread::park_timeout(Duration::from_millis(1));
-        }
-        let _ = worker.join();
+        let _ = self.commands.try_send(GitCommand::Shutdown);
+        crate::reap_worker("editur-git-reaper", worker);
     }
 }
 
@@ -146,6 +140,7 @@ struct Worker {
     wake: Arc<dyn Fn() + Send + Sync>,
     generation: u64,
     repositories: Vec<RepositoryStatus>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -153,6 +148,7 @@ impl Worker {
         workspace_root: PathBuf,
         events: SyncSender<GitEvent>,
         wake: Arc<dyn Fn() + Send + Sync>,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             workspace_root,
@@ -160,11 +156,15 @@ impl Worker {
             wake,
             generation: 0,
             repositories: Vec::new(),
+            shutdown,
         }
     }
 
     fn run(mut self, commands: Receiver<GitCommand>) {
-        while let Ok(command) = commands.recv() {
+        while !self.shutdown.load(Ordering::Acquire) {
+            let Ok(command) = commands.recv() else {
+                return;
+            };
             match command {
                 GitCommand::Refresh => self.refresh(),
                 GitCommand::Init => {
@@ -241,23 +241,26 @@ impl Worker {
     }
 
     fn refresh(&mut self) {
-        if Command::new("git")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
+        if run_git(
+            &self.workspace_root,
+            &[OsString::from("--version")],
+            None,
+            Some(&self.shutdown),
+            64 * 1024,
+        )
+        .is_err()
         {
             self.emit(GitEvent::GitUnavailable);
             return;
         }
         self.generation = self.generation.wrapping_add(1);
-        let result = discover_repositories(&self.workspace_root).and_then(|roots| {
-            roots
-                .into_iter()
-                .map(|root| repository_status(&root))
-                .collect::<Result<Vec<_>, _>>()
-        });
+        let result = discover_repositories_with(&self.workspace_root, Some(&self.shutdown))
+            .and_then(|roots| {
+                roots
+                    .into_iter()
+                    .map(|root| repository_status(&root, Some(&self.shutdown)))
+                    .collect::<Result<Vec<_>, _>>()
+            });
         match result {
             Ok(repositories) => {
                 self.repositories.clone_from(&repositories);
@@ -275,6 +278,7 @@ impl Worker {
             &self.workspace_root,
             &[OsString::from("init")],
             None,
+            Some(&self.shutdown),
             64 * 1024,
         )
         .map(drop)
@@ -284,7 +288,7 @@ impl Worker {
         self.ensure_repository(repository)?;
         let mut args = vec![OsString::from("add"), OsString::from("--")];
         args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
-        run_git(repository, &args, None, 64 * 1024).map(drop)
+        run_git(repository, &args, None, Some(&self.shutdown), 64 * 1024).map(drop)
     }
 
     fn unstage(&self, repository: &Path, paths: &[PathBuf]) -> Result<(), String> {
@@ -305,7 +309,7 @@ impl Worker {
             ]
         };
         args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
-        run_git(repository, &args, None, 64 * 1024).map(drop)
+        run_git(repository, &args, None, Some(&self.shutdown), 64 * 1024).map(drop)
     }
 
     fn discard(&self, repository: &Path, paths: &[PathBuf]) -> Result<(), String> {
@@ -344,7 +348,7 @@ impl Worker {
             OsString::from("--"),
         ];
         args.extend(tracked.into_iter().map(|path| path.as_os_str().to_owned()));
-        run_git(repository, &args, None, 64 * 1024).map(drop)
+        run_git(repository, &args, None, Some(&self.shutdown), 64 * 1024).map(drop)
     }
 
     fn commit(&self, repository: &Path, message: &str) -> Result<(String, String), String> {
@@ -356,9 +360,11 @@ impl Worker {
             repository,
             &[OsString::from("commit"), OsString::from("--file=-")],
             Some(message.as_bytes()),
+            Some(&self.shutdown),
             64 * 1024,
         )?;
-        last_commit(repository)?.ok_or_else(|| "commit succeeded without a new commit".to_owned())
+        last_commit(repository, Some(&self.shutdown))?
+            .ok_or_else(|| "commit succeeded without a new commit".to_owned())
     }
 
     fn load_diff(
@@ -383,7 +389,10 @@ impl Worker {
                         .as_deref()
                         .filter(|_| entry.worktree == Some(ChangeKind::Renamed))
                         .unwrap_or(path);
-                    Some(git_show(repository, ":0:", old_path)?.unwrap_or_default())
+                    Some(
+                        git_show(repository, ":0:", old_path, Some(&self.shutdown))?
+                            .unwrap_or_default(),
+                    )
                 };
                 let new = if entry.worktree == Some(ChangeKind::Deleted) {
                     String::new()
@@ -401,12 +410,12 @@ impl Worker {
                         .as_deref()
                         .filter(|_| entry.index == Some(ChangeKind::Renamed))
                         .unwrap_or(path);
-                    git_show(repository, "HEAD:", old_path)?
+                    git_show(repository, "HEAD:", old_path, Some(&self.shutdown))?
                 };
                 let new = if entry.index == Some(ChangeKind::Deleted) {
                     String::new()
                 } else {
-                    git_show(repository, ":0:", path)?.unwrap_or_default()
+                    git_show(repository, ":0:", path, Some(&self.shutdown))?.unwrap_or_default()
                 };
                 (old, new)
             }
@@ -438,7 +447,12 @@ impl Worker {
     }
 }
 
-fn git_show(repository: &Path, prefix: &str, path: &Path) -> Result<Option<String>, String> {
+fn git_show(
+    repository: &Path,
+    prefix: &str,
+    path: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Option<String>, String> {
     let mut spec = OsString::from(prefix);
     spec.push(path.as_os_str());
     match run_git(
@@ -449,6 +463,7 @@ fn git_show(repository: &Path, prefix: &str, path: &Path) -> Result<Option<Strin
             spec,
         ],
         None,
+        shutdown,
         DIFF_LIMIT,
     ) {
         Ok(bytes) => Ok(Some(diff_text(bytes))),
@@ -483,7 +498,10 @@ fn is_diff_placeholder(text: &str) -> bool {
     matches!(text, "Binary file" | "File too large to diff")
 }
 
-fn repository_status(root: &Path) -> Result<RepositoryStatus, String> {
+fn repository_status(
+    root: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> Result<RepositoryStatus, String> {
     let output = run_git(
         root,
         &[
@@ -494,13 +512,14 @@ fn repository_status(root: &Path) -> Result<RepositoryStatus, String> {
             OsString::from("--untracked-files=all"),
         ],
         None,
+        shutdown,
         64 * 1024,
     )?;
     let parsed = parse_status(&output)?;
     let last_commit_subject = if matches!(parsed.branch, BranchInfo::Named { unborn: true, .. }) {
         None
     } else {
-        last_commit(root)?.map(|(hash, subject)| format!("{hash} {subject}"))
+        last_commit(root, shutdown)?.map(|(hash, subject)| format!("{hash} {subject}"))
     };
     Ok(RepositoryStatus {
         root: root.to_path_buf(),
@@ -512,7 +531,10 @@ fn repository_status(root: &Path) -> Result<RepositoryStatus, String> {
     })
 }
 
-fn last_commit(root: &Path) -> Result<Option<(String, String)>, String> {
+fn last_commit(
+    root: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Option<(String, String)>, String> {
     let output = run_git(
         root,
         &[
@@ -521,6 +543,7 @@ fn last_commit(root: &Path) -> Result<Option<(String, String)>, String> {
             OsString::from("--format=%h%x00%s"),
         ],
         None,
+        shutdown,
         64 * 1024,
     )?;
     if output.is_empty() {
@@ -538,9 +561,11 @@ fn run_git(
     root: &Path,
     args: &[OsString],
     input: Option<&[u8]>,
+    shutdown: Option<&AtomicBool>,
     stdout_limit: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(args)
@@ -550,30 +575,31 @@ fn run_git(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::configure_process_tree(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot run git: {error}"))?;
     if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "git stdin was not available".to_owned())?
-            .write_all(input)
-            .map_err(|error| format!("cannot write to git: {error}"))?;
+        let Some(mut stdin) = child.stdin.take() else {
+            crate::terminate_process_tree(&mut child);
+            let _ = child.wait();
+            return Err("git stdin was not available".into());
+        };
+        if let Err(error) = stdin.write_all(input) {
+            crate::terminate_process_tree(&mut child);
+            let _ = child.wait();
+            return Err(format!("cannot write to git: {error}"));
+        }
     }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "git stdout was not available".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "git stderr was not available".to_owned())?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        crate::terminate_process_tree(&mut child);
+        let _ = child.wait();
+        return Err("git output was not available".into());
+    };
     let stdout = thread::spawn(move || read_bounded(stdout, stdout_limit));
     let stderr = thread::spawn(move || read_bounded(stderr, 64 * 1024));
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for git: {error}"))?;
+    let status = wait_for_git(&mut child, shutdown, GIT_COMMAND_TIMEOUT);
     let (stdout, stdout_overflow) = stdout
         .join()
         .map_err(|_| "git stdout reader stopped".to_owned())?
@@ -582,6 +608,7 @@ fn run_git(
         .join()
         .map_err(|_| "git stderr reader stopped".to_owned())?
         .map_err(|error| format!("cannot read git stderr: {error}"))?;
+    let status = status?;
     if stdout_overflow {
         return Err("git output was too large".into());
     }
@@ -595,6 +622,37 @@ fn run_git(
         return Err(message);
     }
     Ok(stdout)
+}
+
+fn wait_for_git(
+    child: &mut Child,
+    shutdown: Option<&AtomicBool>,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if shutdown.is_some_and(|shutdown| shutdown.load(Ordering::Acquire)) {
+            crate::terminate_process_tree(child);
+            let _ = child.wait();
+            return Err("git command cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                crate::terminate_process_tree(child);
+                let _ = child.wait();
+                return Err("git command timed out".into());
+            }
+            Err(error) => {
+                crate::terminate_process_tree(child);
+                let _ = child.wait();
+                return Err(format!("cannot wait for git: {error}"));
+            }
+        }
+    }
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
@@ -614,19 +672,33 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>
 }
 
 pub fn discover_repositories(workspace_root: &Path) -> Result<Vec<PathBuf>, String> {
+    discover_repositories_with(workspace_root, None)
+}
+
+fn discover_repositories_with(
+    workspace_root: &Path,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<PathBuf>, String> {
     let mut repositories = Vec::new();
     if !git_marker(workspace_root)
-        && let Some(parent) = git_toplevel(workspace_root)
+        && let Some(parent) = git_toplevel(workspace_root, shutdown)
     {
         repositories.push(parent);
     }
-    scan_for_repositories(workspace_root, &mut repositories)?;
+    scan_for_repositories(workspace_root, &mut repositories, shutdown)?;
     repositories.sort();
     repositories.dedup();
     Ok(repositories)
 }
 
-fn scan_for_repositories(directory: &Path, repositories: &mut Vec<PathBuf>) -> Result<(), String> {
+fn scan_for_repositories(
+    directory: &Path,
+    repositories: &mut Vec<PathBuf>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<(), String> {
+    if shutdown.is_some_and(|shutdown| shutdown.load(Ordering::Acquire)) {
+        return Err("git command cancelled".into());
+    }
     if git_marker(directory) {
         repositories.push(directory.to_path_buf());
     }
@@ -647,7 +719,7 @@ fn scan_for_repositories(directory: &Path, repositories: &mut Vec<PathBuf>) -> R
         .collect::<Vec<_>>();
     children.sort();
     for child in children {
-        let _ = scan_for_repositories(&child, repositories);
+        let _ = scan_for_repositories(&child, repositories, shutdown);
     }
     Ok(())
 }
@@ -657,7 +729,7 @@ fn git_marker(directory: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
 }
 
-fn git_toplevel(directory: &Path) -> Option<PathBuf> {
+fn git_toplevel(directory: &Path, shutdown: Option<&AtomicBool>) -> Option<PathBuf> {
     let output = run_git(
         directory,
         &[
@@ -665,6 +737,7 @@ fn git_toplevel(directory: &Path) -> Option<PathBuf> {
             OsString::from("--show-toplevel"),
         ],
         None,
+        shutdown,
         64 * 1024,
     )
     .ok()?;
@@ -674,9 +747,14 @@ fn git_toplevel(directory: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
 
-    use super::discover_repositories;
+    use super::{discover_repositories, wait_for_git};
 
     fn init(path: &std::path::Path) {
         fs::create_dir_all(path).expect("fixture directory");
@@ -686,6 +764,29 @@ mod tests {
             .status()
             .expect("git should be installed for controller tests");
         assert!(status.success(), "git init failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_git_child_is_terminated() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 10"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::configure_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let cancelled = AtomicBool::new(true);
+        let started = Instant::now();
+
+        let error = wait_for_git(&mut child, Some(&cancelled), Duration::from_secs(1)).unwrap_err();
+
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "git child was not reaped"
+        );
     }
 
     #[test]

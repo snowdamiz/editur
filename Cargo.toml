@@ -19,7 +19,6 @@ egui = { version = "0.35.0", default-features = false, features = ["bytemuck", "
 egui-winit = { version = "0.35.0", default-features = false, features = ["accesskit"] }
 flate2 = "1.1.9"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-keyring = "4.1.6"
 lsp-types = "=0.97.0"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 regex = "1.13.1"
@@ -74,4 +73,5 @@ strip = true
 opt-level = 2
 
 [patch.crates-io]
+agent-client-protocol = { path = "vendor/agent-client-protocol" }
 block = { path = "vendor/block" }

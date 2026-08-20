@@ -173,16 +173,14 @@ fn advertised_checksum(checksum: &[u8]) -> Result<&str, String> {
 
 #[cfg(feature = "network")]
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    crate::network::retry(|| {
-        let mut response =
-            crate::network::get(url).map_err(|error| format!("cannot download {url}: {error}"))?;
-        response
-            .body_mut()
-            .with_config()
-            .limit(limit)
-            .read_to_vec()
-            .map_err(|error| format!("cannot read download from {url}: {error}"))
-    })
+    let mut response = crate::network::retry(|| crate::network::get(url))
+        .map_err(|error| format!("cannot download {url}: {error}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .map_err(|error| format!("cannot read download from {url}: {error}"))
 }
 
 #[cfg(not(feature = "network"))]

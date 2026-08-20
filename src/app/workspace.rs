@@ -16,9 +16,11 @@ impl EditorApp {
     }
 
     pub(super) fn buffer(&self) -> Option<&Buffer> {
+        if self.git_diff.is_some() {
+            return None;
+        }
         self.active_tab
             .and_then(|index| self.tabs.get(index))
-            .filter(|tab| tab.git_diff.is_none())
             .map(|tab| &tab.buffer)
     }
 
@@ -26,18 +28,13 @@ impl EditorApp {
         if index >= self.tabs.len() {
             return;
         }
+        self.git_diff = None;
         let changed = self.active_tab != Some(index);
         self.active_tab = Some(index);
         self.active_pane = self.tabs[index].pane;
         self.pane_active_tabs
             .insert(self.active_pane, self.tabs[index].buffer.path.clone());
-        self.tree.select(Some(
-            self.tabs[index]
-                .git_diff
-                .as_ref()
-                .map(|diff| diff.repository.join(&diff.path))
-                .unwrap_or_else(|| self.tabs[index].buffer.path.clone()),
-        ));
+        self.tree.select(Some(self.tabs[index].buffer.path.clone()));
         if changed {
             self.lsp_completion = None;
             self.lsp_definitions = None;
@@ -258,7 +255,7 @@ impl EditorApp {
         let Some(index) = self.active_tab else {
             return true;
         };
-        if self.tabs[index].git_diff.is_some() {
+        if self.git_diff.is_some() {
             return true;
         }
         let save_as = destination.is_some();

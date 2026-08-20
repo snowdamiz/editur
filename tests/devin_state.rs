@@ -117,6 +117,22 @@ fn search_results_replace_the_session_list() {
 }
 
 #[test]
+fn session_list_changes_advance_the_render_revision() {
+    let mut state = DevinState::default();
+    let before = state.sessions_revision;
+
+    state.apply(DevinEvent::SessionsLoaded {
+        sessions: vec![session("new", "New task")],
+        next_cursor: None,
+        total: Some(1),
+        has_next: false,
+        append: false,
+    });
+
+    assert_ne!(state.sessions_revision, before);
+}
+
+#[test]
 fn selected_detail_reconciles_the_matching_session_list_row() {
     let mut state = DevinState {
         sessions: vec![session("one", "Old title")],
@@ -222,7 +238,7 @@ fn numeric_upstream_timestamps_sort_chronologically() {
 }
 
 #[test]
-fn background_refresh_never_consumes_or_clears_the_history_cursor() {
+fn background_refresh_preserves_complete_history() {
     let mut state = DevinState::default();
     let generation = state.select("one".into());
     let page =
@@ -242,7 +258,6 @@ fn background_refresh_never_consumes_or_clears_the_history_cursor() {
     }
     state.apply(page("arrived", "4", None, PageUpdate::Refresh));
 
-    assert_eq!(state.messages_cursor, None);
     assert_eq!(
         state
             .messages
@@ -269,7 +284,7 @@ fn created_sessions_are_selectable_and_disconnect_clears_remote_state() {
         "Created task",
     )));
     state.apply(DevinEvent::CredentialsChanged(Some(
-        CredentialSource::Keyring,
+        CredentialSource::Stored,
     )));
 
     assert_eq!(state.sessions[0].id, "created");

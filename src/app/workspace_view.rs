@@ -684,8 +684,9 @@ impl EditorApp {
                     cut: matches!(action, TreeContextAction::Cut),
                 });
             }
-            TreeContextAction::Paste => match self.paste_tree_entry(&directory) {
-                Ok(path) => self.refresh_tree(Some(path)),
+            TreeContextAction::Paste => match self.paste_tree_entry(&directory, ctx) {
+                Ok(Some(path)) => self.refresh_tree(Some(path)),
+                Ok(None) => {}
                 Err(error) => self.show_error(error),
             },
             TreeContextAction::Duplicate => {
@@ -695,10 +696,10 @@ impl EditorApp {
                     .ok_or_else(|| format!("{} has no parent", entry.path.display()))
                     .and_then(|parent| unique_copy_path(&entry.path, parent))
                     .and_then(|destination| {
-                        copy_tree_entry(&entry.path, &destination).map(|()| destination)
+                        self.start_tree_copy(entry.path.clone(), destination, ctx)
                     });
                 match result {
-                    Ok(path) => self.refresh_tree(Some(path)),
+                    Ok(()) => {}
                     Err(error) => self.show_error(error),
                 }
             }
@@ -724,7 +725,16 @@ impl EditorApp {
                 ctx.copy_text(path.to_string_lossy().into_owned());
             }
             TreeContextAction::Reveal => {
-                if let Err(error) = reveal_in_file_manager(&entry.path) {
+                let slot = Arc::clone(&self.background_error);
+                let repaint = ctx.clone();
+                if let Err(error) = reveal_in_file_manager(&entry.path, move |result| {
+                    if let Err(error) = result {
+                        if let Ok(mut slot) = slot.lock() {
+                            *slot = Some(error);
+                        }
+                        repaint.request_repaint();
+                    }
+                }) {
                     self.show_error(error);
                 }
             }
@@ -737,7 +747,11 @@ impl EditorApp {
         ctx.request_repaint();
     }
 
-    pub(super) fn paste_tree_entry(&mut self, directory: &Path) -> Result<PathBuf, String> {
+    pub(super) fn paste_tree_entry(
+        &mut self,
+        directory: &Path,
+        ctx: &egui::Context,
+    ) -> Result<Option<PathBuf>, String> {
         let clipboard = self
             .tree_clipboard
             .clone()
@@ -754,7 +768,7 @@ impl EditorApp {
         }
         if clipboard.cut && source.parent() == Some(directory.as_path()) {
             self.tree_clipboard = None;
-            return Ok(source);
+            return Ok(Some(source));
         }
         let name = source
             .file_name()
@@ -770,10 +784,33 @@ impl EditorApp {
                 .map_err(|error| format!("cannot move {}: {error}", source.display()))?;
             self.rebase_open_paths(&source, &destination);
             self.tree_clipboard = None;
+            Ok(Some(destination))
         } else {
-            copy_tree_entry(&source, &destination)?;
+            self.start_tree_copy(source, destination, ctx)?;
+            Ok(None)
         }
-        Ok(destination)
+    }
+
+    fn start_tree_copy(
+        &mut self,
+        source: PathBuf,
+        destination: PathBuf,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if self.tree_copying {
+            return Err("another file copy is still running".into());
+        }
+        self.tree_copying = true;
+        let result = Arc::clone(&self.tree_copy_result);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let copied = copy_tree_entry(&source, &destination).map(|()| destination);
+            if let Ok(mut result) = result.lock() {
+                *result = Some(copied);
+            }
+            repaint.request_repaint();
+        });
+        Ok(())
     }
 
     pub(super) fn refresh_tree(&mut self, selected: Option<PathBuf>) {
@@ -924,34 +961,65 @@ impl EditorApp {
             })
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
         let active_pane = !preview && path_override.is_none() && pane == self.active_pane;
-        if let Some(index) = active_tab
-            && let Some(diff) = self.tabs[index].git_diff.clone()
-        {
-            ui.painter()
-                .rect_filled(ui.max_rect(), 0.0, editor_background());
-            let id = Id::new(("tab_git_diff", &self.tabs[index].buffer.path));
-            let rendered = cached_agent_diff(ui, id, diff.old.as_deref(), &diff.new);
-            if diff.unsaved_editor_changes {
+        if active_pane && self.git_diff.is_some() {
+            let back = {
+                let diff = self.git_diff.as_ref().expect("checked above");
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, editor_background());
+                let id = Id::new(("git_diff_preview", &diff.repository, &diff.path, diff.area));
+                let rendered = cached_agent_diff_revision(
+                    ui,
+                    id,
+                    diff.content_revision,
+                    diff.old.as_deref(),
+                    &diff.new,
+                );
+                let mut back = false;
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Unsaved editor changes are not shown.")
-                                .font(theme::typography::small())
-                                .color(theme::text().muted),
-                        );
+                        ui.horizontal(|ui| {
+                            back = agent_diff_view_header(
+                                ui,
+                                &diff.repository,
+                                &diff.path,
+                                &rendered,
+                                diff.old.is_some(),
+                                "Back to editor",
+                            );
+                        });
                     });
+                ui.painter().hline(
+                    ui.available_rect_before_wrap().x_range(),
+                    ui.cursor().top(),
+                    egui::Stroke::new(1.0, theme::border::strong_color()),
+                );
+                if diff.unsaved_editor_changes {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(14, 6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Unsaved editor changes are not shown.")
+                                    .font(theme::typography::small())
+                                    .color(theme::text().muted),
+                            );
+                        });
+                }
+                draw_agent_diff_body(
+                    ui,
+                    id,
+                    &diff.repository.join(&diff.path),
+                    &rendered,
+                    diff.old.as_deref(),
+                    &diff.new,
+                    &self.highlighter,
+                    &self.syntaxes,
+                );
+                back
+            };
+            if back {
+                self.git_diff = None;
             }
-            draw_agent_diff_body(
-                ui,
-                id,
-                &diff.repository.join(&diff.path),
-                &rendered,
-                diff.old.as_deref(),
-                &diff.new,
-                &self.highlighter,
-                &self.syntaxes,
-            );
             return;
         }
         if let Some(index) = active_tab
@@ -1180,7 +1248,7 @@ impl EditorApp {
             self.tree_focused = false;
         }
         if output.changed {
-            buffer.mark_changed();
+            buffer.mark_changed_with_edits(&editor_surface.take_applied_edits());
             cache.valid = false;
             self.lsp_sync_needed = true;
             self.lsp_completion = None;
@@ -1347,7 +1415,7 @@ impl EditorApp {
         );
 
         // The keyboard works against the same filtered list the rows render.
-        let entries = picker.visible_entries();
+        let entries = picker.visible_entry_indices();
         let search_id = Id::new("agent_file_picker_search");
         // History rides on Finder's ⌘[ and ⌘], which never collide with the
         // caret keys the focused filter field owns.
@@ -1381,6 +1449,7 @@ impl EditorApp {
             picker
                 .cursor
                 .and_then(|cursor| entries.get(cursor))
+                .and_then(|index| picker.entries.get(*index))
                 .cloned()
         } else {
             None
@@ -1692,44 +1761,42 @@ impl EditorApp {
                         .max_rect(list.shrink2(egui::vec2(theme::space::SNUG, 0.0)))
                         .layout(Layout::top_down(Align::LEFT)),
                     |ui| {
-                        ScrollArea::vertical()
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                        let scroll = ScrollArea::vertical()
                             .id_salt("agent_file_picker_entries")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                                ui.add_space(theme::space::SNUG);
-                                if entries.is_empty() {
-                                    ui.add_space(theme::space::WIDE);
-                                    ui.centered_and_justified(|ui| {
-                                        let filtered = !picker.query.trim().is_empty();
-                                        let message = if filtered {
-                                            match purpose {
-                                                FilePickerPurpose::AttachFiles => {
-                                                    "No matching files"
-                                                }
-                                                FilePickerPurpose::OpenProject => {
-                                                    "No matching folders"
-                                                }
+                            .auto_shrink([false, false]);
+                        if entries.is_empty() {
+                            scroll.show(ui, |ui| {
+                                ui.add_space(theme::space::WIDE);
+                                ui.centered_and_justified(|ui| {
+                                    let filtered = !picker.query.trim().is_empty();
+                                    let message = if filtered {
+                                        match purpose {
+                                            FilePickerPurpose::AttachFiles => "No matching files",
+                                            FilePickerPurpose::OpenProject => "No matching folders",
+                                        }
+                                    } else if picker.hidden_entries() > 0 {
+                                        "Only hidden items here"
+                                    } else {
+                                        match purpose {
+                                            FilePickerPurpose::AttachFiles => {
+                                                "This folder is empty"
                                             }
-                                        } else if picker.hidden_entries() > 0 {
-                                            "Only hidden items here"
-                                        } else {
-                                            match purpose {
-                                                FilePickerPurpose::AttachFiles => {
-                                                    "This folder is empty"
-                                                }
-                                                FilePickerPurpose::OpenProject => "No folders here",
-                                            }
-                                        };
-                                        ui.label(
-                                            RichText::new(message)
-                                                .size(theme::typography::SMALL_SIZE)
-                                                .color(theme::text_disabled()),
-                                        );
-                                    });
-                                }
-                                for (index, entry) in entries.iter().enumerate() {
+                                            FilePickerPurpose::OpenProject => "No folders here",
+                                        }
+                                    };
+                                    ui.label(
+                                        RichText::new(message)
+                                            .size(theme::typography::SMALL_SIZE)
+                                            .color(theme::text_disabled()),
+                                    );
+                                });
+                            });
+                        } else {
+                            scroll.show_rows(ui, 31.0, entries.len(), |ui, rows| {
+                                for index in rows {
+                                    let entry = &picker.entries[entries[index]];
                                     let selected = picker.selected.contains(&entry.path);
                                     let highlighted = picker.cursor == Some(index);
                                     let response =
@@ -1745,8 +1812,8 @@ impl EditorApp {
                                         }
                                     }
                                 }
-                                ui.add_space(theme::space::SNUG);
                             });
+                        }
                     },
                 );
 

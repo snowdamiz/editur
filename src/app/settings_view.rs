@@ -339,7 +339,7 @@ impl EditorApp {
                     DevinConnectionState::Disconnected => "Disconnected",
                 };
                 settings_row(ui, "Status", status, |ui| {
-                    if source == CredentialSource::Keyring
+                    if source == CredentialSource::Stored
                         && settings_danger_button(ui, "settings_devin_disconnect", "Disconnect")
                             .clicked()
                     {

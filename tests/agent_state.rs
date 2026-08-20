@@ -191,7 +191,7 @@ fn decoded_images_count_toward_the_transcript_budget() {
 }
 
 #[test]
-fn a_single_oversized_structured_item_is_paged() {
+fn oversized_plans_are_bounded_before_entering_the_transcript() {
     let mut state = AgentState::default();
     state.apply(Event::PlanUpdated(
         (0..300)
@@ -202,13 +202,37 @@ fn a_single_oversized_structured_item_is_paged() {
             .collect(),
     ));
 
-    assert!(state.transcript.is_empty());
-    assert!(state.has_earlier_transcript());
-    assert!(state.load_earlier_transcript().unwrap());
-    assert!(matches!(
-        state.transcript.front(),
-        Some(TranscriptItem::Plan(_))
+    let Some(TranscriptItem::Plan(plan)) = state.transcript.front() else {
+        panic!("plan should remain visible");
+    };
+    assert_eq!(plan.len(), 128);
+}
+
+#[test]
+fn active_plans_do_not_disable_the_transcript_memory_budget() {
+    let mut state = AgentState::default();
+    state.apply(Event::UserMessage("start".into()));
+    state.apply(Event::PlanUpdated(
+        (0..300)
+            .map(|_| PlanItem {
+                content: "x".repeat(64 * 1024),
+                status: "Pending".into(),
+            })
+            .collect(),
     ));
+    for byte in 0..2 {
+        state.apply(Event::ContentReceived {
+            role: ContentRole::User,
+            content: DisplayContent::Image {
+                mime_type: "image/png".into(),
+                uri: None,
+                encoded_bytes: 8 * 1024 * 1024,
+                data: Some(std::sync::Arc::from(vec![byte; 8 * 1024 * 1024])),
+            },
+        });
+    }
+
+    assert!(state.transcript.len() <= 2);
 }
 
 #[test]
@@ -576,6 +600,75 @@ fn subagent_result_updates_keep_the_launch_metadata() {
             content.as_slice(),
             [ToolOutput::Task { prompt, .. }, ToolOutput::Text(result)]
                 if prompt == "Inspect authentication" && result == "Authentication is sound"
+        )
+    ));
+}
+
+#[test]
+fn subagent_completion_metadata_keeps_the_captured_output() {
+    let mut state = AgentState::default();
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: Some("Subagent: Explore sidebar".into()),
+        status: Some("Completed".into()),
+        kind: Some("Task".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![
+                ToolOutput::Task {
+                    description: "Explore sidebar".into(),
+                    prompt: "Find the terminal toggle".into(),
+                    subagent_type: "explore".into(),
+                    model: None,
+                    agent_id: Some("agent-9".into()),
+                    agents: Vec::new(),
+                    path: None,
+                    activity: None,
+                    duration_ms: None,
+                },
+                ToolOutput::Log {
+                    label: "Subagent output".into(),
+                    text: "Found workspace_view.rs".into(),
+                },
+            ],
+            output: None,
+        }),
+    }));
+    state.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "task".into(),
+        title: Some("Subagent: Explore sidebar".into()),
+        status: Some("Completed".into()),
+        kind: Some("Task".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: None,
+            content: vec![ToolOutput::Task {
+                description: "Explore sidebar".into(),
+                prompt: "Find the terminal toggle".into(),
+                subagent_type: "explore".into(),
+                model: None,
+                agent_id: Some("agent-9".into()),
+                agents: Vec::new(),
+                path: None,
+                activity: None,
+                duration_ms: Some(1200),
+            }],
+            output: None,
+        }),
+    }));
+
+    assert!(matches!(
+        state.transcript.back(),
+        Some(TranscriptItem::Tool(ToolActivity {
+            detail: Some(ToolDetail { content, .. }),
+            ..
+        })) if matches!(
+            content.as_slice(),
+            [
+                ToolOutput::Task { duration_ms: Some(1200), .. },
+                ToolOutput::Log { label, text },
+            ] if label == "Subagent output" && text == "Found workspace_view.rs"
         )
     ));
 }

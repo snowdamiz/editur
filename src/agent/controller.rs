@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     fs,
+    future::Future,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{
@@ -10,6 +11,7 @@ use std::{
         mpsc::{Receiver, SyncSender},
     },
     thread,
+    time::Duration,
 };
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
@@ -34,6 +36,7 @@ const MAX_CHOICES: usize = 128;
 const MAX_PLAN_ITEMS: usize = MAX_CHOICES;
 const MAX_TOOL_PATHS: usize = 256;
 const MAX_STORED_SESSION_IDS: usize = 4_096;
+const ACP_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Consecutive automatic resumes after retriable transport drops, per user turn.
 const MAX_TURN_RESUMES: u64 = 2;
 /// Prompt sent to resume a turn after the provider's upstream connection dropped.
@@ -41,6 +44,37 @@ pub const TURN_RESUME_PROMPT: &str = "Continue from where you left off.";
 pub const MAX_PROMPT_ATTACHMENTS: usize = 8;
 pub const MAX_PROMPT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_PROMPT_ATTACHMENT_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+
+async fn wait_for_acp<T>(
+    request: impl Future<Output = agent_client_protocol::Result<T>>,
+    operation: &str,
+) -> agent_client_protocol::Result<T> {
+    wait_for_acp_with_timeout(request, operation, ACP_CONTROL_TIMEOUT).await
+}
+
+async fn wait_for_acp_with_timeout<T>(
+    request: impl Future<Output = agent_client_protocol::Result<T>>,
+    operation: &str,
+    timeout: Duration,
+) -> agent_client_protocol::Result<T> {
+    let mut request = std::pin::pin!(request);
+    let mut timer = std::pin::pin!(async_io::Timer::after(timeout));
+    std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = request.as_mut().poll(context) {
+            return std::task::Poll::Ready(result);
+        }
+        if timer.as_mut().poll(context).is_ready() {
+            return std::task::Poll::Ready(Err(agent_client_protocol::util::internal_error(
+                format!(
+                    "{operation} timed out after {} seconds",
+                    timeout.as_secs_f32()
+                ),
+            )));
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PromptAttachmentKind {
@@ -398,6 +432,18 @@ impl ToolActivity {
                 .and_then(|detail| detail.input.as_deref()),
         )
     }
+
+    pub fn command(&self) -> Option<String> {
+        tool_command(
+            self.title.as_deref(),
+            self.kind.as_deref(),
+            self.detail
+                .as_ref()
+                .and_then(|detail| detail.input.as_deref())
+                .and_then(parse_tool_input)
+                .as_ref(),
+        )
+    }
 }
 
 /// A file the tool touched, with the optional line number the agent reported
@@ -620,6 +666,7 @@ pub enum GoalAction {
 pub struct AgentController {
     commands: async_channel::Sender<Command>,
     events: Receiver<Event>,
+    shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -736,12 +783,14 @@ impl AgentController {
         let (command_tx, command_rx) = async_channel::bounded(COMMAND_CAPACITY);
         let debug_commands = command_tx.clone();
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(EVENT_CAPACITY);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let event_tx = EventSender {
             provider,
             event_tx,
             wake,
             active_session: session_startup.active_session.clone(),
         };
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
             .name("editur-agent".into())
             .spawn(move || {
@@ -753,12 +802,14 @@ impl AgentController {
                     debug_commands,
                     event_tx,
                     session_startup,
+                    worker_shutdown,
                 )
             })
             .expect("failed to start Editur agent controller thread");
         Self {
             commands: command_tx,
             events: event_rx,
+            shutdown,
             worker: Some(worker),
         }
     }
@@ -776,24 +827,10 @@ impl AgentController {
 
 impl Drop for AgentController {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            loop {
-                match self.commands.try_send(Command::Shutdown) {
-                    Ok(()) | Err(async_channel::TrySendError::Closed(_)) => break,
-                    Err(async_channel::TrySendError::Full(_)) => {
-                        self.events.try_iter().for_each(drop);
-                        if worker.is_finished() {
-                            break;
-                        }
-                        thread::park_timeout(std::time::Duration::from_millis(1));
-                    }
-                }
-            }
-            while !worker.is_finished() {
-                self.events.try_iter().for_each(drop);
-                thread::park_timeout(std::time::Duration::from_millis(1));
-            }
-            let _ = worker.join();
+            let _ = self.commands.try_send(Command::Shutdown);
+            crate::reap_worker("editur-agent-reaper", worker);
         }
     }
 }
@@ -848,6 +885,7 @@ impl SessionNotificationGate {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn run_thread(
     provider: ProviderId,
     project_root: PathBuf,
@@ -856,6 +894,7 @@ fn run_thread(
     debug_commands: async_channel::Sender<Command>,
     events: EventSender,
     session_startup: SessionStartup,
+    shutdown: Arc<AtomicBool>,
 ) {
     let system_terminal = matches!(launch, Launch::Managed);
     let (config, _managed_tree) = match launch {
@@ -877,30 +916,31 @@ fn run_thread(
     let protocol_debug = std::env::var("EDITUR_LOG").as_deref() == Ok("debug");
     let auth_config = config.clone();
     let internal_commands = debug_commands.clone();
-    let agent = AcpAgent::new(config).with_debug(move |line, direction| {
-        if direction == LineDirection::Stderr {
-            append_bounded(&debug_diagnostics, line, MAX_DIAGNOSTIC_BYTES);
-        } else if direction == LineDirection::Stdout {
-            let valid = if protocol_debug {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .inspect(|message| {
-                        if let Some(label) = protocol_label(message) {
-                            eprintln!("editur: ACP <- {label}");
-                        }
-                    })
-                    .is_ok()
-            } else {
-                serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
-            };
-            if !valid {
-                let _ = debug_commands.try_send(Command::TransportFailed(format!(
-                    "{} wrote malformed JSON to stdout",
-                    descriptor(provider).display_name
-                )));
+    let agent = AcpAgent::new(config)
+        .with_shutdown_flag(Arc::clone(&shutdown))
+        .with_debug(move |line, direction| {
+            if direction == LineDirection::Stderr {
+                append_bounded(&debug_diagnostics, line, MAX_DIAGNOSTIC_BYTES);
+            } else if direction == LineDirection::Stdout {
+                let valid = if protocol_debug {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .inspect(|message| {
+                            if let Some(label) = protocol_label(message) {
+                                eprintln!("editur: ACP <- {label}");
+                            }
+                        })
+                        .is_ok()
+                } else {
+                    serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+                };
+                if !valid {
+                    let _ = debug_commands.try_send(Command::TransportFailed(format!(
+                        "{} wrote malformed JSON to stdout",
+                        descriptor(provider).display_name
+                    )));
+                }
             }
-        }
-    });
-    let shutdown = Arc::new(AtomicBool::new(false));
+        });
     let result = async_io::block_on(run_connection(
         (agent, auth_config, system_terminal, internal_commands),
         provider,
@@ -1457,14 +1497,17 @@ async fn run_connection(
             let shutdown = Arc::clone(&shutdown);
             async move {
                 let client_capabilities = client_capabilities(provider);
-                let initialized = connection
-                    .send_request(
+                let initialized = wait_for_acp(
+                    connection
+                        .send_request(
                         InitializeRequest::new(ProtocolVersion::V1)
                             .client_capabilities(client_capabilities)
                             .client_info(Implementation::new("editur", env!("CARGO_PKG_VERSION"))),
-                    )
-                    .block_task()
-                    .await?;
+                        )
+                        .block_task(),
+                    "agent initialization",
+                )
+                .await?;
                 if initialized.protocol_version != ProtocolVersion::V1 {
                     return Err(agent_client_protocol::Error::invalid_request()
                         .data("agent does not support stable ACP v1"));
@@ -1638,10 +1681,13 @@ async fn run_connection(
                                 }
                                 continue;
                             }
-                            let authenticated = connection
-                                .send_request(AuthenticateRequest::new(method.id.clone()))
-                                .block_task()
-                                .await;
+                            let authenticated = wait_for_acp(
+                                connection
+                                    .send_request(AuthenticateRequest::new(method.id.clone()))
+                                    .block_task(),
+                                "authentication",
+                            )
+                            .await;
                             if let Err(error) = authenticated {
                                 send_event(
                                     &events,
@@ -1906,10 +1952,16 @@ async fn run_connection(
                                 send_event(&events, Event::Error("no active session".into()));
                                 continue;
                             };
-                            match connection
-                                .send_request(SetSessionModeRequest::new(session, mode_id.clone()))
-                                .block_task()
-                                .await
+                            match wait_for_acp(
+                                connection
+                                    .send_request(SetSessionModeRequest::new(
+                                        session,
+                                        mode_id.clone(),
+                                    ))
+                                    .block_task(),
+                                "setting session mode",
+                            )
+                            .await
                             {
                                 Ok(_) => send_event(&events, Event::ModeChanged(mode_id)),
                                 Err(error) => send_event(
@@ -1935,12 +1987,15 @@ async fn run_connection(
                                     SessionConfigOptionValue::boolean(value)
                                 }
                             };
-                            let response = connection
-                                .send_request(SetSessionConfigOptionRequest::new(
-                                    session, id, value,
-                                ))
-                                .block_task()
-                                .await;
+                            let response = wait_for_acp(
+                                connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        session, id, value,
+                                    ))
+                                    .block_task(),
+                                "setting session option",
+                            )
+                            .await;
                             match response {
                                 Ok(response) => send_event(
                                     &events,
@@ -2135,13 +2190,16 @@ async fn run_connection(
                                 };
                                 let mut resumed_directories = additional_directories.clone();
                                 resumed_directories.extend(requested_directories);
-                                match connection
-                                    .send_request(
+                                match wait_for_acp(
+                                    connection
+                                        .send_request(
                                         ResumeSessionRequest::new(prompt_session, &project_root)
                                             .additional_directories(resumed_directories.clone()),
-                                    )
-                                    .block_task()
-                                    .await
+                                        )
+                                        .block_task(),
+                                    "resuming session",
+                                )
+                                .await
                                 {
                                     Ok(response) => {
                                         additional_directories = resumed_directories;
@@ -2844,6 +2902,13 @@ fn external_transcript_message(message: ExternalMessage) -> SessionTranscriptMes
 fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
     let task = external_subagent_task(&tool);
     let structured_task = task.is_some();
+    let title = task
+        .as_ref()
+        .and_then(|task| match task {
+            ToolOutput::Task { description, .. } => Some(format!("Subagent: {description}")),
+            _ => None,
+        })
+        .unwrap_or_else(|| tool.name.clone());
     let mut content = tool
         .diffs
         .into_iter()
@@ -2855,8 +2920,8 @@ fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
         .collect::<Vec<_>>();
     if let Some(task) = task {
         content.insert(0, task);
-        if let Some(output) = tool.output.as_ref().filter(|output| !output.is_empty()) {
-            content.push(ToolOutput::Text(output.clone()));
+        if let Some(output) = external_subagent_output(tool.output.as_deref()) {
+            content.push(ToolOutput::Text(output));
         }
     }
     let detail = (tool.input.is_some() || tool.output.is_some() || !content.is_empty()).then_some(
@@ -2868,7 +2933,7 @@ fn external_tool_activity(tool: ExternalTool) -> ToolActivity {
     );
     ToolActivity {
         id: tool.id,
-        title: Some(tool.name),
+        title: Some(title),
         status: tool
             .status
             .map(|status| match status.to_ascii_lowercase().as_str() {
@@ -2890,10 +2955,18 @@ fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
     }
     let input = tool.input.as_deref().and_then(parse_tool_input);
     let input_object = input.as_ref().and_then(serde_json::Value::as_object);
+    let output = tool.output.as_deref().and_then(parse_tool_input);
+    let output_object = output.as_ref().and_then(serde_json::Value::as_object);
     let input_string = |keys: &[&str]| {
         input_object.and_then(|input| {
             keys.iter()
                 .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+        })
+    };
+    let output_string = |keys: &[&str]| {
+        output_object.and_then(|output| {
+            keys.iter()
+                .find_map(|key| output.get(*key).and_then(serde_json::Value::as_str))
         })
     };
     let prompt = input_string(&["prompt", "message", "task"])
@@ -2901,6 +2974,7 @@ fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
         .unwrap_or_default()
         .to_owned();
     let agent_id = input_string(&["agent_id", "agentId"])
+        .or_else(|| output_string(&["agent_id", "agentId"]))
         .or_else(|| {
             input_object
                 .and_then(|input| input.get("receiverThreadIds"))
@@ -2912,6 +2986,15 @@ fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
     let duration_ms = input_object
         .and_then(|input| input.get("duration_ms").or_else(|| input.get("durationMs")))
         .and_then(serde_json::Value::as_u64);
+    let duration_ms = duration_ms.or_else(|| {
+        output_object
+            .and_then(|output| {
+                output
+                    .get("duration_ms")
+                    .or_else(|| output.get("durationMs"))
+            })
+            .and_then(serde_json::Value::as_u64)
+    });
     Some(ToolOutput::Task {
         description: input_string(&["description"])
             .unwrap_or(&tool.name)
@@ -2929,6 +3012,11 @@ fn external_subagent_task(tool: &ExternalTool) -> Option<ToolOutput> {
     })
 }
 
+fn external_subagent_output(output: Option<&str>) -> Option<String> {
+    let output = parse_tool_input(output?)?;
+    subagent_output_text(Some(&output))
+}
+
 #[expect(clippy::too_many_arguments)]
 async fn handoff_external_session(
     connection: &ConnectionTo<Agent>,
@@ -2942,11 +3030,14 @@ async fn handoff_external_session(
     next_message: &str,
 ) -> Result<(SessionId, String), String> {
     let prompt = external.handoff_prompt(next_message)?;
-    let response = connection
-        .send_request(NewSessionRequest::new(project_root))
-        .block_task()
-        .await
-        .map_err(|error| acp_error(events.provider, "cannot continue imported session", &error))?;
+    let response = wait_for_acp(
+        connection
+            .send_request(NewSessionRequest::new(project_root))
+            .block_task(),
+        "starting imported session",
+    )
+    .await
+    .map_err(|error| acp_error(events.provider, "cannot continue imported session", &error))?;
     let session_id = response.session_id;
     let previous = session_notifications.activate(&session_id);
     close_replaced_session(connection, previous, &session_id, supports_close, events).await;
@@ -2991,10 +3082,13 @@ async fn new_session(
     session_notifications: &SessionNotificationGate,
     supports_close: bool,
 ) -> agent_client_protocol::Result<SessionId> {
-    let response = connection
-        .send_request(NewSessionRequest::new(project_root))
-        .block_task()
-        .await?;
+    let response = wait_for_acp(
+        connection
+            .send_request(NewSessionRequest::new(project_root))
+            .block_task(),
+        "starting session",
+    )
+    .await?;
     let session_id = response.session_id;
     let previous = session_notifications.activate(&session_id);
     close_replaced_session(connection, previous, &session_id, supports_close, events).await;
@@ -3111,14 +3205,17 @@ async fn list_sessions(
     let mut cursor = None;
     let mut seen_cursors = HashSet::new();
     while sessions.len() < MAX_CHOICES {
-        let response = connection
-            .send_request(
-                ListSessionsRequest::new()
-                    .cwd(project_root)
-                    .cursor(cursor.clone()),
-            )
-            .block_task()
-            .await?;
+        let response = wait_for_acp(
+            connection
+                .send_request(
+                    ListSessionsRequest::new()
+                        .cwd(project_root)
+                        .cursor(cursor.clone()),
+                )
+                .block_task(),
+            "listing sessions",
+        )
+        .await?;
         sessions.extend(
             response
                 .sessions
@@ -3389,10 +3486,13 @@ async fn load_session(
     );
     let session_id = SessionId::new(session.id.clone());
     let previous = session_notifications.activate(&session_id);
-    let response = match connection
-        .send_request(LoadSessionRequest::new(session_id.clone(), project_root))
-        .block_task()
-        .await
+    let response = match wait_for_acp(
+        connection
+            .send_request(LoadSessionRequest::new(session_id.clone(), project_root))
+            .block_task(),
+        "loading session",
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -3432,10 +3532,13 @@ async fn close_replaced_session(
     if !supports_close {
         return;
     }
-    if let Err(error) = connection
-        .send_request(CloseSessionRequest::new(previous))
-        .block_task()
-        .await
+    if let Err(error) = wait_for_acp(
+        connection
+            .send_request(CloseSessionRequest::new(previous))
+            .block_task(),
+        "closing previous session",
+    )
+    .await
     {
         send_event(
             events,
@@ -4388,7 +4491,8 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
             ),
         ),
         SessionUpdate::ToolCall(tool) => {
-            let kind = normalized_tool_kind(events.provider, Some(tool.kind), tool.meta.as_ref());
+            let mut kind =
+                normalized_tool_kind(events.provider, Some(tool.kind), tool.meta.as_ref());
             let detail = normalized_tool_detail(
                 events.provider,
                 &tool.title,
@@ -4398,12 +4502,16 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                 tool.meta.as_ref(),
                 true,
             );
+            let title = subagent_description(detail.as_ref()).map_or(tool.title, |description| {
+                kind = Some("Task".into());
+                format!("Subagent: {description}")
+            });
             send_tool_activity(
                 events,
                 tool.meta.as_ref(),
                 ToolActivity {
                     id: bounded_detail(tool.tool_call_id.0.to_string()),
-                    title: Some(bounded_detail(tool.title)),
+                    title: Some(bounded_detail(title)),
                     status: Some(format!("{:?}", tool.status)),
                     kind,
                     paths: tool_paths(&tool.locations, &tool.content),
@@ -4416,24 +4524,45 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
             let fields = update.fields;
             let content = fields.content.as_deref().unwrap_or_default();
             let locations = fields.locations.as_deref().unwrap_or_default();
+            let has_input = fields.raw_input.is_some();
+            let subagent = is_subagent_tool(
+                events.provider,
+                fields.title.as_deref().unwrap_or_default(),
+                meta.as_ref(),
+            );
+            let detail = normalized_tool_detail(
+                events.provider,
+                fields.title.as_deref().unwrap_or_default(),
+                fields.raw_input.as_ref(),
+                content,
+                fields.raw_output.as_ref(),
+                meta.as_ref(),
+                false,
+            );
+            let mut kind = normalized_tool_kind(events.provider, fields.kind, meta.as_ref());
+            if subagent {
+                kind = Some("Task".into());
+            }
+            let title = subagent_description(detail.as_ref()).map_or_else(
+                || {
+                    if subagent && !has_input {
+                        None
+                    } else {
+                        fields.title
+                    }
+                },
+                |description| Some(format!("Subagent: {description}")),
+            );
             send_tool_activity(
                 events,
                 meta.as_ref(),
                 ToolActivity {
                     id: bounded_detail(update.tool_call_id.0.to_string()),
-                    title: fields.title.map(bounded_detail),
+                    title: title.map(bounded_detail),
                     status: fields.status.map(|status| format!("{status:?}")),
-                    kind: normalized_tool_kind(events.provider, fields.kind, meta.as_ref()),
+                    kind,
                     paths: tool_paths(locations, content),
-                    detail: normalized_tool_detail(
-                        events.provider,
-                        "",
-                        fields.raw_input.as_ref(),
-                        content,
-                        fields.raw_output.as_ref(),
-                        meta.as_ref(),
-                        false,
-                    ),
+                    detail,
                 },
             );
         }
@@ -4599,7 +4728,7 @@ fn normalize_cursor_notification(method: &str, params: serde_json::Value, events
             ToolActivity {
                 id: bounded_detail(update.tool_call_id),
                 title: Some(bounded_detail(format!("Subagent: {description}"))),
-                status: None,
+                status: Some("Completed".into()),
                 kind: Some("Task".into()),
                 paths: Vec::new(),
                 detail: Some(ToolDetail {
@@ -5022,8 +5151,9 @@ fn normalized_tool_detail(
     initial: bool,
 ) -> Option<ToolDetail> {
     let mut detail = tool_detail(input, content, output);
+    let subagent = is_subagent_tool(provider, title, meta);
     if (initial || input.is_some())
-        && let Some(task) = normalized_subagent_task(provider, title, input, meta)
+        && let Some(task) = normalized_subagent_task(provider, title, input, output, meta)
     {
         let detail = detail.get_or_insert_with(|| ToolDetail {
             input: None,
@@ -5035,7 +5165,25 @@ fn normalized_tool_detail(
                 .content
                 .retain(|content| !matches!(content, ToolOutput::Text(text) if text == prompt));
         }
+        detail.input = None;
         detail.content.insert(0, task);
+    }
+    if subagent {
+        let output_text = subagent_output_text(output);
+        if detail.is_some() || output_text.is_some() {
+            let detail = detail.get_or_insert_with(|| ToolDetail {
+                input: None,
+                content: Vec::new(),
+                output: None,
+            });
+            detail.output = None;
+            if let Some(text) = output_text {
+                detail.content.push(ToolOutput::Log {
+                    label: "Subagent output".into(),
+                    text,
+                });
+            }
+        }
     }
     let logs = tool_logs(provider, meta);
     if !logs.is_empty() {
@@ -5051,10 +5199,14 @@ fn normalized_tool_detail(
     detail
 }
 
+fn subagent_description(detail: Option<&ToolDetail>) -> Option<&str> {
+    detail?.content.iter().find_map(|content| match content {
+        ToolOutput::Task { description, .. } => Some(description.as_str()),
+        _ => None,
+    })
+}
+
 fn tool_logs(provider: ProviderId, meta: Option<&Meta>) -> Vec<ToolOutput> {
-    if provider == ProviderId::Cursor {
-        return Vec::new();
-    }
     let Some(meta) = meta else {
         return Vec::new();
     };
@@ -5118,38 +5270,61 @@ fn provider_meta_is_subagent(provider: ProviderId, meta: Option<&Meta>) -> bool 
     }
 }
 
+fn is_subagent_tool(provider: ProviderId, title: &str, meta: Option<&Meta>) -> bool {
+    external_sessions::is_subagent_tool_name(title) || provider_meta_is_subagent(provider, meta)
+}
+
 fn normalized_subagent_task(
     provider: ProviderId,
     title: &str,
     input: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
     meta: Option<&Meta>,
 ) -> Option<ToolOutput> {
-    if !provider_meta_is_subagent(provider, meta) {
+    if !is_subagent_tool(provider, title, meta) {
         return None;
     }
     let input = input.and_then(serde_json::Value::as_object);
-    let prompt = input
-        .and_then(|input| input.get("prompt"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let model = input
-        .and_then(|input| input.get("model"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let output = output.and_then(serde_json::Value::as_object);
     let input_string = |keys: &[&str]| {
         input.and_then(|input| {
             keys.iter()
                 .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
         })
     };
+    let output_string = |keys: &[&str]| {
+        output.and_then(|output| {
+            keys.iter()
+                .find_map(|key| output.get(*key).and_then(serde_json::Value::as_str))
+        })
+    };
+    let prompt = input_string(&["prompt", "message", "task"])
+        .unwrap_or_default()
+        .to_owned();
+    let model = input_string(&["model"]).map(str::to_owned);
+    let supplied_agent_id =
+        input_string(&["agent_id", "agentId"]).or_else(|| output_string(&["agent_id", "agentId"]));
+    let duration_ms = input
+        .and_then(|input| input.get("duration_ms").or_else(|| input.get("durationMs")))
+        .or_else(|| {
+            output.and_then(|output| {
+                output
+                    .get("duration_ms")
+                    .or_else(|| output.get("durationMs"))
+            })
+        })
+        .and_then(serde_json::Value::as_u64);
     let (description, subagent_type, agent_id, agents, path, activity) = match provider {
         ProviderId::Codex => {
-            let codex = meta?.get("codex")?.as_object()?;
-            let collaboration = codex
-                .get("collaboration")
+            let codex = meta
+                .and_then(|meta| meta.get("codex"))
                 .and_then(serde_json::Value::as_object);
-            let subagent = codex.get("subagent").and_then(serde_json::Value::as_object);
+            let collaboration = codex
+                .and_then(|codex| codex.get("collaboration"))
+                .and_then(serde_json::Value::as_object);
+            let subagent = codex
+                .and_then(|codex| codex.get("subagent"))
+                .and_then(serde_json::Value::as_object);
             let subagent_type = input_string(&["subagent_type", "subagentType"])
                 .or_else(|| {
                     collaboration
@@ -5177,8 +5352,10 @@ fn normalized_subagent_task(
                 .flatten()
                 .filter_map(serde_json::Value::as_str)
                 .take(MAX_CHOICES)
-                .filter_map(|id| {
-                    let state = states.and_then(|states| states.get(id))?.as_object();
+                .map(|id| {
+                    let state = states
+                        .and_then(|states| states.get(id))
+                        .and_then(serde_json::Value::as_object);
                     let status = state
                         .and_then(|state| state.get("status"))
                         .and_then(serde_json::Value::as_str)
@@ -5187,11 +5364,11 @@ fn normalized_subagent_task(
                         .and_then(|state| state.get("message"))
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
-                    Some(SubagentInfo {
+                    SubagentInfo {
                         id: id.to_owned(),
                         status,
                         message,
-                    })
+                    }
                 })
                 .collect::<Vec<_>>();
             if agents.is_empty()
@@ -5203,7 +5380,10 @@ fn normalized_subagent_task(
                     message: None,
                 });
             }
-            let agent_id = agents.first().map(|agent| agent.id.clone());
+            let agent_id = agents
+                .first()
+                .map(|agent| agent.id.clone())
+                .or_else(|| supplied_agent_id.map(str::to_owned));
             let path = subagent
                 .and_then(|subagent| subagent.get("path"))
                 .and_then(serde_json::Value::as_str)
@@ -5215,7 +5395,7 @@ fn normalized_subagent_task(
                 .or_else(|| input_string(&["activityKind"]))
                 .map(str::to_owned);
             (
-                title.to_owned(),
+                input_string(&["description"]).unwrap_or(title).to_owned(),
                 subagent_type,
                 agent_id,
                 agents,
@@ -5224,21 +5404,39 @@ fn normalized_subagent_task(
             )
         }
         ProviderId::Claude => {
-            let claude = meta?.get("claudeCode")?.as_object()?;
+            let claude = meta
+                .and_then(|meta| meta.get("claudeCode"))
+                .and_then(serde_json::Value::as_object);
             let subagent_type = input_string(&["subagent_type", "subagentType"])
-                .or_else(|| claude.get("toolName").and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    claude
+                        .and_then(|claude| claude.get("toolName"))
+                        .and_then(serde_json::Value::as_str)
+                })
                 .unwrap_or("subagent")
                 .to_owned();
             (
                 input_string(&["description"]).unwrap_or(title).to_owned(),
                 subagent_type,
-                input_string(&["agent_id", "agentId"]).map(str::to_owned),
+                supplied_agent_id.map(str::to_owned),
                 Vec::new(),
                 None,
                 None,
             )
         }
-        ProviderId::Cursor => return None,
+        ProviderId::Cursor => {
+            let subagent_type = input_string(&["subagent_type", "subagentType", "name"])
+                .unwrap_or("subagent")
+                .to_owned();
+            (
+                input_string(&["description"]).unwrap_or(title).to_owned(),
+                subagent_type,
+                supplied_agent_id.map(str::to_owned),
+                Vec::new(),
+                None,
+                None,
+            )
+        }
     };
     Some(ToolOutput::Task {
         description,
@@ -5249,8 +5447,41 @@ fn normalized_subagent_task(
         agents,
         path,
         activity,
-        duration_ms: None,
+        duration_ms,
     })
+}
+
+fn subagent_output_text(output: Option<&serde_json::Value>) -> Option<String> {
+    match output? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| bounded_detail(text.to_owned()))
+        }
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| subagent_output_text(Some(part)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then(|| bounded_detail(text))
+        }
+        serde_json::Value::Object(fields) => {
+            for key in ["output", "result", "response", "message", "text", "content"] {
+                if let Some(text) = subagent_output_text(fields.get(key)) {
+                    return Some(text);
+                }
+            }
+            (!fields.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "agentId" | "agent_id" | "durationMs" | "duration_ms" | "status"
+                )
+            }))
+            .then(|| bounded_json(output.unwrap()))
+        }
+        value => Some(bounded_json(value)),
+    }
 }
 
 fn json_has_content(value: &serde_json::Value) -> bool {
@@ -5332,18 +5563,53 @@ fn tool_display_title<'a>(
     raw_input: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
     let trimmed = title.map(str::trim).filter(|title| !title.is_empty());
+    let input = raw_input.and_then(parse_tool_input);
+    if let Some(command) = tool_command(trimmed, kind, input.as_ref()) {
+        return std::borrow::Cow::Owned(command);
+    }
     if let Some(title) = trimmed
         && !tool_title_needs_humanizing(title)
     {
         return std::borrow::Cow::Borrowed(title);
     }
-    let input = raw_input.and_then(parse_tool_input);
     if let Some(humanized) = humanize_machine_tool_title(trimmed, kind, paths, input.as_ref()) {
         return std::borrow::Cow::Owned(humanized);
     }
     trimmed
         .map(std::borrow::Cow::Borrowed)
         .unwrap_or_else(|| std::borrow::Cow::Borrowed("Tool activity"))
+}
+
+fn tool_command(
+    title: Option<&str>,
+    kind: Option<&str>,
+    input: Option<&serde_json::Value>,
+) -> Option<String> {
+    let name = title.unwrap_or_default().to_ascii_lowercase();
+    let execution = kind.is_some_and(|kind| kind.eq_ignore_ascii_case("execute"))
+        || matches!(
+            name.trim_start_matches(':').trim(),
+            "bash" | "shell" | "exec" | "execute" | "run_terminal_cmd" | "run_command"
+        )
+        || name.contains("terminal command");
+    if !execution {
+        return None;
+    }
+    match input? {
+        serde_json::Value::String(command) => {
+            let command = command.trim();
+            (!command.is_empty()).then(|| command.to_owned())
+        }
+        serde_json::Value::Object(input) => ["command", "cmd"].iter().find_map(|key| {
+            input
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(str::to_owned)
+        }),
+        _ => None,
+    }
 }
 
 fn tool_title_needs_humanizing(title: &str) -> bool {
@@ -5537,6 +5803,18 @@ fn humanize_machine_tool_title(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_acp_control_request_has_a_deadline() {
+        let error = async_io::block_on(wait_for_acp_with_timeout(
+            std::future::pending::<agent_client_protocol::Result<()>>(),
+            "test request",
+            Duration::from_millis(1),
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test request timed out"));
+    }
     use std::sync::{Arc, Mutex, mpsc};
 
     fn one_provider_event(provider: ProviderId, update: SessionUpdate) -> Event {
@@ -6072,6 +6350,110 @@ mod tests {
     }
 
     #[test]
+    fn imported_provider_subagents_keep_metadata_and_human_readable_output() {
+        for name in ["task_v2", "spawnAgent", "Agent"] {
+            let activity = external_tool_activity(ExternalTool {
+                id: "task-1".into(),
+                name: name.into(),
+                status: Some("completed".into()),
+                kind: Some("Task".into()),
+                input: Some(
+                    serde_json::json!({
+                        "description": "Review changes",
+                        "prompt": "Inspect the diff.",
+                        "subagentType": "reviewer",
+                    })
+                    .to_string(),
+                ),
+                output: Some(
+                    serde_json::json!({
+                        "agentId": "agent-1",
+                        "durationMs": 900,
+                        "output": "No issues found",
+                    })
+                    .to_string(),
+                ),
+                paths: Vec::new(),
+                diffs: Vec::new(),
+            });
+
+            assert!(
+                matches!(
+                    activity.detail,
+                    Some(ToolDetail { content, .. }) if matches!(
+                        content.as_slice(),
+                        [
+                            ToolOutput::Task {
+                                agent_id: Some(agent_id),
+                                duration_ms: Some(900),
+                                ..
+                            },
+                            ToolOutput::Text(output),
+                        ] if agent_id == "agent-1" && output == "No issues found"
+                    )
+                ),
+                "{name} did not preserve imported subagent metadata and output"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_cursor_task_v2_restores_every_available_subagent_field() {
+        let activity = external_tool_activity(ExternalTool {
+            id: "task-1".into(),
+            name: "task_v2".into(),
+            status: Some("completed".into()),
+            kind: Some("Task".into()),
+            input: Some(
+                serde_json::json!({
+                    "description": "Explore sidebar and toggle plumbing",
+                    "prompt": "Find the terminal toggle and sidebar layout.",
+                    "subagentType": "explore",
+                    "model": "cursor-grok-4.5-high-fast",
+                    "name": "explore",
+                })
+                .to_string(),
+            ),
+            output: Some(
+                serde_json::json!({
+                    "agentId": "9a79bcc6-d9ed-4392-8782-544fdb078423",
+                })
+                .to_string(),
+            ),
+            paths: Vec::new(),
+            diffs: Vec::new(),
+        });
+
+        assert_eq!(
+            activity.title.as_deref(),
+            Some("Subagent: Explore sidebar and toggle plumbing")
+        );
+        assert_eq!(activity.status.as_deref(), Some("Completed"));
+        assert!(matches!(
+            activity.detail,
+            Some(ToolDetail {
+                input: None,
+                content,
+                output: None,
+            }) if matches!(
+                content.as_slice(),
+                [ToolOutput::Task {
+                    description,
+                    prompt,
+                    subagent_type,
+                    model: Some(model),
+                    agent_id: Some(agent_id),
+                    ..
+                }] if description == "Explore sidebar and toggle plumbing"
+                    && prompt == "Find the terminal toggle and sidebar layout."
+                    && subagent_type == "explore"
+                    && model == "cursor-grok-4.5-high-fast"
+                    && agent_id == "9a79bcc6-d9ed-4392-8782-544fdb078423"
+            )
+        ));
+    }
+
+    #[test]
     fn imported_tool_diffs_reach_the_sidebar_as_structured_content() {
         use crate::agent::external_sessions::{ExternalDiff, ExternalTool};
 
@@ -6155,6 +6537,38 @@ mod tests {
     }
 
     #[test]
+    fn subagent_result_fields_render_as_text_with_sibling_metadata() {
+        let output = serde_json::json!({
+            "agentId": "agent-1",
+            "result": {"content": "No issues found"},
+        });
+
+        assert_eq!(
+            subagent_output_text(Some(&output)).as_deref(),
+            Some("No issues found")
+        );
+    }
+
+    #[test]
+    fn terminal_output_metadata_is_provider_independent() {
+        let meta = serde_json::json!({
+            "terminal_output_delta": {
+                "terminal_id": "terminal-1",
+                "data": "compiling\n"
+            }
+        });
+        let meta = meta.as_object().unwrap();
+
+        for provider in [ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude] {
+            assert!(matches!(
+                tool_logs(provider, Some(meta)).as_slice(),
+                [ToolOutput::Log { label, text }]
+                    if label == "Terminal output" && text == "compiling\n"
+            ));
+        }
+    }
+
+    #[test]
     fn cursor_extension_notifications_stay_structured() {
         let (event_tx, event_rx) = mpsc::sync_channel(4);
         let events = EventSender {
@@ -6203,6 +6617,108 @@ mod tests {
             ))),
             Event::ToolCallUpdated(tool) if tool.kind.is_none()
         ));
+    }
+
+    #[test]
+    fn provider_neutral_task_tools_are_subagent_cards_for_every_provider() {
+        for provider in [ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude] {
+            let event = one_provider_event(
+                provider,
+                SessionUpdate::ToolCall(
+                    ToolCall::new("task-live", "Task V2")
+                        .status(ToolCallStatus::Completed)
+                        .raw_input(serde_json::json!({
+                            "description": "Explore sidebar",
+                            "prompt": "Find the terminal toggle.",
+                            "subagentType": "explore",
+                            "model": "provider-model",
+                        }))
+                        .raw_output(serde_json::json!({
+                            "agentId": "agent-9",
+                            "durationMs": 1200,
+                            "output": "Found the toggle in workspace_view.rs",
+                        })),
+                ),
+            );
+
+            assert!(
+                matches!(
+                    event,
+                    Event::ToolCallUpdated(ToolActivity {
+                        title: Some(title),
+                        status: Some(status),
+                        kind: Some(kind),
+                        detail: Some(ToolDetail { content, .. }),
+                        ..
+                    }) if title == "Subagent: Explore sidebar"
+                        && status == "Completed"
+                        && kind == "Task"
+                        && matches!(
+                            content.as_slice(),
+                            [
+                                ToolOutput::Task {
+                                    prompt,
+                                    subagent_type,
+                                    model: Some(model),
+                                    agent_id: Some(agent_id),
+                                    duration_ms: Some(1200),
+                                    ..
+                                },
+                                ToolOutput::Log { label, text },
+                            ] if prompt == "Find the terminal toggle."
+                                && subagent_type == "explore"
+                                && model == "provider-model"
+                                && agent_id == "agent-9"
+                                && label == "Subagent output"
+                                && text == "Found the toggle in workspace_view.rs"
+                        )
+                ),
+                "{provider:?} did not preserve the provider-neutral subagent contract"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_neutral_subagent_result_updates_merge_as_labeled_output() {
+        for provider in [ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude] {
+            let event = one_provider_event(
+                provider,
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "task-live",
+                    ToolCallUpdateFields::new()
+                        .title("Task V2")
+                        .status(ToolCallStatus::Completed)
+                        .raw_output(serde_json::json!({
+                            "agentId": "agent-9",
+                            "output": "Found the toggle",
+                        })),
+                )),
+            );
+
+            assert!(
+                matches!(
+                    event,
+                    Event::ToolCallUpdated(ToolActivity {
+                        title: None,
+                        status: Some(status),
+                        kind: Some(kind),
+                        detail: Some(ToolDetail {
+                            input: None,
+                            content,
+                            output: None,
+                        }),
+                        ..
+                    }) if status == "Completed"
+                        && kind == "Task"
+                        && matches!(
+                            content.as_slice(),
+                            [ToolOutput::Log { label, text }]
+                                if label == "Subagent output" && text == "Found the toggle"
+                        )
+                ),
+                "{provider:?} did not merge a delayed subagent result"
+            );
+        }
     }
 
     #[test]
@@ -6383,6 +6899,7 @@ mod tests {
             }),
         );
         assert_eq!(tool.kind.as_deref(), Some("Task"));
+        assert_eq!(tool.status.as_deref(), Some("Completed"));
         assert!(matches!(
             tool.detail.as_ref().unwrap().content.as_slice(),
             [ToolOutput::Task {
@@ -6410,6 +6927,60 @@ mod tests {
         assert!(matches!(
             tool.detail.as_ref().unwrap().content.as_slice(),
             [ToolOutput::Task { subagent_type, .. }] if subagent_type == "unspecified"
+        ));
+    }
+
+    #[test]
+    fn cursor_task_v2_tool_calls_are_live_subagent_cards_with_output() {
+        let event = one_provider_event(
+            ProviderId::Cursor,
+            SessionUpdate::ToolCall(
+                ToolCall::new("task-live", "Task V2")
+                    .status(ToolCallStatus::Completed)
+                    .raw_input(serde_json::json!({
+                        "description": "Explore sidebar",
+                        "prompt": "Find the terminal toggle.",
+                        "subagentType": "explore",
+                        "model": "cursor-grok-4.5-high-fast",
+                    }))
+                    .raw_output(serde_json::json!({
+                        "agentId": "agent-9",
+                        "durationMs": 1200,
+                        "output": "Found the toggle in workspace_view.rs",
+                    })),
+            ),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ToolCallUpdated(ToolActivity {
+                title: Some(title),
+                status: Some(status),
+                kind: Some(kind),
+                detail: Some(ToolDetail { content, .. }),
+                ..
+            }) if title == "Subagent: Explore sidebar"
+                && status == "Completed"
+                && kind == "Task"
+                && matches!(
+                    content.as_slice(),
+                    [
+                        ToolOutput::Task {
+                            prompt,
+                            subagent_type,
+                            model: Some(model),
+                            agent_id: Some(agent_id),
+                            duration_ms: Some(1200),
+                            ..
+                        },
+                        ToolOutput::Log { label, text },
+                    ] if prompt == "Find the terminal toggle."
+                        && subagent_type == "explore"
+                        && model == "cursor-grok-4.5-high-fast"
+                        && agent_id == "agent-9"
+                        && label == "Subagent output"
+                        && text == "Found the toggle in workspace_view.rs"
+                )
         ));
     }
 
@@ -6855,6 +7426,27 @@ mod tests {
             }),
         };
         assert_eq!(command.display_title(), "cargo test");
+
+        let cursor_command = ToolActivity {
+            id: "cursor-bash-1".into(),
+            title: Some("Run Terminal Command V2".into()),
+            status: Some("Completed".into()),
+            kind: Some("Execute".into()),
+            paths: Vec::new(),
+            detail: Some(ToolDetail {
+                input: Some(
+                    serde_json::json!({
+                        "command": "cargo test --lib devin",
+                        "cwd": "/project",
+                        "options": { "timeout": 300000 }
+                    })
+                    .to_string(),
+                ),
+                content: Vec::new(),
+                output: None,
+            }),
+        };
+        assert_eq!(cursor_command.display_title(), "cargo test --lib devin");
 
         let snake = ToolActivity {
             id: "git-1".into(),

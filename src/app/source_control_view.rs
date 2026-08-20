@@ -21,6 +21,11 @@ enum SourceGroup {
 }
 
 impl EditorApp {
+    #[cfg(test)]
+    pub(super) fn benchmark_draw_source_control(&mut self, ui: &mut egui::Ui) {
+        let _ = self.draw_source_control_repository(ui);
+    }
+
     pub(super) fn open_source_control(&mut self, ctx: &egui::Context) {
         if self.git_controller.is_none() {
             let wake = ctx.clone();
@@ -91,9 +96,8 @@ impl EditorApp {
 
     fn refresh_active_git_diff(&mut self, generation: u64) {
         let Some(diff) = self
-            .active_tab
-            .and_then(|index| self.tabs.get(index))
-            .and_then(|tab| tab.git_diff.as_ref())
+            .git_diff
+            .as_ref()
             .filter(|diff| diff.generation < generation)
             .cloned()
         else {
@@ -192,35 +196,26 @@ impl EditorApp {
             return;
         }
         let source_path = repository.join(&path);
-        let unsaved_editor_changes = self.tabs.iter().any(|tab| {
-            tab.git_diff.is_none() && tab.buffer.path == source_path && tab.buffer.dirty
-        });
-        let key = git_diff_tab_path(&repository, &path, area);
-        let diff = GitDiffTab {
+        let unsaved_editor_changes = self
+            .tabs
+            .iter()
+            .any(|tab| tab.buffer.path == source_path && tab.buffer.dirty);
+        let mut content = DefaultHasher::new();
+        old.hash(&mut content);
+        new.hash(&mut content);
+        generation.hash(&mut content);
+        let diff = GitDiffPreview {
             repository,
             path,
             area,
             old,
             new,
             generation,
+            content_revision: content.finish(),
             unsaved_editor_changes,
         };
-        if let Some(index) = self.tabs.iter().position(|tab| tab.buffer.path == key) {
-            self.tabs[index].buffer.text.clone_from(&diff.new);
-            self.tabs[index].buffer.mark_changed();
-            self.tabs[index].buffer.dirty = false;
-            self.tabs[index].git_diff = Some(diff);
-            self.activate_tab(index);
-            return;
-        }
-        let mut buffer = Buffer::new(key);
-        buffer.text.clone_from(&diff.new);
-        buffer.mark_changed();
-        buffer.dirty = false;
-        let mut tab = FileTab::new(buffer, self.active_pane);
-        tab.git_diff = Some(diff);
-        self.tabs.push(tab);
-        self.activate_tab(self.tabs.len() - 1);
+        self.git_diff = Some(diff);
+        self.focus_editor = false;
     }
 
     pub(super) fn draw_source_control(&mut self, ui: &mut egui::Ui) {
@@ -473,24 +468,20 @@ impl EditorApp {
                     .id_salt(("source_control_changes", &repository.root))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let merge = repository
-                            .entries
-                            .iter()
-                            .filter(|entry| is_conflicted(entry))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let staged = repository
-                            .entries
-                            .iter()
-                            .filter(|entry| entry.index.is_some() && !is_conflicted(entry))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let changes = repository
-                            .entries
-                            .iter()
-                            .filter(|entry| entry.worktree.is_some() && !is_conflicted(entry))
-                            .cloned()
-                            .collect::<Vec<_>>();
+                        let (mut merge, mut staged, mut changes) =
+                            (Vec::new(), Vec::new(), Vec::new());
+                        for entry in &repository.entries {
+                            if is_conflicted(entry) {
+                                merge.push(entry);
+                                continue;
+                            }
+                            if entry.index.is_some() {
+                                staged.push(entry);
+                            }
+                            if entry.worktree.is_some() {
+                                changes.push(entry);
+                            }
+                        }
                         for (group, label, entries) in [
                             (SourceGroup::Merge, "MERGE CHANGES", merge),
                             (SourceGroup::Staged, "STAGED CHANGES", staged),
@@ -504,31 +495,40 @@ impl EditorApp {
                                     .pending_paths
                                     .contains(&(repository.root.clone(), entry.path.clone()))
                             });
-                            if let Some(found) = source_group_header(
-                                ui,
-                                &repository.root,
-                                group,
-                                label,
-                                &entries,
-                                pending,
-                            ) {
-                                action = Some(found);
-                            }
-                            for entry in entries {
-                                if let Some(found) = source_control_row(
+                            if row_is_visible(ui, theme::control::COMPACT + theme::space::TIGHT) {
+                                if let Some(found) = source_group_header(
                                     ui,
                                     &repository.root,
                                     group,
-                                    &entry,
-                                    row_index,
-                                    self.git_state.focus_index == Some(row_index),
-                                    self.git_state
-                                        .pending_paths
-                                        .contains(&(repository.root.clone(), entry.path.clone())),
+                                    label,
+                                    &entries,
+                                    pending,
                                 ) {
-                                    self.git_state.focus_index = Some(row_index);
-                                    self.scm_focused = true;
                                     action = Some(found);
+                                }
+                            } else {
+                                reserve_row(ui, theme::control::COMPACT + theme::space::TIGHT);
+                            }
+                            for entry in entries {
+                                if row_is_visible(ui, theme::control::COMPACT) {
+                                    if let Some(found) = source_control_row(
+                                        ui,
+                                        &repository.root,
+                                        group,
+                                        entry,
+                                        row_index,
+                                        self.git_state.focus_index == Some(row_index),
+                                        self.git_state.pending_paths.contains(&(
+                                            repository.root.clone(),
+                                            entry.path.clone(),
+                                        )),
+                                    ) {
+                                        self.git_state.focus_index = Some(row_index);
+                                        self.scm_focused = true;
+                                        action = Some(found);
+                                    }
+                                } else {
+                                    reserve_row(ui, theme::control::COMPACT);
                                 }
                                 row_index += 1;
                             }
@@ -753,28 +753,20 @@ fn source_control_empty(ui: &mut egui::Ui, message: &str) {
     });
 }
 
+fn row_is_visible(ui: &egui::Ui, height: f32) -> bool {
+    let row = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height));
+    ui.clip_rect().expand(height).intersects(row)
+}
+
+fn reserve_row(ui: &mut egui::Ui, height: f32) {
+    ui.allocate_space(egui::vec2(ui.available_width(), height));
+}
+
 fn redact_home(message: &str) -> String {
     directories::UserDirs::new()
         .map(|directories| directories.home_dir().to_string_lossy().into_owned())
         .filter(|home| !home.is_empty())
         .map_or_else(|| message.to_owned(), |home| message.replace(&home, "~"))
-}
-
-fn git_diff_tab_path(repository: &Path, path: &Path, area: DiffArea) -> PathBuf {
-    let qualifier = match area {
-        DiffArea::Staged => "Staged",
-        DiffArea::Worktree => "Working Tree",
-    };
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    repository
-        .join(".editur-git-diff")
-        .join(qualifier)
-        .join(parent)
-        .join(format!("{name} ({qualifier})"))
 }
 
 fn source_control_no_repository(
@@ -836,14 +828,13 @@ fn repository_name(workspace: &Path, repository: &Path) -> String {
         .to_string()
 }
 
-fn source_rows(repository: &RepositoryStatus) -> Vec<(SourceGroup, GitEntry)> {
+fn source_rows(repository: &RepositoryStatus) -> Vec<(SourceGroup, &GitEntry)> {
     let mut rows = Vec::new();
     rows.extend(
         repository
             .entries
             .iter()
             .filter(|entry| is_conflicted(entry))
-            .cloned()
             .map(|entry| (SourceGroup::Merge, entry)),
     );
     rows.extend(
@@ -851,7 +842,6 @@ fn source_rows(repository: &RepositoryStatus) -> Vec<(SourceGroup, GitEntry)> {
             .entries
             .iter()
             .filter(|entry| entry.index.is_some() && !is_conflicted(entry))
-            .cloned()
             .map(|entry| (SourceGroup::Staged, entry)),
     );
     rows.extend(
@@ -859,7 +849,6 @@ fn source_rows(repository: &RepositoryStatus) -> Vec<(SourceGroup, GitEntry)> {
             .entries
             .iter()
             .filter(|entry| entry.worktree.is_some() && !is_conflicted(entry))
-            .cloned()
             .map(|entry| (SourceGroup::Changes, entry)),
     );
     rows
@@ -870,7 +859,7 @@ fn source_group_header(
     repository: &Path,
     group: SourceGroup,
     label: &str,
-    entries: &[GitEntry],
+    entries: &[&GitEntry],
     pending: bool,
 ) -> Option<SourceControlAction> {
     let mut action = None;

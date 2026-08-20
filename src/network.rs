@@ -4,22 +4,38 @@ use std::time::Duration;
 /// replaced; retries without delay all land in the same outage.
 const RETRY_ATTEMPTS: u32 = 5;
 
-pub(crate) fn retry<T, E>(request: impl FnMut() -> Result<T, E>) -> Result<T, E> {
-    retry_with_sleep(std::thread::sleep, request)
+#[cfg(feature = "network")]
+pub(crate) fn retry<T>(request: impl FnMut() -> Result<T, ureq::Error>) -> Result<T, ureq::Error> {
+    retry_with_sleep(std::thread::sleep, retryable_request, request)
 }
 
 fn retry_with_sleep<T, E>(
     mut sleep: impl FnMut(Duration),
+    should_retry: impl Fn(&E) -> bool,
     mut request: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
     for attempt in 0..RETRY_ATTEMPTS {
         match request() {
             Ok(value) => return Ok(value),
-            Err(error) if attempt + 1 == RETRY_ATTEMPTS => return Err(error),
+            Err(error) if attempt + 1 == RETRY_ATTEMPTS || !should_retry(&error) => {
+                return Err(error);
+            }
             Err(_) => sleep(backoff_after(attempt)),
         }
     }
     unreachable!()
+}
+
+#[cfg(feature = "network")]
+fn retryable_request(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::StatusCode(408 | 429 | 500..=599)
+            | ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::HostNotFound
+            | ureq::Error::ConnectionFailed
+    )
 }
 
 fn backoff_after(attempt: u32) -> Duration {
@@ -32,8 +48,8 @@ fn backoff_after(attempt: u32) -> Duration {
 }
 
 #[cfg(feature = "network")]
-pub(crate) fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-    agent().get(url).call().map_err(|error| error.to_string())
+pub(crate) fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    agent().get(url).call()
 }
 
 #[cfg(feature = "network")]
@@ -67,6 +83,7 @@ mod tests {
         assert_eq!(
             super::retry_with_sleep(
                 |delay| delays.push(delay),
+                |_| true,
                 || {
                     attempts += 1;
                     (attempts == 5).then_some("ok").ok_or("disconnected")
@@ -90,6 +107,7 @@ mod tests {
         assert_eq!(
             super::retry_with_sleep::<(), _>(
                 |delay| delays.push(delay),
+                |_| true,
                 || {
                     attempts += 1;
                     Err("still down")
@@ -99,6 +117,32 @@ mod tests {
         );
         assert_eq!(attempts, 5);
         assert_eq!(delays.len(), 4);
+
+        attempts = 0;
+        delays.clear();
+        assert_eq!(
+            super::retry_with_sleep::<(), _>(
+                |delay| delays.push(delay),
+                |_| false,
+                || {
+                    attempts += 1;
+                    Err("not found")
+                }
+            ),
+            Err("not found")
+        );
+        assert_eq!(attempts, 1);
+        assert!(delays.is_empty());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(!super::retryable_request(&ureq::Error::StatusCode(404)));
+        assert!(!super::retryable_request(&ureq::Error::StatusCode(403)));
+        assert!(super::retryable_request(&ureq::Error::StatusCode(408)));
+        assert!(super::retryable_request(&ureq::Error::StatusCode(429)));
+        assert!(super::retryable_request(&ureq::Error::StatusCode(503)));
     }
 
     #[cfg(feature = "network")]

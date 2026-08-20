@@ -107,6 +107,31 @@ Five fresh-process trials isolated the macOS titlebar toggle after the first edi
 
 The optimized path retains per-line text and syntax allocations across width-only changes, uses cached document metrics, and skips the stale frame that initiates native maximize. The native toggle runs outside the redraw callback, and its resize burst is coalesced to one final Metal surface update after 50 ms of quiet; ordinary manual resizing remains live. A busy Metal frame slot also defers the redraw instead of synchronously waiting on the UI thread. The editor benchmark measures CPU work; the fresh-process titlebar trials cover the reported cold AppKit stall.
 
+## Optimization decision suite
+
+Run the quick profile while changing a hotspot and the full profile before accepting an architectural rewrite:
+
+```sh
+scripts/benchmark_hotspots.sh --quick
+scripts/benchmark_hotspots.sh --full
+```
+
+The runner uses ignored release-mode tests, one benchmark thread, deterministic temporary fixtures, and no external benchmarking framework. It records newline-delimited JSON, raw output, and host/commit metadata under ignored `target/benchmarks/`. `EDITUR_BENCH_QUICK=1` selects the smaller fixture set when invoking the ignored tests directly.
+
+The 2026-08-19 full run (`hotspots-20260819T213112Z-full.jsonl`) emitted 62 green, 0 watch, and 0 red decisions. The previously watched 10,000-item Devin transcript fell from 11.08 ms to 0.101 ms p95 after retained-height culling. The expanded Vim probe found and then removed one final whole-document clamp: at 10 MiB, paragraph forward/back are 0.451/0.467 ms p95, inner word/quote are below 0.001 ms, and the nesting-aware pair object is 2.834 ms.
+
+| Candidate | Probe | Rewrite signal |
+| --- | --- | --- |
+| Vim motions and text objects | Local word/back/vertical/paragraph motions plus word, quote, and pair objects over 100 KiB, 1 MiB, and 10 MiB Unicode documents | p95 above 4 ms is watch; above 8 ms is red |
+| Transcript and list virtualization | Headless egui frames for Devin transcripts/sessions, source control, file picker, and the 2,048-item Agent cap | p95 above 8 ms is watch; above 16.7 ms is red |
+| Agent persistence/backpressure | A 300-event, 19.2 MiB fake-provider burst after filling the bounded UI queue | event-gap p95 above 16.7 ms or drain above 2 s is red |
+| Controller cancellation | An isolated child drops a controller while ACP initialization is stalled | above 500 ms is watch; above 1 s is red |
+| ACP frame bounds | Isolated terminated and unterminated 1–64 MiB frames with peak-RSS sampling | process peak above 96 MiB, 32→64 MiB growth above 8 MiB, or failure above 1 s is red |
+| Image cache eviction | Unique 128×128 embedded previews are removed from source state, then texture metadata is inspected | any retained preview texture is red |
+| Workspace indexing/discovery | 10k/100k-file search and repository traversal fixtures with query replacement | first result above 2 s, query replacement above 250 ms, or discovery above 2 s is red |
+
+Red records are diagnostic results, not test failures. Profile only red scenarios; accept a rewrite when it clears the failed safety/reliability gate or improves the relevant p95 by at least 25% without regressing startup, idle CPU, or settled memory by more than 5%. Timing records stay manual because shared CI runners are noisy. The non-ignored fixture and runner tests remain part of the normal correctness suite.
+
 ## Reproduction and platform status
 
 ```sh

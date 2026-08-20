@@ -6,7 +6,7 @@ use egui::{
 };
 use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
-use crate::{keybindings::Command, renderer::mark_retained, theme};
+use crate::{buffer::TextEdit, keybindings::Command, renderer::mark_retained, theme};
 
 const TEXT_LEFT_PADDING: f32 = 8.0;
 const TEXT_TOP_PADDING: f32 = 6.0;
@@ -59,6 +59,7 @@ pub struct EditorSurface {
     undo: Vec<Vec<Edit>>,
     redo: Vec<Vec<Edit>>,
     transaction: Option<Vec<Edit>>,
+    applied_edits: Vec<TextEdit>,
     lines: Vec<RetainedLine>,
     line_numbers: Vec<Option<Arc<Galley>>>,
     offsets: Vec<f32>,
@@ -121,26 +122,29 @@ impl EditorSurface {
     }
 
     pub fn replace_selection(&mut self, text: &mut String, replacement: &str) -> bool {
-        let range = self.selection();
-        let character_len = text.chars().count();
-        let range = range.start.min(character_len)..range.end.min(character_len);
-        if range.is_empty() && replacement.is_empty() {
+        let (applied, bytes) = text_edit(text, self.selection(), replacement);
+        if applied.deleted_characters == 0 && replacement.is_empty() {
             return false;
         }
-        let deleted = char_slice(text, range.clone()).to_owned();
+        let deleted = text[bytes.clone()].to_owned();
         let before = (self.anchor, self.cursor);
-        replace_chars(text, range.clone(), replacement);
-        let cursor = range.start + replacement.chars().count();
+        text.replace_range(bytes, replacement);
+        let cursor = applied.start_character + applied.inserted_characters;
         self.anchor = cursor;
         self.cursor = cursor;
         self.record_edit(Edit {
-            start: range.start,
+            start: applied.start_character,
             deleted,
             inserted: replacement.to_owned(),
             before,
             after: (cursor, cursor),
         });
+        self.applied_edits.push(applied);
         true
+    }
+
+    pub(crate) fn take_applied_edits(&mut self) -> Vec<TextEdit> {
+        std::mem::take(&mut self.applied_edits)
     }
 
     fn record_edit(&mut self, edit: Edit) {
@@ -175,7 +179,9 @@ impl EditorSurface {
         };
         for edit in edits.iter().rev() {
             let end = edit.start + edit.inserted.chars().count();
-            replace_chars(text, edit.start..end, &edit.deleted);
+            let (applied, bytes) = text_edit(text, edit.start..end, &edit.deleted);
+            self.applied_edits.push(applied);
+            text.replace_range(bytes, &edit.deleted);
         }
         (self.anchor, self.cursor) = edits
             .first()
@@ -191,7 +197,9 @@ impl EditorSurface {
         };
         for edit in &edits {
             let end = edit.start + edit.deleted.chars().count();
-            replace_chars(text, edit.start..end, &edit.inserted);
+            let (applied, bytes) = text_edit(text, edit.start..end, &edit.inserted);
+            self.applied_edits.push(applied);
+            text.replace_range(bytes, &edit.inserted);
         }
         (self.anchor, self.cursor) = edits
             .last()
@@ -1492,9 +1500,44 @@ fn char_slice(text: &str, range: Range<usize>) -> &str {
     &text[byte_index(text, range.start)..byte_index(text, range.end)]
 }
 
-fn replace_chars(text: &mut String, range: Range<usize>, replacement: &str) {
-    let bytes = byte_index(text, range.start)..byte_index(text, range.end);
-    text.replace_range(bytes, replacement);
+fn text_edit(text: &str, requested: Range<usize>, replacement: &str) -> (TextEdit, Range<usize>) {
+    let (range, bytes) = edit_ranges(text, requested);
+    let mut characters = 0;
+    let inserted_line_starts = replacement
+        .char_indices()
+        .filter_map(|(byte, character)| {
+            characters += 1;
+            (character == '\n').then_some((characters, byte + 1))
+        })
+        .collect();
+    (
+        TextEdit {
+            start_character: range.start,
+            start_byte: bytes.start,
+            deleted_characters: range.end - range.start,
+            deleted_bytes: bytes.end - bytes.start,
+            inserted_characters: characters,
+            inserted_bytes: replacement.len(),
+            inserted_line_starts,
+        },
+        bytes,
+    )
+}
+
+fn edit_ranges(text: &str, requested: Range<usize>) -> (Range<usize>, Range<usize>) {
+    let mut start_byte = None;
+    let mut character_len = 0;
+    for (character, (byte, _)) in text.char_indices().enumerate() {
+        if character == requested.start {
+            start_byte = Some(byte);
+        }
+        if character == requested.end {
+            return (requested, start_byte.unwrap_or(byte)..byte);
+        }
+        character_len = character + 1;
+    }
+    let range = requested.start.min(character_len)..requested.end.min(character_len);
+    (range, start_byte.unwrap_or(text.len())..text.len())
 }
 
 fn byte_index(text: &str, character: usize) -> usize {
@@ -1508,6 +1551,7 @@ mod tests {
     use super::{
         EditorSurface, gutter_width, selection_drag_scroll_delta, split_layout_job, theme,
     };
+    use crate::buffer::TextEdit;
     use egui::{
         Color32, CursorIcon, Event, Id, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput,
         Rect, TextFormat, TouchPhase, Vec2, pos2, text::LayoutJob,
@@ -1642,6 +1686,27 @@ mod tests {
         assert!(editor.redo(&mut text));
         assert_eq!(text, "hello Editur");
         assert_eq!(editor.selection(), 12..12);
+    }
+
+    #[test]
+    fn replacement_reports_the_incremental_buffer_edit() {
+        let mut editor = EditorSurface::default();
+        let mut text = "αβ\nhello".to_owned();
+        editor.set_selection(4, 8);
+
+        assert!(editor.replace_selection(&mut text, "i\nthere"));
+        assert_eq!(
+            editor.take_applied_edits(),
+            vec![TextEdit {
+                start_character: 4,
+                start_byte: 6,
+                deleted_characters: 4,
+                deleted_bytes: 4,
+                inserted_characters: 7,
+                inserted_bytes: 7,
+                inserted_line_starts: vec![(2, 2)],
+            }]
+        );
     }
 
     #[test]

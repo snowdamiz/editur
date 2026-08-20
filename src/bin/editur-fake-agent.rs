@@ -96,6 +96,9 @@ impl agent_client_protocol::JsonRpcRequest for CodexExtensionRequest {
 }
 
 fn main() {
+    if run_performance_fixture() {
+        return;
+    }
     if run_descendant_child() {
         return;
     }
@@ -195,6 +198,60 @@ fn main() {
         eprintln!("fake ACP agent: {error}");
         std::process::exit(1);
     }
+}
+
+fn run_performance_fixture() -> bool {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(path) = arguments
+        .windows(2)
+        .find(|arguments| arguments[0] == "--performance-pid-file")
+        .map(|arguments| &arguments[1])
+    {
+        std::fs::write(path, std::process::id().to_string()).expect("write performance pid");
+    }
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--stall-before-protocol-ms")
+    {
+        let milliseconds = arguments
+            .get(index + 1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(2_000)
+            .min(10_000);
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        return true;
+    }
+    let frame = arguments.iter().enumerate().find_map(|(index, argument)| {
+        let terminated = match argument.as_str() {
+            "--raw-frame-bytes" => true,
+            "--raw-frame-unterminated-bytes" => false,
+            _ => return None,
+        };
+        arguments
+            .get(index + 1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|bytes| (bytes.min(128 * 1024 * 1024), terminated))
+    });
+    let Some((bytes, terminated)) = frame else {
+        return false;
+    };
+    const PREFIX: &[u8] =
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"benchmark/frame\",\"params\":{\"payload\":\"";
+    let suffix: &[u8] = if terminated { b"\"}}\n" } else { b"" };
+    let payload_bytes = bytes.saturating_sub(PREFIX.len() + suffix.len());
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(PREFIX).expect("write raw-frame prefix");
+    let chunk = [b'x'; 64 * 1024];
+    for length in (0..payload_bytes).step_by(chunk.len()) {
+        stdout
+            .write_all(&chunk[..chunk.len().min(payload_bytes - length)])
+            .expect("write raw-frame payload");
+        stdout.flush().expect("flush raw-frame payload");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    stdout.write_all(suffix).expect("write raw-frame suffix");
+    stdout.flush().expect("flush raw frame");
+    true
 }
 
 fn run_claude_login_fixture() -> bool {

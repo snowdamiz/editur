@@ -1,14 +1,18 @@
-use std::fmt;
+use std::{
+    fmt, fs,
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
-const SERVICE: &str = "io.editur.Editur";
-const ACCOUNT: &str = "devin-mcp";
+const FILE_NAME: &str = "devin-credentials.json";
+const MAX_STORED_BYTES: u64 = 20 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialSource {
     Environment,
-    Keyring,
+    Stored,
 }
 
 #[derive(Clone)]
@@ -71,33 +75,83 @@ impl Credentials {
             )
             .map(Some);
         }
-        let entry = entry()?;
-        let record = match entry.get_password() {
-            Ok(record) => record,
-            Err(keyring::v1::Error::NoEntry) => return Ok(None),
-            Err(_) => return Err("cannot read Devin credentials from the operating system".into()),
-        };
-        let record: StoredCredentials = serde_json::from_str(&record)
-            .map_err(|_| "stored Devin credentials are invalid".to_owned())?;
-        Self::new(record.api_key, record.org_id, CredentialSource::Keyring).map(Some)
+        Self::load_from(&credential_path()?)
     }
 
     pub(crate) fn save(&self) -> Result<(), String> {
-        let record = serde_json::to_string(&StoredCredentials {
+        self.save_to(&credential_path()?)
+    }
+
+    fn load_from(path: &Path) -> Result<Option<Self>, String> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "{} is not a regular credential file",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_STORED_BYTES {
+            return Err("stored Devin credentials are too large".into());
+        }
+        let record = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let record: StoredCredentials = serde_json::from_str(&record)
+            .map_err(|_| "stored Devin credentials are invalid".to_owned())?;
+        Self::new(record.api_key, record.org_id, CredentialSource::Stored).map(Some)
+    }
+
+    fn save_to(&self, path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(format!(
+                    "{} is not a regular credential file",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        let record = serde_json::to_vec(&StoredCredentials {
             api_key: self.api_key.clone(),
             org_id: self.org_id.clone(),
         })
         .map_err(|_| "cannot encode Devin credentials".to_owned())?;
-        entry()?
-            .set_password(&record)
-            .map_err(|_| "cannot save Devin credentials in the operating system".to_owned())?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| format!("cannot create credential temporary file: {error}"))?;
+        temporary
+            .write_all(&record)
+            .and_then(|()| temporary.flush())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        temporary
+            .persist(path)
+            .map_err(|error| format!("cannot replace {}: {}", path.display(), error.error))?;
         Ok(())
     }
 
     pub(crate) fn delete() -> Result<(), String> {
-        match entry()?.delete_credential() {
-            Ok(()) | Err(keyring::v1::Error::NoEntry) => Ok(()),
-            Err(_) => Err("cannot remove Devin credentials from the operating system".into()),
+        Self::delete_from(&credential_path()?)
+    }
+
+    fn delete_from(path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+                format!("{} is not a regular credential file", path.display()),
+            ),
+            Ok(_) => fs::remove_file(path)
+                .map_err(|error| format!("cannot remove {}: {error}", path.display())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
         }
     }
 
@@ -126,20 +180,47 @@ struct StoredCredentials {
     org_id: Option<String>,
 }
 
-fn entry() -> Result<keyring::v1::Entry, String> {
-    keyring::v1::Entry::new(SERVICE, ACCOUNT)
-        .map_err(|_| "the operating-system credential store is unavailable".to_owned())
+fn credential_path() -> Result<PathBuf, String> {
+    crate::data_dir().map(|directory| directory.join(FILE_NAME))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_credentials_round_trip_through_one_local_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("devin-credentials.json");
+        let credentials = super::Credentials::new(
+            "cog_local-test".into(),
+            Some("org-1".into()),
+            super::CredentialSource::Stored,
+        )
+        .unwrap();
+
+        credentials.save_to(&path).unwrap();
+        let loaded = super::Credentials::load_from(&path).unwrap().unwrap();
+
+        assert_eq!(
+            (
+                loaded.api_key.as_str(),
+                loaded.org_id.as_deref(),
+                loaded.source
+            ),
+            (
+                "cog_local-test",
+                Some("org-1"),
+                super::CredentialSource::Stored
+            )
+        );
+    }
+
     #[test]
     fn credentials_never_expose_the_api_key_through_debug_or_errors() {
         let token = "cog_a-secret-that-must-not-leak";
         let credential = super::Credentials::new(
             token.into(),
             Some("org-1".into()),
-            super::CredentialSource::Keyring,
+            super::CredentialSource::Stored,
         )
         .unwrap();
 
@@ -152,7 +233,7 @@ mod tests {
             super::Credentials::new(
                 format!("cog_{}", "x".repeat(20_000)),
                 None,
-                super::CredentialSource::Keyring,
+                super::CredentialSource::Stored,
             )
             .is_err()
         );
@@ -160,7 +241,7 @@ mod tests {
             super::Credentials::new(
                 "cog_valid".into(),
                 Some("org\nheader".into()),
-                super::CredentialSource::Keyring,
+                super::CredentialSource::Stored,
             )
             .is_err()
         );

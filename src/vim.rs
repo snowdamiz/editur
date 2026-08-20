@@ -66,6 +66,53 @@ pub struct VimOutcome {
     pub copy_to_system: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct VimTextIndex<'a> {
+    line_starts: &'a [usize],
+    line_byte_starts: &'a [usize],
+    character_len: usize,
+}
+
+impl<'a> VimTextIndex<'a> {
+    pub(crate) fn new(
+        line_starts: &'a [usize],
+        line_byte_starts: &'a [usize],
+        character_len: usize,
+    ) -> Self {
+        Self {
+            line_starts,
+            line_byte_starts,
+            character_len,
+        }
+    }
+
+    fn line(&self, character: usize) -> usize {
+        self.line_starts
+            .partition_point(|start| *start <= character.min(self.character_len))
+            .saturating_sub(1)
+    }
+
+    fn line_start(&self, character: usize) -> usize {
+        self.line_starts[self.line(character)]
+    }
+
+    fn line_end(&self, character: usize) -> usize {
+        self.line_starts
+            .get(self.line(character) + 1)
+            .map_or(self.character_len, |start| start.saturating_sub(1))
+    }
+
+    fn byte_index(&self, text: &str, character: usize) -> usize {
+        let character = character.min(self.character_len);
+        let line = self.line(character);
+        let byte_start = self.line_byte_starts[line];
+        text[byte_start..]
+            .char_indices()
+            .nth(character - self.line_starts[line])
+            .map_or(text.len(), |(offset, _)| byte_start + offset)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operator {
     Delete,
@@ -482,12 +529,61 @@ impl VimState {
         }
     }
 
+    pub(crate) fn execute_indexed(
+        &mut self,
+        command: Command,
+        editor: &mut EditorSurface,
+        text: &mut String,
+        session: &mut VimSession,
+        index: VimTextIndex<'_>,
+    ) -> VimOutcome {
+        if let Some(digit) = command_digit(command) {
+            if digit == 0 && self.count == 0 {
+                return self.execute_motion_with_index(
+                    Motion::LineStart,
+                    editor,
+                    text,
+                    session,
+                    Some(index),
+                );
+            }
+            self.count = self.count.saturating_mul(10).saturating_add(digit);
+            return VimOutcome::default();
+        }
+        if let Some(motion) = command_motion(command, self.last_find) {
+            return self.execute_motion_with_index(motion, editor, text, session, Some(index));
+        }
+        self.execute(command, editor, text, session)
+    }
+
+    pub(crate) fn provide_character_indexed(
+        &mut self,
+        character: char,
+        editor: &mut EditorSurface,
+        text: &mut String,
+        session: &mut VimSession,
+        index: VimTextIndex<'_>,
+    ) -> VimOutcome {
+        self.provide_character_with_index(character, editor, text, session, Some(index))
+    }
+
     pub fn provide_character(
         &mut self,
         character: char,
         editor: &mut EditorSurface,
         text: &mut String,
         session: &mut VimSession,
+    ) -> VimOutcome {
+        self.provide_character_with_index(character, editor, text, session, None)
+    }
+
+    fn provide_character_with_index(
+        &mut self,
+        character: char,
+        editor: &mut EditorSurface,
+        text: &mut String,
+        session: &mut VimSession,
+        index: Option<VimTextIndex<'_>>,
     ) -> VimOutcome {
         let Some(awaiting) = self.awaiting.take() else {
             return VimOutcome::default();
@@ -500,20 +596,23 @@ impl VimState {
                     character,
                 };
                 self.last_find = Some(find);
-                self.execute_motion(Motion::Find(find), editor, text, session)
+                self.execute_motion_with_index(Motion::Find(find), editor, text, session, index)
             }
             Awaiting::Replace => {
                 let count = self.take_count();
                 let start = editor.cursor();
-                let end = (start + count).min(line_end(text, start));
+                let end = (start + count).min(
+                    index.map_or_else(|| line_end(text, start), |index| index.line_end(start)),
+                );
                 editor.set_selection(start, end);
                 let replacement =
                     std::iter::repeat_n(character, end.saturating_sub(start)).collect::<String>();
                 let changed = editor.replace_selection(text, &replacement);
-                editor.set_selection(
-                    start.min(text.chars().count().saturating_sub(1)),
-                    start.min(text.chars().count().saturating_sub(1)),
+                let last = index.map_or_else(
+                    || text.chars().count().saturating_sub(1),
+                    |index| index.character_len.saturating_sub(1),
                 );
+                editor.set_selection(start.min(last), start.min(last));
                 if changed {
                     session.last_change = Some(RepeatChange::Direct {
                         command: Command::VimReplaceCharacter,
@@ -527,12 +626,16 @@ impl VimState {
                 }
             }
             Awaiting::TextObject { around } => {
-                let Some(range) = text_object(text, editor.cursor(), character, around) else {
+                let range = index.map_or_else(
+                    || text_object(text, editor.cursor(), character, around),
+                    |index| indexed_text_object(text, editor.cursor(), character, around, index),
+                );
+                let Some(range) = range else {
                     self.cancel_pending();
                     return VimOutcome::default();
                 };
                 let count = self.operator_count.saturating_mul(self.take_count());
-                self.apply_operator_range(
+                self.apply_operator_range_with_index(
                     range,
                     false,
                     editor,
@@ -543,6 +646,7 @@ impl VimState {
                         RepeatTarget::TextObject { character, around },
                         count,
                     )),
+                    index,
                 )
             }
         }
@@ -682,6 +786,17 @@ impl VimState {
         text: &mut String,
         session: &mut VimSession,
     ) -> VimOutcome {
+        self.execute_motion_with_index(motion, editor, text, session, None)
+    }
+
+    fn execute_motion_with_index(
+        &mut self,
+        motion: Motion,
+        editor: &mut EditorSurface,
+        text: &mut String,
+        session: &mut VimSession,
+        index: Option<VimTextIndex<'_>>,
+    ) -> VimOutcome {
         let count = self
             .take_count()
             .saturating_mul(if self.operator.is_some() {
@@ -690,32 +805,53 @@ impl VimState {
                 1
             });
         if let Some(operator) = self.operator {
-            let (range, linewise) = motion_range(text, editor.cursor(), motion, count);
-            return self.apply_operator_range(
+            let (range, linewise) = index.map_or_else(
+                || motion_range(text, editor.cursor(), motion, count),
+                |index| indexed_motion_range(text, editor.cursor(), motion, count, index),
+            );
+            return self.apply_operator_range_with_index(
                 range,
                 linewise,
                 editor,
                 text,
                 session,
                 Some((operator, RepeatTarget::Motion(motion), count)),
+                index,
             );
         }
         let destination = if matches!(motion, Motion::Up | Motion::Down) {
             let column = *self.preferred_column.get_or_insert_with(|| {
-                editor
-                    .cursor()
-                    .saturating_sub(line_start(text, editor.cursor()))
+                editor.cursor().saturating_sub(index.map_or_else(
+                    || line_start(text, editor.cursor()),
+                    |index| index.line_start(editor.cursor()),
+                ))
             });
-            vertical_destination_with_column(
-                text,
-                editor.cursor(),
-                if motion == Motion::Up { -1 } else { 1 },
-                count,
-                column,
+            index.map_or_else(
+                || {
+                    vertical_destination_with_column(
+                        text,
+                        editor.cursor(),
+                        if motion == Motion::Up { -1 } else { 1 },
+                        count,
+                        column,
+                    )
+                },
+                |index| {
+                    indexed_vertical_destination(
+                        editor.cursor(),
+                        if motion == Motion::Up { -1 } else { 1 },
+                        count,
+                        column,
+                        index,
+                    )
+                },
             )
         } else {
             self.preferred_column = None;
-            motion_destination(text, editor.cursor(), motion, count)
+            index.map_or_else(
+                || motion_destination(text, editor.cursor(), motion, count),
+                |index| indexed_motion_destination(text, editor.cursor(), motion, count, index),
+            )
         };
         match self.mode {
             VimMode::VisualCharacter => {
@@ -725,13 +861,26 @@ impl VimState {
             VimMode::VisualLine => {
                 let anchor = self.visual_anchor.unwrap_or(editor.cursor());
                 editor.set_selection(
-                    line_start(text, anchor),
-                    line_end_with_newline(text, destination),
+                    index.map_or_else(
+                        || line_start(text, anchor),
+                        |index| index.line_start(anchor),
+                    ),
+                    index.map_or_else(
+                        || line_end_with_newline(text, destination),
+                        |index| {
+                            let end = index.line_end(destination);
+                            (end + usize::from(end < index.character_len)).min(index.character_len)
+                        },
+                    ),
                 );
             }
             _ => editor.set_selection(destination, destination),
         }
-        clamp_normal(editor, text);
+        if let Some(index) = index {
+            indexed_clamp_normal(editor, index);
+        } else {
+            clamp_normal(editor, text);
+        }
         VimOutcome::default()
     }
 
@@ -744,6 +893,20 @@ impl VimState {
         session: &mut VimSession,
         repeat: Option<(Operator, RepeatTarget, usize)>,
     ) -> VimOutcome {
+        self.apply_operator_range_with_index(range, linewise, editor, text, session, repeat, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_operator_range_with_index(
+        &mut self,
+        range: Range<usize>,
+        linewise: bool,
+        editor: &mut EditorSurface,
+        text: &mut String,
+        session: &mut VimSession,
+        repeat: Option<(Operator, RepeatTarget, usize)>,
+        index: Option<VimTextIndex<'_>>,
+    ) -> VimOutcome {
         let Some(operator) = self
             .operator
             .take()
@@ -753,8 +916,15 @@ impl VimState {
         };
         self.operator_count = 1;
         self.count = 0;
-        let range = range.start.min(text.chars().count())..range.end.min(text.chars().count());
-        let selected = char_slice(text, range.clone()).to_owned();
+        let character_len = index.map_or_else(|| text.chars().count(), |index| index.character_len);
+        let range = range.start.min(character_len)..range.end.min(character_len);
+        let selected = index.map_or_else(
+            || char_slice(text, range.clone()).to_owned(),
+            |index| {
+                text[index.byte_index(text, range.start)..index.byte_index(text, range.end)]
+                    .to_owned()
+            },
+        );
         let mut outcome = VimOutcome::default();
         if matches!(
             operator,
@@ -777,18 +947,18 @@ impl VimState {
                 if operator == Operator::Change {
                     editor.begin_transaction();
                 }
-                outcome.changed = editor.replace_selection(
-                    text,
+                let replacement =
                     if operator == Operator::Change && linewise && selected.ends_with('\n') {
                         "\n"
                     } else {
                         ""
-                    },
-                );
+                    };
+                outcome.changed = editor.replace_selection(text, replacement);
+                let new_len = character_len - range.len() + replacement.chars().count();
                 let cursor = if operator == Operator::Change {
-                    range.start.min(text.chars().count())
+                    range.start.min(new_len)
                 } else {
-                    range.start.min(text.chars().count().saturating_sub(1))
+                    range.start.min(new_len.saturating_sub(1))
                 };
                 editor.set_selection(cursor, cursor);
                 if operator == Operator::Change {
@@ -823,7 +993,11 @@ impl VimState {
         self.visual_anchor = None;
         self.use_system_register = false;
         if operator != Operator::Change {
-            clamp_normal(editor, text);
+            if let Some(index) = index {
+                indexed_clamp_normal(editor, index);
+            } else {
+                clamp_normal(editor, text);
+            }
         }
         outcome
     }
@@ -1225,6 +1399,277 @@ fn motion_range(text: &str, cursor: usize, motion: Motion, count: usize) -> (Ran
     }
 }
 
+fn indexed_motion_range(
+    text: &str,
+    cursor: usize,
+    motion: Motion,
+    count: usize,
+    index: VimTextIndex<'_>,
+) -> (Range<usize>, bool) {
+    if matches!(motion, Motion::Up | Motion::Down) {
+        let destination = indexed_motion_destination(text, cursor, motion, count, index);
+        let start = index.line_start(cursor.min(destination));
+        let end = indexed_line_end_with_newline(cursor.max(destination), index);
+        return (start..end, true);
+    }
+    let destination = indexed_motion_destination_unclamped(text, cursor, motion, count, index);
+    let inclusive = matches!(
+        motion,
+        Motion::WordEnd(_)
+            | Motion::LineEnd
+            | Motion::FileEnd
+            | Motion::Find(Find { till: false, .. })
+    );
+    if destination >= cursor {
+        (
+            cursor..(destination + usize::from(inclusive)).min(index.character_len),
+            false,
+        )
+    } else {
+        (
+            destination..(cursor + usize::from(inclusive)).min(index.character_len),
+            false,
+        )
+    }
+}
+
+fn indexed_motion_destination(
+    text: &str,
+    cursor: usize,
+    motion: Motion,
+    count: usize,
+    index: VimTextIndex<'_>,
+) -> usize {
+    indexed_motion_destination_unclamped(text, cursor, motion, count, index).min(
+        index
+            .character_len
+            .saturating_sub(usize::from(index.character_len > 0)),
+    )
+}
+
+fn indexed_motion_destination_unclamped(
+    text: &str,
+    cursor: usize,
+    motion: Motion,
+    count: usize,
+    index: VimTextIndex<'_>,
+) -> usize {
+    let mut destination = cursor.min(index.character_len);
+    for _ in 0..count.max(1) {
+        destination = match motion {
+            Motion::Left => destination
+                .saturating_sub(1)
+                .max(index.line_start(destination)),
+            Motion::Right => (destination + 1).min(index.line_end(destination).saturating_sub(1)),
+            Motion::Up => indexed_vertical_destination(
+                destination,
+                -1,
+                1,
+                destination.saturating_sub(index.line_start(destination)),
+                index,
+            ),
+            Motion::Down => indexed_vertical_destination(
+                destination,
+                1,
+                1,
+                destination.saturating_sub(index.line_start(destination)),
+                index,
+            ),
+            Motion::LineStart => index.line_start(destination),
+            Motion::FirstNonBlank => indexed_first_nonblank(text, destination, index),
+            Motion::LineEnd => index
+                .line_end(destination)
+                .saturating_sub(1)
+                .max(index.line_start(destination)),
+            Motion::FileStart => 0,
+            Motion::FileEnd => index.character_len.saturating_sub(1),
+            Motion::WordForward(big) => indexed_word_forward(text, destination, big, index),
+            Motion::WordEnd(big) => indexed_word_end(text, destination, big, index),
+            Motion::WordBack(big) => indexed_word_back(text, destination, big, index),
+            Motion::ParagraphBack => indexed_paragraph_back(text, destination, index),
+            Motion::ParagraphForward => indexed_paragraph_forward(text, destination, index),
+            Motion::Find(find) => {
+                indexed_find_character(text, destination, find, index).unwrap_or(destination)
+            }
+        };
+    }
+    destination
+}
+
+fn indexed_line_end_with_newline(character: usize, index: VimTextIndex<'_>) -> usize {
+    let end = index.line_end(character);
+    (end + usize::from(end < index.character_len)).min(index.character_len)
+}
+
+fn indexed_paragraph_back(text: &str, cursor: usize, index: VimTextIndex<'_>) -> usize {
+    let mut line = index.line(cursor);
+    while line > 0 {
+        line -= 1;
+        if indexed_line_is_blank(text, line, index) {
+            return index.line_starts[line];
+        }
+    }
+    0
+}
+
+fn indexed_paragraph_forward(text: &str, cursor: usize, index: VimTextIndex<'_>) -> usize {
+    let mut line = index.line(cursor) + 1;
+    while line < index.line_starts.len() {
+        if indexed_line_is_blank(text, line, index) {
+            return index.line_starts[line];
+        }
+        line += 1;
+    }
+    index
+        .character_len
+        .saturating_sub(usize::from(index.character_len > 0))
+}
+
+fn indexed_line_is_blank(text: &str, line: usize, index: VimTextIndex<'_>) -> bool {
+    let start = index.line_byte_starts[line];
+    let end = index
+        .line_byte_starts
+        .get(line + 1)
+        .map_or(text.len(), |next| next.saturating_sub(1));
+    text[start..end].trim().is_empty()
+}
+
+fn indexed_first_nonblank(text: &str, cursor: usize, index: VimTextIndex<'_>) -> usize {
+    let start = index.line_start(cursor);
+    start
+        + text[index.byte_index(text, start)..]
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .count()
+}
+
+fn indexed_vertical_destination(
+    cursor: usize,
+    direction: i8,
+    count: usize,
+    column: usize,
+    index: VimTextIndex<'_>,
+) -> usize {
+    let mut line = index.line(cursor);
+    for _ in 0..count.max(1) {
+        if direction < 0 {
+            if line == 0 {
+                break;
+            }
+            line -= 1;
+        } else if line + 1 < index.line_starts.len() {
+            line += 1;
+        } else {
+            break;
+        }
+    }
+    let start = index.line_starts[line];
+    let end = index.line_end(start);
+    start
+        + column.min(
+            end.saturating_sub(start)
+                .saturating_sub(usize::from(end > start)),
+        )
+}
+
+fn indexed_word_forward(text: &str, cursor: usize, big: bool, index: VimTextIndex<'_>) -> usize {
+    let mut destination = cursor.min(index.character_len);
+    let mut characters = text[index.byte_index(text, destination)..]
+        .chars()
+        .peekable();
+    if let Some(character) = characters.next() {
+        destination += 1;
+        let class = word_class(character, big);
+        while characters
+            .next_if(|character| word_class(*character, big) == class)
+            .is_some()
+        {
+            destination += 1;
+        }
+    }
+    while characters
+        .next_if(|character| character.is_whitespace())
+        .is_some()
+    {
+        destination += 1;
+    }
+    destination
+}
+
+fn indexed_word_end(text: &str, cursor: usize, big: bool, index: VimTextIndex<'_>) -> usize {
+    let mut destination = (cursor + 1).min(index.character_len);
+    let mut characters = text[index.byte_index(text, destination)..].chars();
+    let Some(mut character) = characters.next() else {
+        return index.character_len.saturating_sub(1);
+    };
+    while character.is_whitespace() {
+        destination += 1;
+        let Some(next) = characters.next() else {
+            return index.character_len.saturating_sub(1);
+        };
+        character = next;
+    }
+    let class = word_class(character, big);
+    for character in characters {
+        if word_class(character, big) != class {
+            break;
+        }
+        destination += 1;
+    }
+    destination
+}
+
+fn indexed_word_back(text: &str, cursor: usize, big: bool, index: VimTextIndex<'_>) -> usize {
+    let mut destination = cursor.min(index.character_len);
+    let mut characters = text[..index.byte_index(text, destination)].chars().rev();
+    let Some(mut character) = characters.next() else {
+        return 0;
+    };
+    while character.is_whitespace() {
+        destination = destination.saturating_sub(1);
+        let Some(next) = characters.next() else {
+            return 0;
+        };
+        character = next;
+    }
+    destination = destination.saturating_sub(1);
+    let class = word_class(character, big);
+    for character in characters {
+        if word_class(character, big) != class {
+            break;
+        }
+        destination = destination.saturating_sub(1);
+    }
+    destination
+}
+
+fn indexed_find_character(
+    text: &str,
+    cursor: usize,
+    find: Find,
+    index: VimTextIndex<'_>,
+) -> Option<usize> {
+    let start = index.line_start(cursor);
+    let end = index.line_end(cursor);
+    match find.direction {
+        FindDirection::Forward => {
+            let from = cursor.saturating_add(1).min(end);
+            text[index.byte_index(text, from)..index.byte_index(text, end)]
+                .chars()
+                .position(|character| character == find.character)
+                .map(|offset| from + offset)
+                .map(|found| found.saturating_sub(usize::from(find.till)))
+        }
+        FindDirection::Backward => text
+            [index.byte_index(text, start)..index.byte_index(text, cursor)]
+            .chars()
+            .rev()
+            .position(|character| character == find.character)
+            .map(|offset| cursor - 1 - offset)
+            .map(|found| (found + usize::from(find.till)).min(end.saturating_sub(1))),
+    }
+}
+
 fn motion_destination(text: &str, cursor: usize, motion: Motion, count: usize) -> usize {
     motion_destination_unclamped(text, cursor, motion, count).min(
         text.chars()
@@ -1483,6 +1928,163 @@ fn text_object(text: &str, cursor: usize, character: char, around: bool) -> Opti
     }
 }
 
+fn indexed_text_object(
+    text: &str,
+    cursor: usize,
+    character: char,
+    around: bool,
+    index: VimTextIndex<'_>,
+) -> Option<Range<usize>> {
+    match character {
+        'w' => indexed_word_object(text, cursor, false, around, index),
+        'W' => indexed_word_object(text, cursor, true, around, index),
+        '"' | '\'' | '`' => indexed_quote_object(text, cursor, character, around, index),
+        '(' | ')' | 'b' => indexed_pair_object(text, cursor, '(', ')', around, index),
+        '[' | ']' => indexed_pair_object(text, cursor, '[', ']', around, index),
+        '{' | '}' | 'B' => indexed_pair_object(text, cursor, '{', '}', around, index),
+        'p' => Some(indexed_paragraph_object(text, cursor, around, index)),
+        _ => None,
+    }
+}
+
+fn indexed_word_object(
+    text: &str,
+    cursor: usize,
+    big: bool,
+    around: bool,
+    index: VimTextIndex<'_>,
+) -> Option<Range<usize>> {
+    if index.character_len == 0 {
+        return None;
+    }
+    let mut cursor = cursor.min(index.character_len - 1);
+    let mut byte = index.byte_index(text, cursor);
+    while let Some(character) = text[byte..].chars().next()
+        && character.is_whitespace()
+    {
+        cursor += 1;
+        byte += character.len_utf8();
+    }
+    let character = text[byte..].chars().next()?;
+    let class = word_class(character, big);
+    let mut start = cursor;
+    for character in text[..byte].chars().rev() {
+        if word_class(character, big) != class {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = cursor;
+    for character in text[byte..].chars() {
+        if word_class(character, big) != class {
+            break;
+        }
+        end += 1;
+    }
+    if around {
+        let original_end = end;
+        for character in text[index.byte_index(text, end)..].chars() {
+            if !character.is_whitespace() {
+                break;
+            }
+            end += 1;
+        }
+        if end == original_end {
+            for character in text[..index.byte_index(text, start)].chars().rev() {
+                if !character.is_whitespace() {
+                    break;
+                }
+                start -= 1;
+            }
+        }
+    }
+    Some(start..end)
+}
+
+fn indexed_quote_object(
+    text: &str,
+    cursor: usize,
+    quote: char,
+    around: bool,
+    index: VimTextIndex<'_>,
+) -> Option<Range<usize>> {
+    let start = index.line_start(cursor);
+    let end = index.line_end(cursor);
+    let left_end = (cursor + 1).min(end);
+    let left_offset = text[index.byte_index(text, start)..index.byte_index(text, left_end)]
+        .chars()
+        .rev()
+        .position(|character| character == quote)?;
+    let left = left_end - 1 - left_offset;
+    let right_start = cursor + usize::from(left == cursor);
+    let right = right_start
+        + text[index.byte_index(text, right_start.min(end))..index.byte_index(text, end)]
+            .chars()
+            .position(|character| character == quote)?;
+    Some(if around {
+        left..right + 1
+    } else {
+        left + 1..right
+    })
+}
+
+fn indexed_pair_object(
+    text: &str,
+    cursor: usize,
+    open: char,
+    close: char,
+    around: bool,
+    index: VimTextIndex<'_>,
+) -> Option<Range<usize>> {
+    let mut stack = Vec::new();
+    let through_cursor = (cursor + 1).min(index.character_len);
+    for (position, character) in text[..index.byte_index(text, through_cursor)]
+        .chars()
+        .enumerate()
+    {
+        if character == open {
+            stack.push(position);
+        } else if character == close {
+            stack.pop();
+        }
+    }
+    let left = stack.pop()?;
+    let mut depth = 0;
+    let right = text[index.byte_index(text, left + 1)..]
+        .chars()
+        .enumerate()
+        .find_map(|(offset, character)| {
+            if character == open {
+                depth += 1;
+            } else if character == close {
+                if depth == 0 {
+                    return Some(left + 1 + offset);
+                }
+                depth -= 1;
+            }
+            None
+        })?;
+    Some(if around {
+        left..right + 1
+    } else {
+        left + 1..right
+    })
+}
+
+fn indexed_paragraph_object(
+    text: &str,
+    cursor: usize,
+    around: bool,
+    index: VimTextIndex<'_>,
+) -> Range<usize> {
+    let start = indexed_paragraph_back(text, cursor, index);
+    let mut end = indexed_paragraph_forward(text, cursor, index);
+    if around {
+        end = indexed_line_end_with_newline(end, index);
+    }
+    start..end
+}
+
 fn word_object(text: &str, cursor: usize, big: bool, around: bool) -> Option<Range<usize>> {
     let chars = text.chars().collect::<Vec<_>>();
     if chars.is_empty() {
@@ -1621,6 +2223,21 @@ fn clamp_normal(editor: &mut EditorSurface, text: &str) {
         editor.cursor().min(end - 1)
     } else {
         start.min(len.saturating_sub(1))
+    };
+    editor.set_selection(cursor, cursor);
+}
+
+fn indexed_clamp_normal(editor: &mut EditorSurface, index: VimTextIndex<'_>) {
+    if index.character_len == 0 {
+        editor.set_selection(0, 0);
+        return;
+    }
+    let start = index.line_start(editor.cursor());
+    let end = index.line_end(editor.cursor());
+    let cursor = if end > start {
+        editor.cursor().min(end - 1)
+    } else {
+        start.min(index.character_len - 1)
     };
     editor.set_selection(cursor, cursor);
 }
@@ -1840,6 +2457,128 @@ mod tests {
         state.execute(Command::VimMoveDown, &mut editor, &mut text, &mut session);
 
         assert_eq!(editor.cursor(), 10);
+    }
+
+    #[test]
+    fn indexed_motions_match_the_fallback_on_unicode_text() {
+        let original = "alpha βeta\n  gamma delta\n\nz";
+        let mut line_starts = vec![0];
+        let mut line_byte_starts = vec![0];
+        let mut character_len = 0;
+        for (byte, character) in original.char_indices() {
+            character_len += 1;
+            if character == '\n' {
+                line_starts.push(character_len);
+                line_byte_starts.push(byte + 1);
+            }
+        }
+
+        for (command, cursor) in [
+            (Command::VimWordForward, 0),
+            (Command::VimWordBack, character_len),
+            (Command::VimMoveDown, 7),
+            (Command::VimFirstNonBlank, 12),
+            (Command::VimLineEnd, 12),
+            (Command::VimParagraphForward, 0),
+            (Command::VimParagraphBack, character_len),
+        ] {
+            let mut fallback = VimState::default();
+            let mut indexed = VimState::default();
+            let mut fallback_editor = EditorSurface::default();
+            let mut indexed_editor = EditorSurface::default();
+            let mut fallback_session = VimSession::default();
+            let mut indexed_session = VimSession::default();
+            let mut fallback_text = original.to_owned();
+            let mut indexed_text = original.to_owned();
+            fallback_editor.set_selection(cursor, cursor);
+            indexed_editor.set_selection(cursor, cursor);
+
+            fallback.execute(
+                command,
+                &mut fallback_editor,
+                &mut fallback_text,
+                &mut fallback_session,
+            );
+            indexed.execute_indexed(
+                command,
+                &mut indexed_editor,
+                &mut indexed_text,
+                &mut indexed_session,
+                VimTextIndex::new(&line_starts, &line_byte_starts, character_len),
+            );
+
+            assert_eq!(
+                indexed_editor.cursor(),
+                fallback_editor.cursor(),
+                "{command:?}"
+            );
+        }
+
+        let mut fallback = VimState::default();
+        let mut indexed = VimState::default();
+        let mut fallback_editor = EditorSurface::default();
+        let mut indexed_editor = EditorSurface::default();
+        let mut fallback_session = VimSession::default();
+        let mut indexed_session = VimSession::default();
+        let mut fallback_text = original.to_owned();
+        let mut indexed_text = original.to_owned();
+        fallback.execute(
+            Command::VimFindForward,
+            &mut fallback_editor,
+            &mut fallback_text,
+            &mut fallback_session,
+        );
+        indexed.execute_indexed(
+            Command::VimFindForward,
+            &mut indexed_editor,
+            &mut indexed_text,
+            &mut indexed_session,
+            VimTextIndex::new(&line_starts, &line_byte_starts, character_len),
+        );
+        fallback.provide_character(
+            'β',
+            &mut fallback_editor,
+            &mut fallback_text,
+            &mut fallback_session,
+        );
+        indexed.provide_character_indexed(
+            'β',
+            &mut indexed_editor,
+            &mut indexed_text,
+            &mut indexed_session,
+            VimTextIndex::new(&line_starts, &line_byte_starts, character_len),
+        );
+
+        assert_eq!(indexed_editor.cursor(), fallback_editor.cursor());
+    }
+
+    #[test]
+    fn indexed_text_objects_match_the_fallback() {
+        for (text, cursor, object) in [
+            ("alpha βeta", 2, 'w'),
+            ("say \"hello\" now", 7, '"'),
+            ("a (b [c] d) e", 8, '('),
+            ("one\n\nthree\n", 0, 'p'),
+        ] {
+            let mut line_starts = vec![0];
+            let mut line_byte_starts = vec![0];
+            let mut character_len = 0;
+            for (byte, character) in text.char_indices() {
+                character_len += 1;
+                if character == '\n' {
+                    line_starts.push(character_len);
+                    line_byte_starts.push(byte + 1);
+                }
+            }
+            let index = VimTextIndex::new(&line_starts, &line_byte_starts, character_len);
+            for around in [false, true] {
+                assert_eq!(
+                    indexed_text_object(text, cursor, object, around, index),
+                    text_object(text, cursor, object, around),
+                    "{object} around={around}"
+                );
+            }
+        }
     }
 
     #[test]

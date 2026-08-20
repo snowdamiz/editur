@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read, Seek, Write},
     path::{Component, Path},
     time::UNIX_EPOCH,
 };
@@ -909,12 +909,11 @@ pub fn ensure(
         .flush()
         .and_then(|()| archive.sync_all())
         .map_err(|error| format!("cannot finish {}: {error}", archive_path.display()))?;
-    let bytes = fs::read(&archive_path)
-        .map_err(|error| format!("cannot read {}: {error}", archive_path.display()))?;
-    provision_from_bytes(manifest, data_dir, &bytes)
+    drop(archive);
+    provision_from_file(manifest, data_dir, &archive_path)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const fn development_archive_environment(provider: ProviderId) -> Option<&'static str> {
     match provider {
         ProviderId::Cursor => None,
@@ -923,7 +922,7 @@ const fn development_archive_environment(provider: ProviderId) -> Option<&'stati
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn provision_from_development_archive(
     manifest: &SidecarManifest,
     data_dir: &Path,
@@ -937,15 +936,10 @@ fn provision_from_development_archive(
             "development {display_name} archive is not a regular file"
         ));
     }
-    let limit = manifest
-        .max_compressed_bytes
-        .min(MAX_COMPRESSED_BYTES)
-        .saturating_add(1);
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(limit).read_to_end(&mut bytes))
-        .map_err(|error| format!("cannot read development {display_name} archive: {error}"))?;
-    provision_from_bytes(manifest, data_dir, &bytes)
+    if metadata.len() > manifest.max_compressed_bytes.min(MAX_COMPRESSED_BYTES) {
+        return Err(format!("development {display_name} archive is too large"));
+    }
+    provision_from_file(manifest, data_dir, path)
 }
 
 #[cfg(not(feature = "network"))]
@@ -964,64 +958,75 @@ pub fn provision_from_bytes(
     bytes: &[u8],
 ) -> Result<InstalledSidecar, String> {
     provision_from_bytes_with(manifest, data_dir, bytes, |command, entrypoint, version| {
-        if !manifest.version_probes.is_empty() {
-            let root = command
-                .ancestors()
-                .nth(Path::new(&manifest.command).components().count())
-                .ok_or_else(|| "cannot locate staged ACP provider root".to_owned())?;
-            for probe in &manifest.version_probes {
-                let mut process = std::process::Command::new(root.join(&probe.command));
-                process.args(probe.args.iter().map(|argument| {
-                    if argument.starts_with('-') {
-                        Path::new(argument).to_path_buf()
-                    } else {
-                        root.join(argument)
-                    }
-                }));
-                for name in super::provider::removed_environment(manifest.provider()?) {
-                    process.env_remove(name);
-                }
-                let output = process.current_dir(root).output().map_err(|error| {
-                    format!("cannot validate ACP provider version probe: {error}")
-                })?;
-                let reported = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                if !output.status.success()
-                    || !reported.lines().any(|line| line.trim() == probe.expected)
-                {
-                    return Err(format!(
-                        "ACP provider version probe did not report `{}`",
-                        probe.expected
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        let mut process = std::process::Command::new(command);
-        if let Some(entrypoint) = entrypoint {
-            process.arg(entrypoint);
-        }
-        let output = process
-            .arg("--version")
-            .current_dir(command.parent().unwrap_or(data_dir))
-            .output()
-            .map_err(|error| format!("cannot validate ACP provider: {error}"))?;
-        let reported = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if !output.status.success() || !reported.contains(version) {
-            return Err(format!(
-                "ACP provider reported an unexpected version: {}",
-                reported.trim()
-            ));
-        }
-        Ok(())
+        validate_staged_provider(manifest, data_dir, command, entrypoint, version)
     })
+}
+
+fn validate_staged_provider(
+    manifest: &SidecarManifest,
+    data_dir: &Path,
+    command: &Path,
+    entrypoint: Option<&Path>,
+    version: &str,
+) -> Result<(), String> {
+    if !manifest.version_probes.is_empty() {
+        let root = command
+            .ancestors()
+            .nth(Path::new(&manifest.command).components().count())
+            .ok_or_else(|| "cannot locate staged ACP provider root".to_owned())?;
+        for probe in &manifest.version_probes {
+            let mut process = std::process::Command::new(root.join(&probe.command));
+            process.args(probe.args.iter().map(|argument| {
+                if argument.starts_with('-') {
+                    Path::new(argument).to_path_buf()
+                } else {
+                    root.join(argument)
+                }
+            }));
+            for name in super::provider::removed_environment(manifest.provider()?) {
+                process.env_remove(name);
+            }
+            let output = process
+                .current_dir(root)
+                .output()
+                .map_err(|error| format!("cannot validate ACP provider version probe: {error}"))?;
+            let reported = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success()
+                || !reported.lines().any(|line| line.trim() == probe.expected)
+            {
+                return Err(format!(
+                    "ACP provider version probe did not report `{}`",
+                    probe.expected
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let mut process = std::process::Command::new(command);
+    if let Some(entrypoint) = entrypoint {
+        process.arg(entrypoint);
+    }
+    let output = process
+        .arg("--version")
+        .current_dir(command.parent().unwrap_or(data_dir))
+        .output()
+        .map_err(|error| format!("cannot validate ACP provider: {error}"))?;
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() || !reported.contains(version) {
+        return Err(format!(
+            "ACP provider reported an unexpected version: {}",
+            reported.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn provision_from_bytes_with(
@@ -1031,8 +1036,31 @@ fn provision_from_bytes_with(
     validate: impl FnOnce(&Path, Option<&Path>, &str) -> Result<(), String>,
 ) -> Result<InstalledSidecar, String> {
     with_provision_lock(data_dir, manifest.provider()?, || {
-        provision_from_bytes_locked(manifest, data_dir, bytes, validate)
+        provision_from_source_locked(manifest, data_dir, ArchiveSource::Bytes(bytes), validate)
     })
+}
+
+fn provision_from_file(
+    manifest: &SidecarManifest,
+    data_dir: &Path,
+    path: &Path,
+) -> Result<InstalledSidecar, String> {
+    with_provision_lock(data_dir, manifest.provider()?, || {
+        provision_from_source_locked(
+            manifest,
+            data_dir,
+            ArchiveSource::File(path),
+            |command, entrypoint, version| {
+                validate_staged_provider(manifest, data_dir, command, entrypoint, version)
+            },
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveSource<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Path),
 }
 
 /// Windows briefly reports `Access is denied` when renaming a directory whose
@@ -1067,10 +1095,10 @@ fn retry_denied_rename<T>(
     }
 }
 
-fn provision_from_bytes_locked(
+fn provision_from_source_locked(
     manifest: &SidecarManifest,
     data_dir: &Path,
-    bytes: &[u8],
+    source: ArchiveSource<'_>,
     validate: impl FnOnce(&Path, Option<&Path>, &str) -> Result<(), String>,
 ) -> Result<InstalledSidecar, String> {
     validate_version(&manifest.version)?;
@@ -1095,7 +1123,10 @@ fn provision_from_bytes_locked(
         .prefix(".install-")
         .tempdir_in(&versions)
         .map_err(|error| format!("cannot stage {display_name}: {error}"))?;
-    extract_archive(manifest, bytes, staging.path())?;
+    match source {
+        ArchiveSource::Bytes(bytes) => extract_archive(manifest, bytes, staging.path())?,
+        ArchiveSource::File(path) => extract_archive_file(manifest, path, staging.path())?,
+    }
     let staged_command = staging.path().join(&manifest.command);
     if !staged_command.is_file() {
         return Err(format!(
@@ -1427,8 +1458,46 @@ fn extract_archive(
     destination: &Path,
 ) -> Result<(), String> {
     verify_archive(manifest, bytes)?;
+    extract_verified_archive(manifest, destination, || Ok(Box::new(Cursor::new(bytes))))
+}
+
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+type ArchiveReader<'a> = Box<dyn ReadSeek + 'a>;
+
+fn extract_archive_file(
+    manifest: &SidecarManifest,
+    path: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("ACP provider archive is not a regular file".into());
+    }
+    if metadata.len() > manifest.max_compressed_bytes
+        || metadata.len() != manifest.archive_size_bytes
+    {
+        return Err("ACP provider archive size does not match its manifest".into());
+    }
+    if !file_checksum(path)?.eq_ignore_ascii_case(&manifest.archive_sha256) {
+        return Err("ACP provider archive failed SHA-256 verification".into());
+    }
+    extract_verified_archive(manifest, destination, || {
+        fs::File::open(path)
+            .map(|file| Box::new(file) as ArchiveReader<'_>)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))
+    })
+}
+
+fn extract_verified_archive<'a>(
+    manifest: &SidecarManifest,
+    destination: &Path,
+    mut open: impl FnMut() -> Result<ArchiveReader<'a>, String>,
+) -> Result<(), String> {
     if manifest.archive_format == ArchiveFormat::TarGz {
-        return extract_tar_gz(manifest, bytes, destination);
+        return extract_tar_gz(manifest, destination, &mut open);
     }
     let mut expected = HashMap::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
@@ -1437,7 +1506,7 @@ fn extract_archive(
             return Err(format!("duplicate manifest path `{}`", entry.path));
         }
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+    let mut archive = zip::ZipArchive::new(open()?)
         .map_err(|error| format!("invalid ACP provider ZIP archive: {error}"))?;
     if archive.len() > manifest.max_entries {
         return Err("ACP provider archive exceeds its entry-count limit".into());
@@ -1480,7 +1549,7 @@ fn extract_archive(
     if seen.len() != manifest.entries.len() {
         return Err("ACP provider archive does not match its pinned entry count".into());
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+    let mut archive = zip::ZipArchive::new(open()?)
         .map_err(|error| format!("invalid ACP provider ZIP archive: {error}"))?;
     for index in 0..archive.len() {
         let mut entry = archive
@@ -1548,10 +1617,10 @@ fn extract_archive(
     Ok(())
 }
 
-fn extract_tar_gz(
+fn extract_tar_gz<'a>(
     manifest: &SidecarManifest,
-    bytes: &[u8],
     destination: &Path,
+    open: &mut impl FnMut() -> Result<ArchiveReader<'a>, String>,
 ) -> Result<(), String> {
     let mut expected = HashMap::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
@@ -1560,7 +1629,7 @@ fn extract_tar_gz(
             return Err(format!("duplicate manifest path `{}`", entry.path));
         }
     }
-    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let decoder = flate2::read::GzDecoder::new(open()?);
     let mut archive = tar::Archive::new(decoder);
     let entries = archive
         .entries()
@@ -1611,7 +1680,7 @@ fn extract_tar_gz(
         return Err("ACP provider archive entry count does not match its manifest".into());
     }
 
-    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let decoder = flate2::read::GzDecoder::new(open()?);
     let mut archive = tar::Archive::new(decoder);
     for entry in archive
         .entries()
@@ -1879,9 +1948,9 @@ mod tests {
     use super::{
         ArchiveFormat, EntryKind, MAX_ARCHIVE_ENTRIES, ManagedEntry, PackageProbe, ProviderId,
         ReleaseSpec, SidecarManifest, cleanup_obsolete_versions, development_archive_environment,
-        embedded_manifest, ensure, extract_archive, installed, provision_from_bytes_with,
-        provision_from_development_archive, verify_archive, verify_installed,
-        verify_package_metadata,
+        embedded_manifest, ensure, extract_archive, extract_archive_file, installed,
+        provision_from_bytes_with, provision_from_development_archive, verify_archive,
+        verify_installed, verify_package_metadata,
     };
     #[cfg(feature = "network")]
     use super::{valid_archive_uri, valid_cursor_archive_uri};
@@ -2416,6 +2485,19 @@ mod tests {
 
         assert_eq!(
             std::fs::read(temp.path().join("dist-package/agent")).unwrap(),
+            b"agent"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let archive_path = fixture.path().join("provider.zip");
+        let destination = fixture.path().join("from-file");
+        std::fs::write(&archive_path, &bytes).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+
+        extract_archive_file(&manifest, &archive_path, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("dist-package/agent")).unwrap(),
             b"agent"
         );
     }

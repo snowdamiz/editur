@@ -25,6 +25,9 @@ const LINE_HEIGHT: f32 = 18.0;
 const CONTENT_PADDING: f32 = 8.0;
 const SCROLLBACK_ROWS: usize = 2_000;
 const CURSOR_BLINK_INTERVAL: f64 = 0.5;
+const MAX_OUTPUT_CHUNKS_PER_FRAME: usize = 16;
+const TRANSCRIPT_TERMINAL_ROWS: u16 = 400;
+const TRANSCRIPT_TERMINAL_VISIBLE_ROWS: f32 = 12.0;
 
 pub(crate) struct TerminalPanel {
     sessions: Vec<TerminalSession>,
@@ -59,6 +62,92 @@ struct TerminalSession {
     selecting: bool,
     cursor_blink_started: f64,
     cursor_was_focused: bool,
+}
+
+fn drain_output(output: &Receiver<Vec<u8>>, parser: &mut vt100::Parser) -> bool {
+    for _ in 0..MAX_OUTPUT_CHUNKS_PER_FRAME {
+        let Ok(bytes) = output.try_recv() else {
+            return false;
+        };
+        parser.process(&bytes);
+    }
+    true
+}
+
+fn transcript_terminal_parser(command: Option<&str>, output: &str, cols: u16) -> vt100::Parser {
+    let mut bytes =
+        Vec::with_capacity(command.map_or(0, |command| command.len() + 4) + output.len());
+    if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+        bytes.extend_from_slice(b"$ ");
+        bytes.extend_from_slice(command.trim().as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+    }
+    let mut previous = None;
+    for &byte in output.as_bytes() {
+        if byte == b'\n' && previous != Some(b'\r') {
+            bytes.push(b'\r');
+        }
+        bytes.push(byte);
+        previous = Some(byte);
+    }
+
+    let parse = |rows| {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(&bytes);
+        parser
+    };
+    let parser = parse(TRANSCRIPT_TERMINAL_ROWS);
+    let rows = parser
+        .screen()
+        .contents()
+        .lines()
+        .count()
+        .saturating_add(1)
+        .clamp(1, usize::from(TRANSCRIPT_TERMINAL_ROWS)) as u16;
+    if rows == TRANSCRIPT_TERMINAL_ROWS {
+        parser
+    } else {
+        parse(rows)
+    }
+}
+
+pub(crate) fn show_transcript_terminal(ui: &mut egui::Ui, command: Option<&str>, output: &str) {
+    let font = FontId::monospace(FONT_SIZE);
+    let cell_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("M".into(), font.clone(), theme::text().primary)
+            .size()
+            .x
+    });
+    let cols = ((ui.available_width() - CONTENT_PADDING * 2.0) / cell_width.max(1.0))
+        .floor()
+        .clamp(2.0, u16::MAX as f32) as u16;
+    let parser = transcript_terminal_parser(command, output, cols);
+    let screen = parser.screen();
+    let rows = screen.size().0;
+    egui::Frame::new()
+        .fill(theme::state::content_material())
+        .stroke(theme::border::hairline())
+        .corner_radius(5)
+        .inner_margin(CONTENT_PADDING)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::ScrollArea::vertical()
+                .max_height(LINE_HEIGHT * TRANSCRIPT_TERMINAL_VISIBLE_ROWS)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for row in 0..rows {
+                        ui.add(
+                            egui::Label::new(terminal_row_job(
+                                screen, row, cols, &font, None, 0, None,
+                            ))
+                            .selectable(true)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
+                });
+        });
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -752,8 +841,8 @@ impl TerminalSession {
         rect: egui::Rect,
         request_focus: bool,
     ) -> Result<bool, String> {
-        while let Ok(bytes) = self.output.try_recv() {
-            self.parser.process(&bytes);
+        if drain_output(&self.output, &mut self.parser) {
+            ui.ctx().request_repaint();
         }
         if !self.exit_reported
             && let Some(status) = self
@@ -924,53 +1013,15 @@ impl TerminalSession {
             .then(|| screen.cursor_position());
         let painter = ui.painter_at(rect);
         for row in 0..rows {
-            let mut job = LayoutJob::default();
-            job.wrap.max_width = f32::INFINITY;
-            for col in 0..cols {
-                let cell = screen.cell(row, col);
-                let mut foreground = cell.map_or(theme::text().primary, |cell| {
-                    terminal_color(cell.fgcolor(), true)
-                });
-                let mut background = cell.map_or(Color32::TRANSPARENT, |cell| {
-                    terminal_color(cell.bgcolor(), false)
-                });
-                if cell.is_some_and(vt100::Cell::inverse) {
-                    std::mem::swap(&mut foreground, &mut background);
-                    if foreground == Color32::TRANSPARENT {
-                        foreground = theme::surface().editor;
-                    }
-                }
-                if self.selection.is_some_and(|selection| {
-                    selection.contains(CellPosition {
-                        row: visible_buffer_start + usize::from(row),
-                        col,
-                    })
-                }) {
-                    background = theme::editor::selection();
-                }
-                if cursor == Some((row, col)) {
-                    foreground = theme::surface().editor;
-                    background = theme::accent();
-                }
-                let mut format = TextFormat {
-                    font_id: font.clone(),
-                    color: foreground,
-                    background,
-                    line_height: Some(LINE_HEIGHT),
-                    ..TextFormat::default()
-                };
-                if cell.is_some_and(vt100::Cell::underline) {
-                    format.underline = egui::Stroke::new(1.0, foreground);
-                }
-                job.append(
-                    cell.map_or(" ", |cell| {
-                        let contents = cell.contents();
-                        if contents.is_empty() { " " } else { contents }
-                    }),
-                    0.0,
-                    format,
-                );
-            }
+            let job = terminal_row_job(
+                screen,
+                row,
+                cols,
+                &font,
+                self.selection,
+                visible_buffer_start,
+                cursor,
+            );
             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
             painter.galley(
                 egui::pos2(
@@ -1043,6 +1094,65 @@ impl TerminalSession {
         }
         Ok(())
     }
+}
+
+fn terminal_row_job(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    font: &FontId,
+    selection: Option<TerminalSelection>,
+    visible_buffer_start: usize,
+    cursor: Option<(u16, u16)>,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    for col in 0..cols {
+        let cell = screen.cell(row, col);
+        let mut foreground = cell.map_or(theme::text().primary, |cell| {
+            terminal_color(cell.fgcolor(), true)
+        });
+        let mut background = cell.map_or(Color32::TRANSPARENT, |cell| {
+            terminal_color(cell.bgcolor(), false)
+        });
+        if cell.is_some_and(vt100::Cell::inverse) {
+            std::mem::swap(&mut foreground, &mut background);
+            if foreground == Color32::TRANSPARENT {
+                foreground = theme::surface().editor;
+            }
+        }
+        if selection.is_some_and(|selection| {
+            selection.contains(CellPosition {
+                row: visible_buffer_start + usize::from(row),
+                col,
+            })
+        }) {
+            background = theme::editor::selection();
+        }
+        if cursor == Some((row, col)) {
+            foreground = theme::surface().editor;
+            background = theme::accent();
+        }
+        let mut format = TextFormat {
+            font_id: font.clone(),
+            color: foreground,
+            background,
+            line_height: Some(LINE_HEIGHT),
+            ..TextFormat::default()
+        };
+        if cell.is_some_and(vt100::Cell::underline) {
+            format.underline = egui::Stroke::new(1.0, foreground);
+        }
+        job.append(
+            cell.map_or(" ", |cell| {
+                let contents = cell.contents();
+                if contents.is_empty() { " " } else { contents }
+            }),
+            0.0,
+            format,
+        );
+    }
+    job
 }
 
 impl Drop for TerminalSession {
@@ -1261,6 +1371,67 @@ mod tests {
         CONTENT_PADDING, CellPosition, FONT_SIZE, LINE_HEIGHT, TerminalPanel, TerminalSelection,
         TerminalSession,
     };
+
+    #[test]
+    fn terminal_output_drain_is_bounded_per_frame() {
+        let (sender, output) = std::sync::mpsc::sync_channel(256);
+        for _ in 0..17 {
+            sender.send(vec![b'x']).unwrap();
+        }
+        let mut parser = vt100::Parser::new(24, 80, 0);
+
+        super::drain_output(&output, &mut parser);
+
+        assert_eq!(output.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn transcript_terminal_preserves_the_command_and_ansi_output() {
+        let parser =
+            super::transcript_terminal_parser(Some("cargo test"), "\x1b[31mfailed\x1b[0m\n", 80);
+        let screen = parser.screen();
+
+        assert!(screen.contents().contains("$ cargo test"));
+        assert_eq!(screen.cell(1, 0).unwrap().contents(), "f");
+        assert_eq!(screen.cell(1, 0).unwrap().fgcolor(), vt100::Color::Idx(1));
+    }
+
+    #[test]
+    fn transcript_terminal_keeps_a_full_viewport_for_short_output() {
+        fn terminal_frame(shape: &egui::Shape) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill == theme::state::content_material() => {
+                    Some(rect.rect)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(terminal_frame),
+                _ => None,
+            }
+        }
+
+        let output = theme::test_context().run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ui| super::show_transcript_terminal(ui, Some("pwd"), "/tmp\n"),
+        );
+        let frame = output
+            .shapes
+            .iter()
+            .find_map(|shape| terminal_frame(&shape.shape))
+            .expect("terminal frame");
+
+        assert!(
+            frame.height()
+                >= super::CONTENT_PADDING * 2.0
+                    + super::LINE_HEIGHT * super::TRANSCRIPT_TERMINAL_VISIBLE_ROWS,
+            "terminal frame was only {} points tall",
+            frame.height()
+        );
+    }
 
     #[cfg(unix)]
     fn painted_cursor_count(output: &egui::FullOutput) -> usize {

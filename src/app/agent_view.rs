@@ -251,6 +251,9 @@ impl EditorApp {
         if events.len() >= 8 {
             ctx.request_repaint();
         }
+        let mut changed_paths = HashSet::new();
+        let mut reconcile_all = false;
+        let mut refresh_providers = HashSet::new();
         for (provider, event) in events {
             let selected = provider == self.selected_provider;
             if selected {
@@ -291,14 +294,9 @@ impl EditorApp {
             {
                 self.agent_run_everything = None;
             }
-            let reconcile_path = match &event {
-                AgentEvent::ToolCallUpdated(tool) => self.tabs.iter().any(|tab| {
-                    tool.paths
-                        .iter()
-                        .any(|tool_path| tool_path.path == tab.buffer.path)
-                }),
-                _ => false,
-            };
+            if let AgentEvent::ToolCallUpdated(tool) = &event {
+                changed_paths.extend(tool.paths.iter().map(|tool_path| tool_path.path.clone()));
+            }
             let turn_finished = matches!(event, AgentEvent::TurnFinished { .. });
             let refresh_project =
                 turn_finished || matches!(event, AgentEvent::ProcessExited { .. });
@@ -310,22 +308,39 @@ impl EditorApp {
                     .or_default()
                     .apply(event);
             }
-            if reconcile_path || turn_finished {
-                self.reconcile_open_buffer();
-                self.refresh_agentic_diff();
+            if turn_finished {
+                reconcile_all = true;
             }
             if refresh_project {
-                self.refresh_after_agent(provider);
+                refresh_providers.insert(provider);
             }
+        }
+        if reconcile_all {
+            self.reconcile_open_buffer();
+            self.refresh_agentic_diff();
+        } else if !changed_paths.is_empty() {
+            self.reconcile_open_paths(&changed_paths);
+            self.refresh_agentic_diff_paths(&changed_paths);
+        }
+        for provider in refresh_providers {
+            self.refresh_after_agent(provider);
         }
     }
 
     pub(super) fn reconcile_open_buffer(&mut self) {
+        self.reconcile_open_buffers(None);
+    }
+
+    pub(super) fn reconcile_open_paths(&mut self, paths: &HashSet<PathBuf>) {
+        self.reconcile_open_buffers(Some(paths));
+    }
+
+    fn reconcile_open_buffers(&mut self, paths: Option<&HashSet<PathBuf>>) {
         let mut active_reloaded = false;
         let mut conflict = None;
         let mut error = None;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
-            if tab.git_diff.is_some() {
+            if paths.is_some_and(|paths| !paths.contains(&tab.buffer.path)) {
                 continue;
             }
             match reconcile_buffer(&mut tab.buffer) {
@@ -612,17 +627,25 @@ impl EditorApp {
         } else {
             "Agent"
         });
-        #[cfg(target_os = "macos")]
         let mut title_x = if self.agentic_mode && !self.sidebar {
-            header.left() + 166.0
+            let titlebar = ui
+                .ctx()
+                .content_rect()
+                .with_min_y(header.top())
+                .with_max_y(header.bottom());
+            let file_tree_button = file_tree_toggle_rect(titlebar, header);
+            let terminal_button = terminal_toggle_rect(file_tree_button);
+            let source_control_button = source_control_toggle_rect(terminal_button);
+            agentic_toggle_rect(source_control_button, None).right() + theme::space::SMALL
         } else {
-            header.left() + 14.0
-        };
-        #[cfg(not(target_os = "macos"))]
-        let mut title_x = if self.agentic_mode {
-            header.left() + if self.sidebar { 76.0 } else { 90.0 }
-        } else {
-            header.left() + 14.0
+            #[cfg(target_os = "macos")]
+            {
+                header.left() + 14.0
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                header.left() + if self.agentic_mode { 76.0 } else { 14.0 }
+            }
         };
         if !self.agentic_mode && provider_selector_visible(&self.available_providers) {
             let provider_rect = egui::Rect::from_min_max(
@@ -657,6 +680,23 @@ impl EditorApp {
         } else if !self.agentic_mode {
             self.provider_menu_anchor = None;
         }
+        let agent_panes = self.agent_pane_layout.panes();
+        if self.agentic_mode
+            && agent_panes.len() > 1
+            && let Some(index) = agent_panes.iter().position(|pane| *pane == agent_pane)
+        {
+            let badge = egui::Rect::from_center_size(
+                egui::pos2(title_x + 14.0, header.center().y),
+                egui::vec2(28.0, 18.0),
+            );
+            draw_agent_pane_badge(
+                ui,
+                badge,
+                index + 1,
+                scoped_agent_id(agentic_mode, agent_pane, "agent_pane_badge"),
+            );
+            title_x = badge.right() + theme::space::SMALL;
+        }
         if !self.agentic_mode && self.agent.session_ready && self.agent.history_available {
             let button = agent_session_selector_rect(ui, header, title_x, title);
             let response = draw_agent_session_selector(ui, button, title);
@@ -683,7 +723,7 @@ impl EditorApp {
             );
         }
         if self.agentic_mode {
-            if self.agent_pane_layout.panes().len() > 1 {
+            if agent_panes.len() > 1 {
                 let pane_title = title.to_owned();
                 let (close, dragging) =
                     draw_agent_pane_controls(ui, header, agent_pane, &pane_title, true);
@@ -1239,6 +1279,8 @@ impl EditorApp {
                                 let dense_cluster = is_dense_work
                                     .then(|| dense_work_clusters[item_index].as_ref())
                                     .flatten();
+                                let single_item_dense_cluster = dense_cluster.is_some()
+                                    && dense_work_items.get(item_index + 1) != Some(&true);
                                 if let Some(cluster) = dense_cluster {
                                     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                                         ui.ctx(),
@@ -1358,7 +1400,16 @@ impl EditorApp {
                                                     .wrap(),
                                                 );
                                             };
-                                        if dense_agent {
+                                        if dense_agent && single_item_dense_cluster {
+                                            egui::Frame::new()
+                                                .inner_margin(egui::Margin {
+                                                    left: 24,
+                                                    right: 4,
+                                                    top: 2,
+                                                    bottom: 6,
+                                                })
+                                                .show(ui, add_thought);
+                                        } else if dense_agent {
                                             assistant_dense_tool(
                                                 ui,
                                                 scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_thought", item_index)),
@@ -1386,6 +1437,26 @@ impl EditorApp {
                                                 .id_salt(("agent_content_image", item_index))
                                                 .default_open(false)
                                                 .icon(paint_agent_disclosure)
+                                                .show(ui, |ui| {
+                                                    if let Some(source) = draw_agent_content(
+                                                        ui,
+                                                        content,
+                                                        item_search,
+                                                    ) {
+                                                        open_image_request = Some(source);
+                                                    }
+                                                });
+                                        } else if dense_agent
+                                            && matches!(role, ContentRole::Thought)
+                                            && single_item_dense_cluster
+                                        {
+                                            egui::Frame::new()
+                                                .inner_margin(egui::Margin {
+                                                    left: 24,
+                                                    right: 4,
+                                                    top: 2,
+                                                    bottom: 6,
+                                                })
                                                 .show(ui, |ui| {
                                                     if let Some(source) = draw_agent_content(
                                                         ui,
@@ -1493,20 +1564,61 @@ impl EditorApp {
                                                 .is_some_and(|kind| kind.eq_ignore_ascii_case("Edit"));
                                         let contains_diff = tool_contains_diff(tool);
                                         let is_subagent = tool_is_subagent(tool);
-                                        let has_body = tool.detail.is_some()
-                                            || (!title_includes_paths && !tool.paths.is_empty());
+                                        let is_terminal = agent_tool_is_terminal(tool);
+                                        let terminal_command = tool.command();
+                                        let terminal_output = agent_terminal_output(tool);
                                         let change = is_file_edit
                                             .then(|| tool_changes.get(&tool.id).copied())
                                             .flatten();
+                                        let subagent_title = tool
+                                            .detail
+                                            .as_ref()
+                                            .and_then(|detail| {
+                                                detail.content.iter().find_map(|content| {
+                                                    if let ToolOutput::Task { description, .. } = content {
+                                                        Some(description.as_str())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or_else(|| {
+                                                title.strip_prefix("Subagent: ").unwrap_or(title)
+                                            });
+                                        let subagent_metadata = tool.detail.as_ref().and_then(|detail| {
+                                            detail.content.iter().find_map(|content| {
+                                                let ToolOutput::Task { model, duration_ms, .. } = content else {
+                                                    return None;
+                                                };
+                                                let metadata = [
+                                                    model.as_ref().map(|model| {
+                                                        model_display_name(model, model).into_owned()
+                                                    }),
+                                                    duration_ms.map(agent_task_duration),
+                                                ]
+                                                .into_iter()
+                                                .flatten()
+                                                .collect::<Vec<_>>()
+                                                .join(" · ");
+                                                (!metadata.is_empty()).then_some(metadata)
+                                            })
+                                        });
+                                        let has_body = if is_subagent {
+                                            (!title_includes_paths && !tool.paths.is_empty())
+                                                || tool.detail.as_ref().is_some_and(|detail| {
+                                                    detail.output.as_deref().is_some_and(|text| !text.is_empty())
+                                                        || detail.content.iter().any(|content| match content {
+                                                            ToolOutput::Task { agents, .. } => agents.iter().any(|agent| {
+                                                                agent.message.as_deref().is_some_and(|message| !message.is_empty())
+                                                            }),
+                                                            _ => true,
+                                                        })
+                                                })
+                                        } else {
+                                            tool.detail.is_some()
+                                                || (!title_includes_paths && !tool.paths.is_empty())
+                                        };
                                         let add_body = |ui: &mut egui::Ui| {
-                                                if is_subagent {
-                                                    ui.label(
-                                                        RichText::new("SUBAGENT")
-                                                            .size(theme::typography::MICRO_SIZE)
-                                                            .strong()
-                                                            .color(theme::accent()),
-                                                    );
-                                                }
                                                 if !title_includes_paths {
                                                     for tool_path in &tool.paths {
                                                         let label = match tool_path.line {
@@ -1530,11 +1642,28 @@ impl EditorApp {
                                                     }
                                                 }
                                                 if let Some(detail) = &tool.detail {
+                                                    if is_terminal {
+                                                        crate::terminal::show_transcript_terminal(
+                                                            ui,
+                                                            terminal_command.as_deref(),
+                                                            terminal_output.as_deref().unwrap_or_default(),
+                                                        );
+                                                    }
                                                     for (content_index, content) in
                                                         detail.content.iter().enumerate()
                                                     {
                                                         match content {
+                                                            ToolOutput::Text(_) if is_terminal => {}
                                                             ToolOutput::Text(text) => {
+                                                                if is_subagent {
+                                                                    agent_search_label(
+                                                                        ui,
+                                                                        "Output",
+                                                                        theme::typography::small(),
+                                                                        theme::text().muted,
+                                                                        item_search,
+                                                                    );
+                                                                }
                                                                 if let Some(path) = tool
                                                                     .paths
                                                                     .get(content_index)
@@ -1573,6 +1702,11 @@ impl EditorApp {
                                                                     );
                                                                 }
                                                             }
+                                                            ToolOutput::Log { label, .. }
+                                                                if is_terminal
+                                                                    && label.eq_ignore_ascii_case(
+                                                                        "Terminal output",
+                                                                    ) => {}
                                                             ToolOutput::Log { label, text } => {
                                                                 agent_search_label(
                                                                     ui,
@@ -1628,6 +1762,7 @@ impl EditorApp {
                                                                     ));
                                                                 }
                                                             }
+                                                            ToolOutput::Terminal(_) if is_terminal => {}
                                                             ToolOutput::Terminal(id) => {
                                                                 agent_search_label(
                                                                     ui,
@@ -1653,95 +1788,27 @@ impl EditorApp {
                                                                 );
                                                             }
                                                             ToolOutput::Task {
-                                                                description,
-                                                                prompt,
-                                                                subagent_type,
-                                                                model,
-                                                                agent_id,
+                                                                description: _,
+                                                                prompt: _,
+                                                                subagent_type: _,
+                                                                model: _,
+                                                                agent_id: _,
                                                                 agents,
-                                                                path,
-                                                                activity,
-                                                                duration_ms,
+                                                                path: _,
+                                                                activity: _,
+                                                                duration_ms: _,
                                                             } => {
-                                                                agent_search_label(
-                                                                    ui,
-                                                                    description,
-                                                                    theme::typography::strong(),
-                                                                    theme::text().primary,
-                                                                    item_search,
-                                                                );
-                                                                let metadata = [
-                                                                    Some(subagent_type.clone()),
-                                                                    model.clone(),
-                                                                    activity.clone(),
-                                                                    path.clone(),
-                                                                    duration_ms.map(
-                                                                        agent_task_duration,
-                                                                    ),
-                                                                ]
-                                                                .into_iter()
-                                                                .flatten()
-                                                                .collect::<Vec<_>>()
-                                                                .join(" · ");
-                                                                agent_search_label(
-                                                                    ui,
-                                                                    &metadata,
-                                                                    theme::typography::small(),
-                                                                    theme::text().muted,
-                                                                    item_search,
-                                                                );
-                                                                if agents.is_empty() {
-                                                                    if let Some(agent_id) = agent_id {
+                                                                for agent in agents {
+                                                                    if let Some(message) = &agent.message {
                                                                         agent_search_label(
                                                                             ui,
-                                                                            &format!("Agent {agent_id}"),
-                                                                            theme::typography::small(),
-                                                                            theme::text().muted,
+                                                                            message,
+                                                                            theme::typography::body(),
+                                                                            theme::text().primary,
                                                                             item_search,
                                                                         );
-                                                                    }
-                                                                } else {
-                                                                    for agent in agents {
-                                                                        let state = agent
-                                                                            .status
-                                                                            .as_deref()
-                                                                            .unwrap_or("unknown");
-                                                                        agent_search_label(
-                                                                            ui,
-                                                                            &format!("{state} · {}", agent.id),
-                                                                            theme::typography::small(),
-                                                                            theme::text().muted,
-                                                                            item_search,
-                                                                        );
-                                                                        if let Some(message) = &agent.message {
-                                                                            agent_search_label(
-                                                                                ui,
-                                                                                message,
-                                                                                theme::typography::body(),
-                                                                                theme::text().primary,
-                                                                                item_search,
-                                                                            );
-                                                                        }
                                                                     }
                                                                 }
-                                                                egui::CollapsingHeader::new(
-                                                                    "Prompt",
-                                                                )
-                                                                .id_salt((
-                                                                    "task_prompt",
-                                                                    item_index,
-                                                                    content_index,
-                                                                ))
-                                                                .icon(paint_agent_disclosure)
-                                                                .show(ui, |ui| {
-                                                                    agent_search_label(
-                                                                        ui,
-                                                                        prompt,
-                                                                        theme::typography::body(),
-                                                                        theme::text().primary,
-                                                                        item_search,
-                                                                    );
-                                                                });
                                                             }
                                                             ToolOutput::GeneratedImage {
                                                                 description,
@@ -1809,10 +1876,12 @@ impl EditorApp {
                                                         }
                                                     }
                                                     if detail.content.is_empty()
-                                                        && let Some(text) = detail
-                                                            .output
-                                                            .as_deref()
-                                                            .or(detail.input.as_deref())
+                                                        && !is_terminal
+                                                        && let Some(text) = if is_subagent {
+                                                            detail.output.as_deref()
+                                                        } else {
+                                                            detail.output.as_deref().or(detail.input.as_deref())
+                                                        }
                                                     {
                                                         let job = agent_text_job(
                                                             text,
@@ -1829,7 +1898,19 @@ impl EditorApp {
                                                     }
                                                 }
                                             };
-                                        if dense_agent {
+                                        if is_subagent {
+                                            agent_subagent_card(
+                                                ui,
+                                                ("subagent", item_index),
+                                                subagent_title,
+                                                subagent_metadata.as_deref(),
+                                                tool.status.as_deref(),
+                                                transcript_width,
+                                                item_search,
+                                                has_body,
+                                                add_body,
+                                            );
+                                        } else if dense_agent {
                                                 assistant_dense_tool(
                                                     ui,
                                                     scoped_agent_id(agentic_mode, agent_pane, ("dense_agent_tool", item_index)),
@@ -1850,8 +1931,7 @@ impl EditorApp {
                                                 transcript_width,
                                                 item_search,
                                                 has_body,
-                                                is_subagent
-                                                    || (contains_diff && !is_file_edit),
+                                                contains_diff && !is_file_edit,
                                                 add_body,
                                             );
                                         }
@@ -2759,6 +2839,8 @@ impl EditorApp {
                             || (model_config.is_some()
                                 && is_thinking_config(&option.id, &option.name))
                             || (model_config.is_some() && is_fast_config(option))
+                            || (model_config.is_some()
+                                && is_context_config(&option.id, &option.name))
                         {
                             continue;
                         }
@@ -2881,10 +2963,24 @@ impl EditorApp {
                             .sum::<usize>();
                         let fast_rows =
                             usize::from(fast_mode_config(&self.agent.config_options).is_some()) * 2;
+                        let context_rows = self
+                            .agent
+                            .config_options
+                            .iter()
+                            .filter(|other| is_context_config(&other.id, &other.name))
+                            .map(|other| match &other.value {
+                                ConfigValue::Select(_) => other.options.len() + 1,
+                                ConfigValue::Boolean(_) => 1,
+                            })
+                            .sum::<usize>();
                         if is_model_config(&option.id, &option.name)
-                            && (thinking_rows > 0 || fast_rows > 0)
+                            && (thinking_rows > 0 || fast_rows > 0 || context_rows > 0)
                         {
-                            return option.options.len() + thinking_rows + 1 + fast_rows;
+                            return option.options.len()
+                                + thinking_rows
+                                + fast_rows
+                                + context_rows
+                                + 1;
                         }
                         option.options.len()
                             + usize::from(
@@ -2923,9 +3019,24 @@ impl EditorApp {
                         row_height,
                         AGENT_MENU_WIDTH,
                     ),
-                    _ => {
-                        agent_menu_rect(transcript, anchor, item_count, row_height, menu_padding_y)
-                    }
+                    _ => agent_menu_rect(
+                        transcript,
+                        anchor,
+                        item_count,
+                        row_height,
+                        menu_padding_y,
+                        if matches!(menu, AgentMenu::Config(id) if self
+                            .agent
+                            .config_options
+                            .iter()
+                            .any(|option| option.id == *id
+                                && is_model_config(&option.id, &option.name)))
+                        {
+                            480.0
+                        } else {
+                            280.0
+                        },
+                    ),
                 };
                 menu_popup = Some(popup);
                 let max_scroll = (item_count as f32 * row_height
@@ -2969,6 +3080,7 @@ impl EditorApp {
                             egui::Stroke::new(1.0, theme::border::strong_color()),
                             egui::StrokeKind::Inside,
                         );
+                        ui.set_clip_rect(popup);
                         ui.scope_builder(
                             UiBuilder::new()
                                 .id_salt("agent_menu_content")
@@ -3037,9 +3149,9 @@ impl EditorApp {
                                                         let (open, remove, _) = agent_session_row(
                                                             ui,
                                                             session,
-                                                            self.selected_provider,
                                                             false,
                                                             false,
+                                                            &[],
                                                         );
                                                         if open {
                                                             session_load = Some(session.id.clone());
@@ -3203,6 +3315,15 @@ impl EditorApp {
                                                             )
                                                         })
                                                         .flatten();
+                                                    let combined_context = model_menu
+                                                        && self.agent.config_options.iter().any(
+                                                            |other| {
+                                                                is_context_config(
+                                                                    &other.id,
+                                                                    &other.name,
+                                                                )
+                                                            },
+                                                        );
                                                     if combined_thinking {
                                                         for thinking in
                                                             self.agent.config_options.iter().filter(
@@ -3280,7 +3401,68 @@ impl EditorApp {
                                                         config_changes
                                                             .push((fast.id.clone(), next.clone()));
                                                     }
-                                                    if combined_thinking || combined_fast.is_some()
+                                                    if combined_context {
+                                                        for context in
+                                                            self.agent.config_options.iter().filter(
+                                                                |other| {
+                                                                    is_context_config(
+                                                                        &other.id,
+                                                                        &other.name,
+                                                                    )
+                                                                },
+                                                            )
+                                                        {
+                                                            match &context.value {
+                                                                ConfigValue::Select(current) => {
+                                                                    agent_menu_section_label(
+                                                                        ui,
+                                                                        &context.name,
+                                                                        row_height,
+                                                                    );
+                                                                    for value in &context.options {
+                                                                        if agent_menu_option(
+                                                                            ui,
+                                                                            &value.name,
+                                                                            value.id == *current,
+                                                                            row_height,
+                                                                        )
+                                                                        .clicked()
+                                                                        {
+                                                                            config_changes.push((
+                                                                                context.id.clone(),
+                                                                                ConfigValue::Select(
+                                                                                    value
+                                                                                        .id
+                                                                                        .clone(),
+                                                                                ),
+                                                                            ));
+                                                                            selected = true;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                ConfigValue::Boolean(enabled) => {
+                                                                    if agent_toggle_row(
+                                                                        ui,
+                                                                        &context.name,
+                                                                        *enabled,
+                                                                        row_height,
+                                                                    )
+                                                                    .clicked()
+                                                                    {
+                                                                        config_changes.push((
+                                                                            context.id.clone(),
+                                                                            ConfigValue::Boolean(
+                                                                                !enabled,
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    if combined_thinking
+                                                        || combined_fast.is_some()
+                                                        || combined_context
                                                     {
                                                         agent_menu_section_label(
                                                             ui, "Model", row_height,

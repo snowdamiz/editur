@@ -238,10 +238,7 @@ impl EditorApp {
         paste: Option<&str>,
         ctx: &egui::Context,
     ) {
-        if self
-            .active_tab
-            .and_then(|index| self.tabs.get(index))
-            .is_some_and(|tab| tab.git_diff.is_some())
+        if self.git_diff.is_some()
             && (command.id().starts_with("editor.")
                 || command.id().starts_with("vim.")
                 || matches!(
@@ -374,8 +371,9 @@ impl EditorApp {
             }
             KeybindingCommand::ViewToggleSourceControl => {
                 if self.sidebar && self.sidebar_pane == SidebarPane::SourceControl {
-                    self.sidebar = false;
+                    self.sidebar_pane = SidebarPane::Files;
                     self.scm_focused = false;
+                    self.tree_focused = true;
                 } else {
                     if self.agentic_mode {
                         self.set_agentic_mode(false, ctx);
@@ -466,7 +464,9 @@ impl EditorApp {
     }
 
     pub(super) fn mark_tab_changed(&mut self, index: usize) {
-        self.tabs[index].buffer.mark_changed();
+        let tab = &mut self.tabs[index];
+        let edits = tab.editor_surface.take_applied_edits();
+        tab.buffer.mark_changed_with_edits(&edits);
         self.tabs[index].highlight_cache.valid = false;
         self.lsp_sync_needed = true;
         self.lsp_completion = None;
@@ -611,11 +611,14 @@ impl EditorApp {
         };
         let outcome = {
             let tab = &mut self.tabs[index];
-            tab.vim.execute(
+            let (text, line_starts, line_byte_starts, character_len) = tab.buffer.vim_parts();
+            let index = VimTextIndex::new(line_starts, line_byte_starts, character_len);
+            tab.vim.execute_indexed(
                 command,
                 &mut tab.editor_surface,
-                &mut tab.buffer.text,
+                text,
                 &mut self.vim_session,
+                index,
             )
         };
         self.apply_vim_outcome(index, outcome, ctx);
@@ -627,11 +630,14 @@ impl EditorApp {
         };
         let outcome = {
             let tab = &mut self.tabs[index];
-            tab.vim.provide_character(
+            let (text, line_starts, line_byte_starts, character_len) = tab.buffer.vim_parts();
+            let index = VimTextIndex::new(line_starts, line_byte_starts, character_len);
+            tab.vim.provide_character_indexed(
                 character,
                 &mut tab.editor_surface,
-                &mut tab.buffer.text,
+                text,
                 &mut self.vim_session,
+                index,
             )
         };
         self.apply_vim_outcome(index, outcome, ctx);
@@ -947,10 +953,7 @@ impl EditorApp {
             .editor_surface
             .replace_selection(&mut tab.buffer.text, replacement)
         {
-            tab.buffer.mark_changed();
-            tab.highlight_cache.valid = false;
-            self.cursor = tab.buffer.line_column(tab.editor_surface.cursor());
-            self.lsp_sync_needed = true;
+            self.mark_tab_changed(index);
             self.lsp_caret = None;
         }
     }
@@ -1101,7 +1104,7 @@ impl EditorApp {
             self.tree.root.join(path)
         };
         if self.agentic_mode {
-            match fs::read_to_string(&absolute) {
+            match read_utf8_bounded(&absolute, AGENTIC_DIFF_MAX_BYTES) {
                 Ok(text) => {
                     // Without a recorded baseline (kind-only edit, oversized
                     // file) the panel still shows the file; old == new
@@ -1111,6 +1114,7 @@ impl EditorApp {
                         path: absolute,
                         baseline,
                         text,
+                        error: None,
                     };
                     if let Some(index) = self
                         .agentic_diffs
@@ -1144,11 +1148,17 @@ impl EditorApp {
     /// edit open files; the baseline side never moves.
     pub(super) fn refresh_agentic_diff(&mut self) {
         for panel in &mut self.agentic_diffs {
-            if let Ok(text) = fs::read_to_string(&panel.path)
-                && text != panel.text
-            {
-                panel.text = text;
-            }
+            refresh_agentic_diff_panel(panel);
+        }
+    }
+
+    pub(super) fn refresh_agentic_diff_paths(&mut self, paths: &HashSet<PathBuf>) {
+        for panel in self
+            .agentic_diffs
+            .iter_mut()
+            .filter(|panel| paths.contains(&panel.path))
+        {
+            refresh_agentic_diff_panel(panel);
         }
     }
 
@@ -1175,5 +1185,17 @@ impl EditorApp {
         find.match_query.clone_from(&find.query);
         find.selected = find.selected.min(find.matches.len().saturating_sub(1));
         self.tabs[index].highlight_cache.find_valid = false;
+    }
+}
+
+fn refresh_agentic_diff_panel(panel: &mut AgenticDiff) {
+    match read_utf8_bounded(&panel.path, AGENTIC_DIFF_MAX_BYTES) {
+        Ok(text) => {
+            panel.error = None;
+            if text != panel.text {
+                panel.text = text;
+            }
+        }
+        Err(error) => panel.error = Some(error),
     }
 }

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, env, fs, path::PathBuf};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use editur::agent::provision::{ProviderBundle, SidecarManifest};
 
@@ -29,6 +33,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(output, bytes)?;
+    write_if_changed(&output, &bytes)?;
     Ok(())
+}
+
+fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    if fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(false);
+    }
+    fs::write(path, bytes)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unchanged_bundle_is_not_rewritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("bundle.json");
+        std::fs::write(&output, b"same").unwrap();
+
+        assert!(!super::write_if_changed(&output, b"same").unwrap());
+    }
 }
