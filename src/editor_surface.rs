@@ -34,6 +34,7 @@ struct RetainedLine {
     /// where a wrapped continuation resumes.
     indent: usize,
     height: f32,
+    width: f32,
     galley: Option<Arc<Galley>>,
     revision: u64,
 }
@@ -63,6 +64,8 @@ pub struct EditorSurface {
     lines: Vec<RetainedLine>,
     line_numbers: Vec<Option<Arc<Galley>>>,
     offsets: Vec<f32>,
+    document_width: f32,
+    document_width_lines: usize,
     visual_revision: Option<u64>,
     wrap_width: u32,
     appearance: u64,
@@ -481,13 +484,13 @@ impl EditorSurface {
         self.clamp_scroll(content.height());
 
         self.layout_visible_lines(ui, content);
-        let mut document_width = self.document_width(advance).max(content.width());
+        let mut document_width = self.document_width().max(content.width());
         self.clamp_horizontal_scroll(content.width(), document_width);
         let mut ensure_cursor_visible = request_focus;
         if let Some(character) = scroll_to_character {
             self.scroll_character_into_view(character, content.height());
             self.layout_visible_lines(ui, content);
-            document_width = self.document_width(advance).max(content.width());
+            document_width = self.document_width().max(content.width());
             if !wrap {
                 self.scroll_character_horizontally_into_view(character, content.width());
             }
@@ -662,6 +665,7 @@ impl EditorSurface {
             for line in &mut self.lines {
                 line.galley = None;
                 line.height = estimated_height(line.character_len, wrap_width, advance);
+                line.width = line.character_len as f32 * advance;
             }
             self.rebuild_offsets();
         }
@@ -672,6 +676,7 @@ impl EditorSurface {
             for line in &mut self.lines {
                 line.job.wrap.max_width = wrap_line_width(wrap_width, line.indent, advance);
                 line.height = estimated_height(line.character_len, wrap_width, advance);
+                line.width = line.character_len as f32 * advance;
                 line.galley = None;
             }
             self.wrap_width = width;
@@ -716,6 +721,7 @@ impl EditorSurface {
                     job.wrap.max_width = wrap_line_width(wrap_width, spec.indent, advance);
                     RetainedLine {
                         height: estimated_height(spec.character_len, wrap_width, advance),
+                        width: spec.character_len as f32 * advance,
                         job,
                         char_start: spec.char_start,
                         character_len: spec.character_len,
@@ -734,11 +740,19 @@ impl EditorSurface {
     fn rebuild_offsets(&mut self) {
         self.offsets.clear();
         self.offsets.reserve(self.lines.len() + 1);
+        self.document_width = 0.0;
+        self.document_width_lines = 0;
         let mut y = 0.0;
         self.offsets.push(y);
         for line in &self.lines {
             y += line.height.max(line_height());
             self.offsets.push(y);
+            if line.width > self.document_width {
+                self.document_width = line.width;
+                self.document_width_lines = 1;
+            } else if line.width == self.document_width {
+                self.document_width_lines += 1;
+            }
         }
     }
 
@@ -759,13 +773,12 @@ impl EditorSurface {
     fn layout_visible_lines(&mut self, ui: &Ui, content: Rect) {
         let range = self.visible_lines(content.height());
         let cursor_line = self.line_for_character(self.cursor);
-        let mut indexes: Vec<_> = range.collect();
-        if !indexes.contains(&cursor_line) && cursor_line < self.lines.len() {
-            indexes.push(cursor_line);
-        }
+        let extra = (!range.contains(&cursor_line) && cursor_line < self.lines.len())
+            .then_some(cursor_line);
         let advance = digit_advance(ui);
         let mut changed_height = false;
-        for index in indexes {
+        let mut width_shrank = false;
+        for index in range.chain(extra) {
             let line = &mut self.lines[index];
             if line.galley.is_none() {
                 let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(line.job.clone()));
@@ -773,6 +786,17 @@ impl EditorSurface {
                 let height = galley.size().y.max(line_height());
                 changed_height |= (height - line.height).abs() > f32::EPSILON;
                 line.height = height;
+                let old_width = line.width;
+                line.width = galley.size().x;
+                if old_width == self.document_width && line.width < old_width {
+                    self.document_width_lines -= 1;
+                    width_shrank |= self.document_width_lines == 0;
+                } else if line.width > self.document_width {
+                    self.document_width = line.width;
+                    self.document_width_lines = 1;
+                } else if old_width < self.document_width && line.width == self.document_width {
+                    self.document_width_lines += 1;
+                }
                 line.galley = Some(galley);
             }
             if self.line_numbers.len() <= index {
@@ -793,6 +817,21 @@ impl EditorSurface {
         if changed_height {
             self.rebuild_offsets();
             self.clamp_scroll(content.height());
+        } else if width_shrank {
+            self.rebuild_document_width();
+        }
+    }
+
+    fn rebuild_document_width(&mut self) {
+        self.document_width = 0.0;
+        self.document_width_lines = 0;
+        for line in &self.lines {
+            if line.width > self.document_width {
+                self.document_width = line.width;
+                self.document_width_lines = 1;
+            } else if line.width == self.document_width {
+                self.document_width_lines += 1;
+            }
         }
     }
 
@@ -1252,18 +1291,8 @@ impl EditorSurface {
         self.scroll_y = self.scroll_y.clamp(0.0, (total - viewport_height).max(0.0));
     }
 
-    fn document_width(&self, advance: f32) -> f32 {
-        self.lines
-            .iter()
-            .map(|line| {
-                line.galley
-                    .as_ref()
-                    .map_or(line.character_len as f32 * advance, |galley| {
-                        galley.size().x
-                    })
-            })
-            .fold(0.0, f32::max)
-            + TEXT_LEFT_PADDING
+    fn document_width(&self) -> f32 {
+        self.document_width + TEXT_LEFT_PADDING
     }
 
     fn clamp_horizontal_scroll(&mut self, viewport_width: f32, document_width: f32) {
@@ -1767,6 +1796,54 @@ mod tests {
                 .map(|line| line.job.text.as_ptr())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn cached_document_width_matches_retained_lines_after_scrolling() {
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let mut text = "fn cached_width() { let value = 42; }\n".repeat(200);
+        let job = LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            Color32::WHITE,
+            f32::INFINITY,
+        );
+        let input = |events| RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 160.0))),
+            events,
+            ..RawInput::default()
+        };
+        for events in [
+            Vec::new(),
+            vec![
+                Event::PointerMoved(pos2(200.0, 80.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -96.0),
+                    phase: TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        ] {
+            let _ = context.run_ui(input(events), |ui| {
+                editor.show(ui, &mut text, &job, 1, false, None);
+            });
+            let width = editor
+                .lines
+                .iter()
+                .map(|line| line.width)
+                .fold(0.0, f32::max);
+            assert_eq!(editor.document_width, width);
+            assert_eq!(
+                editor.document_width_lines,
+                editor
+                    .lines
+                    .iter()
+                    .filter(|line| line.width == width)
+                    .count()
+            );
+        }
     }
 
     #[test]

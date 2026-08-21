@@ -12047,6 +12047,69 @@ fn transcript_following_only_resticks_at_the_bottom() {
 }
 
 #[test]
+fn dragging_the_agent_scrollbar_stops_following_the_transcript() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.transcript.extend(
+        (0..80).map(|line| TranscriptItem::Assistant(format!("transcript overflow line {line}"))),
+    );
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let draw = |app: &mut EditorApp, events, time| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                time: Some(time),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(&mut app, Vec::new(), 0.0);
+    let _ = draw(&mut app, Vec::new(), 1.0);
+    let (_, _, agent) = split_workspace(
+        screen,
+        app.sidebar,
+        app.sidebar_width,
+        true,
+        app.agent_sidebar_width,
+    );
+    let (_, transcript, _) = split_agent_sidebar(agent, ASSISTANT_COMPOSER_HEIGHT);
+    let scrollbar = pos2(transcript.right() - 2.0, transcript.bottom() - 8.0);
+    let _ = draw(&mut app, vec![Event::PointerMoved(scrollbar)], 1.5);
+    let _ = draw(
+        &mut app,
+        vec![Event::PointerButton {
+            pos: scrollbar,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }],
+        2.0,
+    );
+    let _ = draw(
+        &mut app,
+        vec![Event::PointerMoved(pos2(
+            scrollbar.x,
+            transcript.top() + 20.0,
+        ))],
+        2.1,
+    );
+
+    assert!(!app.agent_follow_transcript);
+}
+
+#[test]
 fn agentic_transcript_scrolls_from_the_side_gutters() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {

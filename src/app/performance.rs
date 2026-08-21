@@ -18,7 +18,7 @@ use crate::{
     agent::{controller::ConnectionState, state::TranscriptItem},
     buffer::Buffer,
     devin::{Activity, DevinMessage, SessionSummary, StatusCategory},
-    editor_surface::EditorSurface,
+    editor_surface::{DocumentMetrics, EditorSurface},
     file_io::OpenTarget,
     git::{
         controller::discover_repositories,
@@ -285,6 +285,62 @@ fn benchmark_vim_motions() {
                 "local text object p95 should stay below the input budget",
             ));
         }
+    }
+}
+
+#[test]
+#[ignore = "manual release-mode performance benchmark"]
+fn benchmark_editor_scroll() {
+    let config = config();
+    let scales: &[usize] = if config.quick {
+        &[10_000, 100_000]
+    } else {
+        &[10_000, 100_000, 250_000]
+    };
+    for &scale in scales {
+        let mut text = "fn scroll_frame() { let value = 42; }\n".repeat(scale);
+        let job = egui::text::LayoutJob::simple(
+            text.clone(),
+            theme::typography::code_editor(),
+            theme::syntax().foreground,
+            f32::INFINITY,
+        );
+        let document = DocumentMetrics {
+            revision: 1,
+            line_count: scale + 1,
+            character_len: text.chars().count(),
+        };
+        let context = theme::test_context();
+        let mut editor = EditorSurface::default();
+        let _ = context.run_ui(input(), |ui| {
+            editor.show_document(ui, &mut text, &job, document, false, None);
+        });
+        let summary = sample(config, || {
+            let mut frame_input = input();
+            frame_input.events = vec![
+                egui::Event::PointerMoved(pos2(600.0, 400.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -96.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let output = context.run_ui(frame_input, |ui| {
+                black_box(editor.show_document(ui, &mut text, &job, document, false, None));
+            });
+            black_box(output.shapes.len());
+        });
+        emit(timed_record(
+            "ui",
+            "editor-scroll",
+            scale,
+            summary,
+            config.samples,
+            4.0,
+            8.0,
+            "editor scroll p95 should react inside half a 60 Hz frame",
+        ));
     }
 }
 

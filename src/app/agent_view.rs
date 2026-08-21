@@ -2782,6 +2782,10 @@ impl EditorApp {
                     let max_offset =
                         (output.content_size.y - output.inner_rect.height()).max(0.0);
                     let at_bottom = agent_at_bottom(output.state.offset.y, max_offset);
+                    let scrollbar_active = ui
+                        .ctx()
+                        .read_response(output.id.with(1))
+                        .is_some_and(|response| response.is_pointer_button_down_on());
                     let page_result = if scrolling_up
                         && output.state.offset.y <= 0.5
                         && self.agent.has_earlier_transcript()
@@ -2809,6 +2813,7 @@ impl EditorApp {
                     }
                     self.agent_follow_transcript = !self.agent.has_later_transcript()
                         && !scrolling_up
+                        && !scrollbar_active
                         && (self.agent_follow_transcript || at_bottom);
                     if self.agent_follow_transcript
                         && (output.state.offset.y - max_offset).abs() > 0.5
