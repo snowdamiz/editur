@@ -325,6 +325,7 @@ const AGENT_PROVIDER_HEADING_HEIGHT: f32 = 24.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_MENTION_ROW_HEIGHT: f32 = 32.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
+const AGENT_PROJECT_SESSION_PAGE: usize = 5;
 const AGENT_TRANSCRIPT_TOP_PADDING: i8 = 14;
 const AGENT_DIFF_PREVIEW_ROWS: usize = 18;
 const AGENT_DIFF_PREVIEW_HEAD: usize = 12;
@@ -3935,6 +3936,8 @@ impl AccountPrompt {
 }
 
 struct AgentPaneRuntime {
+    project_root: PathBuf,
+    sidebar_history_pending: bool,
     agent_menu: Option<AgentMenu>,
     agent_menu_popup: Option<egui::Rect>,
     agent_menu_scroll_y: f32,
@@ -3967,8 +3970,10 @@ struct AgentPaneDrag {
 }
 
 impl AgentPaneRuntime {
-    fn blank(selected_account: AccountKey) -> Self {
+    fn blank(selected_account: AccountKey, project_root: PathBuf) -> Self {
         Self {
+            project_root,
+            sidebar_history_pending: false,
             agent_menu: None,
             agent_menu_popup: None,
             agent_menu_scroll_y: 0.0,
@@ -5091,6 +5096,11 @@ pub struct EditorApp {
     /// The previous window was in agent mode when the project switched, so the
     /// replacement starts its providers on the first frame that has a context.
     agent_boot_pending: bool,
+    agent_boot_fresh_session: bool,
+    agent_project_sessions: HashMap<(AccountKey, PathBuf), Option<Vec<SessionChoice>>>,
+    agent_project_session_limits: HashMap<(AccountKey, PathBuf), usize>,
+    agent_collapsed_projects: HashSet<PathBuf>,
+    agent_sidebar_history_pending: bool,
     syntaxes: SyntaxManager,
     highlighter: Highlighter,
     search: SearchController,
@@ -5115,6 +5125,7 @@ pub struct EditorApp {
     terminal_dragging: bool,
     terminal: TerminalPanel,
     agentic_mode: bool,
+    agent_project_root: PathBuf,
     agent_pane_layout: PaneLayout,
     active_agent_pane: PaneId,
     agent_pane_picker: Option<PaneId>,
@@ -5295,6 +5306,7 @@ impl EditorApp {
             settings.keybindings.effective_bindings()?,
             KeybindingPlatform::current(),
         )?;
+        let agent_project_root = target.root.clone();
         Ok(Self {
             tabs,
             active_tab,
@@ -5310,6 +5322,11 @@ impl EditorApp {
                 .unwrap_or_default(),
             project_menu: false,
             agent_boot_pending: false,
+            agent_boot_fresh_session: false,
+            agent_project_sessions: HashMap::new(),
+            agent_project_session_limits: HashMap::new(),
+            agent_collapsed_projects: HashSet::new(),
+            agent_sidebar_history_pending: false,
             syntaxes,
             highlighter: Highlighter::new()?,
             search,
@@ -5334,6 +5351,7 @@ impl EditorApp {
             terminal_dragging: false,
             terminal: TerminalPanel::default(),
             agentic_mode: false,
+            agent_project_root,
             agent_pane_layout: PaneLayout::default(),
             active_agent_pane: PaneId(0),
             agent_pane_picker: None,
@@ -6300,10 +6318,9 @@ impl EditorApp {
             .or(self.agent_pane_picker)
             .expect("a pane remains after removing a split pane");
         self.active_agent_pane = next;
-        let runtime = self
-            .agent_pane_runtimes
-            .remove(&next)
-            .unwrap_or_else(|| AgentPaneRuntime::blank(self.selected_account));
+        let runtime = self.agent_pane_runtimes.remove(&next).unwrap_or_else(|| {
+            AgentPaneRuntime::blank(self.selected_account, self.agent_project_root.clone())
+        });
         self.put_agent_pane_runtime(runtime);
         true
     }
@@ -6340,6 +6357,8 @@ impl EditorApp {
 
     fn take_agent_pane_runtime(&mut self) -> AgentPaneRuntime {
         AgentPaneRuntime {
+            project_root: std::mem::take(&mut self.agent_project_root),
+            sidebar_history_pending: std::mem::take(&mut self.agent_sidebar_history_pending),
             agent_menu: self.agent_menu.take(),
             agent_menu_popup: self.agent_menu_popup.take(),
             agent_menu_scroll_y: std::mem::take(&mut self.agent_menu_scroll_y),
@@ -6374,6 +6393,8 @@ impl EditorApp {
     }
 
     fn put_agent_pane_runtime(&mut self, runtime: AgentPaneRuntime) {
+        self.agent_project_root = runtime.project_root;
+        self.agent_sidebar_history_pending = runtime.sidebar_history_pending;
         self.agent_menu = runtime.agent_menu;
         self.agent_menu_popup = runtime.agent_menu_popup;
         self.agent_menu_scroll_y = runtime.agent_menu_scroll_y;
@@ -6416,14 +6437,40 @@ impl EditorApp {
     }
 
     fn assign_agent_session_pane(&mut self, pane: PaneId, session_id: Option<String>) {
-        if self.agent_pane_picker != Some(pane) {
+        self.assign_agent_project_session_pane(pane, self.agent_project_root.clone(), session_id);
+    }
+
+    fn assign_agent_project_session_pane(
+        &mut self,
+        pane: PaneId,
+        project_root: PathBuf,
+        session_id: Option<String>,
+    ) {
+        if self.agent_pane_picker != Some(pane) && self.active_agent_pane != pane {
             return;
         }
-        let mut runtime = AgentPaneRuntime::blank(self.selected_account);
-        runtime.agent.history_available = self.agent.history_available;
-        runtime.agent.sessions = self.agent.sessions.clone();
+        let sessions = if project_root == self.agent_project_root {
+            self.agent.sessions.clone()
+        } else {
+            self.agent_project_sessions
+                .get(&(self.selected_account, project_root.clone()))
+                .cloned()
+                .flatten()
+        };
+        if let Some(sessions) = &sessions {
+            self.agent_project_sessions.insert(
+                (self.selected_account, project_root.clone()),
+                Some(sessions.clone()),
+            );
+        }
+        let mut runtime = AgentPaneRuntime::blank(self.selected_account, project_root);
+        runtime.agent.history_available = sessions.is_some();
+        runtime.sidebar_history_pending = sessions.is_some();
+        runtime.agent.sessions = sessions;
         runtime.agent.session_id = session_id;
-        self.agent_pane_picker = None;
+        if self.agent_pane_picker == Some(pane) {
+            self.agent_pane_picker = None;
+        }
         if self.active_agent_pane == pane {
             self.put_agent_pane_runtime(runtime);
         } else {
@@ -6450,36 +6497,50 @@ impl EditorApp {
                 zone
             },
         )?;
-        let mut runtime = AgentPaneRuntime::blank(self.selected_account);
+        let mut runtime =
+            AgentPaneRuntime::blank(self.selected_account, self.agent_project_root.clone());
         runtime.agent.history_available = self.agent.history_available;
         runtime.agent.sessions = self.agent.sessions.clone();
+        runtime.sidebar_history_pending = runtime.agent.sessions.is_some();
+        if let Some(sessions) = &runtime.agent.sessions {
+            self.agent_project_sessions.insert(
+                (self.selected_account, self.agent_project_root.clone()),
+                Some(sessions.clone()),
+            );
+        }
         runtime.agent.session_id = Some(session_id);
         self.agent_pane_runtimes.insert(pane, runtime);
         self.activate_agent_session_pane(pane);
         Some(pane)
     }
 
-    fn agent_session_panes(&self) -> HashMap<String, Vec<usize>> {
+    fn agent_session_panes(&self) -> HashMap<(PathBuf, String), Vec<usize>> {
         let panes = self.agent_pane_layout.panes();
         if panes.len() < 2 {
             return HashMap::new();
         }
-        let mut sessions = HashMap::<String, Vec<usize>>::new();
+        let mut sessions = HashMap::<(PathBuf, String), Vec<usize>>::new();
         for (index, pane) in panes.into_iter().enumerate() {
-            let session_id = if pane == self.active_agent_pane {
-                self.agent.session_id.as_deref()
+            let session = if pane == self.active_agent_pane {
+                self.agent
+                    .session_id
+                    .as_ref()
+                    .map(|session| (self.agent_project_root.clone(), session.clone()))
             } else {
                 self.agent_pane_runtimes.get(&pane).and_then(|runtime| {
                     (runtime.selected_account == self.selected_account)
-                        .then_some(runtime.agent.session_id.as_deref())
+                        .then(|| {
+                            runtime
+                                .agent
+                                .session_id
+                                .as_ref()
+                                .map(|session| (runtime.project_root.clone(), session.clone()))
+                        })
                         .flatten()
                 })
             };
-            if let Some(session_id) = session_id {
-                sessions
-                    .entry(session_id.to_owned())
-                    .or_default()
-                    .push(index + 1);
+            if let Some(session) = session {
+                sessions.entry(session).or_default().push(index + 1);
             }
         }
         sessions
@@ -6749,7 +6810,62 @@ impl EditorApp {
         }
     }
 
+    fn agentic_project_roots(&self) -> Vec<PathBuf> {
+        let mut projects = Vec::new();
+        for root in &self.recent_projects {
+            if !projects.contains(root) {
+                projects.push(root.clone());
+            }
+        }
+        if !projects.contains(&self.tree.root) {
+            projects.insert(0, self.tree.root.clone());
+        }
+        if !projects.contains(&self.agent_project_root) {
+            projects.push(self.agent_project_root.clone());
+        }
+        for runtime in self.agent_pane_runtimes.values() {
+            if !projects.contains(&runtime.project_root) {
+                projects.push(runtime.project_root.clone());
+            }
+        }
+        projects
+    }
+
+    fn request_agentic_project_sessions(&mut self) {
+        if !self.agent.session_ready {
+            return;
+        }
+        let account = self.selected_account;
+        let projects = self
+            .agentic_project_roots()
+            .into_iter()
+            .filter(|project| {
+                project != &self.agent_project_root
+                    && !self
+                        .agent_project_sessions
+                        .contains_key(&(account, project.clone()))
+            })
+            .collect::<Vec<_>>();
+        if projects.is_empty() {
+            return;
+        }
+        let sent = self
+            .agent_controllers
+            .get(&account)
+            .is_some_and(|controller| {
+                controller
+                    .send(AgentCommand::RefreshProjectSessions(projects.clone()))
+                    .is_ok()
+            });
+        if sent {
+            for project in projects {
+                self.agent_project_sessions.insert((account, project), None);
+            }
+        }
+    }
+
     fn draw_agentic_sessions(&mut self, ui: &mut egui::Ui) {
+        self.request_agentic_project_sessions();
         let rect = ui.max_rect();
         draw_assistant_sidebar_surface(ui, rect);
         let settings = sidebar_settings_rect(rect);
@@ -6759,11 +6875,17 @@ impl EditorApp {
         );
         let mut session_load = None;
         let mut session_remove = None;
-        let mut new_session = false;
         let mut add_project = false;
-        let mut switch_to = None;
-        let mut sessions_top = content.top();
+        let mut toggle_project = None;
+        let mut open_session = None;
+        let mut new_session_project = None;
+        let mut load_more_project = None;
+        let mut dragged_session = None;
+        let mut projects_top = content.top();
         let session_panes = self.agent_session_panes();
+        let projects = self.agentic_project_roots();
+        let active_project = self.agent_project_root.clone();
+        let account = self.selected_account;
         ui.scope_builder(
             UiBuilder::new()
                 .id_salt("agentic_session_content")
@@ -6789,45 +6911,25 @@ impl EditorApp {
                 ui.add_space(theme::space::SMALL);
                 add_project = agentic_section_header(
                     ui,
-                    "Workspaces",
-                    Some(("agentic_add_project", "Add workspace")),
+                    "Projects",
+                    Some(("agentic_add_project", "Add project")),
                 );
-                ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                if agentic_project_row(ui, &self.tree.root, true) {
-                    switch_to = Some(self.tree.root.clone());
-                }
-                for root in &self.recent_projects {
-                    if root == &self.tree.root {
-                        continue;
-                    }
-                    if agentic_project_row(ui, root, false) {
-                        switch_to = Some(root.clone());
-                    }
-                }
-                ui.add_space(theme::space::LARGE);
-                new_session = agentic_section_header(
-                    ui,
-                    "Sessions",
-                    self.agent
-                        .session_ready
-                        .then_some(("agentic_new_session", "New session")),
-                );
-                sessions_top = ui.cursor().top();
+                projects_top = ui.cursor().top();
             },
         );
-        if sessions_top < content.bottom() {
-            let sessions = egui::Rect::from_min_max(
-                egui::pos2(content.left(), sessions_top),
+        if projects_top < content.bottom() {
+            let project_region = egui::Rect::from_min_max(
+                egui::pos2(content.left(), projects_top),
                 egui::pos2(rect.right(), content.bottom()),
             );
             ui.scope_builder(
                 UiBuilder::new()
-                    .id_salt("agentic_session_list_region")
-                    .max_rect(sessions)
+                    .id_salt("agentic_project_list_region")
+                    .max_rect(project_region)
                     .layout(Layout::top_down(Align::LEFT)),
                 |ui| {
                     ScrollArea::vertical()
-                        .id_salt("agentic_session_list")
+                        .id_salt("agentic_project_list")
                         .auto_shrink([false, false])
                         .scroll_source(
                             egui::scroll_area::ScrollSource::SCROLL_BAR
@@ -6839,58 +6941,140 @@ impl EditorApp {
                             top: 0,
                             bottom: 0,
                         })
-                        .show(ui, |ui| match &self.agent.sessions {
-                            _ if !self.agent.history_available => {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(theme::space::SMALL);
-                                    ui.label(
-                                        RichText::new("Session history unavailable").small().weak(),
-                                    );
-                                });
-                            }
-                            None => {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(theme::space::SMALL);
-                                    ui.label(RichText::new("Loading sessions…").small().weak());
-                                });
-                            }
-                            Some(sessions) if sessions.is_empty() => {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(theme::space::SMALL);
-                                    ui.label(RichText::new("No previous sessions").small().weak());
-                                });
-                            }
-                            Some(sessions) => {
-                                ui.spacing_mut().item_spacing.y = theme::space::HAIR;
-                                for session in sessions {
-                                    let pane_numbers = session_panes
-                                        .get(&session.id)
-                                        .map(Vec::as_slice)
-                                        .unwrap_or_default();
-                                    let selected = !pane_numbers.is_empty()
-                                        || self.agent.session_id.as_deref()
-                                            == Some(session.id.as_str());
-                                    let (open, remove, drag) = agent_session_row(
-                                        ui,
-                                        session,
-                                        selected,
-                                        true,
-                                        pane_numbers,
-                                    );
-                                    if open {
-                                        session_load = Some(session.id.clone());
-                                    }
-                                    if remove {
-                                        session_remove = Some(session.id.clone());
-                                    }
-                                    if drag {
-                                        self.agent_session_drag = Some(session.clone());
-                                    }
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                            for project in &projects {
+                                let current = project == &active_project;
+                                let collapsed = self.agent_collapsed_projects.contains(project);
+                                let (toggle, create_session) = agentic_project_row_with_new_session(
+                                    ui,
+                                    project,
+                                    self.agent.session_ready,
+                                    Some(collapsed),
+                                );
+                                if toggle {
+                                    toggle_project = Some(project.clone());
                                 }
+                                if create_session {
+                                    new_session_project = Some(project.clone());
+                                }
+                                if collapsed {
+                                    continue;
+                                }
+                                let key = (account, project.clone());
+                                let visible = self
+                                    .agent_project_session_limits
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or(AGENT_PROJECT_SESSION_PAGE);
+                                let cached_sessions = self
+                                    .agent_project_sessions
+                                    .get(&key)
+                                    .and_then(Option::as_deref);
+                                let sessions = if current {
+                                    if self.agent_sidebar_history_pending {
+                                        cached_sessions
+                                    } else {
+                                        self.agent.sessions.as_deref().or(cached_sessions)
+                                    }
+                                } else {
+                                    cached_sessions
+                                };
+                                ui.spacing_mut().indent = theme::space::XWIDE;
+                                ui.indent(("agentic_project_sessions", project), |ui| {
+                                    if current && !self.agent.history_available {
+                                        ui.label(
+                                            RichText::new("Session history unavailable")
+                                                .small()
+                                                .weak(),
+                                        );
+                                        return;
+                                    }
+                                    let Some(sessions) = sessions else {
+                                        ui.label(RichText::new("Loading sessions…").small().weak());
+                                        return;
+                                    };
+                                    if sessions.is_empty() {
+                                        ui.label(
+                                            RichText::new("No previous sessions").small().weak(),
+                                        );
+                                        return;
+                                    }
+                                    for session in sessions.iter().take(visible) {
+                                        let pane_numbers = session_panes
+                                            .get(&(project.clone(), session.id.clone()))
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default();
+                                        let selected = !pane_numbers.is_empty()
+                                            || (current
+                                                && self.agent.session_id.as_deref()
+                                                    == Some(session.id.as_str()));
+                                        let (open, remove, drag) = agent_session_row(
+                                            ui,
+                                            session,
+                                            selected,
+                                            true,
+                                            pane_numbers,
+                                            current,
+                                        );
+                                        if open {
+                                            open_session =
+                                                Some((project.clone(), session.id.clone()));
+                                        }
+                                        if remove {
+                                            session_remove = Some(session.id.clone());
+                                        }
+                                        if drag {
+                                            dragged_session = Some(session.clone());
+                                        }
+                                    }
+                                    if sessions.len() > visible
+                                        && agentic_project_load_more(ui, project)
+                                    {
+                                        load_more_project = Some(project.clone());
+                                    }
+                                });
                             }
                         });
                 },
             );
+        }
+        if let Some(session) = dragged_session {
+            self.agent_session_drag = Some(session);
+        }
+        if let Some(project) = toggle_project
+            && !self.agent_collapsed_projects.insert(project.clone())
+        {
+            self.agent_collapsed_projects.remove(&project);
+        }
+        if let Some(project) = load_more_project {
+            *self
+                .agent_project_session_limits
+                .entry((account, project))
+                .or_insert(AGENT_PROJECT_SESSION_PAGE) += AGENT_PROJECT_SESSION_PAGE;
+        }
+        if let Some((project, session)) = open_session {
+            if project == active_project {
+                session_load = Some(session);
+            } else {
+                self.assign_agent_project_session_pane(
+                    self.active_agent_pane,
+                    project,
+                    Some(session),
+                );
+                self.agent_boot_pending = true;
+            }
+        }
+        if let Some(project) = new_session_project {
+            if project == active_project {
+                if let Some(controller) = self.agent_controllers.get(&self.selected_account) {
+                    let _ = controller.send(AgentCommand::NewSession);
+                }
+            } else {
+                self.assign_agent_project_session_pane(self.active_agent_pane, project, None);
+                self.agent_boot_fresh_session = true;
+                self.agent_boot_pending = true;
+            }
         }
         let (open_settings, update) = self.draw_settings_row(ui, settings);
         if open_settings {
@@ -6909,13 +7093,7 @@ impl EditorApp {
         {
             let _ = controller.send(AgentCommand::RemoveSession(session_id));
         }
-        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_account)
-        {
-            let _ = controller.send(AgentCommand::NewSession);
-        }
-        if let Some(root) = switch_to {
-            self.switch_project(root);
-        } else if add_project {
+        if add_project {
             self.add_project_via_dialog();
         }
     }
@@ -9464,9 +9642,17 @@ fn agentic_section_header(
     response.clicked()
 }
 
-/// One project in the agentic rail. The open project is marked selected;
-/// clicking any row asks the app to switch to that root.
-fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
+/// One neutral project row for menus that switch the active workspace.
+fn agentic_project_row(ui: &mut egui::Ui, root: &Path) -> bool {
+    agentic_project_row_with_new_session(ui, root, false, None).0
+}
+
+fn agentic_project_row_with_new_session(
+    ui: &mut egui::Ui,
+    root: &Path,
+    show_new_session: bool,
+    collapsed: Option<bool>,
+) -> (bool, bool) {
     let name = root
         .file_name()
         .unwrap_or(root.as_os_str())
@@ -9478,40 +9664,138 @@ fn agentic_project_row(ui: &mut egui::Ui, root: &Path, selected: bool) -> bool {
         ),
         Sense::hover(),
     );
-    let response = ui.interact(rect, Id::new(("agentic_project", root)), Sense::click());
+    let action = show_new_session.then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.right() - theme::control::COMPACT, rect.top()),
+            rect.right_bottom(),
+        )
+    });
+    let project = action.map_or(rect, |action| rect.with_max_x(action.left()));
+    let response = ui.interact(project, Id::new(("agentic_project", root)), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            format!("Open project {name}"),
+            match collapsed {
+                Some(true) => format!("Expand project {name}"),
+                Some(false) => format!("Collapse project {name}"),
+                None => format!("Open project {name}"),
+            },
         )
     });
-    if selected {
-        ui.painter().rect_filled(
-            rect,
-            theme::corner(theme::radius::CONTROL),
-            theme::state::selected(),
-        );
-    } else if response.hovered() {
+    let new_session = action.map(|action| {
+        let response = ui
+            .interact(
+                action,
+                Id::new(("agentic_new_session", root)),
+                Sense::click(),
+            )
+            .on_hover_text("New session");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "New session")
+        });
+        response
+    });
+    if response.hovered() || new_session.as_ref().is_some_and(egui::Response::hovered) {
         ui.painter().rect_filled(
             rect,
             theme::corner(theme::radius::CONTROL),
             theme::state::hover(),
         );
     }
+    let color = if response.hovered() {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    icons::paint(
+        ui.painter(),
+        Icon::Folder,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + theme::space::MEDIUM, rect.center().y),
+            egui::Vec2::splat(icons::GRID),
+        ),
+        color,
+    );
     ui.painter().text(
-        egui::pos2(rect.left() + theme::space::MEDIUM, rect.center().y),
+        egui::pos2(
+            rect.left() + theme::space::MEDIUM + icons::GRID,
+            rect.center().y,
+        ),
         Align2::LEFT_CENTER,
         name,
-        if selected {
-            theme::typography::strong()
-        } else {
-            theme::typography::body()
-        },
-        if selected || response.hovered() {
+        theme::typography::strong(),
+        color,
+    );
+    if let Some(collapsed) = collapsed {
+        icons::paint(
+            ui.painter(),
+            if collapsed {
+                Icon::ChevronRight
+            } else {
+                Icon::ChevronDown
+            },
+            egui::Rect::from_center_size(
+                egui::pos2(project.right() - theme::space::MEDIUM, project.center().y),
+                egui::Vec2::splat(icons::GRID * 0.75),
+            ),
+            color,
+        );
+    }
+    if let (Some(action), Some(action_response)) = (action, new_session.as_ref()) {
+        if action_response.hovered() {
+            ui.painter().rect_filled(
+                action,
+                theme::corner(theme::radius::CONTROL),
+                theme::state::hover(),
+            );
+        }
+        icons::paint(
+            ui.painter(),
+            Icon::Plus,
+            egui::Rect::from_center_size(action.center(), egui::Vec2::splat(14.0)),
+            if action_response.hovered() {
+                theme::text().primary
+            } else {
+                theme::text().secondary
+            },
+        );
+    }
+    (
+        response.clicked(),
+        new_session.is_some_and(|response| response.clicked()),
+    )
+}
+
+fn agentic_project_load_more(ui: &mut egui::Ui, project: &Path) -> bool {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), theme::control::COMPACT),
+        Sense::hover(),
+    );
+    let response = ui.interact(
+        rect,
+        Id::new(("agentic_project_load_more", project)),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Load more")
+    });
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::ROW),
+            theme::state::hover(),
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + theme::space::SMALL, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Load more",
+        theme::typography::small_strong(),
+        if response.hovered() {
             theme::text().primary
         } else {
-            theme::text().secondary
+            theme::text().muted
         },
     );
     response.clicked()
@@ -9523,6 +9807,7 @@ fn agent_session_row(
     selected: bool,
     compact: bool,
     pane_numbers: &[usize],
+    actions: bool,
 ) -> (bool, bool, bool) {
     let label = session
         .title
@@ -9535,33 +9820,42 @@ fn agent_session_row(
         AGENT_SESSION_ROW_HEIGHT
     };
     let (_, row) = ui.allocate_space(egui::vec2(ui.available_width(), row_height));
-    let remove = egui::Rect::from_min_max(
-        egui::pos2(row.right() - row_height, row.top()),
-        row.right_bottom(),
-    );
-    let open = row.with_max_x(remove.left());
+    let remove = actions.then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(row.right() - row_height, row.top()),
+            row.right_bottom(),
+        )
+    });
+    let open = remove.map_or(row, |remove| row.with_max_x(remove.left()));
     let open_response = ui.interact(
         open,
         Id::new(("agent_session_open", &session.id)),
-        Sense::click_and_drag(),
+        if actions {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        },
     );
     open_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    let remove_label = format!("Remove {label} from history");
-    let remove_response = ui
-        .interact(
-            remove,
-            Id::new(("agent_session_remove", &session.id)),
-            Sense::click(),
-        )
-        .on_hover_text(&remove_label);
-    remove_response.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
-            ui.is_enabled(),
-            remove_label.clone(),
-        )
+    let remove_response = remove.map(|remove| {
+        let remove_label = format!("Remove {label} from history");
+        let response = ui
+            .interact(
+                remove,
+                Id::new(("agent_session_remove", &session.id)),
+                Sense::click(),
+            )
+            .on_hover_text(&remove_label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                remove_label.clone(),
+            )
+        });
+        response
     });
     if selected {
         ui.painter().rect_filled(
@@ -9576,7 +9870,9 @@ fn agent_session_row(
             theme::state::hover(),
         );
     }
-    if remove_response.hovered() {
+    if let (Some(remove), Some(response)) = (remove, remove_response.as_ref())
+        && response.hovered()
+    {
         ui.painter().rect_filled(
             remove,
             theme::corner(theme::radius::ROW),
@@ -9595,7 +9891,7 @@ fn agent_session_row(
     };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     let text_padding = theme::space::SMALL;
-    let mut badge_right = remove.left() - theme::space::TIGHT;
+    let mut badge_right = remove.map_or(row.right(), |remove| remove.left()) - theme::space::TIGHT;
     for number in pane_numbers.iter().rev() {
         let badge = egui::Rect::from_center_size(
             egui::pos2(badge_right - 14.0, open.center().y),
@@ -9622,7 +9918,9 @@ fn agent_session_row(
             galley,
             color,
         );
-    if !compact || open_response.hovered() || remove_response.hovered() {
+    if let (Some(remove), Some(remove_response)) = (remove, remove_response.as_ref())
+        && (!compact || open_response.hovered() || remove_response.hovered())
+    {
         ui.painter().text(
             remove.center(),
             Align2::CENTER_CENTER,
@@ -9637,8 +9935,8 @@ fn agent_session_row(
     }
     (
         open_response.clicked(),
-        remove_response.clicked(),
-        open_response.drag_started() || open_response.dragged(),
+        remove_response.is_some_and(|response| response.clicked()),
+        actions && (open_response.drag_started() || open_response.dragged()),
     )
 }
 

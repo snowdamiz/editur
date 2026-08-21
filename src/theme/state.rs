@@ -91,16 +91,36 @@ pub(crate) fn fill(selected_row: bool, focused: bool, hovered: bool, pressed: bo
 
 /// Dims the whole window behind a modal so it reads as modal.
 pub(crate) fn scrim() -> Color32 {
-    color::palette().surface.sunken.gamma_multiply(0.45)
+    if color::palette().dark {
+        color::palette().surface.sunken.gamma_multiply(0.45)
+    } else {
+        // A wash of a light surface cannot dim a light window; light mode
+        // darkens outright, the way the platform's own sheets do.
+        shade(64)
+    }
+}
+
+/// How much of the native blur each material covers. Light surfaces sit far
+/// from any typical wallpaper, so the light tints must cover much more of the
+/// blur than the dark ones or the chrome composites into mud over a dark
+/// desktop.
+#[cfg(target_os = "macos")]
+fn material_alphas() -> (u8, u8) {
+    if color::palette().dark {
+        (120, 216)
+    } else {
+        (216, 240)
+    }
 }
 
 /// Tint over macOS's native sidebar material. The partial opacity keeps the
-/// blur visible without letting a bright wallpaper wash out the sidebar.
+/// blur visible without letting the wallpaper take over the sidebar.
 pub(crate) fn sidebar_material() -> Color32 {
     #[cfg(target_os = "macos")]
     {
         let chrome = color::surface().chrome;
-        Color32::from_rgba_unmultiplied(chrome.r(), chrome.g(), chrome.b(), 120)
+        let (sidebar, _) = material_alphas();
+        Color32::from_rgba_unmultiplied(chrome.r(), chrome.g(), chrome.b(), sidebar)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -114,7 +134,8 @@ pub(crate) fn content_material() -> Color32 {
     #[cfg(target_os = "macos")]
     {
         let editor = color::mix(color::surface().editor, color::surface().sunken, 0.20);
-        Color32::from_rgba_unmultiplied(editor.r(), editor.g(), editor.b(), 216)
+        let (_, content) = material_alphas();
+        Color32::from_rgba_unmultiplied(editor.r(), editor.g(), editor.b(), content)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -126,7 +147,8 @@ pub(crate) fn secondary_material() -> Color32 {
     #[cfg(target_os = "macos")]
     {
         let content = color::mix(color::settings().content, color::surface().sunken, 0.20);
-        Color32::from_rgba_unmultiplied(content.r(), content.g(), content.b(), 216)
+        let (_, alpha) = material_alphas();
+        Color32::from_rgba_unmultiplied(content.r(), content.g(), content.b(), alpha)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -320,6 +342,49 @@ mod tests {
         border, content_material, diff, editor, fill, find, hover, secondary_material,
         selected_focus, sidebar_material,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn light_materials_stay_light_even_over_a_dark_wallpaper() {
+        color::set_light(true);
+        let backdrop = egui::Color32::from_rgb(20, 20, 24);
+        let sidebar = color::composite(sidebar_material(), backdrop);
+        let content = color::composite(content_material(), backdrop);
+        let sidebar_alpha = sidebar_material().a();
+        let content_alpha = content_material().a();
+        color::set_light(false);
+
+        assert!(
+            sidebar.r() >= 200,
+            "the light sidebar turns to mud over a dark desktop: {sidebar:?}"
+        );
+        assert!(
+            content.r() >= 220,
+            "the light canvas turns to mud over a dark desktop: {content:?}"
+        );
+        assert!(
+            content_alpha > sidebar_alpha,
+            "the canvas must reveal less wallpaper than the rail"
+        );
+        assert!(
+            content.r() > sidebar.r(),
+            "in light mode the canvas sits above the rail, not below it"
+        );
+    }
+
+    #[test]
+    fn a_light_scrim_still_dims_the_window_behind_a_modal() {
+        color::set_light(true);
+        let editor = color::surface().editor;
+        let dimmed = color::composite(super::scrim(), editor);
+        color::set_light(false);
+
+        assert!(
+            i16::from(editor.r()) - i16::from(dimmed.r()) >= 40,
+            "a light wash cannot dim a light window; \
+             the scrim reads as fog instead of a modal: {dimmed:?} over {editor:?}"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

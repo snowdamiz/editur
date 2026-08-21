@@ -195,16 +195,46 @@ impl EditorApp {
     pub(super) fn perform(&mut self, action: PendingAction) {
         match action {
             PendingAction::Open(path) => self.open_tab(path, false),
-            PendingAction::OpenTarget(target) => match Self::new(target) {
-                Ok(mut editor) => {
-                    editor.agentic_mode = self.agentic_mode;
-                    editor.agent_boot_pending = self.agentic_mode;
-                    *self = editor;
-                }
-                Err(error) => self.show_error(error),
-            },
+            PendingAction::OpenTarget(target) => self.replace_project(target),
             PendingAction::CloseTab(index) => self.close_tab(index),
             PendingAction::Close => self.should_close = true,
+        }
+    }
+
+    fn replace_project(&mut self, target: OpenTarget) {
+        let preserve_agent_sidebar = self.agentic_mode;
+        let previous_account = self.selected_account;
+        let previous_project = self.tree.root.clone();
+        let previous_sessions = self.agent.sessions.clone();
+        let project_order = self.agentic_project_roots();
+        match Self::new(target) {
+            Ok(mut editor) => {
+                editor.agentic_mode = self.agentic_mode;
+                editor.agent_boot_pending = self.agentic_mode;
+                if preserve_agent_sidebar {
+                    let mut sessions = std::mem::take(&mut self.agent_project_sessions);
+                    if let Some(previous_sessions) = previous_sessions {
+                        sessions.insert(
+                            (previous_account, previous_project),
+                            Some(previous_sessions),
+                        );
+                    }
+                    editor.agent.sessions = sessions
+                        .get(&(editor.selected_account, editor.tree.root.clone()))
+                        .cloned()
+                        .flatten();
+                    editor.agent.history_available = editor.agent.sessions.is_some();
+                    editor.agent_sidebar_history_pending = editor.agent.sessions.is_some();
+                    editor.agent_project_sessions = sessions;
+                    editor.agent_project_session_limits =
+                        std::mem::take(&mut self.agent_project_session_limits);
+                    editor.agent_collapsed_projects =
+                        std::mem::take(&mut self.agent_collapsed_projects);
+                    editor.recent_projects = project_order;
+                }
+                *self = editor;
+            }
+            Err(error) => self.show_error(error),
         }
     }
 
@@ -222,11 +252,12 @@ impl EditorApp {
                 self.show_error(error);
             }
         }
-        self.request(PendingAction::OpenTarget(OpenTarget {
+        let target = OpenTarget {
             root,
             file: None,
             create: false,
-        }));
+        };
+        self.request(PendingAction::OpenTarget(target));
     }
 
     /// Opens the custom folder picker instead of a platform dialog: the same

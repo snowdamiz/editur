@@ -394,6 +394,7 @@ impl AgentState {
             Event::SessionsUpdated(sessions) => {
                 self.sessions = Some(sessions.into_iter().take(MAX_CHOICES).collect());
             }
+            Event::ProjectSessionsUpdated { .. } => {}
             Event::SessionLoading { title } => {
                 self.session_load_backup = Some(SessionLoadBackup {
                     transcript: std::mem::take(&mut self.transcript),

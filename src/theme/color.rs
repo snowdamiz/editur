@@ -125,16 +125,19 @@ pub(crate) const DARK: Palette = Palette {
 pub(crate) const LIGHT: Palette = Palette {
     dark: false,
     accent: Color32::from_rgb(17, 120, 136),
+    // The light ramp is not the dark ramp inverted: it anchors at true white
+    // and steps down subtly, with a slight cool cast, so the window reads airy
+    // instead of gray. Separation leans on hairlines and shadows, not fill.
     surface: Surfaces {
-        sunken: Color32::from_rgb(210, 210, 215),
-        chrome: Color32::from_rgb(226, 226, 231),
-        editor: Color32::from_rgb(243, 243, 246),
+        sunken: Color32::from_rgb(229, 231, 235),
+        chrome: Color32::from_rgb(240, 242, 245),
+        editor: Color32::from_rgb(249, 250, 252),
         raised: Color32::from_rgb(255, 255, 255),
-        input: Color32::from_rgb(236, 236, 240),
+        input: Color32::from_rgb(243, 244, 248),
     },
     settings: SettingsSurfaces {
-        content: Color32::from_rgb(234, 234, 238),
-        card: Color32::from_rgb(247, 247, 250),
+        content: Color32::from_rgb(245, 246, 249),
+        card: Color32::from_rgb(252, 252, 254),
         control: Color32::from_rgb(255, 255, 255),
     },
     text: TextRoles {
@@ -496,6 +499,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The failure mode this guards against: a light theme built by literally
+    /// inverting the dark ramp lands on mid-grays and reads a decade old. A
+    /// light theme has to be anchored at white and step down subtly from it.
+    #[test]
+    fn the_light_surfaces_read_airy_rather_than_battleship_gray() {
+        for surface in [
+            LIGHT.surface.sunken,
+            LIGHT.surface.chrome,
+            LIGHT.surface.editor,
+            LIGHT.surface.raised,
+            LIGHT.surface.input,
+        ] {
+            assert!(
+                surface.r() >= 224,
+                "{surface:?} drags the light theme back toward gray"
+            );
+            assert!(
+                surface.b() >= surface.r(),
+                "{surface:?} must stay neutral-to-cool; a warm gray reads dated"
+            );
+        }
+        assert_eq!(
+            LIGHT.surface.raised.r(),
+            255,
+            "menus and cards must reach true white for the ramp to read lit"
+        );
     }
 
     #[test]

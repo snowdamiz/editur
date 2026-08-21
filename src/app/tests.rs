@@ -17,10 +17,10 @@ use super::{
     WorkspaceFilePicker, agent_at_bottom, agent_collapsing_header, agent_diff_cache_count,
     agent_diff_preview, agent_empty_state_rect, agent_mention_matches, agent_mention_query,
     agent_menu_rect, agent_new_session_rect, agent_search_matches, agent_selector_button,
-    agent_session_row, agent_toggle_rect, agentic_project_row, assistant_composer_content,
-    assistant_composer_height, assistant_dense_disclosure_row, assistant_dense_tool,
-    assistant_markdown_galley, assistant_send_button_colors, build_agent_diff, cached_agent_diff,
-    child_path, collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
+    agent_toggle_rect, agentic_project_row, assistant_composer_content, assistant_composer_height,
+    assistant_dense_disclosure_row, assistant_dense_tool, assistant_markdown_galley,
+    assistant_send_button_colors, build_agent_diff, cached_agent_diff, child_path,
+    collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
     diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
     draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
     draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
@@ -15341,7 +15341,7 @@ fn agentic_mode_replaces_the_editor_with_project_sessions() {
 }
 
 #[test]
-fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
+fn agentic_sidebar_scrolls_the_project_session_tree_at_the_right_edge() {
     fn has_scrollbar_at(shape: &Shape, right: f32) -> bool {
         match shape {
             Shape::Rect(rect) => {
@@ -15387,7 +15387,13 @@ fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
         .0
         .expect("agentic sidebar");
     let context = theme::test_context();
-    let draw = |app: &mut EditorApp, events| {
+    let project_root = app.tree.root.clone();
+    let project = project_root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut draw = |events| {
         context.run_ui(
             RawInput {
                 screen_rect: Some(screen),
@@ -15398,9 +15404,16 @@ fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
         )
     };
 
-    let initial = draw(&mut app, Vec::new());
-    let project_id = Id::new(("agentic_project", app.tree.root.clone()));
-    let project_before = context.read_response(project_id).unwrap().rect;
+    let _ = draw(Vec::new());
+    let load_more = Id::new(("agentic_project_load_more", project_root));
+    let _ = click_response(&context, &mut draw, load_more);
+    let _ = click_response(&context, &mut draw, load_more);
+    let initial = draw(Vec::new());
+    let project_before = initial
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, &project))
+        .unwrap();
     let session_before = initial
         .shapes
         .iter()
@@ -15410,20 +15423,21 @@ fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
         .read_response(Id::new(("agent_session_open", "session-5")))
         .unwrap()
         .rect;
-    let _ = draw(
-        &mut app,
-        vec![
-            Event::PointerMoved(scroll_from.center()),
-            Event::MouseWheel {
-                unit: MouseWheelUnit::Point,
-                delta: Vec2::new(0.0, -300.0),
-                phase: TouchPhase::Move,
-                modifiers: Modifiers::NONE,
-            },
-        ],
-    );
-    let scrolled = draw(&mut app, Vec::new());
-    let project_after = context.read_response(project_id).unwrap().rect;
+    let _ = draw(vec![
+        Event::PointerMoved(scroll_from.center()),
+        Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, -300.0),
+            phase: TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    let scrolled = draw(Vec::new());
+    let project_after = scrolled
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, &project))
+        .unwrap();
     let session_after = scrolled
         .shapes
         .iter()
@@ -15436,7 +15450,10 @@ fn agentic_sidebar_scrolls_only_sessions_at_the_right_edge() {
             .iter()
             .any(|shape| has_scrollbar_at(&shape.shape, sidebar.right()))
     );
-    assert_eq!(project_after.top(), project_before.top());
+    assert!(
+        project_after < project_before,
+        "project row did not scroll with its nested sessions"
+    );
     assert!(
         session_after < session_before,
         "session row did not scroll: before={session_before:?}, after={session_after:?}"
@@ -15536,7 +15553,7 @@ fn sidebar_visibility_is_shared_by_ide_and_agentic_modes() {
 }
 
 #[test]
-fn agentic_session_rail_lists_workspaces_before_sessions() {
+fn agentic_session_rail_nests_sessions_under_the_current_project() {
     let temp = tempfile::tempdir().unwrap();
     let recent = temp.path().join("other-project");
     fs::create_dir_all(&recent).unwrap();
@@ -15550,7 +15567,23 @@ fn agentic_session_rail_lists_workspaces_before_sessions() {
     app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex];
     app.agent.connection = ConnectionState::Ready;
     app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "nested-session".into(),
+        title: Some("Nested session".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
     app.recent_projects = vec![recent.clone()];
+    app.agent_project_sessions.insert(
+        (app.selected_account, recent.clone()),
+        Some(vec![SessionChoice {
+            id: "recent-project-session".into(),
+            title: Some("Recent project session".into()),
+            updated_at: None,
+            started_in_editur: false,
+        }]),
+    );
     let project = app
         .tree
         .root
@@ -15585,19 +15618,28 @@ fn agentic_session_rail_lists_workspaces_before_sessions() {
             .find_map(|shape| text_rect(&shape.shape, expected))
     };
     let provider = find("Cursor").expect("provider");
-    let projects_header = find("WORKSPACES").expect("workspaces header");
+    let projects_header = find("PROJECTS").expect("projects header");
     let project = find(&project).expect("open project row");
+    let session = find("Nested session").expect("nested session row");
     let recent_row = find("other-project").expect("recent project row");
-    let sessions_header = find("SESSIONS").expect("sessions header");
+    let recent_session = find("Recent project session").expect("recent project session row");
 
+    assert!(
+        !output.shapes.iter().any(|shape| has_id_clash(&shape.shape)),
+        "project controls reuse a widget ID"
+    );
     assert!(projects_header.top() >= provider.bottom());
     assert!(project.top() >= projects_header.bottom());
-    assert!(recent_row.top() >= project.bottom());
-    assert!(sessions_header.top() >= recent_row.bottom());
+    assert!(session.top() >= project.bottom());
+    assert!(session.left() > project.left());
+    assert!(recent_row.top() >= session.bottom());
+    assert!(recent_session.top() >= recent_row.bottom());
+    assert!(recent_session.left() > recent_row.left());
+    assert!(find("SESSIONS").is_none());
 }
 
 #[test]
-fn agentic_workspace_row_only_contains_the_project_name() {
+fn agentic_workspace_row_leads_with_a_folder_icon() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -15639,17 +15681,230 @@ fn agentic_workspace_row_only_contains_the_project_name() {
     }
     let mut text = Vec::new();
     let mut has_path = false;
+    let mut has_selected_fill = false;
     output.shapes.iter().for_each(|shape| {
         collect_row_content(&shape.shape, row, &mut text, &mut has_path);
+        if let Shape::Rect(rect) = &shape.shape
+            && rect.rect == row
+            && rect.fill == theme::state::selected()
+        {
+            has_selected_fill = true;
+        }
     });
 
     assert_eq!(text, [name]);
-    assert!(!has_path, "workspace row still contains an icon");
+    assert!(has_path, "workspace row is missing its folder icon");
+    assert!(
+        !has_selected_fill,
+        "projects must not have a selected state"
+    );
     assert_eq!(row.height(), theme::control::ROW + theme::space::TIGHT);
 }
 
 #[test]
-fn agentic_workspace_rows_match_session_typography() {
+fn agentic_project_shows_five_sessions_before_load_more() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(
+        (0..7)
+            .map(|index| SessionChoice {
+                id: format!("session-{index}"),
+                title: Some(format!("Session {index}")),
+                updated_at: Some(format!("{index:02}")),
+                started_in_editur: true,
+            })
+            .collect(),
+    );
+    let project = app.tree.root.clone();
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 700.0),
+        )),
+        ..RawInput::default()
+    };
+    let mut draw = |events| context.run_ui(RawInput { events, ..input() }, |root| app.ui(root));
+
+    let initial = draw(Vec::new());
+    assert!(
+        initial
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Session 4"))
+    );
+    assert!(
+        !initial
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Session 5"))
+    );
+    assert!(
+        context
+            .read_response(Id::new(("agentic_project_load_more", project.clone())))
+            .is_some()
+    );
+
+    let _ = click_response(
+        &context,
+        &mut draw,
+        Id::new(("agentic_project_load_more", project)),
+    );
+    let expanded = draw(Vec::new());
+    assert!(
+        expanded
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Session 6"))
+    );
+}
+
+#[test]
+fn agentic_project_keeps_cached_sessions_while_provider_history_is_partial() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "partial-session".into(),
+        title: Some("Partial session".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    app.agent_project_sessions.insert(
+        (app.selected_account, app.agent_project_root.clone()),
+        Some(
+            (0..5)
+                .map(|index| SessionChoice {
+                    id: format!("cached-session-{index}"),
+                    title: Some(format!("Cached session {index}")),
+                    updated_at: None,
+                    started_in_editur: true,
+                })
+                .collect(),
+        ),
+    );
+    app.agent_sidebar_history_pending = true;
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |ui| app.draw_agentic_sessions(ui),
+    );
+    let contains = |expected| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, expected))
+    };
+
+    assert_eq!(
+        (contains("Cached session 4"), contains("Partial session")),
+        (true, false)
+    );
+}
+
+#[test]
+fn agentic_project_row_toggles_its_sessions() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "nested-session".into(),
+        title: Some("Nested session".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    let project = app.tree.root.clone();
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            Vec2::new(1000.0, 700.0),
+        )),
+        ..RawInput::default()
+    };
+    let mut draw = |events| context.run_ui(RawInput { events, ..input() }, |root| app.ui(root));
+
+    assert!(
+        draw(Vec::new())
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Nested session"))
+    );
+    let _ = click_response(
+        &context,
+        &mut draw,
+        Id::new(("agentic_project", project.clone())),
+    );
+    assert!(
+        !draw(Vec::new())
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Nested session"))
+    );
+    let _ = click_response(&context, &mut draw, Id::new(("agentic_project", project)));
+    assert!(
+        draw(Vec::new())
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, "Nested session"))
+    );
+}
+
+#[test]
+fn agentic_workspace_rows_share_one_neutral_typography() {
     fn text_style(shape: &Shape, expected: &str) -> Option<(egui::FontId, Color32)> {
         match shape {
             Shape::Text(text) if text.galley.text() == expected => {
@@ -15662,32 +15917,8 @@ fn agentic_workspace_rows_match_session_typography() {
     }
 
     let output = theme::test_context().run_ui(RawInput::default(), |ui| {
-        agentic_project_row(ui, Path::new("/Selected workspace"), true);
-        agentic_project_row(ui, Path::new("/Other workspace"), false);
-        agent_session_row(
-            ui,
-            &SessionChoice {
-                id: "selected-session".into(),
-                title: Some("Selected session".into()),
-                updated_at: None,
-                started_in_editur: true,
-            },
-            true,
-            true,
-            &[],
-        );
-        agent_session_row(
-            ui,
-            &SessionChoice {
-                id: "other-session".into(),
-                title: Some("Other session".into()),
-                updated_at: None,
-                started_in_editur: true,
-            },
-            false,
-            true,
-            &[],
-        );
+        agentic_project_row(ui, Path::new("/First workspace"));
+        agentic_project_row(ui, Path::new("/Other workspace"));
     });
     let find = |expected| {
         output
@@ -15697,8 +15928,7 @@ fn agentic_workspace_rows_match_session_typography() {
             .unwrap_or_else(|| panic!("missing {expected:?}"))
     };
 
-    assert_eq!(find("Selected workspace"), find("Selected session"));
-    assert_eq!(find("Other workspace"), find("Other session"));
+    assert_eq!(find("First workspace"), find("Other workspace"));
 }
 
 #[test]
@@ -15725,6 +15955,76 @@ fn switching_projects_keeps_the_agentic_workspace_open() {
     assert_eq!(app.tree.root, second.canonicalize().unwrap());
     assert!(app.agentic_mode);
     assert!(app.agent_boot_pending);
+}
+
+#[test]
+fn opening_another_projects_session_replaces_the_active_agent_pane() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    let first = first.canonicalize().unwrap();
+    let second = second.canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: first.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.recent_projects = vec![first.clone(), second.clone()];
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(vec![SessionChoice {
+        id: "first-session".into(),
+        title: Some("First session".into()),
+        updated_at: None,
+        started_in_editur: true,
+    }]);
+    app.agent_project_sessions.insert(
+        (app.selected_account, second.clone()),
+        Some(vec![SessionChoice {
+            id: "second-session".into(),
+            title: Some("Second session".into()),
+            updated_at: None,
+            started_in_editur: true,
+        }]),
+    );
+    let context = theme::test_context();
+    let screen = Some(Rect::from_min_size(
+        pos2(0.0, 0.0),
+        Vec2::new(1000.0, 700.0),
+    ));
+    {
+        let mut draw = |events| {
+            context.run_ui(
+                RawInput {
+                    screen_rect: screen,
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| app.draw_agentic_sessions(ui),
+            )
+        };
+        let _ = draw(Vec::new());
+        let _ = click_response(
+            &context,
+            &mut draw,
+            Id::new(("agent_session_open", "second-session")),
+        );
+    }
+
+    assert_eq!(
+        (
+            app.tree.root,
+            app.agent_project_root,
+            app.agent_pane_layout.panes().len(),
+            app.agent.session_id.as_deref(),
+        ),
+        (first, second, 1, Some("second-session"))
+    );
 }
 
 #[test]

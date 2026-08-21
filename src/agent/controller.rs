@@ -339,6 +339,10 @@ pub enum Event {
         config_options: Vec<ConfigChoice>,
     },
     SessionsUpdated(Vec<SessionChoice>),
+    ProjectSessionsUpdated {
+        project: PathBuf,
+        sessions: Vec<SessionChoice>,
+    },
     SessionLoading {
         title: Option<String>,
     },
@@ -681,6 +685,7 @@ pub enum Command {
     Authenticate(String),
     NewSession,
     RefreshSessions,
+    RefreshProjectSessions(Vec<PathBuf>),
     LoadSession(String),
     RemoveSession(String),
     SetMode(String),
@@ -817,6 +822,7 @@ impl AgentController {
                 editur_sessions,
                 preferred_session: None,
                 fresh_session: false,
+                account: None,
             },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
@@ -836,6 +842,7 @@ impl AgentController {
                 editur_sessions,
                 preferred_session: None,
                 fresh_session: true,
+                account: None,
             },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
@@ -860,6 +867,7 @@ impl AgentController {
                 editur_sessions,
                 preferred_session: Some(preferred_session),
                 fresh_session: false,
+                account: None,
             },
             project_root,
             Launch::Process(AcpAgentConfig::new(command).args(args)),
@@ -940,6 +948,7 @@ struct SessionStartup {
     editur_sessions: Option<PathBuf>,
     preferred_session: Option<String>,
     fresh_session: bool,
+    account: Option<ProviderAccount>,
 }
 
 #[derive(Clone)]
@@ -1384,6 +1393,7 @@ async fn run_connection(
     let mut editur_sessions = EditurSessions::load(session_startup.editur_sessions);
     let preferred_session = session_startup.preferred_session;
     let fresh_session = session_startup.fresh_session;
+    let project_account = session_startup.account;
     let session_notifications = SessionNotificationGate::default();
     agent_client_protocol::Client
         .builder()
@@ -1701,7 +1711,6 @@ async fn run_connection(
                         (None, Vec::new())
                     }
                 };
-                let has_external_sessions = !discovered_external.is_empty();
                 let (mut sessions, mut external_sessions) =
                     merge_external_sessions(
                         native_sessions,
@@ -1710,9 +1719,13 @@ async fn run_connection(
                     );
                 let mut pending_external = None;
                 let mut additional_directories = Vec::new();
-                if has_external_sessions {
-                    send_event(&events, Event::SessionsUpdated(sessions.clone()));
-                }
+                send_event(
+                    &events,
+                    Event::ProjectSessionsUpdated {
+                        project: project_root.clone(),
+                        sessions: sessions.clone(),
+                    },
+                );
                 if session_id.is_some()
                     && let Some(preferred) = preferred_session.as_deref()
                     && external_sessions::is_external_choice(preferred)
@@ -1835,19 +1848,19 @@ async fn run_connection(
                                         provider_data.as_deref(),
                                     )
                                     .unwrap_or_default();
-                                    let has_external_sessions = !discovered.is_empty();
                                     (sessions, external_sessions) =
                                         merge_external_sessions(
                                             listed,
                                             discovered,
                                             &hidden_sessions.ids,
                                         );
-                                    if has_external_sessions {
-                                        send_event(
-                                            &events,
-                                            Event::SessionsUpdated(sessions.clone()),
-                                        );
-                                    }
+                                    send_event(
+                                        &events,
+                                        Event::ProjectSessionsUpdated {
+                                            project: project_root.clone(),
+                                            sessions: sessions.clone(),
+                                        },
+                                    );
                                     enrich_native_session(
                                         &loaded_id,
                                         &external_sessions,
@@ -1967,6 +1980,79 @@ async fn run_connection(
                                 if send_merged {
                                     send_event(&events, Event::SessionsUpdated(sessions.clone()));
                                 }
+                            }
+                        }
+                        Command::RefreshProjectSessions(projects) => {
+                            for project in projects.into_iter().take(MAX_CHOICES) {
+                                if project == project_root {
+                                    send_event(
+                                        &events,
+                                        Event::ProjectSessionsUpdated {
+                                            project,
+                                            sessions: sessions.clone(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                                let project_hidden = HiddenSessions::load(
+                                    project_account
+                                        .as_ref()
+                                        .and_then(|account| session_history_path(account, &project)),
+                                );
+                                let project_editur = EditurSessions::load(
+                                    project_account.as_ref().and_then(|account| {
+                                        crate::data_dir().ok().map(|directory| {
+                                            editur_sessions_path_in(
+                                                &directory,
+                                                account,
+                                                &project,
+                                            )
+                                        })
+                                    }),
+                                );
+                                let native = if supports_history {
+                                    match query_sessions(
+                                        &connection,
+                                        &project,
+                                        &project_hidden.ids,
+                                        &project_editur,
+                                    )
+                                    .await
+                                    {
+                                        Ok(sessions) => sessions,
+                                        Err(error) => {
+                                            send_event(
+                                                &events,
+                                                Event::Error(acp_error(
+                                                    provider,
+                                                    "cannot list project sessions",
+                                                    &error,
+                                                )),
+                                            );
+                                            Vec::new()
+                                        }
+                                    }
+                                } else {
+                                    Vec::new()
+                                };
+                                let discovered = external_sessions::discover(
+                                    provider,
+                                    &project,
+                                    provider_data.as_deref(),
+                                )
+                                .unwrap_or_default();
+                                let (project_sessions, _) = merge_external_sessions(
+                                    native,
+                                    discovered,
+                                    &project_hidden.ids,
+                                );
+                                send_event(
+                                    &events,
+                                    Event::ProjectSessionsUpdated {
+                                        project,
+                                        sessions: project_sessions,
+                                    },
+                                );
                             }
                         }
                         Command::RemoveSession(id) => {
@@ -2509,19 +2595,19 @@ async fn run_connection(
                                         provider_data.as_deref(),
                                     )
                                     .unwrap_or_default();
-                                    let has_external_sessions = !discovered.is_empty();
                                     (sessions, external_sessions) =
                                         merge_external_sessions(
                                             listed,
                                             discovered,
                                             &hidden_sessions.ids,
                                         );
-                                    if has_external_sessions {
-                                        send_event(
-                                            &events,
-                                            Event::SessionsUpdated(sessions.clone()),
-                                        );
-                                    }
+                                    send_event(
+                                        &events,
+                                        Event::ProjectSessionsUpdated {
+                                            project: project_root.clone(),
+                                            sessions: sessions.clone(),
+                                        },
+                                    );
                                     enrich_native_session(
                                         &loaded_id,
                                         &external_sessions,
@@ -2971,6 +3057,7 @@ fn merge_external_sessions(
         };
         external_by_choice.insert(choice_id, session);
     }
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(MAX_CHOICES);
     external_by_choice.retain(|id, _| sessions.iter().any(|session| &session.id == id));
     (sessions, external_by_choice)
@@ -3348,6 +3435,18 @@ async fn list_sessions(
     hidden_sessions: &HashSet<String>,
     editur_sessions: &EditurSessions,
 ) -> agent_client_protocol::Result<Vec<SessionChoice>> {
+    let sessions =
+        query_sessions(connection, project_root, hidden_sessions, editur_sessions).await?;
+    send_event(events, Event::SessionsUpdated(sessions.clone()));
+    Ok(sessions)
+}
+
+async fn query_sessions(
+    connection: &ConnectionTo<Agent>,
+    project_root: &std::path::Path,
+    hidden_sessions: &HashSet<String>,
+    editur_sessions: &EditurSessions,
+) -> agent_client_protocol::Result<Vec<SessionChoice>> {
     let mut sessions = Vec::new();
     let mut cursor = None;
     let mut seen_cursors = HashSet::new();
@@ -3388,7 +3487,6 @@ async fn list_sessions(
     }
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     sessions.truncate(MAX_CHOICES);
-    send_event(events, Event::SessionsUpdated(sessions.clone()));
     Ok(sessions)
 }
 
@@ -3529,6 +3627,7 @@ fn managed_session_startup(
         editur_sessions,
         preferred_session,
         fresh_session,
+        account: Some(account.clone()),
     }
 }
 

@@ -46,7 +46,9 @@ impl EditorApp {
     }
 
     pub(super) fn open_agent(&mut self, ctx: &egui::Context) {
-        self.warm_providers(ctx);
+        self.ensure_provider_catalog();
+        let fresh_session = std::mem::take(&mut self.agent_boot_fresh_session);
+        self.start_provider(self.selected_provider, ctx, fresh_session);
     }
 
     pub(super) fn draw_agent_find(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -228,7 +230,7 @@ impl EditorApp {
             key,
             AgentController::start_account_with_wake(
                 account,
-                self.tree.root.clone(),
+                self.agent_project_root.clone(),
                 preferred_session,
                 fresh_session,
                 move || wake.request_repaint(),
@@ -279,9 +281,6 @@ impl EditorApp {
             || !self.can_switch_accounts()
         {
             return;
-        }
-        if let Some(controller) = self.agent_controllers.remove(&self.selected_account) {
-            drop(controller);
         }
         self.agent_failover = None;
         self.exhausted_accounts.remove(&target);
@@ -398,6 +397,14 @@ impl EditorApp {
         let mut refresh_providers = HashSet::new();
         for (account, event) in events {
             let selected = account == self.selected_account;
+            if let AgentEvent::ProjectSessionsUpdated { project, sessions } = &event {
+                self.agent_project_sessions
+                    .insert((account, project.clone()), Some(sessions.clone()));
+                if selected && project == &self.agent_project_root {
+                    self.agent.sessions = Some(sessions.clone());
+                    self.agent_sidebar_history_pending = false;
+                }
+            }
             let usage_exhausted = match &event {
                 AgentEvent::TurnFailed {
                     kind: TurnFailureKind::UsageExhausted { reset_at },
@@ -556,9 +563,6 @@ impl EditorApp {
                 }
             };
         attempt.attempted_accounts.insert(target.account_id);
-        if let Some(controller) = self.agent_controllers.remove(&self.selected_account) {
-            drop(controller);
-        }
         self.select_account_state(target);
         self.accounts.selected = target;
         if let Ok(directory) = data_dir()
@@ -566,7 +570,16 @@ impl EditorApp {
         {
             self.show_error(error);
         }
-        self.start_account(account, ctx, true);
+        let resumed = self
+            .agent_controllers
+            .get(&target)
+            .is_some_and(|controller| controller.send(AgentCommand::NewSession).is_ok());
+        if resumed {
+            self.agent.session_ready = false;
+        } else {
+            self.agent_controllers.remove(&target);
+            self.start_account(account, ctx, true);
+        }
         if let Some(transcript) = attempt.visible_transcript.clone() {
             self.agent.restore_account_handoff(transcript);
         }
@@ -706,7 +719,6 @@ impl EditorApp {
     }
 
     pub(super) fn refresh_after_agent(&mut self, account: AccountKey) {
-        self.schedule_git_refresh();
         let changed = if account == self.selected_account {
             std::mem::take(&mut self.agent.refresh_queue)
         } else {
@@ -718,6 +730,10 @@ impl EditorApp {
                     .refresh_queue,
             )
         };
+        if self.agent_project_root != self.tree.root {
+            return;
+        }
+        self.schedule_git_refresh();
         let directories = if changed.is_empty() {
             self.tree.children.keys().cloned().collect::<HashSet<_>>()
         } else {
@@ -853,11 +869,14 @@ impl EditorApp {
     }
 
     fn open_attachment_file_picker(&mut self, target: AttachmentTarget) {
-        let directory = self.tree.root.clone();
-        let picker = self
-            .tree
-            .children
-            .get(&directory)
+        let directory = if target == AttachmentTarget::Agent {
+            self.agent_project_root.clone()
+        } else {
+            self.tree.root.clone()
+        };
+        let picker = (directory == self.tree.root)
+            .then(|| self.tree.children.get(&directory))
+            .flatten()
             .cloned()
             .map(|entries| WorkspaceFilePicker::with_entries(directory.clone(), entries))
             .map(Ok)
@@ -958,10 +977,9 @@ impl EditorApp {
         let painter = ui.painter().clone();
         paint_assistant_header_divider(&painter, header);
         let project_title = self
-            .tree
-            .root
+            .agent_project_root
             .file_name()
-            .unwrap_or(self.tree.root.as_os_str())
+            .unwrap_or(self.agent_project_root.as_os_str())
             .to_string_lossy();
         let title = self.agent.title.as_deref().unwrap_or(if self.agentic_mode {
             project_title.as_ref()
@@ -1470,10 +1488,9 @@ impl EditorApp {
                 }
                 ConnectionState::Ready if self.agent.transcript.is_empty() && !self.agent.active => {
                     let project = self
-                        .tree
-                        .root
+                        .agent_project_root
                         .file_name()
-                        .unwrap_or(self.tree.root.as_os_str())
+                        .unwrap_or(self.agent_project_root.as_os_str())
                         .to_string_lossy();
                     draw_agent_empty_state(
                         ui,
@@ -2710,7 +2727,7 @@ impl EditorApp {
                                 let item_top = ui.cursor().top();
                                 if let Some(path) = draw_agent_changed_files(
                                     ui,
-                                    &self.tree.root,
+                                    &self.agent_project_root,
                                     &self.agent.changed_paths,
                                     (selected_find_item == Some(self.agent.transcript.len()))
                                         .then_some((
@@ -3075,7 +3092,7 @@ impl EditorApp {
             if mentions_changed {
                 // ponytail: one path-only scan on the first @; move it to the existing search
                 // worker only if very large workspaces make this measurable.
-                self.agent_mentions = Some(collect_agent_mentions(&self.tree.root));
+                self.agent_mentions = Some(collect_agent_mentions(&self.agent_project_root));
             }
             let query_changed = !matches!(
                 &open_menu,
@@ -3725,6 +3742,7 @@ impl EditorApp {
                                                             false,
                                                             false,
                                                             &[],
+                                                            true,
                                                         );
                                                         if open {
                                                             session_load = Some(session.id.clone());

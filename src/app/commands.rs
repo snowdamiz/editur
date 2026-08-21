@@ -1059,7 +1059,7 @@ impl EditorApp {
         let path = if path.is_absolute() {
             path
         } else {
-            self.tree.root.join(path)
+            self.agent_project_root.join(path)
         };
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {}
@@ -1101,7 +1101,7 @@ impl EditorApp {
         let absolute = if path.is_absolute() {
             path
         } else {
-            self.tree.root.join(path)
+            self.agent_project_root.join(path)
         };
         if self.agentic_mode {
             match read_utf8_bounded(&absolute, AGENTIC_DIFF_MAX_BYTES) {

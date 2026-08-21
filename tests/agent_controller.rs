@@ -673,6 +673,66 @@ fn reconnecting_restores_the_newest_project_session() {
 }
 
 #[test]
+fn startup_marks_the_complete_project_history() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_path_buf();
+    let controller = AgentController::start_process(
+        root.clone(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+    );
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ProjectSessionsUpdated { project, .. } if project == &root),
+    );
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProjectSessionsUpdated { project, sessions }
+            if project == &root
+                && sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>()
+                    == ["newest-session", "older-session"]
+    )));
+}
+
+#[test]
+fn project_session_refresh_lists_another_projects_history() {
+    let project = tempfile::tempdir().unwrap();
+    let other_project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--sessions".into()],
+    );
+    receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ActiveSessionChanged(id) if id == "newest-session"),
+    );
+
+    controller
+        .send(Command::RefreshProjectSessions(vec![
+            other_project.path().to_path_buf(),
+        ]))
+        .unwrap();
+    let root = other_project.path();
+    let events = receive_until(
+        &controller,
+        Duration::from_secs(5),
+        |event| matches!(event, Event::ProjectSessionsUpdated { project, .. } if project == root),
+    );
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProjectSessionsUpdated { project, sessions }
+            if project == root
+                && sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>()
+                    == ["newest-session", "older-session"]
+    )));
+}
+
+#[test]
 fn fresh_start_ignores_existing_project_sessions() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process_fresh(
