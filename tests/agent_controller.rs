@@ -26,6 +26,60 @@ fn receive_until(
     panic!("timed out waiting for controller event: {events:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn cursor_cloud_prompt_uses_the_cursor_cli_handoff() {
+    let project = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project.path().join(".gitignore"), ".editur-test-*.json\n").unwrap();
+    git(&["add", ".gitignore"]);
+    git(&["commit", "--quiet", "-m", "fixture"]);
+    git(&["remote", "add", "origin", "https://example.com/repo.git"]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&["config", "branch.main.remote", "origin"]);
+    git(&["config", "branch.main.merge", "refs/heads/main"]);
+
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec!["--cursor-cloud-fixture".into()],
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(
+            event,
+            Event::SessionReady { .. } | Event::SessionLoaded { .. }
+        )
+    });
+    controller
+        .send(Command::CloudPrompt("Fix cloud".into()))
+        .unwrap();
+    let events = receive_until(&controller, Duration::from_secs(10), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            Event::AssistantDelta(text)
+                if text == "Cursor Cloud started [bc-fixture](https://cursor.com/agents/bc-fixture)."
+        )
+    }));
+}
+
 #[test]
 fn acp_output_is_paged_without_losing_history() {
     let project = tempfile::tempdir().unwrap();

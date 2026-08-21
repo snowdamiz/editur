@@ -4834,6 +4834,25 @@ fn failover_selection_is_ordered_and_never_retries_an_account() {
 }
 
 #[test]
+fn ampersand_routes_only_cursor_prompts_without_attachments_to_cloud() {
+    assert_eq!(
+        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "& Fix cloud", false),
+        Ok(Some("Fix cloud".into()))
+    );
+    assert_eq!(
+        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "Fix locally", false),
+        Ok(None)
+    );
+    assert_eq!(
+        super::agent_view::cursor_cloud_prompt(ProviderId::Codex, "& Stay local", false),
+        Ok(None)
+    );
+    assert!(
+        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "& Fix cloud", true).is_err()
+    );
+}
+
+#[test]
 fn live_account_handoff_is_bounded_private_and_replays_as_one_switch_card() {
     let mut state = AgentState::default();
     state.apply(AgentEvent::UserMessage("Finish the migration".into()));

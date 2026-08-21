@@ -20,6 +20,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::cursor_cloud;
 use super::external_sessions::{self, ExternalMessage, ExternalSession, ExternalTool};
 use super::provider::{
     AccountKey, AuthSource, ProviderAccount, ProviderExtensions, ProviderId,
@@ -696,6 +697,7 @@ pub enum Command {
     SetRunEverything(bool),
     ControlGoal(GoalAction),
     Prompt(String),
+    CloudPrompt(String),
     PromptWithAttachments {
         text: String,
         attachments: Vec<PromptAttachment>,
@@ -718,6 +720,8 @@ pub enum Command {
     TransportFailed(String),
     #[doc(hidden)]
     TerminalAuthFinished(Result<(), String>),
+    #[doc(hidden)]
+    CursorCloudStarted(Result<(String, String), String>),
     #[doc(hidden)]
     ResumeTurn,
 }
@@ -2227,6 +2231,59 @@ async fn run_connection(
                                 &goal_actions,
                             )?;
                         }
+                        Command::CloudPrompt(text) => {
+                            if provider != ProviderId::Cursor {
+                                send_event(
+                                    &events,
+                                    Event::Error("cloud prompts require the Cursor provider".into()),
+                                );
+                                send_event(
+                                    &events,
+                                    Event::TurnFinished { cancelled: false },
+                                );
+                                continue;
+                            }
+                            if text.trim().is_empty() || active.swap(true, Ordering::AcqRel) {
+                                send_event(
+                                    &events,
+                                    Event::Error(
+                                        "only one non-empty prompt can run at a time".into(),
+                                    ),
+                                );
+                                continue;
+                            }
+                            send_event(&events, Event::UserMessage(format!("& {text}")));
+                            let project_root = project_root.clone();
+                            let cloud_agent = auth_config.clone();
+                            let cloud_shutdown = Arc::clone(&shutdown);
+                            let internal_commands = internal_commands.clone();
+                            if let Err(error) = thread::Builder::new()
+                                .name("editur-cursor-cloud".into())
+                                .spawn(move || {
+                                    let result = cursor_cloud::start(
+                                        &cloud_agent,
+                                        &project_root,
+                                        &text,
+                                        &cloud_shutdown,
+                                    )
+                                    .map(|started| (started.id, started.url));
+                                    let _ = internal_commands
+                                        .send_blocking(Command::CursorCloudStarted(result));
+                                })
+                            {
+                                active.store(false, Ordering::Release);
+                                send_event(
+                                    &events,
+                                    Event::Error(format!(
+                                        "cannot start Cursor Cloud request: {error}"
+                                    )),
+                                );
+                                send_event(
+                                    &events,
+                                    Event::TurnFinished { cancelled: false },
+                                );
+                            }
+                        }
                         Command::Prompt(text) => {
                             if active.load(Ordering::Acquire) && supports_steering {
                                 send_steering(
@@ -2631,6 +2688,22 @@ async fn run_connection(
                                     );
                                 }
                             }
+                        }
+                        Command::CursorCloudStarted(result) => {
+                            active.store(false, Ordering::Release);
+                            match result {
+                                Ok((agent_id, url)) => send_event(
+                                    &events,
+                                    Event::AssistantDelta(format!(
+                                        "Cursor Cloud started [{agent_id}]({url})."
+                                    )),
+                                ),
+                                Err(error) => send_event(&events, Event::Error(error)),
+                            }
+                            send_event(
+                                &events,
+                                Event::TurnFinished { cancelled: false },
+                            );
                         }
                     }
                 }

@@ -7,6 +7,9 @@ use std::{
     },
 };
 
+#[cfg(unix)]
+use std::io::{IsTerminal as _, Read as _};
+
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
     AuthenticateResponse, CancelNotification, CloseSessionRequest, CloseSessionResponse,
@@ -106,6 +109,10 @@ fn main() {
     if run_performance_fixture() {
         return;
     }
+    #[cfg(unix)]
+    if run_cursor_cloud_fixture() {
+        return;
+    }
     if run_descendant_child() {
         return;
     }
@@ -180,6 +187,7 @@ fn main() {
                         .into_owned(),
                 );
             }
+            Some("--cursor-cloud-fixture") => {}
             Some("--handoff-file") => {
                 account_fixture.handoff_file =
                     Some(arguments.next().expect("handoff marker path").into());
@@ -224,6 +232,51 @@ fn main() {
         eprintln!("fake ACP agent: {error}");
         std::process::exit(1);
     }
+}
+
+#[cfg(unix)]
+fn run_cursor_cloud_fixture() -> bool {
+    if !std::env::args().any(|argument| argument == "--cursor-cloud-fixture")
+        || !std::io::stdout().is_terminal()
+    {
+        return false;
+    }
+    assert!(
+        std::process::Command::new("stty")
+            .args(["raw", "-echo"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(b"Plan, search, build anything")
+        .and_then(|()| stdout.flush())
+        .unwrap();
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+    stdin.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'&']);
+    stdout
+        .write_all(b"\r\n^ Move to cloud agent")
+        .and_then(|()| stdout.flush())
+        .unwrap();
+
+    let mut prompt = Vec::new();
+    loop {
+        stdin.read_exact(&mut byte).unwrap();
+        if byte[0] == b'\r' {
+            break;
+        }
+        prompt.push(byte[0]);
+    }
+    assert_eq!(prompt, b"\x1b[200~Fix cloud\x1b[201~");
+    stdout
+        .write_all(b"\r\nOpen Cloud Agent in: https://cursor.com/agents/bc-fixture\r\n")
+        .and_then(|()| stdout.flush())
+        .unwrap();
+    true
 }
 
 fn run_performance_fixture() -> bool {

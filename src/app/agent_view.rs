@@ -1,5 +1,23 @@
 use super::*;
 
+pub(super) fn cursor_cloud_prompt(
+    provider: ProviderId,
+    prompt: &str,
+    has_attachments: bool,
+) -> Result<Option<String>, String> {
+    if provider != ProviderId::Cursor || !prompt.starts_with('&') {
+        return Ok(None);
+    }
+    if has_attachments {
+        return Err("Cursor Cloud prompts do not support local attachments".into());
+    }
+    let prompt = prompt[1..].trim();
+    if prompt.is_empty() {
+        return Err("enter a prompt after & to start Cursor Cloud".into());
+    }
+    Ok(Some(prompt.to_owned()))
+}
+
 pub(super) fn next_failover_account(
     accounts: &[ProviderAccount],
     provider: ProviderId,
@@ -785,9 +803,6 @@ impl EditorApp {
     }
 
     pub(super) fn send_agent_prompt(&mut self) {
-        let Some(controller) = self.agent_controllers.get(&self.selected_account) else {
-            return;
-        };
         let prompt = self.agent.prompt.trim().to_owned();
         if (prompt.is_empty() && self.agent_attachments.is_empty())
             || (self.agent.active && !self.agent.steering)
@@ -801,36 +816,56 @@ impl EditorApp {
             .iter()
             .map(|attachment| attachment.file.clone())
             .collect::<Vec<_>>();
+        let cloud_prompt =
+            match cursor_cloud_prompt(self.selected_provider, &prompt, !attachments.is_empty()) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.show_error(error);
+                    return;
+                }
+            };
+        let Some(controller) = self.agent_controllers.get(&self.selected_account) else {
+            return;
+        };
         let envelope = PromptEnvelope {
             text: prompt.clone(),
             attachments: attachments.clone(),
         };
         self.agent.active = true;
-        match controller.send(AgentCommand::PromptWithAttachments {
-            text: prompt,
-            attachments,
-        }) {
+        let command = cloud_prompt
+            .clone()
+            .map(AgentCommand::CloudPrompt)
+            .unwrap_or(AgentCommand::PromptWithAttachments {
+                text: prompt,
+                attachments,
+            });
+        match controller.send(command) {
             Ok(()) => {
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
                 if !was_active {
                     self.exhausted_accounts.remove(&self.selected_account);
-                    self.agent_failover = self
-                        .accounts
-                        .accounts_for(self.selected_provider)
-                        .any(|account| {
-                            account.key != self.selected_account && account.auto_failover
-                        })
-                        .then(|| FailoverAttempt {
-                            provider: self.selected_provider,
-                            attempted_accounts: HashSet::from([self.selected_account.account_id]),
-                            original_prompt: envelope,
-                            pending_exhaustion: false,
-                            stage: FailoverStage::Running,
-                            handoff: None,
-                            visible_transcript: None,
-                            from_label: None,
-                        });
+                    self.agent_failover = if cloud_prompt.is_some() {
+                        None
+                    } else {
+                        self.accounts
+                            .accounts_for(self.selected_provider)
+                            .any(|account| {
+                                account.key != self.selected_account && account.auto_failover
+                            })
+                            .then(|| FailoverAttempt {
+                                provider: self.selected_provider,
+                                attempted_accounts: HashSet::from([self
+                                    .selected_account
+                                    .account_id]),
+                                original_prompt: envelope,
+                                pending_exhaustion: false,
+                                stage: FailoverStage::Running,
+                                handoff: None,
+                                visible_transcript: None,
+                                from_label: None,
+                            })
+                    };
                 }
             }
             Err(error) => {
@@ -2898,17 +2933,20 @@ impl EditorApp {
         let mut mention_attach = None;
         let composer_enabled =
             self.agent.session_ready && (!self.agent.active || self.agent.steering);
-        let composer_hint = if self.agent.session_ready {
-            format!(
-                "Ask {} Agent…",
-                provider_descriptor(self.selected_provider).display_name
-            )
-        } else {
-            format!(
-                "Connect {} to start…",
-                provider_descriptor(self.selected_provider).display_name
-            )
-        };
+        let composer_hint =
+            if self.agent.session_ready && self.selected_provider == ProviderId::Cursor {
+                "Ask Cursor Agent… · & for Cloud".to_owned()
+            } else if self.agent.session_ready {
+                format!(
+                    "Ask {} Agent…",
+                    provider_descriptor(self.selected_provider).display_name
+                )
+            } else {
+                format!(
+                    "Connect {} to start…",
+                    provider_descriptor(self.selected_provider).display_name
+                )
+            };
         let mut open_menu = self.agent_menu.clone();
         if (!self.agent.session_ready || self.agent.active)
             && !matches!(

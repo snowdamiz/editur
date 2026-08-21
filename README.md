@@ -244,9 +244,11 @@ To run the Cursor-only local development flow, use `./dev.sh .`; it generates an
 
 Authentication is owned by the selected agent. Editur renders agent-launched login methods separately from terminal or environment setup methods and does not ask for, print, or store provider credentials. Provider use consumes that account's limits or usage-based billing; review [Cursor pricing](https://cursor.com/pricing) or [OpenAI API pricing](https://openai.com/api/pricing/) before use.
 
+To start a Cursor Cloud Agent, connect the repository in the [Cursor Dashboard](https://cursor.com/dashboard), then prefix a Cursor composer prompt with `&` (for example, `& fix the failing CI test`). Editur hands the prompt to Cursor's own CLI using the selected account's existing sign-in; no API key or environment file is required. The current Git branch must be clean, committed, and pushed to its upstream. Editur returns the Cloud Agent URL; local attachments are not supported for cloud prompts.
+
 Prompts, relevant project code, tool results, and conversation context may be sent to the selected provider and its model providers. Editur does not add telemetry or persist the transcript. Review [Cursor's data-use policy](https://cursor.com/data-use) or [OpenAI's data controls](https://platform.openai.com/docs/guides/your-data), use provider ignore controls where available, and do not submit regulated or third-party data unless your agreements permit it.
 
-Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. The ACP surface has no cloud sessions, parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
+Permission cards reduce accidental execution but are not an operating-system sandbox. Review the exact proposed action and choice; agents can make incorrect changes or run risky commands. Editur retains one selected local provider process and one active turn. The ACP surface does not stream or manage a Cursor Cloud Agent after creation and has no parallel chats, persisted transcripts, Editur-owned allowlists, automatic worktree creation, automatic Git operations, or ACP v2 draft features.
 
 ## Devin cloud sidebar
 
