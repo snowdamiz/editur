@@ -641,6 +641,25 @@ pub fn provider_root(data_dir: &Path, provider: ProviderId) -> std::path::PathBu
     data_dir.join("agents").join(provider.as_str())
 }
 
+pub fn account_root(
+    data_dir: &Path,
+    account: super::provider::AccountKey,
+) -> Result<std::path::PathBuf, String> {
+    if account.account_id == 0 || account.account_id > super::provider::MAX_ACCOUNT_ID {
+        return Err("ACP account id is outside the supported range".into());
+    }
+    Ok(provider_root(data_dir, account.provider)
+        .join("accounts")
+        .join(account.account_id.to_string()))
+}
+
+pub fn account_provider_data_root(
+    data_dir: &Path,
+    account: super::provider::AccountKey,
+) -> Result<std::path::PathBuf, String> {
+    Ok(account_root(data_dir, account)?.join("provider-data"))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedEntry {
@@ -793,6 +812,104 @@ pub struct InstalledSidecar {
     pub command: std::path::PathBuf,
     pub args: Vec<String>,
     pub version: String,
+}
+
+/// Environment variable the rewritten Cursor bundle consults for its
+/// credential file, giving each Editur account an isolated browser sign-in.
+pub const CURSOR_AUTH_FILE_VARIABLE: &str = "EDITUR_CURSOR_AUTH_FILE";
+
+/// Start of the Cursor CLI's minified credential-path method. The stock CLI
+/// hard-codes the auth file under the user's home directory (and ignores
+/// CURSOR_CONFIG_DIR / CURSOR_DATA_DIR for credentials), so a second browser
+/// sign-in would overwrite the first. Editur splices a redirect right after
+/// this anchor; releases are hash-pinned, so the anchor is checked when a
+/// pinned version is bumped and account launches fail closed if it moves.
+const CURSOR_AUTH_PATH_ANCHOR: &str = "getAuthFilePath(e){";
+const CURSOR_AUTH_PATH_REDIRECT: &str = "const editurAuthFile=process.env.EDITUR_CURSOR_AUTH_FILE;\
+     if(editurAuthFile)return editurAuthFile;";
+const CURSOR_ISOLATED_ENTRYPOINT: &str = "editur-multi-account-index.js";
+
+fn spliced_cursor_auth_redirect(source: &str) -> Result<String, String> {
+    if source.contains(CURSOR_AUTH_FILE_VARIABLE) {
+        return Err("Cursor bundle already redirects its credential file".into());
+    }
+    let mut anchors = source.match_indices(CURSOR_AUTH_PATH_ANCHOR);
+    let (position, _) = anchors.next().ok_or_else(|| {
+        "this Cursor release changed its credential storage; \
+         Editur needs an update before it can isolate browser sign-ins"
+            .to_owned()
+    })?;
+    if anchors.next().is_some() {
+        return Err(
+            "this Cursor release stores credentials in more than one place; \
+             Editur needs an update before it can isolate browser sign-ins"
+                .into(),
+        );
+    }
+    let insert_at = position + CURSOR_AUTH_PATH_ANCHOR.len();
+    let mut patched = String::with_capacity(source.len() + CURSOR_AUTH_PATH_REDIRECT.len());
+    patched.push_str(&source[..insert_at]);
+    patched.push_str(CURSOR_AUTH_PATH_REDIRECT);
+    patched.push_str(&source[insert_at..]);
+    Ok(patched)
+}
+
+/// Derives a launch for the verified Cursor install whose credential file
+/// honors [`CURSOR_AUTH_FILE_VARIABLE`]. The managed bundle stays pristine
+/// for integrity verification; the rewritten copy is a separate Editur-owned
+/// file beside it, run directly with the bundled Node runtime exactly as the
+/// stock launcher script does in file-credential mode.
+pub fn cursor_isolated_sidecar(installed: &InstalledSidecar) -> Result<InstalledSidecar, String> {
+    let dist = installed
+        .command
+        .parent()
+        .ok_or_else(|| "cannot locate the Cursor package directory".to_owned())?;
+    let node = dist.join(if cfg!(windows) { "node.exe" } else { "node" });
+    if !node.is_file() {
+        return Err("the Cursor package is missing its Node runtime".into());
+    }
+    let stock_entrypoint = dist.join("index.js");
+    let patched_path = dist.join(CURSOR_ISOLATED_ENTRYPOINT);
+    let source_size = fs::symlink_metadata(&stock_entrypoint)
+        .map_err(|error| format!("cannot inspect the Cursor entrypoint: {error}"))?
+        .len();
+    let expected_size = source_size + CURSOR_AUTH_PATH_REDIRECT.len() as u64;
+    // Version directories are immutable once verified, so an existing
+    // complete copy is always current; writes are atomic, so a partial
+    // copy can never be observed.
+    let reusable = fs::symlink_metadata(&patched_path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size);
+    if !reusable {
+        let source = fs::read_to_string(&stock_entrypoint)
+            .map_err(|error| format!("cannot read the Cursor entrypoint: {error}"))?;
+        let patched = spliced_cursor_auth_redirect(&source)?;
+        let mut staged = tempfile::NamedTempFile::new_in(dist)
+            .map_err(|error| format!("cannot stage the isolated Cursor entrypoint: {error}"))?;
+        staged
+            .write_all(patched.as_bytes())
+            .and_then(|()| staged.flush())
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(|error| format!("cannot write the isolated Cursor entrypoint: {error}"))?;
+        staged.persist(&patched_path).map_err(|error| {
+            format!(
+                "cannot save the isolated Cursor entrypoint: {}",
+                error.error
+            )
+        })?;
+    }
+    let mut args = installed.args.clone();
+    if args
+        .first()
+        .is_some_and(|first| Path::new(first) == stock_entrypoint)
+    {
+        args.remove(0);
+    }
+    args.insert(0, patched_path.to_string_lossy().into_owned());
+    Ok(InstalledSidecar {
+        command: node,
+        args,
+        version: installed.version.clone(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2004,6 +2121,76 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::PermissionDenied);
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn cursor_auth_redirect_splices_exactly_one_verified_anchor() {
+        let source = "class o{getAuthFilePath(e){switch(platform()){case\"darwin\":\
+                      return join(homedir(),`.${e}`,\"auth.json\")}}}";
+        let patched = super::spliced_cursor_auth_redirect(source).unwrap();
+        assert!(patched.starts_with(
+            "class o{getAuthFilePath(e){\
+             const editurAuthFile=process.env.EDITUR_CURSOR_AUTH_FILE;\
+             if(editurAuthFile)return editurAuthFile;switch("
+        ));
+        assert!(patched.ends_with("`.${e}`,\"auth.json\")}}}"));
+        assert!(
+            super::spliced_cursor_auth_redirect(&patched).is_err(),
+            "an already-redirected bundle must not be patched twice"
+        );
+        assert!(
+            super::spliced_cursor_auth_redirect("class o{readAuthData(){}}")
+                .is_err_and(|error| error.contains("Editur needs an update")),
+            "a missing anchor must fail closed"
+        );
+        assert!(
+            super::spliced_cursor_auth_redirect("getAuthFilePath(e){}getAuthFilePath(e){}")
+                .is_err(),
+            "an ambiguous anchor must fail closed"
+        );
+    }
+
+    #[test]
+    fn cursor_isolated_sidecar_reuses_the_patched_entrypoint_and_swaps_stock_arguments() {
+        let dist = tempfile::tempdir().unwrap();
+        std::fs::write(dist.path().join("node"), b"node-runtime").unwrap();
+        std::fs::write(dist.path().join("node.exe"), b"node-runtime").unwrap();
+        std::fs::write(dist.path().join("index.js"), "getAuthFilePath(e){return e}").unwrap();
+        let installed = super::InstalledSidecar {
+            command: dist.path().join("cursor-agent"),
+            args: vec!["--disable-auto-update".into(), "acp".into()],
+            version: "pinned".into(),
+        };
+
+        let first = super::cursor_isolated_sidecar(&installed).unwrap();
+        let modified = std::fs::symlink_metadata(&first.args[0])
+            .unwrap()
+            .modified()
+            .unwrap();
+        let second = super::cursor_isolated_sidecar(&installed).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::symlink_metadata(&second.args[0])
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "a complete patched entrypoint must be reused, not rewritten"
+        );
+
+        // Windows launches pass the stock entrypoint as the first argument;
+        // it must be replaced rather than duplicated.
+        let stock_entry = dist.path().join("index.js").to_string_lossy().into_owned();
+        let windows_style = super::InstalledSidecar {
+            command: dist.path().join("node.exe"),
+            args: vec![stock_entry, "--disable-auto-update".into(), "acp".into()],
+            version: "pinned".into(),
+        };
+        let isolated = super::cursor_isolated_sidecar(&windows_style).unwrap();
+        assert_eq!(isolated.args.len(), 3);
+        assert!(isolated.args[0].ends_with("editur-multi-account-index.js"));
+        assert_eq!(&isolated.args[1..], ["--disable-auto-update", "acp"]);
     }
 
     fn manifest() -> SidecarManifest {

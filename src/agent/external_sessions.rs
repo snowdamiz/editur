@@ -16,12 +16,77 @@ const MAX_TRANSCRIPT_EVENTS: usize = 4_096;
 const MAX_EXTERNAL_RECORD_BYTES: usize = 24 * 1024 * 1024;
 const MAX_EXTERNAL_TRANSCRIPT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HANDOFF_BYTES: usize = 64 * 1024;
+const MAX_HANDOFF_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_CURSOR_BUBBLE_BYTES: usize = 1024 * 1024;
 const MAX_EXTERNAL_DIFF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTERNAL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXTERNAL_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CURSOR_IMAGE_FILES: usize = 65_536;
 const EXTERNAL_ID_PREFIX: &str = "external:";
+
+pub(crate) struct BoundedHandoff {
+    prefix: String,
+    suffix: String,
+    available: usize,
+    history: VecDeque<String>,
+    history_bytes: usize,
+}
+
+impl BoundedHandoff {
+    pub(crate) fn new(prefix: String, suffix: String) -> Result<Self, String> {
+        let available = MAX_HANDOFF_BYTES
+            .checked_sub(prefix.len().saturating_add(suffix.len()))
+            .ok_or_else(|| "handoff instructions exceed the prompt size limit".to_owned())?;
+        Ok(Self {
+            prefix,
+            suffix,
+            available,
+            history: VecDeque::new(),
+            history_bytes: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, message: ExternalMessage) {
+        let Some(mut message) = handoff_message(message) else {
+            return;
+        };
+        if message.len() > MAX_HANDOFF_MESSAGE_BYTES {
+            let mut end = MAX_HANDOFF_MESSAGE_BYTES - '…'.len_utf8();
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        self.history_bytes = self
+            .history_bytes
+            .saturating_add(message.len() + usize::from(!self.history.is_empty()) * 2);
+        self.history.push_back(message);
+        while self.history_bytes > self.available && self.history.len() > 1 {
+            self.history_bytes = self
+                .history_bytes
+                .saturating_sub(self.history.pop_front().unwrap().len() + 2);
+        }
+        if self.history_bytes > self.available {
+            let message = self.history.front_mut().unwrap();
+            let mut start = message.len().saturating_sub(self.available);
+            while !message.is_char_boundary(start) {
+                start += 1;
+            }
+            *message = message[start..].to_owned();
+            self.history_bytes = message.len();
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> String {
+        format!(
+            "{}{}{}",
+            self.prefix,
+            self.history.make_contiguous().join("\n\n"),
+            self.suffix
+        )
+    }
+}
 
 struct BoundedLines<R> {
     reader: R,
@@ -227,36 +292,16 @@ impl ExternalSession {
     }
 
     pub(crate) fn handoff_prompt(&self, next_message: &str) -> Result<String, String> {
-        let fixed = format!(
-            "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n\n\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
+        let prefix = "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n".to_owned();
+        let suffix = format!(
+            "\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
         );
-        let available = MAX_HANDOFF_BYTES.saturating_sub(fixed.len());
-        let mut history = VecDeque::new();
-        let mut bytes = 0_usize;
+        let mut handoff = BoundedHandoff::new(prefix, suffix)?;
         self.visit_transcript(&mut |message| {
-            let Some(message) = handoff_message(message) else {
-                return Ok(());
-            };
-            bytes = bytes.saturating_add(message.len() + usize::from(!history.is_empty()) * 2);
-            history.push_back(message);
-            while bytes > available && history.len() > 1 {
-                bytes = bytes.saturating_sub(history.pop_front().unwrap().len() + 2);
-            }
-            if bytes > available {
-                let message = history.front_mut().unwrap();
-                let mut start = message.len().saturating_sub(available);
-                while !message.is_char_boundary(start) {
-                    start += 1;
-                }
-                *message = message[start..].to_owned();
-                bytes = message.len();
-            }
+            handoff.push(message);
             Ok(())
         })?;
-        let history = history.make_contiguous().join("\n\n");
-        Ok(format!(
-            "Continue the imported conversation below. Treat it as prior context, do not repeat or summarize it unless asked, and respond only to the new user message.\n\n<imported-conversation>\n{history}\n</imported-conversation>\n\n<new-user-message>\n{next_message}\n</new-user-message>"
-        ))
+        Ok(handoff.finish())
     }
 }
 
@@ -267,6 +312,15 @@ fn handoff_message(message: ExternalMessage) -> Option<String> {
         ExternalMessage::Thought(_) | ExternalMessage::Image(_) => None,
         ExternalMessage::Tool(tool) => {
             let mut text = format!("Tool {}", tool.name);
+            if let Some(status) = tool.status {
+                text.push_str(&format!(" ({status})"));
+            }
+            if !tool.paths.is_empty() {
+                text.push_str(" paths:");
+                for path in tool.paths.into_iter().take(16) {
+                    text.push_str(&format!("\n{}", path.display()));
+                }
+            }
             if let Some(input) = tool.input {
                 text.push_str(&format!(" input:\n{input}"));
             }
@@ -296,10 +350,15 @@ pub(crate) fn is_external_choice(id: &str) -> bool {
 pub(crate) fn discover(
     provider: ProviderId,
     project_root: &Path,
+    provider_data: Option<&Path>,
 ) -> Result<Vec<ExternalSession>, String> {
+    if provider == ProviderId::Cursor && provider_data.is_some() {
+        return Ok(Vec::new());
+    }
     let base = directories::BaseDirs::new()
         .ok_or_else(|| "cannot locate provider session storage".to_owned())?;
     let home = base.home_dir();
+    let session_root = provider_session_root(provider, provider_data, home);
     match provider {
         ProviderId::Cursor => {
             let database = cursor_databases(home, base.config_dir())
@@ -311,26 +370,38 @@ pub(crate) fn discover(
             discover_cursor(project_root, &database, &home.join(".cursor/projects"))
         }
         ProviderId::Codex => {
-            let codex_home = std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"));
             let database = [
-                codex_home.join("state_5.sqlite"),
-                codex_home.join("sqlite/state_5.sqlite"),
+                session_root.join("state_5.sqlite"),
+                session_root.join("sqlite/state_5.sqlite"),
             ]
             .into_iter()
             .find(|path| path.is_file());
             let Some(database) = database else {
                 return Ok(Vec::new());
             };
-            discover_codex(project_root, &database, &codex_home)
+            discover_codex(project_root, &database, &session_root)
         }
-        ProviderId::Claude => {
-            let claude_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+        ProviderId::Claude => discover_claude(project_root, &session_root.join("projects")),
+    }
+}
+
+fn provider_session_root(
+    provider: ProviderId,
+    provider_data: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
+    match provider {
+        ProviderId::Cursor => home.to_path_buf(),
+        ProviderId::Codex => provider_data.map(Path::to_path_buf).unwrap_or_else(|| {
+            std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".claude"));
-            discover_claude(project_root, &claude_home.join("projects"))
-        }
+                .unwrap_or_else(|| home.join(".codex"))
+        }),
+        ProviderId::Claude => provider_data.map(Path::to_path_buf).unwrap_or_else(|| {
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".claude"))
+        }),
     }
 }
 
@@ -1575,6 +1646,7 @@ fn visit_distinct(
 mod tests {
     use std::{fs, path::Path};
 
+    use crate::agent::provider::ProviderId;
     use base64::Engine as _;
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -1582,9 +1654,37 @@ mod tests {
     use super::{
         CursorContentCache, ExternalMessage, ExternalSession, MAX_HANDOFF_BYTES, TranscriptFormat,
         claude_project_directory, claude_transcript, codex_transcript, cursor_database_transcript,
-        cursor_project_directory, discover_claude, discover_codex, discover_cursor,
-        external_tool_kind, external_tool_output,
+        cursor_project_directory, discover, discover_claude, discover_codex, discover_cursor,
+        external_tool_kind, external_tool_output, provider_session_root,
     };
+
+    #[test]
+    fn explicit_account_provider_data_overrides_only_isolatable_session_roots() {
+        let home = Path::new("/home/user");
+        let account = Path::new("/data/agents/codex/accounts/7/provider-data");
+
+        assert_eq!(
+            provider_session_root(ProviderId::Codex, Some(account), home),
+            account
+        );
+        assert_eq!(
+            provider_session_root(ProviderId::Claude, Some(account), home),
+            account
+        );
+        assert_eq!(
+            provider_session_root(ProviderId::Cursor, Some(account), home),
+            home
+        );
+        assert!(
+            discover(
+                ProviderId::Cursor,
+                Path::new("/work/project"),
+                Some(account)
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
 
     #[test]
     fn provider_subagent_names_restore_as_tasks_without_matching_task_management() {

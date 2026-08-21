@@ -54,8 +54,8 @@ fn run(args: Vec<OsString>, started: Instant) -> Result<(), String> {
             app::run(resolve_target(&cwd, Some(&path))?, started)
         }
         Command::QuitRunning => app::quit_running(),
-        Command::AgentProcess(provider, project_root, extra_args) => {
-            editur::agent::run_managed_process(provider, &project_root, extra_args)
+        Command::AgentProcess(account, project_root, extra_args) => {
+            editur::agent::run_managed_process(account, &project_root, extra_args)
         }
         Command::AgentProvision(provider) => {
             let bundle = editur::agent::provision::embedded_bundle()?;

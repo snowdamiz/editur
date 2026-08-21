@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufRead, Cursor, IsTerminal, Seek},
@@ -62,9 +62,11 @@ use crate::{
             ConnectionState, ContentRole, DisplayContent, Event as AgentEvent, GoalAction,
             InteractionKind, InteractionResponse, MAX_PROMPT_ATTACHMENT_TOTAL_BYTES,
             MAX_PROMPT_ATTACHMENTS, PromptAttachment, QuestionAnswer, SessionChoice, ToolOutput,
+            TurnFailureKind,
         },
         provider::{
-            ProviderDescriptor, ProviderIcon, ProviderId, catalog as provider_catalog,
+            AccountKey, AccountRegistry, AuthSource, ProviderAccount, ProviderDescriptor,
+            ProviderIcon, ProviderId, catalog as provider_catalog,
             descriptor as provider_descriptor,
         },
         state::{AgentState, FileChange, TranscriptItem},
@@ -313,9 +315,13 @@ const ASSISTANT_COMPOSER_HEIGHT: f32 = 108.0;
 const ASSISTANT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
 const ASSISTANT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
 const AGENT_MENU_WIDTH: f32 = 240.0;
-const AGENT_PROVIDER_MENU_WIDTH: f32 = 240.0;
+const AGENT_PROVIDER_MENU_WIDTH: f32 = 280.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
-const AGENT_PROVIDER_ROW_HEIGHT: f32 = 44.0;
+const AGENT_PROVIDER_ROW_HEIGHT: f32 = 36.0;
+/// The hairline gap plus the add-account row under the account list.
+const AGENT_PROVIDER_FOOTER_HEIGHT: f32 = 38.0;
+/// The quiet heading above the add-account provider choice.
+const AGENT_PROVIDER_HEADING_HEIGHT: f32 = 24.0;
 const AGENT_COMMAND_ROW_HEIGHT: f32 = 40.0;
 const AGENT_MENTION_ROW_HEIGHT: f32 = 32.0;
 const AGENT_SESSION_ROW_HEIGHT: f32 = 40.0;
@@ -3237,12 +3243,11 @@ fn agent_session_menu_rect(
 fn agent_provider_menu_rect(
     bounds: egui::Rect,
     anchor: egui::Rect,
-    item_count: usize,
-    row_height: f32,
+    content_height: f32,
 ) -> egui::Rect {
     let width = AGENT_PROVIDER_MENU_WIDTH.min((bounds.width() - 16.0).max(1.0));
     let top = anchor.bottom() + 6.0;
-    let height = (16.0 + item_count as f32 * row_height)
+    let height = (16.0 + content_height)
         .min(280.0)
         .min((bounds.bottom() - top - 8.0).max(1.0));
     let left = anchor.left().clamp(
@@ -3426,6 +3431,9 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
         TranscriptItem::User(content)
         | TranscriptItem::Assistant(content)
         | TranscriptItem::Error(content) => text.push_str(content),
+        TranscriptItem::AccountSwitch { from, to } => {
+            let _ = writeln!(text, "Switched from {from} to {to}");
+        }
         TranscriptItem::Content { content, .. } => append_display_search_text(&mut text, content),
         TranscriptItem::Plan(items) => {
             for item in items {
@@ -3628,13 +3636,17 @@ fn run_everything_state(commands: &[crate::agent::controller::CommandChoice]) ->
         .then(|| description.contains("currently enabled"))
 }
 
-fn provider_selector_visible(available: &[crate::agent::provider::ProviderId]) -> bool {
-    available.len() >= 2
+fn provider_selector_visible(
+    available: &[crate::agent::provider::ProviderId],
+    account_count: usize,
+) -> bool {
+    available.len() >= 2 || account_count >= 2
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum AgentMenu {
     Providers,
+    AddAccount,
     Sessions,
     Commands(String),
     Mentions(String),
@@ -3882,6 +3894,46 @@ impl Default for AgentFind {
     }
 }
 
+#[derive(Clone)]
+struct PromptEnvelope {
+    text: String,
+    attachments: Vec<PromptAttachment>,
+}
+
+enum FailoverStage {
+    Running,
+    Starting(AccountKey),
+}
+
+struct FailoverAttempt {
+    provider: ProviderId,
+    attempted_accounts: HashSet<u64>,
+    original_prompt: PromptEnvelope,
+    pending_exhaustion: bool,
+    stage: FailoverStage,
+    handoff: Option<String>,
+    visible_transcript: Option<VecDeque<TranscriptItem>>,
+    from_label: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum AccountPromptAction {
+    Add(ProviderId),
+    Rename(AccountKey),
+}
+
+struct AccountPrompt {
+    action: AccountPromptAction,
+    label: String,
+    focus: bool,
+}
+
+impl AccountPrompt {
+    fn incomplete(&self) -> bool {
+        self.label.trim().is_empty()
+    }
+}
+
 struct AgentPaneRuntime {
     agent_menu: Option<AgentMenu>,
     agent_menu_popup: Option<egui::Rect>,
@@ -3900,11 +3952,13 @@ struct AgentPaneRuntime {
     agent_drop_hovered: bool,
     agent_run_everything: Option<bool>,
     selected_provider: ProviderId,
-    provider_agents: HashMap<ProviderId, AgentState>,
+    selected_account: AccountKey,
+    provider_agents: HashMap<AccountKey, AgentState>,
     provider_menu_anchor: Option<egui::Rect>,
     agent: AgentState,
-    agent_controllers: HashMap<ProviderId, AgentController>,
+    agent_controllers: HashMap<AccountKey, AgentController>,
     pending_agent_prompt: bool,
+    agent_failover: Option<FailoverAttempt>,
 }
 
 struct AgentPaneDrag {
@@ -3913,7 +3967,7 @@ struct AgentPaneDrag {
 }
 
 impl AgentPaneRuntime {
-    fn blank(selected_provider: ProviderId) -> Self {
+    fn blank(selected_account: AccountKey) -> Self {
         Self {
             agent_menu: None,
             agent_menu_popup: None,
@@ -3931,12 +3985,14 @@ impl AgentPaneRuntime {
             agent_transcript_rendered: 0,
             agent_drop_hovered: false,
             agent_run_everything: None,
-            selected_provider,
+            selected_provider: selected_account.provider,
+            selected_account,
             provider_agents: HashMap::new(),
             provider_menu_anchor: None,
             agent: AgentState::default(),
             agent_controllers: HashMap::new(),
             pending_agent_prompt: false,
+            agent_failover: None,
         }
     }
 }
@@ -5137,13 +5193,18 @@ pub struct EditorApp {
     project_folder_picker: Option<WorkspaceFilePicker>,
     agent_run_everything: Option<bool>,
     selected_provider: ProviderId,
+    selected_account: AccountKey,
+    accounts: AccountRegistry,
+    account_prompt: Option<AccountPrompt>,
+    exhausted_accounts: HashMap<AccountKey, Option<SystemTime>>,
     available_providers: Vec<ProviderId>,
-    provider_agents: HashMap<ProviderId, AgentState>,
+    provider_agents: HashMap<AccountKey, AgentState>,
     provider_menu_anchor: Option<egui::Rect>,
     scrollbar_activity: crate::scrollbar::Activity,
     agent: AgentState,
-    agent_controllers: HashMap<ProviderId, AgentController>,
+    agent_controllers: HashMap<AccountKey, AgentController>,
     pending_agent_prompt: bool,
+    agent_failover: Option<FailoverAttempt>,
     focus_editor: bool,
     tree_focused: bool,
     scm_focused: bool,
@@ -5345,6 +5406,13 @@ impl EditorApp {
             project_folder_picker: None,
             agent_run_everything: None,
             selected_provider: ProviderId::Cursor,
+            selected_account: AccountKey {
+                provider: ProviderId::Cursor,
+                account_id: 1,
+            },
+            accounts: AccountRegistry::default(),
+            account_prompt: None,
+            exhausted_accounts: HashMap::new(),
             available_providers: Vec::new(),
             provider_agents: HashMap::new(),
             provider_menu_anchor: None,
@@ -5352,6 +5420,7 @@ impl EditorApp {
             agent: AgentState::default(),
             agent_controllers: HashMap::new(),
             pending_agent_prompt: false,
+            agent_failover: None,
             focus_editor: target.file.is_some(),
             tree_focused: target.file.is_none(),
             scm_focused: false,
@@ -6234,7 +6303,7 @@ impl EditorApp {
         let runtime = self
             .agent_pane_runtimes
             .remove(&next)
-            .unwrap_or_else(|| AgentPaneRuntime::blank(self.selected_provider));
+            .unwrap_or_else(|| AgentPaneRuntime::blank(self.selected_account));
         self.put_agent_pane_runtime(runtime);
         true
     }
@@ -6288,11 +6357,19 @@ impl EditorApp {
             agent_drop_hovered: std::mem::take(&mut self.agent_drop_hovered),
             agent_run_everything: self.agent_run_everything.take(),
             selected_provider: std::mem::replace(&mut self.selected_provider, ProviderId::Cursor),
+            selected_account: std::mem::replace(
+                &mut self.selected_account,
+                AccountKey {
+                    provider: ProviderId::Cursor,
+                    account_id: 1,
+                },
+            ),
             provider_agents: std::mem::take(&mut self.provider_agents),
             provider_menu_anchor: self.provider_menu_anchor.take(),
             agent: std::mem::take(&mut self.agent),
             agent_controllers: std::mem::take(&mut self.agent_controllers),
             pending_agent_prompt: std::mem::take(&mut self.pending_agent_prompt),
+            agent_failover: self.agent_failover.take(),
         }
     }
 
@@ -6314,11 +6391,13 @@ impl EditorApp {
         self.agent_drop_hovered = runtime.agent_drop_hovered;
         self.agent_run_everything = runtime.agent_run_everything;
         self.selected_provider = runtime.selected_provider;
+        self.selected_account = runtime.selected_account;
         self.provider_agents = runtime.provider_agents;
         self.provider_menu_anchor = runtime.provider_menu_anchor;
         self.agent = runtime.agent;
         self.agent_controllers = runtime.agent_controllers;
         self.pending_agent_prompt = runtime.pending_agent_prompt;
+        self.agent_failover = runtime.agent_failover;
     }
 
     fn activate_agent_session_pane(&mut self, pane: PaneId) -> bool {
@@ -6340,7 +6419,7 @@ impl EditorApp {
         if self.agent_pane_picker != Some(pane) {
             return;
         }
-        let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        let mut runtime = AgentPaneRuntime::blank(self.selected_account);
         runtime.agent.history_available = self.agent.history_available;
         runtime.agent.sessions = self.agent.sessions.clone();
         runtime.agent.session_id = session_id;
@@ -6371,7 +6450,7 @@ impl EditorApp {
                 zone
             },
         )?;
-        let mut runtime = AgentPaneRuntime::blank(self.selected_provider);
+        let mut runtime = AgentPaneRuntime::blank(self.selected_account);
         runtime.agent.history_available = self.agent.history_available;
         runtime.agent.sessions = self.agent.sessions.clone();
         runtime.agent.session_id = Some(session_id);
@@ -6391,7 +6470,7 @@ impl EditorApp {
                 self.agent.session_id.as_deref()
             } else {
                 self.agent_pane_runtimes.get(&pane).and_then(|runtime| {
-                    (runtime.selected_provider == self.selected_provider)
+                    (runtime.selected_account == self.selected_account)
                         .then_some(runtime.agent.session_id.as_deref())
                         .flatten()
                 })
@@ -6692,7 +6771,10 @@ impl EditorApp {
                 .layout(Layout::top_down(Align::LEFT)),
             |ui| {
                 ui.set_width(content.width());
-                if provider_selector_visible(&self.available_providers) {
+                if provider_selector_visible(
+                    &self.available_providers,
+                    self.accounts.accounts.len(),
+                ) {
                     let response =
                         draw_provider_selector_identity(ui, self.selected_provider, true, true);
                     self.provider_menu_anchor = Some(response.rect);
@@ -6818,16 +6900,16 @@ impl EditorApp {
             self.start_update(ui.ctx());
         }
         if let Some(session_id) = session_load
-            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+            && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::LoadSession(session_id));
         }
         if let Some(session_id) = session_remove
-            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+            && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::RemoveSession(session_id));
         }
-        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::NewSession);
         }
@@ -7232,7 +7314,10 @@ impl EditorApp {
             let agent_header =
                 egui::Rect::from_min_max(editor_header.right_top(), rect.right_bottom());
             let title = self.agent.title.as_deref().unwrap_or("Agent");
-            let title_x = if provider_selector_visible(&self.available_providers) {
+            let title_x = if provider_selector_visible(
+                &self.available_providers,
+                self.accounts.accounts.len(),
+            ) {
                 agent_header.left() + 64.0
             } else {
                 agent_header.left() + 14.0
@@ -7898,7 +7983,7 @@ impl EditorApp {
                     let _ = controller.send(DevinCommand::SetVisible(false));
                 }
             }
-            if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
+            if let Some(controller) = self.agent_controllers.get(&self.selected_account) {
                 let _ = controller.send(AgentCommand::RefreshSessions);
             } else {
                 self.open_agent(ctx);
@@ -8192,6 +8277,77 @@ impl EditorApp {
                 }
                 Outcome::Cancel | Outcome::Dismissed => self.devin_confirm_mutation = None,
                 _ => {}
+            }
+        }
+        if self.account_prompt.is_some() {
+            let action = self.account_prompt.as_ref().map(|prompt| prompt.action);
+            let (title, button, body) = match action {
+                Some(AccountPromptAction::Add(provider)) => {
+                    let name = provider_descriptor(provider).display_name;
+                    let (button, body) = match provider {
+                        ProviderId::Cursor => (
+                            "Add and sign in",
+                            "The new account gets its own Cursor sign-in, kept \
+                             separate from your other Cursor accounts. No API key is \
+                             needed.",
+                        ),
+                        ProviderId::Codex => (
+                            "Add and sign in",
+                            "The new account gets its own ChatGPT plan sign-in, kept \
+                             separate from your other Codex accounts. No API key is \
+                             needed.",
+                        ),
+                        ProviderId::Claude => (
+                            "Add and sign in",
+                            "The new account gets its own Claude plan sign-in, kept \
+                             separate from your other Claude accounts. No API key is \
+                             needed.",
+                        ),
+                    };
+                    (format!("Add {name} account"), button, Some(body))
+                }
+                Some(AccountPromptAction::Rename(_)) => ("Rename account".into(), "Rename", None),
+                None => ("Account".into(), "Save", None),
+            };
+            let invalid = self
+                .account_prompt
+                .as_ref()
+                .is_none_or(AccountPrompt::incomplete);
+            let mut submitted_by_return = false;
+            let mut dialog = Dialog::new("agent_account_dialog", &title)
+                .primary(button)
+                .primary_enabled(!invalid);
+            if let Some(body) = body {
+                dialog = dialog.body(body);
+            }
+            let outcome = dialog.show_with(ctx, |ui| {
+                ui.add_space(theme::space::TIGHT);
+                ui.label(
+                    RichText::new("Account label")
+                        .font(theme::typography::small())
+                        .color(theme::text().muted),
+                );
+                if let Some(prompt) = self.account_prompt.as_mut() {
+                    let response = ui.add(
+                        TextEdit::singleline(&mut prompt.label)
+                            .id(Id::new("agent_account_label"))
+                            .hint_text("Work, personal, team …")
+                            .margin(egui::Margin::symmetric(10, 7))
+                            .desired_width(ui.available_width()),
+                    );
+                    if std::mem::take(&mut prompt.focus) {
+                        response.request_focus();
+                    }
+                    submitted_by_return =
+                        response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                }
+            });
+            if (outcome == Outcome::Primary || submitted_by_return) && !invalid {
+                if let Err(error) = self.finish_account_prompt(ctx) {
+                    self.show_error(error);
+                }
+            } else if matches!(outcome, Outcome::Cancel | Outcome::Dismissed) {
+                self.account_prompt = None;
             }
         }
         if self.tree_prompt.is_some() {
@@ -8753,39 +8909,373 @@ fn selected_config_name(option: &ConfigChoice) -> Option<Cow<'_, str>> {
     })
 }
 
-fn provider_menu_option(
+#[derive(Default)]
+struct AccountMenuResponse {
+    select: bool,
+    toggle_failover: bool,
+    move_up: bool,
+    move_down: bool,
+    rename: bool,
+}
+
+/// The tone of an account's trailing note. Only states worth acting on are
+/// painted at all; the text stays the accessible source of truth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccountStatusTone {
+    Caution,
+    Negative,
+    Neutral,
+}
+
+pub(crate) struct AccountStatus<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) tone: AccountStatusTone,
+}
+
+/// What one account row presents, separate from the account it represents.
+struct AccountRowModel<'a> {
+    title: &'a str,
+    selected: bool,
+    status: Option<AccountStatus<'a>>,
+    priority: usize,
+    account_count: usize,
+}
+
+fn account_status_color(tone: AccountStatusTone, enabled: bool) -> Color32 {
+    if !enabled {
+        return theme::text_disabled();
+    }
+    match tone {
+        AccountStatusTone::Caution => theme::ink(theme::semantic().warning),
+        AccountStatusTone::Negative => theme::ink(theme::semantic().danger),
+        AccountStatusTone::Neutral => theme::text().muted,
+    }
+}
+
+/// The provider mark inside a soft chip, the visual anchor of every row in
+/// the provider menu.
+fn provider_menu_glyph(ui: &egui::Ui, row: egui::Rect, icon: ProviderIcon) {
+    let chip = egui::Rect::from_center_size(
+        egui::pos2(row.left() + 22.0, row.center().y),
+        egui::Vec2::splat(24.0),
+    );
+    ui.painter().rect_filled(
+        chip,
+        theme::corner(theme::radius::CONTROL),
+        theme::state::hover(),
+    );
+    let ink = if ui.is_enabled() {
+        theme::text().secondary
+    } else {
+        theme::text_disabled()
+    };
+    paint_provider_icon(ui.painter(), chip.shrink(5.0), icon, ink);
+}
+
+fn provider_menu_heading(ui: &mut egui::Ui, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), AGENT_PROVIDER_HEADING_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + theme::space::MEDIUM, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::typography::micro(),
+        theme::text().muted,
+    );
+}
+
+/// One account in the provider menu: a provider chip and a single title.
+/// A provider's only account borrows the provider's name; named accounts
+/// show the label the user gave them. The trailing edge carries the accent
+/// check, an actionable state, or — on hover of a multi-account provider —
+/// the management controls. Nothing else.
+fn account_menu_row(
     ui: &mut egui::Ui,
     provider: &ProviderDescriptor,
-    packaged: bool,
-    selected: bool,
-) -> egui::Response {
-    let unavailable = provider
-        .unavailable_reason
-        .or_else(|| (!packaged).then_some("Unavailable in this build"));
-    let accessibility = unavailable.map_or_else(
-        || format!("{}: {}", provider.display_name, provider.description),
+    account: &ProviderAccount,
+    model: AccountRowModel<'_>,
+) -> AccountMenuResponse {
+    let AccountRowModel {
+        title,
+        selected,
+        status,
+        priority,
+        account_count,
+    } = model;
+    let accessibility = status.as_ref().map_or_else(
+        || {
+            format!(
+                "{} account {}. Failover priority {priority}",
+                provider.display_name, account.label
+            )
+        },
         |status| {
             format!(
-                "{}: {}. {status}",
-                provider.display_name, provider.description
+                "{} account {}. {}. Failover priority {priority}",
+                provider.display_name, account.label, status.text
             )
         },
     );
-    let row = selectable_row(ui, &accessibility, selected, AGENT_PROVIDER_ROW_HEIGHT);
-    let rect = row.rect;
-    let name_color = row.foreground;
-    let response = row.response;
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 20.0, rect.center().y),
-        egui::vec2(18.0, 18.0),
+    let mut result = AccountMenuResponse::default();
+    let (row, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), AGENT_PROVIDER_ROW_HEIGHT),
+        Sense::click(),
     );
-    paint_provider_icon(ui.painter(), icon_rect, provider.icon, name_color);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            accessibility.clone(),
+        )
+    });
+    let hovered = ui.is_enabled() && ui.rect_contains_pointer(row);
+    let fill = if selected {
+        theme::state::selected()
+    } else if hovered {
+        theme::state::hover()
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(
+            row.shrink2(egui::vec2(0.0, 1.0)),
+            theme::corner(theme::radius::CONTROL),
+            fill,
+        );
+    }
+    provider_menu_glyph(ui, row, provider.icon);
+    let managed = account_count > 1;
+    let mut trailing = row.right() - theme::space::MEDIUM;
+    if hovered && managed {
+        // Management only exists once a provider has several accounts, and
+        // only while the pointer is on the row: idle rows stay clean.
+        let mut edge = row.right() - theme::space::TIGHT;
+        let mut control = |ui: &mut egui::Ui, id: &str, label: String, icon: Icon, active: bool| {
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(edge - 11.0, row.center().y),
+                egui::Vec2::splat(22.0),
+            );
+            edge = rect.left() - theme::space::HAIR;
+            let response = ui.interact(
+                rect,
+                ui.id().with(("account_control", account.key, id)),
+                Sense::click(),
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
+            });
+            if response.hovered() {
+                ui.painter().rect_filled(
+                    rect,
+                    theme::corner(theme::radius::CONTROL),
+                    theme::state::hover(),
+                );
+            }
+            let color = if active {
+                theme::accent()
+            } else if response.hovered() {
+                theme::text().primary
+            } else {
+                theme::text().muted
+            };
+            icons::paint(ui.painter(), icon, rect.shrink(5.0), color);
+            response.on_hover_text(label).clicked()
+        };
+        result.rename = control(
+            ui,
+            "rename",
+            format!("Rename {} · {}", provider.display_name, account.label),
+            Icon::Edit,
+            false,
+        );
+        if priority < account_count {
+            result.move_down = control(
+                ui,
+                "down",
+                format!("Move {} · {} later", provider.display_name, account.label),
+                Icon::ChevronDown,
+                false,
+            );
+        }
+        if priority > 1 {
+            result.move_up = control(
+                ui,
+                "up",
+                format!("Move {} · {} earlier", provider.display_name, account.label),
+                Icon::ChevronUp,
+                false,
+            );
+        }
+        result.toggle_failover = control(
+            ui,
+            "failover",
+            format!(
+                "{} · {} automatic failover",
+                provider.display_name, account.label
+            ),
+            Icon::Refresh,
+            account.auto_failover,
+        );
+        trailing = edge - theme::space::TIGHT;
+    } else {
+        if selected {
+            let check = egui::Rect::from_center_size(
+                egui::pos2(trailing - 7.0, row.center().y),
+                egui::Vec2::splat(14.0),
+            );
+            icons::paint(ui.painter(), Icon::Check, check, theme::accent());
+            trailing = check.left() - theme::space::SNUG;
+        }
+        if let Some(status) = &status {
+            let galley = ui.painter().layout_no_wrap(
+                status.text.to_owned(),
+                theme::typography::small(),
+                account_status_color(status.tone, ui.is_enabled()),
+            );
+            let position = egui::pos2(
+                trailing - galley.size().x,
+                row.center().y - galley.size().y * 0.5,
+            );
+            trailing = position.x - theme::space::SNUG;
+            let color = galley.job.sections[0].format.color;
+            ui.painter().galley(position, galley, color);
+        } else if managed {
+            let detail = format!(
+                "Priority {priority}{}",
+                if account.auto_failover {
+                    " · Auto"
+                } else {
+                    ""
+                }
+            );
+            let color = if ui.is_enabled() {
+                theme::text().muted
+            } else {
+                theme::text_disabled()
+            };
+            let galley = ui
+                .painter()
+                .layout_no_wrap(detail, theme::typography::micro(), color);
+            let position = egui::pos2(
+                trailing - galley.size().x,
+                row.center().y - galley.size().y * 0.5,
+            );
+            trailing = position.x - theme::space::SNUG;
+            ui.painter().galley(position, galley, color);
+        }
+    }
+    let foreground = if !ui.is_enabled() {
+        theme::text_disabled()
+    } else if selected || hovered {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    ui.painter()
+        .with_clip_rect(row.with_max_x(trailing).intersect(ui.clip_rect()))
+        .text(
+            egui::pos2(row.left() + 42.0, row.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            theme::typography::body(),
+            foreground,
+        );
+    result.select = response.clicked()
+        && !(result.rename || result.move_up || result.move_down || result.toggle_failover);
+    result
+}
+
+/// A plain provider row: the add-account drill-in choices, and the
+/// placeholder for a provider the account registry does not know yet.
+fn provider_pick_row(
+    ui: &mut egui::Ui,
+    provider: &ProviderDescriptor,
+    action: &str,
+) -> egui::Response {
+    let (row, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), AGENT_PROVIDER_ROW_HEIGHT),
+        Sense::click(),
+    );
+    let enabled = ui.is_enabled();
+    let action = action.to_owned();
+    response.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, action.clone())
+    });
+    let hovered = ui.is_enabled() && ui.rect_contains_pointer(row);
+    if hovered {
+        ui.painter().rect_filled(
+            row.shrink2(egui::vec2(0.0, 1.0)),
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
+    }
+    provider_menu_glyph(ui, row, provider.icon);
     ui.painter().text(
-        egui::pos2(rect.left() + 39.0, rect.center().y),
+        egui::pos2(row.left() + 42.0, row.center().y),
         Align2::LEFT_CENTER,
         provider.display_name,
         theme::typography::body(),
-        name_color,
+        if !ui.is_enabled() {
+            theme::text_disabled()
+        } else if hovered {
+            theme::text().primary
+        } else {
+            theme::text().secondary
+        },
+    );
+    response.on_hover_text(provider.description)
+}
+
+/// The single entry point for new accounts, sitting under the account list
+/// behind a hairline.
+fn add_account_menu_row(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), AGENT_PROVIDER_FOOTER_HEIGHT),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Add account")
+    });
+    ui.painter().hline(
+        rect.shrink2(egui::vec2(theme::space::MEDIUM, 0.0))
+            .x_range(),
+        rect.top() + 2.5,
+        theme::border::hairline(),
+    );
+    let row = rect.with_min_y(rect.top() + 6.0);
+    let hovered = ui.is_enabled() && ui.rect_contains_pointer(row);
+    if hovered {
+        ui.painter().rect_filled(
+            row,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
+    }
+    let color = if !ui.is_enabled() {
+        theme::text_disabled()
+    } else if hovered {
+        theme::text().primary
+    } else {
+        theme::text().muted
+    };
+    icons::paint(
+        ui.painter(),
+        Icon::Plus,
+        egui::Rect::from_center_size(
+            egui::pos2(row.left() + 22.0, row.center().y),
+            egui::Vec2::splat(14.0),
+        ),
+        color,
+    );
+    ui.painter().text(
+        egui::pos2(row.left() + 42.0, row.center().y),
+        Align2::LEFT_CENTER,
+        "Add account",
+        theme::typography::body(),
+        color,
     );
     response
 }

@@ -1,8 +1,11 @@
 use editur::agent::provider::{
-    InstallPolicy, ProviderExtensions, ProviderIcon, ProviderId, catalog, load_selected, prepare,
-    prepare_installed, save_selected,
+    AccountKey, AuthSource, InstallPolicy, ProviderAccount, ProviderExtensions, ProviderIcon,
+    ProviderId, catalog, load_accounts, load_selected, prepare, prepare_installed,
+    prepare_installed_for_account, save_accounts, save_selected,
 };
-use editur::agent::provision::{InstalledSidecar, ProviderBundle, provider_root};
+use editur::agent::provision::{
+    InstalledSidecar, ProviderBundle, account_provider_data_root, account_root, provider_root,
+};
 
 #[test]
 fn static_catalog_is_the_complete_provider_identity_source() {
@@ -110,6 +113,210 @@ fn provider_preference_is_one_small_atomic_file() {
         "{\"provider\":\"claude\"}"
     );
     assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn account_registry_migrates_selected_provider_to_legacy_accounts() {
+    let data = tempfile::tempdir().unwrap();
+    save_selected(data.path(), ProviderId::Claude).unwrap();
+
+    let registry = load_accounts(
+        data.path(),
+        &[ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude],
+    )
+    .unwrap();
+
+    assert_eq!(registry.version, 1);
+    assert_eq!(registry.accounts.len(), 3);
+    assert_eq!(registry.selected.provider, ProviderId::Claude);
+    assert!(registry.accounts.iter().all(|account| {
+        account.label == "Current login"
+            && account.auth_source == AuthSource::Legacy
+            && !account.auto_failover
+    }));
+    assert!(data.path().join("agent-accounts.json").is_file());
+
+    let reloaded = load_accounts(data.path(), &[ProviderId::Cursor, ProviderId::Codex]).unwrap();
+    assert_eq!(reloaded, registry);
+}
+
+#[test]
+fn account_registry_adds_legacy_accounts_for_providers_discovered_later() {
+    let data = tempfile::tempdir().unwrap();
+    let initial = load_accounts(data.path(), &[ProviderId::Cursor]).unwrap();
+    assert_eq!(initial.accounts.len(), 1);
+
+    let migrated = load_accounts(
+        data.path(),
+        &[ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude],
+    )
+    .unwrap();
+
+    assert_eq!(migrated.selected, initial.selected);
+    assert_eq!(migrated.accounts.len(), 3);
+    for provider in [ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude] {
+        let accounts = migrated.accounts_for(provider).collect::<Vec<_>>();
+        assert_eq!(accounts.len(), 1, "missing {provider} legacy account");
+        assert_eq!(accounts[0].auth_source, AuthSource::Legacy);
+    }
+    assert_eq!(
+        load_accounts(data.path(), &[ProviderId::Cursor]).unwrap(),
+        migrated,
+        "the migration must be persisted atomically"
+    );
+}
+
+#[test]
+fn account_registry_is_bounded_versioned_and_validated() {
+    let data = tempfile::tempdir().unwrap();
+    let mut registry = load_accounts(data.path(), &[ProviderId::Codex]).unwrap();
+    let account = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Codex,
+            account_id: 2,
+        },
+        label: "Work".into(),
+        auth_source: AuthSource::Environment {
+            variable: "EDITUR_CODEX_WORK_KEY".into(),
+        },
+        auto_failover: true,
+    };
+    registry.accounts.push(account.clone());
+    registry.selected = account.key;
+    save_accounts(data.path(), &registry).unwrap();
+
+    let json = std::fs::read_to_string(data.path().join("agent-accounts.json")).unwrap();
+    assert!(json.contains("EDITUR_CODEX_WORK_KEY"));
+    assert!(!json.contains("credential_value"));
+    assert_eq!(
+        load_accounts(data.path(), &[ProviderId::Codex]).unwrap(),
+        registry
+    );
+
+    let invalid = [
+        json.replace("\"version\":1", "\"version\":2"),
+        json.replace("\"Work\"", &format!("\"{}\"", "x".repeat(65))),
+        json.replace("EDITUR_CODEX_WORK_KEY", "NOT-AN-ENV-VAR"),
+        json.replacen("\"account_id\":2", "\"account_id\":0", 1),
+        json.replacen("{", "{\"unknown\":true,", 1),
+    ];
+    for contents in invalid {
+        std::fs::write(data.path().join("agent-accounts.json"), contents).unwrap();
+        assert!(load_accounts(data.path(), &[ProviderId::Codex]).is_err());
+    }
+
+    std::fs::write(
+        data.path().join("agent-accounts.json"),
+        vec![b'x'; 65 * 1024],
+    )
+    .unwrap();
+    assert!(load_accounts(data.path(), &[ProviderId::Codex]).is_err());
+}
+
+#[test]
+fn added_accounts_stay_in_provider_failover_order() {
+    let data = tempfile::tempdir().unwrap();
+    let mut registry = load_accounts(
+        data.path(),
+        &[ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude],
+    )
+    .unwrap();
+
+    let first = registry
+        .add_account(
+            ProviderId::Codex,
+            "Work".into(),
+            AuthSource::ProviderManaged,
+        )
+        .unwrap();
+    let second = registry
+        .add_account(
+            ProviderId::Codex,
+            "Personal".into(),
+            AuthSource::ProviderManaged,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .accounts_for(ProviderId::Codex)
+            .map(|account| account.key)
+            .collect::<Vec<_>>(),
+        vec![
+            AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            first,
+            second,
+        ]
+    );
+    assert!(registry.move_account(second, -1));
+    assert_eq!(
+        registry
+            .accounts_for(ProviderId::Codex)
+            .map(|account| account.key)
+            .collect::<Vec<_>>(),
+        vec![
+            AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            second,
+            first,
+        ]
+    );
+    assert!(registry.move_account(second, -1));
+    assert_eq!(
+        registry
+            .accounts_for(ProviderId::Codex)
+            .map(|account| account.key)
+            .collect::<Vec<_>>(),
+        vec![
+            second,
+            AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            first,
+        ]
+    );
+}
+
+#[test]
+fn account_roots_are_numeric_distinct_and_beneath_the_provider() {
+    let data = std::path::Path::new("/application-data");
+    let first = AccountKey {
+        provider: ProviderId::Codex,
+        account_id: 1,
+    };
+    let second = AccountKey {
+        provider: ProviderId::Codex,
+        account_id: 2,
+    };
+
+    assert_eq!(
+        account_root(data, first).unwrap(),
+        data.join("agents/codex/accounts/1")
+    );
+    assert_ne!(
+        account_root(data, first).unwrap(),
+        account_root(data, second).unwrap()
+    );
+    assert_eq!(
+        account_provider_data_root(data, second).unwrap(),
+        data.join("agents/codex/accounts/2/provider-data")
+    );
+    assert!(
+        account_root(
+            data,
+            AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 0,
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -679,7 +886,12 @@ fn claude_launch_uses_provider_owned_auth_and_strips_runtime_overrides() {
 
     assert_eq!(prepared.display_name, "Claude");
     assert_eq!(prepared.args, [entrypoint]);
-    assert!(!prepared.remove_env.contains(&"ANTHROPIC_API_KEY"));
+    assert!(
+        !prepared
+            .remove_env
+            .iter()
+            .any(|name| name == "ANTHROPIC_API_KEY")
+    );
     assert_eq!(
         prepared.env,
         [(
@@ -701,4 +913,197 @@ fn claude_launch_uses_provider_owned_auth_and_strips_runtime_overrides() {
         argument.starts_with('-') || std::path::Path::new(argument).is_absolute()
     }));
     assert_eq!(prepared.extensions, ProviderExtensions::None);
+}
+
+#[test]
+fn account_launches_isolate_provider_state_and_never_debug_credentials() {
+    let data = tempfile::tempdir().unwrap();
+    let installed = |provider: ProviderId| InstalledSidecar {
+        command: provider_root(data.path(), provider).join("versions/pinned/agent"),
+        args: Vec::new(),
+        version: "pinned".into(),
+    };
+    let source = "EDITUR_TEST_CODEX_ACCOUNT_KEY_8D7C";
+    unsafe { std::env::set_var(source, "credential_value_must_be_redacted") };
+    let codex = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Codex,
+            account_id: 7,
+        },
+        label: "Work".into(),
+        auth_source: AuthSource::Environment {
+            variable: source.into(),
+        },
+        auto_failover: true,
+    };
+
+    let prepared =
+        prepare_installed_for_account(&codex, installed(ProviderId::Codex), data.path()).unwrap();
+    unsafe { std::env::remove_var(source) };
+
+    let provider_data = account_provider_data_root(data.path(), codex.key).unwrap();
+    assert!(
+        prepared
+            .env
+            .iter()
+            .any(|(name, value)| { name == "CODEX_HOME" && value == provider_data.as_os_str() })
+    );
+    assert!(prepared.env.iter().any(|(name, value)| {
+        name == "CODEX_API_KEY" && value == "credential_value_must_be_redacted"
+    }));
+    assert!(
+        prepared
+            .remove_env
+            .iter()
+            .any(|name| name == "CODEX_API_KEY")
+    );
+    assert!(
+        prepared
+            .remove_env
+            .iter()
+            .any(|name| name == "OPENAI_API_KEY")
+    );
+    assert!(prepared.remove_env.iter().any(|name| name == source));
+    assert_eq!(
+        std::fs::read_to_string(provider_data.join("config.toml")).unwrap(),
+        "cli_auth_credentials_store = \"file\"\n"
+    );
+    assert!(!format!("{prepared:?}").contains("credential_value_must_be_redacted"));
+
+    let claude = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Claude,
+            account_id: 8,
+        },
+        label: "Team".into(),
+        auth_source: AuthSource::ProviderManaged,
+        auto_failover: false,
+    };
+    let prepared =
+        prepare_installed_for_account(&claude, installed(ProviderId::Claude), data.path()).unwrap();
+    let provider_data = account_provider_data_root(data.path(), claude.key).unwrap();
+    assert!(prepared.env.iter().any(|(name, value)| {
+        name == "CLAUDE_CONFIG_DIR" && value == provider_data.as_os_str()
+    }));
+    assert!(
+        prepared
+            .remove_env
+            .iter()
+            .any(|name| name == "CLAUDE_CODE_OAUTH_TOKEN")
+    );
+    assert!(
+        prepared
+            .remove_env
+            .iter()
+            .any(|name| name == "ANTHROPIC_API_KEY")
+    );
+}
+
+#[test]
+fn cursor_plan_accounts_get_an_isolated_sign_in_through_the_patched_entrypoint() {
+    let data = tempfile::tempdir().unwrap();
+    let dist = provider_root(data.path(), ProviderId::Cursor).join("versions/pinned/dist-package");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("node"), b"node-runtime").unwrap();
+    std::fs::write(dist.join("node.exe"), b"node-runtime").unwrap();
+    std::fs::write(
+        dist.join("index.js"),
+        "class o{getAuthFilePath(e){return join(homedir(),`.${e}`,\"auth.json\")}}",
+    )
+    .unwrap();
+    let installed = InstalledSidecar {
+        command: dist.join("cursor-agent"),
+        args: vec!["--disable-auto-update".into(), "acp".into()],
+        version: "pinned".into(),
+    };
+    let account = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Cursor,
+            account_id: 4,
+        },
+        label: "Work".into(),
+        auth_source: AuthSource::ProviderManaged,
+        auto_failover: false,
+    };
+
+    let prepared = prepare_installed_for_account(&account, installed, data.path()).unwrap();
+
+    let provider_data = account_provider_data_root(data.path(), account.key).unwrap();
+    let node = if cfg!(windows) { "node.exe" } else { "node" };
+    assert_eq!(prepared.command, dist.join(node));
+    assert!(prepared.args[0].ends_with("editur-multi-account-index.js"));
+    assert_eq!(&prepared.args[1..], ["--disable-auto-update", "acp"]);
+    let patched = std::fs::read_to_string(&prepared.args[0]).unwrap();
+    assert!(
+        patched.contains(
+            "getAuthFilePath(e){const editurAuthFile=process.env.EDITUR_CURSOR_AUTH_FILE;\
+             if(editurAuthFile)return editurAuthFile;"
+        ),
+        "the isolated entrypoint must consult EDITUR_CURSOR_AUTH_FILE first"
+    );
+    let expectations = [
+        ("CURSOR_CONFIG_DIR", provider_data.join("config")),
+        ("CURSOR_DATA_DIR", provider_data.join("data")),
+        ("EDITUR_CURSOR_AUTH_FILE", provider_data.join("auth.json")),
+    ];
+    for (name, path) in expectations {
+        assert!(
+            prepared
+                .env
+                .iter()
+                .any(|(key, value)| key == name && value == path.as_os_str()),
+            "{name} must point inside the account's provider data"
+        );
+        assert!(path.starts_with(&provider_data));
+    }
+    assert!(
+        prepared
+            .env
+            .iter()
+            .any(|(name, value)| name == "AGENT_CLI_CREDENTIAL_STORE" && value == "file")
+    );
+    assert!(provider_data.join("config").is_dir());
+    assert!(provider_data.join("data").is_dir());
+    for ambient in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+        assert!(prepared.remove_env.iter().any(|name| name == ambient));
+    }
+
+    // The managed bundle stays pristine for integrity verification.
+    assert_eq!(
+        std::fs::read_to_string(dist.join("index.js")).unwrap(),
+        "class o{getAuthFilePath(e){return join(homedir(),`.${e}`,\"auth.json\")}}"
+    );
+}
+
+#[test]
+fn cursor_plan_accounts_fail_closed_when_the_credential_anchor_moves() {
+    let data = tempfile::tempdir().unwrap();
+    let dist = provider_root(data.path(), ProviderId::Cursor).join("versions/pinned/dist-package");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("node"), b"node-runtime").unwrap();
+    std::fs::write(dist.join("node.exe"), b"node-runtime").unwrap();
+    std::fs::write(dist.join("index.js"), "class o{readAuthData(){}}").unwrap();
+    let account = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Cursor,
+            account_id: 4,
+        },
+        label: "Work".into(),
+        auth_source: AuthSource::ProviderManaged,
+        auto_failover: false,
+    };
+
+    let error = prepare_installed_for_account(
+        &account,
+        InstalledSidecar {
+            command: dist.join("cursor-agent"),
+            args: vec!["--disable-auto-update".into(), "acp".into()],
+            version: "pinned".into(),
+        },
+        data.path(),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("Editur needs an update"), "{error}");
+    assert!(!dist.join("editur-multi-account-index.js").exists());
 }

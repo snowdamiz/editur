@@ -97,7 +97,7 @@ pub fn join_windows_job(name: &str) -> Result<(), String> {
 }
 
 pub fn run_managed_process(
-    provider: provider::ProviderId,
+    account: provider::AccountKey,
     project_root: &std::path::Path,
     extra_args: Vec<std::ffi::OsString>,
 ) -> Result<(), String> {
@@ -114,9 +114,18 @@ pub fn run_managed_process(
         ));
     }
     let data_dir = crate::data_dir()?;
+    let available = provider::catalog()
+        .iter()
+        .map(|provider| provider.id)
+        .collect::<Vec<_>>();
+    let registry = provider::load_accounts(&data_dir, &available)?;
+    let profile = registry
+        .account(account)
+        .cloned()
+        .ok_or_else(|| "internal ACP account does not exist for this provider".to_owned())?;
     let bundle = provision::embedded_bundle()?;
-    let installed = provision::installed(bundle.manifest(provider)?, &data_dir)?;
-    let prepared = provider::prepare_installed(provider, installed, &data_dir);
+    let installed = provision::installed(bundle.manifest(account.provider)?, &data_dir)?;
+    let prepared = provider::prepare_installed_for_account(&profile, installed, &data_dir)?;
     #[cfg(windows)]
     join_windows_job(
         &std::env::var(WINDOWS_JOB_ENV)

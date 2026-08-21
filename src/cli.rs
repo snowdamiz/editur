@@ -1,14 +1,14 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::agent::provider::ProviderId;
+use crate::agent::provider::{AccountKey, ProviderId};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
     Open(Option<PathBuf>),
     Resident(PathBuf),
     QuitRunning,
-    AgentProcess(ProviderId, PathBuf, Vec<OsString>),
+    AgentProcess(AccountKey, PathBuf, Vec<OsString>),
     AgentProvision(ProviderId),
     Update,
     #[cfg(windows)]
@@ -46,12 +46,28 @@ where
             .and_then(|value| value.into_string().ok())
             .ok_or_else(|| "missing internal ACP provider id".to_owned())?
             .parse::<ProviderId>()?;
+        let account_id = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or_else(|| "missing internal ACP account id".to_owned())?
+            .parse::<u64>()
+            .map_err(|_| "invalid internal ACP account id".to_owned())?;
+        if account_id == 0 || account_id > crate::agent::provider::MAX_ACCOUNT_ID {
+            return Err("internal ACP account id is outside the supported range".into());
+        }
         let target = args
             .next()
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .ok_or_else(|| "missing internal agent process target".to_owned())?;
-        return Ok(Command::AgentProcess(provider, target, args.collect()));
+        return Ok(Command::AgentProcess(
+            AccountKey {
+                provider,
+                account_id,
+            },
+            target,
+            args.collect(),
+        ));
     }
 
     if first == "--provision-agent" {
@@ -142,9 +158,12 @@ mod tests {
     #[test]
     fn parses_hidden_managed_agent_launcher_with_its_project_root() {
         assert_eq!(
-            parse(&["--agent-process", "codex", "/tmp/project"]),
+            parse(&["--agent-process", "codex", "7", "/tmp/project"]),
             Ok(Command::AgentProcess(
-                crate::agent::provider::ProviderId::Codex,
+                AccountKey {
+                    provider: ProviderId::Codex,
+                    account_id: 7,
+                },
                 PathBuf::from("/tmp/project"),
                 Vec::new(),
             ))
@@ -153,6 +172,7 @@ mod tests {
             parse(&[
                 "--agent-process",
                 "claude",
+                "9",
                 "/tmp/project",
                 "--cli",
                 "auth",
@@ -160,7 +180,10 @@ mod tests {
                 "--claudeai",
             ]),
             Ok(Command::AgentProcess(
-                crate::agent::provider::ProviderId::Claude,
+                AccountKey {
+                    provider: ProviderId::Claude,
+                    account_id: 9,
+                },
                 PathBuf::from("/tmp/project"),
                 ["--cli", "auth", "login", "--claudeai"]
                     .into_iter()
@@ -169,6 +192,8 @@ mod tests {
             ))
         );
         assert!(parse(&["--agent-process"]).is_err());
+        assert!(parse(&["--agent-process", "codex", "0", "/tmp/project"]).is_err());
+        assert!(parse(&["--agent-process", "codex", "nope", "/tmp/project"]).is_err());
         assert_eq!(
             parse(&["--provision-agent"]),
             Ok(Command::AgentProvision(

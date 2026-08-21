@@ -5,21 +5,22 @@ use crate::{
     pane::allowed_tab_drop_zone,
 };
 
+use super::agent_view::next_failover_account;
 #[cfg(unix)]
 use super::picker_breadcrumb_segments;
 use super::{
-    AGENT_MENU_ROW_HEIGHT, ASSISTANT_COMPOSER_HEIGHT, AgenticDiff, CompletionPopup, DevinView,
-    DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId, PaneLayout,
-    PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection, TAB_CLOSE,
-    TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT, TITLEBAR_PAINT_KEY,
-    TabDrop, ToolOutput, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS, WorkspaceFilePicker,
-    agent_at_bottom, agent_collapsing_header, agent_diff_cache_count, agent_diff_preview,
-    agent_empty_state_rect, agent_mention_matches, agent_mention_query, agent_menu_rect,
-    agent_new_session_rect, agent_search_matches, agent_selector_button, agent_session_row,
-    agent_toggle_rect, agentic_project_row, assistant_composer_content, assistant_composer_height,
-    assistant_dense_disclosure_row, assistant_dense_tool, assistant_markdown_galley,
-    assistant_send_button_colors, build_agent_diff, cached_agent_diff, child_path,
-    collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
+    AGENT_MENU_ROW_HEIGHT, ASSISTANT_COMPOSER_HEIGHT, AgentState, AgenticDiff, CompletionPopup,
+    DevinView, DropZone, EditorApp, FileChange, LspDiagnosticsState, PANE_TAB_HEIGHT, PaneId,
+    PaneLayout, PendingAction, RESIZE_SETTLE_DELAY, SIDEBAR_SETTINGS_ROW_HEIGHT, SettingsSection,
+    TAB_CLOSE, TAB_DRAG_GHOST_PAINT_KEY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
+    TITLEBAR_PAINT_KEY, TabDrop, ToolOutput, TreeState, UPDATE_BUTTON_SIZE, WINDOW_CORNER_RADIUS,
+    WorkspaceFilePicker, agent_at_bottom, agent_collapsing_header, agent_diff_cache_count,
+    agent_diff_preview, agent_empty_state_rect, agent_mention_matches, agent_mention_query,
+    agent_menu_rect, agent_new_session_rect, agent_search_matches, agent_selector_button,
+    agent_session_row, agent_toggle_rect, agentic_project_row, assistant_composer_content,
+    assistant_composer_height, assistant_dense_disclosure_row, assistant_dense_tool,
+    assistant_markdown_galley, assistant_send_button_colors, build_agent_diff, cached_agent_diff,
+    child_path, collect_agent_mentions, completion_word_range, copy_tree_entry, defer_resize,
     diagnostic_highlighted_job, disable_transient_egui_debug_overlays, draw_agent_changed_files,
     draw_agent_diff, draw_editor_empty_state, draw_provider_selector_identity,
     draw_sidebar_toggle_icon, draw_tab_drag_ghost, editor_background, editor_column_content,
@@ -35,7 +36,10 @@ use super::{
     split_workspace_with_devin, stable_tab_drop_zone, tab_width, terminal_toggle_rect,
     unique_copy_path,
 };
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    time::SystemTime,
+};
 
 fn click_response(
     context: &egui::Context,
@@ -290,9 +294,10 @@ fn foreground_menu_mesh_is_not_cached_as_retained_content() {
 use crate::{
     agent::controller::{
         AuthChoice, AuthKind, CommandChoice, ConfigChoice, ConfigValue, ConfigValueChoice,
-        ConnectionState, ModeChoice, PermissionChoice, SessionChoice, ToolActivity, ToolDetail,
+        ConnectionState, Event as AgentEvent, InteractionKind, InteractionRequest, ModeChoice,
+        PermissionChoice, SessionChoice, ToolActivity, ToolDetail,
     },
-    agent::provider::ProviderId,
+    agent::provider::{AccountKey, AuthSource, ProviderAccount, ProviderId},
     agent::state::{PermissionCard, TranscriptItem},
     buffer::Buffer,
     file_io::OpenTarget,
@@ -1414,13 +1419,14 @@ fn every_markdown_pane_has_its_own_preview_toggle() {
 }
 
 #[test]
-fn provider_selector_requires_two_available_providers() {
-    assert!(!provider_selector_visible(&[]));
-    assert!(!provider_selector_visible(&[ProviderId::Cursor]));
-    assert!(provider_selector_visible(&[
-        ProviderId::Cursor,
-        ProviderId::Codex,
-    ]));
+fn provider_selector_shows_for_multiple_providers_or_accounts() {
+    assert!(!provider_selector_visible(&[], 0));
+    assert!(!provider_selector_visible(&[ProviderId::Cursor], 1));
+    assert!(provider_selector_visible(&[ProviderId::Cursor], 2));
+    assert!(provider_selector_visible(
+        &[ProviderId::Cursor, ProviderId::Codex,],
+        2
+    ));
 }
 
 #[test]
@@ -1608,25 +1614,69 @@ fn provider_selector_and_provider_specific_controls_follow_capabilities() {
     assert!(text.contains(&"Cursor"));
     assert!(text.contains(&"Codex"));
     assert!(text.contains(&"Claude"));
+    assert!(
+        text.contains(&"Add account"),
+        "the menu needs its add-account row"
+    );
     for removed in [
+        "+ Add",
+        "Aa",
+        "Add Cursor account",
+        "Add Codex account",
+        "Add Claude account",
         "Cursor's ACP coding agent",
         "OpenAI Codex through the canonical ACP adapter",
         "Anthropic Claude through the canonical ACP adapter",
         "Installs on first use",
         "◎",
         "✦",
+        "↻",
+        "↑",
+        "↓",
+        "✎",
+        // A provider's only account is presented as the provider itself:
+        // no placeholder label and no status line underneath it.
+        "Current login",
+        "Ready",
+        "Existing sign-in",
+        "Isolated sign-in",
     ] {
         assert!(
             !text.contains(&removed),
             "provider menu still paints {removed}"
         );
     }
+    assert!(
+        !text.iter().any(|text| text.contains("Priority")),
+        "failover priority is noise while every provider has one account"
+    );
     let popup = app.agent_menu_popup.unwrap();
+    let check = crate::icons::probe::bounds(&output.shapes, popup, theme::accent())
+        .expect("the selected account carries an accent check");
+    assert!(
+        check.center().x > popup.center().x,
+        "the check belongs on the trailing edge: {check:?} in {popup:?}"
+    );
     assert!(popup.top() >= app.provider_menu_anchor.unwrap().bottom());
     assert!(
-        popup.height() <= 150.0,
-        "provider menu is not compact: {popup:?}"
+        popup.height() <= 280.0,
+        "provider menu is too tall: {popup:?}"
     );
+    for provider in ["Cursor", "Codex", "Claude"] {
+        let shape = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == provider => Some(text),
+                _ => None,
+            })
+            .next()
+            .unwrap_or_else(|| panic!("missing {provider} header"));
+        assert!(
+            shape.pos.y + shape.galley.size().y <= popup.bottom(),
+            "{provider} header is clipped by {popup:?}"
+        );
+    }
 
     app.agent_menu = Some(super::AgentMenu::Permissions);
     draw(&mut app);
@@ -1636,6 +1686,245 @@ fn provider_selector_and_provider_specific_controls_follow_capabilities() {
     app.agent_menu = Some(super::AgentMenu::Permissions);
     draw(&mut app);
     assert!(app.agent_menu_popup.is_some());
+}
+
+#[test]
+fn provider_menu_owns_the_wheel_and_scrolls_when_accounts_overflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    for index in 0..8 {
+        app.accounts
+            .add_account(
+                ProviderId::Cursor,
+                format!("Account {index}"),
+                AuthSource::Environment {
+                    variable: format!("EDITUR_CURSOR_ACCOUNT_{index}"),
+                },
+            )
+            .unwrap();
+    }
+    app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 560.0));
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let _ = draw(&mut app, Vec::new());
+    app.agent_menu = Some(super::AgentMenu::Providers);
+    let output = draw(&mut app, Vec::new());
+    assert!(
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .any(|text| text.contains("Priority")),
+        "accounts on a multi-account provider must show their failover priority"
+    );
+    let popup = app.agent_menu_popup.expect("provider menu");
+    let _ = draw(
+        &mut app,
+        vec![
+            Event::PointerMoved(popup.center()),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Line,
+                delta: Vec2::new(0.0, -4.0),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+
+    assert!(app.agent_menu_scroll_y > 0.0);
+    assert_eq!(app.agent_menu, Some(super::AgentMenu::Providers));
+}
+
+#[test]
+fn add_account_drills_in_from_the_provider_menu() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.available_providers = vec![ProviderId::Cursor, ProviderId::Codex, ProviderId::Claude];
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let find_text = |output: &egui::FullOutput, expected: &str| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        })
+    };
+    let click = |app: &mut EditorApp, position| {
+        let _ = draw(
+            app,
+            vec![
+                Event::PointerMoved(position),
+                Event::PointerButton {
+                    pos: position,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(
+            app,
+            vec![Event::PointerButton {
+                pos: position,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+    };
+
+    let _ = draw(&mut app, Vec::new());
+    app.agent_menu = Some(super::AgentMenu::Providers);
+    let output = draw(&mut app, Vec::new());
+    let add = find_text(&output, "Add account").expect("add-account row");
+    click(&mut app, add.center());
+    assert_eq!(
+        app.agent_menu,
+        Some(super::AgentMenu::AddAccount),
+        "the add-account row drills into the provider choice"
+    );
+
+    let output = draw(&mut app, Vec::new());
+    let popup = app.agent_menu_popup.expect("add-account menu");
+    let codex = find_text(&output, "Codex").expect("codex choice");
+    assert!(popup.contains_rect(codex));
+    click(&mut app, codex.center());
+    let prompt = app.account_prompt.as_ref().expect("add-account prompt");
+    assert!(matches!(
+        prompt.action,
+        super::AccountPromptAction::Add(ProviderId::Codex)
+    ));
+    assert!(
+        app.agent_menu.is_none(),
+        "choosing a provider closes the menu"
+    );
+}
+
+#[test]
+fn account_dialog_explains_plan_logins_without_environment_credentials() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(expected),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    Vec2::new(1000.0, 700.0),
+                )),
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+
+    let prompt = |provider| super::AccountPrompt {
+        action: super::AccountPromptAction::Add(provider),
+        label: "Work".into(),
+        focus: false,
+    };
+
+    app.account_prompt = Some(prompt(ProviderId::Codex));
+    let _ = draw(&mut app);
+    let output = draw(&mut app);
+    let has = |expected: &str| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, expected))
+    };
+    assert!(has("Add Codex account"));
+    assert!(
+        has("No API key is needed."),
+        "a plan account must say that sign-in needs no API key"
+    );
+    assert!(has("Add and sign in"));
+    assert!(
+        !has("Environment variable"),
+        "plan accounts must not ask for an environment variable"
+    );
+
+    app.account_prompt = Some(prompt(ProviderId::Cursor));
+    let _ = draw(&mut app);
+    let output = draw(&mut app);
+    let has = |expected: &str| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_text(&shape.shape, expected))
+    };
+    assert!(has("Add Cursor account"));
+    assert!(
+        has("its own Cursor sign-in"),
+        "Cursor accounts default to an isolated plan sign-in"
+    );
+    assert!(has("Add and sign in"));
+    assert!(!has("Use an environment variable instead"));
+    assert!(
+        !has("Environment variable") && !has("CURSOR_WORK_API_KEY"),
+        "the add-account dialog must not offer environment credentials"
+    );
+
+    assert!(!prompt(ProviderId::Cursor).incomplete());
+    assert!(!prompt(ProviderId::Codex).incomplete());
+    let mut unlabeled = prompt(ProviderId::Claude);
+    unlabeled.label = "  ".into();
+    assert!(unlabeled.incomplete());
 }
 
 #[test]
@@ -4365,6 +4654,15 @@ fn provider_switch_preserves_each_providers_session_and_the_composer_draft() {
         create: false,
     })
     .unwrap();
+    app.accounts.accounts.push(ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Codex,
+            account_id: 2,
+        },
+        label: "Current login".into(),
+        auth_source: AuthSource::Legacy,
+        auto_failover: false,
+    });
     app.selected_provider = ProviderId::Cursor;
     app.agent.prompt = "keep this draft".into();
     app.agent.session_id = Some("cursor-session".into());
@@ -4398,6 +4696,179 @@ fn provider_switch_preserves_each_providers_session_and_the_composer_draft() {
         app.agent.transcript.back(),
         Some(TranscriptItem::Assistant(text)) if text == "codex output"
     ));
+}
+
+#[test]
+fn account_switch_preserves_independent_same_provider_sessions_and_blocks_active_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    let work = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Codex,
+            account_id: 4,
+        },
+        label: "Work".into(),
+        auth_source: AuthSource::ProviderManaged,
+        auto_failover: true,
+    };
+    let personal = ProviderAccount {
+        key: AccountKey {
+            provider: ProviderId::Codex,
+            account_id: 5,
+        },
+        label: "Personal".into(),
+        auth_source: AuthSource::ProviderManaged,
+        auto_failover: true,
+    };
+    app.accounts
+        .accounts
+        .extend([work.clone(), personal.clone()]);
+    app.selected_account = work.key;
+    app.selected_provider = ProviderId::Codex;
+    app.agent.prompt = "keep draft".into();
+    app.agent.session_id = Some("work-session".into());
+
+    app.select_account_state(personal.key);
+    assert_eq!(app.selected_account, personal.key);
+    assert_eq!(app.agent.prompt, "keep draft");
+    assert!(app.agent.session_id.is_none());
+    app.agent.session_id = Some("personal-session".into());
+
+    app.select_account_state(work.key);
+    assert_eq!(app.agent.session_id.as_deref(), Some("work-session"));
+    app.agent.active = true;
+    assert!(!app.can_switch_accounts());
+    app.agent.active = false;
+    app.agent
+        .apply(AgentEvent::InteractionRequested(InteractionRequest {
+            request_id: 1,
+            tool_call_id: "question".into(),
+            kind: InteractionKind::Questions {
+                title: "Choose".into(),
+                questions: Vec::new(),
+            },
+        }));
+    assert!(!app.can_switch_accounts());
+}
+
+#[test]
+fn failover_selection_is_ordered_and_never_retries_an_account() {
+    let provider = ProviderId::Codex;
+    let accounts = [
+        ProviderAccount {
+            key: AccountKey {
+                provider,
+                account_id: 1,
+            },
+            label: "First".into(),
+            auth_source: AuthSource::Legacy,
+            auto_failover: true,
+        },
+        ProviderAccount {
+            key: AccountKey {
+                provider,
+                account_id: 2,
+            },
+            label: "Disabled".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: false,
+        },
+        ProviderAccount {
+            key: AccountKey {
+                provider,
+                account_id: 3,
+            },
+            label: "Exhausted".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: true,
+        },
+        ProviderAccount {
+            key: AccountKey {
+                provider,
+                account_id: 4,
+            },
+            label: "Ready".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: true,
+        },
+        ProviderAccount {
+            key: AccountKey {
+                provider: ProviderId::Claude,
+                account_id: 5,
+            },
+            label: "Wrong provider".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: true,
+        },
+    ];
+    let attempted = HashSet::from([1]);
+    let exhausted = HashMap::from([(accounts[2].key, None)]);
+
+    assert_eq!(
+        next_failover_account(
+            &accounts,
+            provider,
+            &attempted,
+            &exhausted,
+            SystemTime::now()
+        ),
+        Some(accounts[3].key)
+    );
+
+    let attempted = HashSet::from([1, 4]);
+    assert_eq!(
+        next_failover_account(
+            &accounts,
+            provider,
+            &attempted,
+            &exhausted,
+            SystemTime::now()
+        ),
+        None
+    );
+}
+
+#[test]
+fn live_account_handoff_is_bounded_private_and_replays_as_one_switch_card() {
+    let mut state = AgentState::default();
+    state.apply(AgentEvent::UserMessage("Finish the migration".into()));
+    state.apply(AgentEvent::ThoughtDelta("private chain of thought".into()));
+    state.apply(AgentEvent::AssistantDelta("I changed the registry".into()));
+    state.apply(AgentEvent::InteractionRequested(InteractionRequest {
+        request_id: 7,
+        tool_call_id: "secret-question".into(),
+        kind: InteractionKind::Questions {
+            title: "Secret".into(),
+            questions: Vec::new(),
+        },
+    }));
+    state.apply(AgentEvent::AssistantDelta("x".repeat(128 * 1024)));
+    state.apply(AgentEvent::TurnFinished { cancelled: false });
+
+    let prompt = state
+        .account_handoff_prompt("Codex · Work", "Codex · Personal", "Finish the migration")
+        .unwrap();
+    assert!(prompt.len() <= 64 * 1024);
+    assert!(prompt.contains("Finish the migration"));
+    assert!(prompt.contains("usage plan was exhausted"));
+    assert!(!prompt.contains("private chain of thought"));
+    assert!(!prompt.contains("secret-question"));
+
+    let mut replayed = AgentState::default();
+    replayed.apply(AgentEvent::SessionTranscriptLoaded(vec![
+        crate::agent::controller::SessionTranscriptMessage::User(prompt),
+    ]));
+    assert!(matches!(
+        replayed.transcript.front(),
+        Some(TranscriptItem::AccountSwitch { from, to })
+            if from == "Codex · Work" && to == "Codex · Personal"
+    ));
+    assert_eq!(replayed.transcript.len(), 1);
 }
 
 #[test]

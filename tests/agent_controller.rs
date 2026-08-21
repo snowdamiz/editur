@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use editur::agent::controller::{
     AgentController, AuthKind, Command, ConfigValue, ConnectionState, Event, GoalAction,
-    InteractionKind, InteractionResponse, PromptAttachment, QuestionAnswer,
+    InteractionKind, InteractionResponse, PromptAttachment, QuestionAnswer, TurnFailureKind,
 };
 use editur::agent::provider::ProviderId;
 use editur::agent::state::{AgentState, TranscriptItem};
@@ -960,6 +960,115 @@ fn fake_agent_streams_a_prompt_and_keeps_the_session_for_a_follow_up() {
 }
 
 #[test]
+fn exhausted_account_handoff_completes_on_a_second_fake_account() {
+    let project = tempfile::tempdir().unwrap();
+    let workspace_file = project.path().join("partial-change.txt");
+    let handoff_file = project.path().join("received-handoff.txt");
+    let attachment = project.path().join("context.txt");
+    std::fs::write(&attachment, b"attachment context").unwrap();
+    let first = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--account-fixture".into(),
+            "a".into(),
+            "--workspace-file".into(),
+            workspace_file.to_string_lossy().into_owned(),
+        ],
+    );
+    receive_until(&first, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    first
+        .send(Command::PromptWithAttachments {
+            text: "account-failover".into(),
+            attachments: vec![PromptAttachment::from_path(&attachment).unwrap()],
+        })
+        .unwrap();
+    let first_events = receive_until(&first, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        Event::TurnFailed {
+            kind: TurnFailureKind::UsageExhausted { .. },
+            ..
+        }
+    )));
+    assert_eq!(
+        std::fs::read_to_string(&workspace_file).unwrap(),
+        "partial workspace change"
+    );
+
+    let mut state = AgentState::default();
+    for event in first_events {
+        state.apply(event);
+    }
+    let handoff = state
+        .account_handoff_prompt("Codex · Work", "Codex · Personal", "account-failover")
+        .unwrap();
+    state.record_account_switch("Codex · Work".into(), "Codex · Personal".into());
+
+    let second = AgentController::start_process_for(
+        ProviderId::Codex,
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        vec![
+            "--account-fixture".into(),
+            "b".into(),
+            "--handoff-file".into(),
+            handoff_file.to_string_lossy().into_owned(),
+        ],
+    );
+    let ready = receive_until(&second, Duration::from_secs(5), |event| {
+        matches!(event, Event::ActiveSessionChanged(_))
+    });
+    assert!(
+        ready
+            .iter()
+            .any(|event| matches!(event, Event::ActiveSessionChanged(id) if id == "fake-session"))
+    );
+    second
+        .send(Command::HiddenPromptWithAttachments {
+            text: handoff,
+            attachments: vec![PromptAttachment::from_path(&attachment).unwrap()],
+        })
+        .unwrap();
+    let second_events = receive_until(&second, Duration::from_secs(5), |event| {
+        matches!(event, Event::TurnFinished { .. })
+    });
+    for event in second_events {
+        state.apply(event);
+    }
+
+    assert!(
+        std::fs::read_to_string(handoff_file)
+            .unwrap()
+            .starts_with("<!-- editur-account-handoff:v1 ")
+    );
+    assert!(state.transcript.iter().any(
+        |item| matches!(item, TranscriptItem::Assistant(text) if text.contains("account B completed handoff"))
+    ));
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::User(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::AccountSwitch { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn advertised_session_controls_round_trip_exact_values() {
     let project = tempfile::tempdir().unwrap();
     let controller = AgentController::start_process(
@@ -1044,7 +1153,13 @@ fn rejected_prompt_reports_an_error_and_finishes_the_turn() {
         matches!(event, Event::TurnFinished { .. })
     });
 
-    assert!(events.iter().any(|event| matches!(event, Event::Error(_))));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::TurnFailed {
+            kind: TurnFailureKind::Other,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -1071,8 +1186,10 @@ fn cursor_transport_drop_resumes_the_turn_automatically() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            Event::Error(error)
-                if error.contains("RetriableError") && error.contains("resuming")
+            Event::TurnFailed {
+                kind: TurnFailureKind::Transport,
+                message: error,
+            } if error.contains("RetriableError") && error.contains("resuming")
         )),
         "transport drop should be reported and resumed: {events:?}"
     );
@@ -1808,6 +1925,37 @@ fn codex_stderr_never_copies_provider_payloads_into_events() {
         event,
         Event::ProcessExited { diagnostics, .. }
             if diagnostics == "Codex stderr suppressed to protect authentication and protocol data."
+    )));
+}
+
+#[test]
+fn cursor_stderr_redacts_canonical_credential_assignments() {
+    let project = tempfile::tempdir().unwrap();
+    let controller = AgentController::start_process(
+        project.path().to_path_buf(),
+        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+        Vec::new(),
+    );
+    receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::SessionReady { .. })
+    });
+    controller
+        .send(Command::Prompt("exit-secret".into()))
+        .unwrap();
+
+    let events = receive_until(&controller, Duration::from_secs(5), |event| {
+        matches!(event, Event::ProcessExited { .. })
+    });
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !format!("{event:?}").contains("super-secret-test-value"))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProcessExited { diagnostics, .. }
+            if diagnostics.contains("credential diagnostic redacted")
     )));
 }
 

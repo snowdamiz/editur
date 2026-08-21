@@ -144,7 +144,7 @@ impl<'a> Dialog<'a> {
     /// a chip row. It is the only part of a dialog a call site controls.
     pub(crate) fn show_with(self, ctx: &Context, content: impl FnOnce(&mut Ui)) -> Outcome {
         let frame = egui::Frame::new()
-            .fill(theme::surface().raised)
+            .fill(theme::surface().input)
             .stroke(theme::border::strong())
             .corner_radius(theme::corner(theme::radius::DIALOG))
             .shadow(theme::shadow::dialog())
@@ -190,6 +190,7 @@ impl<'a> Dialog<'a> {
     }
 
     fn contents(&self, ui: &mut Ui, content: impl FnOnce(&mut Ui), first_frame: bool) -> Outcome {
+        ui.visuals_mut().text_edit_bg_color = Some(theme::surface().raised);
         ui.set_min_width(MIN_WIDTH - theme::space::WIDE * 2.0);
         ui.set_max_width(MAX_WIDTH - theme::space::WIDE * 2.0);
         ui.spacing_mut().item_spacing = egui::vec2(theme::space::SMALL, theme::space::SMALL);
@@ -454,6 +455,43 @@ mod tests {
                 .all(|rect| rect.width() >= super::ACTION_WIDTH - 0.5),
             "an action narrower than the floor breaks the row: {found:?}"
         );
+    }
+
+    #[test]
+    fn dialogs_match_the_file_picker_surface_and_lift_text_inputs() {
+        let context = theme::test_context();
+        let (_, output) = run(&context, Vec::new(), |ctx| {
+            let mut name = "Account 2".to_owned();
+            Dialog::new("field_dialog", "Add account")
+                .primary("Add")
+                .show_with(ctx, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
+                })
+        });
+
+        fn rectangles(shape: &Shape, found: &mut Vec<(Rect, egui::Color32)>) {
+            match shape {
+                Shape::Rect(rect) => found.push((rect.rect, rect.fill)),
+                Shape::Vec(shapes) => shapes.iter().for_each(|shape| rectangles(shape, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for shape in &output.shapes {
+            rectangles(&shape.shape, &mut found);
+        }
+        let dialog_fill = found
+            .iter()
+            .filter(|(rect, fill)| {
+                rect.width() >= super::MIN_WIDTH - 1.0
+                    && (*fill == theme::surface().input || *fill == theme::surface().raised)
+            })
+            .max_by(|(left, _), (right, _)| left.area().total_cmp(&right.area()))
+            .map(|(_, fill)| *fill);
+        assert_eq!(dialog_fill, Some(theme::surface().input));
+        assert!(found.iter().any(|(rect, fill)| {
+            *fill == theme::surface().raised && rect.width() > 250.0 && rect.height() < 50.0
+        }));
     }
 
     #[test]

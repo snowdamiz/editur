@@ -33,6 +33,13 @@ struct CompatibilityFixture {
     new_session: NewSessionResponse,
 }
 
+#[derive(Default)]
+struct AccountFixture {
+    mode: Option<String>,
+    handoff_file: Option<PathBuf>,
+    workspace_file: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 struct CursorRequest {
     method: String,
@@ -123,6 +130,7 @@ fn main() {
     let mut address_file = None;
     let mut descendant_file = None;
     let mut compatibility_fixture = None;
+    let mut account_fixture = AccountFixture::default();
     let mut arguments = std::env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
@@ -163,6 +171,23 @@ fn main() {
             Some("--descendant") => {
                 descendant_file = Some(arguments.next().expect("descendant marker path"));
             }
+            Some("--account-fixture") => {
+                account_fixture.mode = Some(
+                    arguments
+                        .next()
+                        .expect("account fixture mode")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Some("--handoff-file") => {
+                account_fixture.handoff_file =
+                    Some(arguments.next().expect("handoff marker path").into());
+            }
+            Some("--workspace-file") => {
+                account_fixture.workspace_file =
+                    Some(arguments.next().expect("workspace marker path").into());
+            }
             _ if address_file.is_none() => address_file = Some(argument),
             _ => {}
         }
@@ -192,6 +217,7 @@ fn main() {
         session_lifecycle_file,
         additional_directories_file,
         compatibility_fixture,
+        account_fixture,
     ));
     drop(listener);
     if let Err(error) = result {
@@ -337,6 +363,7 @@ async fn run(
     session_lifecycle_file: Option<std::ffi::OsString>,
     additional_directories_file: Option<std::ffi::OsString>,
     compatibility_fixture: Option<CompatibilityFixture>,
+    account_fixture: AccountFixture,
 ) -> Result<()> {
     let compatibility_fixture = compatibility_fixture.map(Arc::new);
     let sessions_supported = sessions_supported
@@ -351,6 +378,7 @@ async fn run(
     let authenticated = Arc::new(AtomicBool::new(!authentication_required));
     let claude_auth_file = claude_auth_file.map(PathBuf::from).map(Arc::new);
     let boolean_config_options = Arc::new(AtomicBool::new(false));
+    let account_fixture = Arc::new(account_fixture);
     let (cancel_tx, cancel_rx) = async_channel::unbounded();
     Agent
         .builder()
@@ -795,6 +823,7 @@ async fn run(
             {
                 let prompts = Arc::clone(&prompts);
                 let always_drop_transport = Arc::clone(&always_drop_transport);
+                let account_fixture = Arc::clone(&account_fixture);
                 async move |request: PromptRequest,
                             responder,
                             connection: ConnectionTo<agent_client_protocol::Client>| {
@@ -802,7 +831,59 @@ async fn run(
                     let always_drop_transport = Arc::clone(&always_drop_transport);
                     let turn = prompts.fetch_add(1, Ordering::Relaxed) + 1;
                     let task_connection = connection.clone();
+                    let account_fixture = Arc::clone(&account_fixture);
                     connection.spawn(async move {
+                        if account_fixture.mode.as_deref() == Some("a")
+                            && prompt_text(&request) == "account-failover"
+                        {
+                            if let Some(path) = &account_fixture.workspace_file {
+                                std::fs::write(path, b"partial workspace change").map_err(|_| {
+                                    agent_client_protocol::Error::internal_error()
+                                })?;
+                            }
+                            stream_text(&task_connection, &request, "partial account A output")?;
+                            task_connection.send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new("account-a-edit", "Edit workspace")
+                                        .status(ToolCallStatus::Completed)
+                                        .locations(vec![ToolCallLocation::new(
+                                            account_fixture
+                                                .workspace_file
+                                                .as_deref()
+                                                .unwrap_or_else(|| std::path::Path::new("workspace")),
+                                        )]),
+                                ),
+                            ))?;
+                            return responder.respond_with_result(Err(
+                                agent_client_protocol::Error::internal_error().data(
+                                    serde_json::json!({
+                                        "codexErrorInfo": "usageLimitExceeded"
+                                    }),
+                                ),
+                            ));
+                        }
+                        if account_fixture.mode.as_deref() == Some("exhausted") {
+                            return responder.respond_with_result(Err(
+                                agent_client_protocol::Error::internal_error().data(
+                                    serde_json::json!({
+                                        "codexErrorInfo": "usageLimitExceeded"
+                                    }),
+                                ),
+                            ));
+                        }
+                        if account_fixture.mode.as_deref() == Some("b")
+                            && prompt_text(&request)
+                                .starts_with("<!-- editur-account-handoff:v1 ")
+                        {
+                            if let Some(path) = &account_fixture.handoff_file {
+                                std::fs::write(path, prompt_text(&request)).map_err(|_| {
+                                    agent_client_protocol::Error::internal_error()
+                                })?;
+                            }
+                            stream_text(&task_connection, &request, "account B completed handoff")?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        }
                         if prompt_text(&request) == "transport-drop-loop" {
                             always_drop_transport.store(true, Ordering::Release);
                         }

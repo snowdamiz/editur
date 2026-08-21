@@ -11,7 +11,7 @@ use std::{
         mpsc::{Receiver, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::external_sessions::{self, ExternalMessage, ExternalSession, ExternalTool};
-pub use super::provider::{AuthChoice, AuthKind};
 use super::provider::{
-    ProviderExtensions, ProviderId, authentication_required_choices, descriptor,
-    normalize_auth_methods, visible_diagnostics,
+    AccountKey, AuthSource, ProviderAccount, ProviderExtensions, ProviderId,
+    authentication_required_choices, descriptor, normalize_auth_methods, visible_diagnostics,
 };
+pub use super::provider::{AuthChoice, AuthKind};
 
 const EVENT_CAPACITY: usize = 8;
 const COMMAND_CAPACITY: usize = 64;
@@ -373,6 +373,10 @@ pub enum Event {
         cost: Option<String>,
     },
     GoalUpdated(Option<GoalState>),
+    TurnFailed {
+        kind: TurnFailureKind,
+        message: String,
+    },
     TurnFinished {
         cancelled: bool,
     },
@@ -381,6 +385,60 @@ pub enum Event {
         error: String,
         diagnostics: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnFailureKind {
+    UsageExhausted { reset_at: Option<SystemTime> },
+    Authentication,
+    Transport,
+    Other,
+}
+
+fn classify_turn_failure(
+    provider: ProviderId,
+    error: &agent_client_protocol::Error,
+    claude_rate_limit_status: Option<&str>,
+) -> TurnFailureKind {
+    if error.code == ErrorCode::AuthRequired
+        || (provider == ProviderId::Claude
+            && error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("errorKind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("authentication_failed"))
+    {
+        return TurnFailureKind::Authentication;
+    }
+    if is_retriable_transport_error(error) {
+        return TurnFailureKind::Transport;
+    }
+    let exhausted = match provider {
+        ProviderId::Codex => {
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("codexErrorInfo"))
+                .and_then(serde_json::Value::as_str)
+                == Some("usageLimitExceeded")
+        }
+        ProviderId::Claude => {
+            claude_rate_limit_status == Some("rejected")
+                && error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("errorKind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("rate_limit")
+        }
+        ProviderId::Cursor => false,
+    };
+    if exhausted {
+        TurnFailureKind::UsageExhausted { reset_at: None }
+    } else {
+        TurnFailureKind::Other
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -637,6 +695,10 @@ pub enum Command {
         text: String,
         attachments: Vec<PromptAttachment>,
     },
+    HiddenPromptWithAttachments {
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    },
     DecidePermission {
         request_id: u64,
         option_id: String,
@@ -670,13 +732,29 @@ pub struct AgentController {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+fn legacy_account(provider: ProviderId) -> ProviderAccount {
+    ProviderAccount {
+        key: AccountKey {
+            provider,
+            account_id: 1,
+        },
+        label: "Current login".into(),
+        auth_source: AuthSource::Legacy,
+        auto_failover: false,
+    }
+}
+
 impl AgentController {
     pub fn start(provider: ProviderId, project_root: PathBuf) -> Self {
+        Self::start_account(legacy_account(provider), project_root)
+    }
+
+    pub fn start_account(account: ProviderAccount, project_root: PathBuf) -> Self {
         Self::start_launch(
-            provider,
-            managed_session_startup(provider, &project_root, None, false),
+            account.key.provider,
+            managed_session_startup(&account, &project_root, None, false),
             project_root,
-            Launch::Managed,
+            Launch::Managed(account),
             Arc::new(|| {}),
         )
     }
@@ -688,11 +766,27 @@ impl AgentController {
         fresh_session: bool,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        Self::start_launch(
-            provider,
-            managed_session_startup(provider, &project_root, preferred_session, fresh_session),
+        Self::start_account_with_wake(
+            legacy_account(provider),
             project_root,
-            Launch::Managed,
+            preferred_session,
+            fresh_session,
+            wake,
+        )
+    }
+
+    pub fn start_account_with_wake(
+        account: ProviderAccount,
+        project_root: PathBuf,
+        preferred_session: Option<String>,
+        fresh_session: bool,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_launch(
+            account.key.provider,
+            managed_session_startup(&account, &project_root, preferred_session, fresh_session),
+            project_root,
+            Launch::Managed(account),
             Arc::new(wake),
         )
     }
@@ -836,7 +930,7 @@ impl Drop for AgentController {
 }
 
 enum Launch {
-    Managed,
+    Managed(ProviderAccount),
     Process(AcpAgentConfig),
 }
 
@@ -896,10 +990,19 @@ fn run_thread(
     session_startup: SessionStartup,
     shutdown: Arc<AtomicBool>,
 ) {
-    let system_terminal = matches!(launch, Launch::Managed);
-    let (config, _managed_tree) = match launch {
-        Launch::Managed => match managed_config(provider, &project_root, &events) {
-            Ok(config) => (config.0, Some(config.1)),
+    let system_terminal = matches!(launch, Launch::Managed(_));
+    let (config, _managed_tree, provider_data) = match launch {
+        Launch::Managed(account) => match managed_config(&account, &project_root, &events) {
+            Ok(config) => (
+                config.0,
+                Some(config.1),
+                (account.auth_source != AuthSource::Legacy)
+                    .then(|| crate::data_dir().ok())
+                    .flatten()
+                    .and_then(|data_dir| {
+                        super::provision::account_provider_data_root(&data_dir, account.key).ok()
+                    }),
+            ),
             Err(error) => {
                 send_event(
                     &events,
@@ -908,7 +1011,7 @@ fn run_thread(
                 return;
             }
         },
-        Launch::Process(config) => (config, None),
+        Launch::Process(config) => (config, None, None),
     };
     send_event(&events, Event::ConnectionChanged(ConnectionState::Starting));
     let diagnostics = Arc::new(Mutex::new(String::new()));
@@ -943,8 +1046,7 @@ fn run_thread(
         });
     let result = async_io::block_on(run_connection(
         (agent, auth_config, system_terminal, internal_commands),
-        provider,
-        project_root,
+        (provider, project_root, provider_data),
         commands,
         events.clone(),
         Arc::clone(&shutdown),
@@ -1147,12 +1249,12 @@ fn launch_system_terminal_auth(
 }
 
 fn managed_config(
-    provider: ProviderId,
+    account: &ProviderAccount,
     project_root: &std::path::Path,
     events: &EventSender,
 ) -> Result<(AcpAgentConfig, ManagedTree), String> {
     let data_dir = crate::data_dir()?;
-    super::provider::prepare(provider, &data_dir, |progress| {
+    super::provider::prepare_account(account, &data_dir, |progress| {
         send_event(
             events,
             Event::ConnectionChanged(ConnectionState::Provisioning {
@@ -1165,7 +1267,8 @@ fn managed_config(
         .map_err(|error| format!("cannot locate Editur agent launcher: {error}"))?;
     let config = AcpAgentConfig::new(executable)
         .arg("--agent-process")
-        .arg(provider.as_str())
+        .arg(account.key.provider.as_str())
+        .arg(account.key.account_id.to_string())
         .arg(project_root.to_string_lossy());
     protect_managed_process(config)
 }
@@ -1258,8 +1361,7 @@ async fn run_connection(
         bool,
         async_channel::Sender<Command>,
     ),
-    provider: ProviderId,
-    project_root: PathBuf,
+    (provider, project_root, provider_data): (ProviderId, PathBuf, Option<PathBuf>),
     commands: async_channel::Receiver<Command>,
     events: EventSender,
     shutdown: Arc<AtomicBool>,
@@ -1276,6 +1378,7 @@ async fn run_connection(
     let permissions = Arc::new(Mutex::new(HashMap::new()));
     let interactions = Arc::new(Mutex::new(HashMap::new()));
     let elicitations = Arc::new(Mutex::new(HashMap::new()));
+    let claude_rate_limit_status = Arc::new(Mutex::new(None::<String>));
     let next_permission = Arc::new(AtomicU64::new(1));
     let mut hidden_sessions = HiddenSessions::load(session_startup.history);
     let mut editur_sessions = EditurSessions::load(session_startup.editur_sessions);
@@ -1289,9 +1392,14 @@ async fn run_connection(
             {
                 let events = events.clone();
                 let session_notifications = session_notifications.clone();
+                let claude_rate_limit_status = Arc::clone(&claude_rate_limit_status);
                 async move |notification: SessionNotification, _connection| {
                     if session_notifications.accepts(&notification.session_id) {
-                        normalize_update(notification.update, &events);
+                        normalize_update_with_rate_limit(
+                            notification.update,
+                            &events,
+                            &claude_rate_limit_status,
+                        );
                     }
                     Ok(())
                 }
@@ -1544,7 +1652,11 @@ async fn run_connection(
                     .is_some();
                 let (supports_steering, goal_actions) =
                     session_extension_capabilities(provider, initialized.meta.as_ref());
-                let discovered_external = external_sessions::discover(provider, &project_root)
+                let discovered_external = external_sessions::discover(
+                    provider,
+                    &project_root,
+                    provider_data.as_deref(),
+                )
                     .unwrap_or_else(|error| {
                         if std::env::var("EDITUR_LOG").as_deref() == Ok("debug") {
                             eprintln!("editur: {error}");
@@ -1720,6 +1832,7 @@ async fn run_connection(
                                     let discovered = external_sessions::discover(
                                         provider,
                                         &project_root,
+                                        provider_data.as_deref(),
                                     )
                                     .unwrap_or_default();
                                     let has_external_sessions = !discovered.is_empty();
@@ -1841,6 +1954,7 @@ async fn run_connection(
                                 let discovered = external_sessions::discover(
                                     provider,
                                     &project_root,
+                                    provider_data.as_deref(),
                                 )
                                 .unwrap_or_default();
                                 let send_merged = !supports_history || !discovered.is_empty();
@@ -2082,6 +2196,7 @@ async fn run_connection(
                                 imported.then_some(visible_text),
                                 Vec::new(),
                                 attachment_support,
+                                &claude_rate_limit_status,
                                 turn_resume.clone(),
                             )?;
                         }
@@ -2245,6 +2360,22 @@ async fn run_connection(
                                 imported.then_some(visible_text),
                                 attachments,
                                 attachment_support,
+                                &claude_rate_limit_status,
+                                turn_resume.clone(),
+                            )?;
+                        }
+                        Command::HiddenPromptWithAttachments { text, attachments } => {
+                            turn_resume.attempts.store(0, Ordering::Release);
+                            send_prompt(
+                                &connection,
+                                &events,
+                                &active,
+                                session_id.clone(),
+                                text,
+                                Some(String::new()),
+                                attachments,
+                                attachment_support,
+                                &claude_rate_limit_status,
                                 turn_resume.clone(),
                             )?;
                         }
@@ -2258,6 +2389,7 @@ async fn run_connection(
                                 None,
                                 Vec::new(),
                                 attachment_support,
+                                &claude_rate_limit_status,
                                 turn_resume.clone(),
                             )?;
                         }
@@ -2374,6 +2506,7 @@ async fn run_connection(
                                     let discovered = external_sessions::discover(
                                         provider,
                                         &project_root,
+                                        provider_data.as_deref(),
                                     )
                                     .unwrap_or_default();
                                     let has_external_sessions = !discovered.is_empty();
@@ -2582,6 +2715,7 @@ fn send_prompt(
     visible_text: Option<String>,
     attachments: Vec<PromptAttachment>,
     attachment_support: AttachmentSupport,
+    claude_rate_limit_status: &Arc<Mutex<Option<String>>>,
     resume: TurnResume,
 ) -> agent_client_protocol::Result<()> {
     let Some(session) = session else {
@@ -2619,6 +2753,7 @@ fn send_prompt(
     }
     let events_for_result = events.clone();
     let active_for_result = Arc::clone(active);
+    let rate_limit_for_result = Arc::clone(claude_rate_limit_status);
     connection
         .send_request(PromptRequest::new(session, content))
         .on_receiving_result(async move |result| {
@@ -2629,6 +2764,15 @@ fn send_prompt(
                     response.stop_reason == StopReason::Cancelled
                 }
                 Err(error) => {
+                    let kind = classify_turn_failure(
+                        events_for_result.provider,
+                        &error,
+                        rate_limit_for_result
+                            .lock()
+                            .ok()
+                            .and_then(|status| status.clone())
+                            .as_deref(),
+                    );
                     let message =
                         acp_error(events_for_result.provider, "agent turn failed", &error);
                     let resuming = resume.enabled
@@ -2637,14 +2781,17 @@ fn send_prompt(
                         && resume.commands.try_send(Command::ResumeTurn).is_ok();
                     send_event(
                         &events_for_result,
-                        Event::Error(if resuming {
-                            format!(
-                                "{message}\n\nThe connection dropped mid-turn; progress is \
+                        Event::TurnFailed {
+                            kind,
+                            message: if resuming {
+                                format!(
+                                    "{message}\n\nThe connection dropped mid-turn; progress is \
                                  preserved in this session — resuming automatically."
-                            )
-                        } else {
-                            message
-                        }),
+                                )
+                            } else {
+                                message
+                            },
+                        },
                     );
                     false
                 }
@@ -3349,25 +3496,28 @@ fn load_bounded_json(path: Option<&Path>) -> Option<Vec<u8>> {
     })
 }
 
-fn session_history_path(provider: ProviderId, project_root: &std::path::Path) -> Option<PathBuf> {
+fn session_history_path(
+    account: &ProviderAccount,
+    project_root: &std::path::Path,
+) -> Option<PathBuf> {
     crate::data_dir()
         .ok()
-        .map(|directory| session_history_path_in(&directory, provider, project_root))
+        .map(|directory| session_history_path_in(&directory, account, project_root))
 }
 
 fn managed_session_startup(
-    provider: ProviderId,
+    account: &ProviderAccount,
     project_root: &Path,
     preferred_session: Option<String>,
     fresh_session: bool,
 ) -> SessionStartup {
-    let history = session_history_path(provider, project_root);
+    let history = session_history_path(account, project_root);
     let active_session = crate::data_dir()
         .ok()
-        .map(|directory| active_session_path_in(&directory, provider, project_root));
+        .map(|directory| active_session_path_in(&directory, account, project_root));
     let editur_sessions = crate::data_dir()
         .ok()
-        .map(|directory| editur_sessions_path_in(&directory, provider, project_root));
+        .map(|directory| editur_sessions_path_in(&directory, account, project_root));
     let preferred_session = if fresh_session {
         None
     } else {
@@ -3382,54 +3532,102 @@ fn managed_session_startup(
     }
 }
 
-fn session_history_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
+fn session_history_path_in(
+    data_dir: &Path,
+    account: &ProviderAccount,
+    project_root: &Path,
+) -> PathBuf {
     let digest = Sha256::digest(project_root.as_os_str().as_encoded_bytes());
     let mut name = String::with_capacity(digest.len() * 2 + 5);
     for byte in digest {
         write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
     }
     name.push_str(".json");
-    let destination = super::provision::provider_root(data_dir, provider)
+    let destination = super::provision::account_root(data_dir, account.key)
+        .expect("validated ACP account id")
         .join("session-history")
         .join(&name);
-    if provider == ProviderId::Cursor && !destination.exists() {
-        let legacy = data_dir.join("agents/session-history").join(name);
-        let migratable = fs::symlink_metadata(&legacy).ok().is_some_and(|metadata| {
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() <= MAX_DETAIL_BYTES as u64
-        });
-        if migratable
-            && destination
-                .parent()
-                .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
-        {
-            let _ = fs::rename(legacy, &destination);
+    if account.auth_source == AuthSource::Legacy && !destination.exists() {
+        let provider_legacy = super::provision::provider_root(data_dir, account.key.provider)
+            .join("session-history")
+            .join(&name);
+        if account.key.provider == ProviderId::Cursor && !provider_legacy.exists() {
+            migrate_small_file(
+                &data_dir.join("agents/session-history").join(&name),
+                &provider_legacy,
+            );
         }
+        migrate_small_file(&provider_legacy, &destination);
     }
     destination
 }
 
-fn active_session_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
-    let history = session_history_path_in(data_dir, provider, project_root);
-    super::provision::provider_root(data_dir, provider)
+fn migrate_small_file(legacy: &Path, destination: &Path) {
+    if destination.exists() {
+        return;
+    }
+    let migratable = fs::symlink_metadata(legacy).ok().is_some_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= MAX_DETAIL_BYTES as u64
+    });
+    if migratable
+        && destination
+            .parent()
+            .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
+    {
+        let _ = fs::rename(legacy, destination);
+    }
+}
+
+fn active_session_path_in(
+    data_dir: &Path,
+    account: &ProviderAccount,
+    project_root: &Path,
+) -> PathBuf {
+    let history = session_history_path_in(data_dir, account, project_root);
+    let destination = super::provision::account_root(data_dir, account.key)
+        .expect("validated ACP account id")
         .join("active-session")
         .join(
             history
                 .file_name()
                 .expect("session history has a file name"),
-        )
+        );
+    if account.auth_source == AuthSource::Legacy && !destination.exists() {
+        migrate_small_file(
+            &super::provision::provider_root(data_dir, account.key.provider)
+                .join("active-session")
+                .join(history.file_name().unwrap()),
+            &destination,
+        );
+    }
+    destination
 }
 
-fn editur_sessions_path_in(data_dir: &Path, provider: ProviderId, project_root: &Path) -> PathBuf {
-    let history = session_history_path_in(data_dir, provider, project_root);
-    super::provision::provider_root(data_dir, provider)
+fn editur_sessions_path_in(
+    data_dir: &Path,
+    account: &ProviderAccount,
+    project_root: &Path,
+) -> PathBuf {
+    let history = session_history_path_in(data_dir, account, project_root);
+    let destination = super::provision::account_root(data_dir, account.key)
+        .expect("validated ACP account id")
         .join("editur-sessions")
         .join(
             history
                 .file_name()
                 .expect("session history has a file name"),
-        )
+        );
+    if account.auth_source == AuthSource::Legacy && !destination.exists() {
+        migrate_small_file(
+            &super::provision::provider_root(data_dir, account.key.provider)
+                .join("editur-sessions")
+                .join(history.file_name().unwrap()),
+            &destination,
+        );
+    }
+    destination
 }
 
 fn load_active_session(path: &Path) -> Option<String> {
@@ -4466,7 +4664,16 @@ fn decide_permission(
         .try_send(PendingDecision::Selected(option_id));
 }
 
+#[cfg(test)]
 fn normalize_update(update: SessionUpdate, events: &EventSender) {
+    normalize_update_with_rate_limit(update, events, &Mutex::new(None));
+}
+
+fn normalize_update_with_rate_limit(
+    update: SessionUpdate,
+    events: &EventSender,
+    claude_rate_limit_status: &Mutex<Option<String>>,
+) {
     match update {
         SessionUpdate::UserMessageChunk(chunk) => {
             normalize_content_chunk(ContentRole::User, chunk, events)
@@ -4566,16 +4773,29 @@ fn normalize_update(update: SessionUpdate, events: &EventSender) {
                 },
             );
         }
-        SessionUpdate::UsageUpdate(usage) => send_event(
-            events,
-            Event::UsageUpdated {
-                used: usage.used,
-                size: usage.size,
-                cost: usage
-                    .cost
-                    .map(|cost| format!("{} {}", cost.amount, cost.currency)),
-            },
-        ),
+        SessionUpdate::UsageUpdate(usage) => {
+            if events.provider == ProviderId::Claude
+                && let Some(status) = usage
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("_claude/rateLimit"))
+                    .and_then(|rate_limit| rate_limit.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                && let Ok(mut latest) = claude_rate_limit_status.lock()
+            {
+                *latest = Some(status.chars().take(64).collect());
+            }
+            send_event(
+                events,
+                Event::UsageUpdated {
+                    used: usage.used,
+                    size: usage.size,
+                    cost: usage
+                        .cost
+                        .map(|cost| format!("{} {}", cost.amount, cost.currency)),
+                },
+            );
+        }
         SessionUpdate::CurrentModeUpdate(update) => send_event(
             events,
             Event::ModeChanged(update.current_mode_id.0.to_string()),
@@ -6080,72 +6300,159 @@ mod tests {
     }
 
     #[test]
-    fn hidden_session_history_is_provider_scoped_and_migrates_cursor_once() {
+    fn hidden_session_history_is_account_scoped_and_migrates_legacy_once() {
         let data = tempfile::tempdir().unwrap();
         let project = Path::new("/work/project");
-        let codex = session_history_path_in(data.path(), ProviderId::Codex, project);
+        let account = |provider, account_id, auth_source| ProviderAccount {
+            key: AccountKey {
+                provider,
+                account_id,
+            },
+            label: "test".into(),
+            auth_source,
+            auto_failover: false,
+        };
+        let codex_legacy = account(ProviderId::Codex, 2, AuthSource::Legacy);
+        let codex = session_history_path_in(data.path(), &codex_legacy, project);
         let legacy = data
             .path()
-            .join("agents/session-history")
+            .join("agents/codex/session-history")
             .join(codex.file_name().unwrap());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, br#"["cursor-session"]"#).unwrap();
+        std::fs::write(&legacy, br#"["codex-session"]"#).unwrap();
 
-        let cursor = session_history_path_in(data.path(), ProviderId::Cursor, project);
-        let claude = session_history_path_in(data.path(), ProviderId::Claude, project);
+        let codex = session_history_path_in(data.path(), &codex_legacy, project);
+        let codex_work = session_history_path_in(
+            data.path(),
+            &account(ProviderId::Codex, 4, AuthSource::ProviderManaged),
+            project,
+        );
+        let claude = session_history_path_in(
+            data.path(),
+            &account(ProviderId::Claude, 3, AuthSource::Legacy),
+            project,
+        );
 
-        assert_ne!(cursor, codex);
-        assert_ne!(claude, cursor);
+        assert_ne!(codex_work, codex);
+        assert_ne!(claude, codex_work);
         assert_ne!(claude, codex);
         assert_eq!(
-            std::fs::read_to_string(&cursor).unwrap(),
-            r#"["cursor-session"]"#
+            std::fs::read_to_string(&codex).unwrap(),
+            r#"["codex-session"]"#
         );
         assert!(!legacy.exists());
 
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, br#"["later"]"#).unwrap();
         assert_eq!(
-            session_history_path_in(data.path(), ProviderId::Cursor, project),
-            cursor
+            session_history_path_in(data.path(), &codex_legacy, project),
+            codex
         );
         assert_eq!(
-            std::fs::read_to_string(&cursor).unwrap(),
-            r#"["cursor-session"]"#
+            std::fs::read_to_string(&codex).unwrap(),
+            r#"["codex-session"]"#
         );
         assert!(legacy.exists());
     }
 
     #[test]
-    fn active_session_is_restored_per_provider_and_project() {
+    fn active_session_is_restored_per_account_and_project() {
         let data = tempfile::tempdir().unwrap();
         let project = Path::new("/work/project");
-        let cursor = active_session_path_in(data.path(), ProviderId::Cursor, project);
-        let codex = active_session_path_in(data.path(), ProviderId::Codex, project);
+        let cursor = ProviderAccount {
+            key: AccountKey {
+                provider: ProviderId::Cursor,
+                account_id: 1,
+            },
+            label: "Current login".into(),
+            auth_source: AuthSource::Legacy,
+            auto_failover: false,
+        };
+        let codex = ProviderAccount {
+            key: AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            label: "Work".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: false,
+        };
+        let cursor_path = active_session_path_in(data.path(), &cursor, project);
+        let codex_path = active_session_path_in(data.path(), &codex, project);
 
-        save_active_session(&cursor, "cursor-session").unwrap();
-        save_active_session(&codex, "codex-session").unwrap();
+        save_active_session(&cursor_path, "cursor-session").unwrap();
+        save_active_session(&codex_path, "codex-session").unwrap();
 
         assert_eq!(
-            load_active_session(&cursor).as_deref(),
+            load_active_session(&cursor_path).as_deref(),
             Some("cursor-session")
         );
         assert_eq!(
-            load_active_session(&codex).as_deref(),
+            load_active_session(&codex_path).as_deref(),
             Some("codex-session")
         );
-        assert_ne!(cursor, codex);
+        assert_ne!(cursor_path, codex_path);
         assert_ne!(
-            cursor,
-            active_session_path_in(data.path(), ProviderId::Cursor, Path::new("/work/other"))
+            cursor_path,
+            active_session_path_in(data.path(), &cursor, Path::new("/work/other"))
         );
+    }
+
+    #[test]
+    fn legacy_active_and_editur_session_metadata_migrate_to_the_account() {
+        let data = tempfile::tempdir().unwrap();
+        let project = Path::new("/work/project");
+        let account = ProviderAccount {
+            key: AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            label: "Current login".into(),
+            auth_source: AuthSource::Legacy,
+            auto_failover: false,
+        };
+        let file_name = session_history_path_in(data.path(), &account, project)
+            .file_name()
+            .unwrap()
+            .to_owned();
+        let old_root = data.path().join("agents/codex");
+        for (directory, destination) in [
+            (
+                "active-session",
+                active_session_path_in(data.path(), &account, project),
+            ),
+            (
+                "editur-sessions",
+                editur_sessions_path_in(data.path(), &account, project),
+            ),
+        ] {
+            let legacy = old_root.join(directory).join(&file_name);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, br#"["session"]"#).unwrap();
+
+            let resolved = match directory {
+                "active-session" => active_session_path_in(data.path(), &account, project),
+                _ => editur_sessions_path_in(data.path(), &account, project),
+            };
+            assert_eq!(resolved, destination);
+            assert_eq!(std::fs::read_to_string(resolved).unwrap(), r#"["session"]"#);
+            assert!(!legacy.exists());
+        }
     }
 
     #[test]
     fn editur_session_origins_survive_a_restart() {
         let data = tempfile::tempdir().unwrap();
-        let path =
-            editur_sessions_path_in(data.path(), ProviderId::Codex, Path::new("/work/project"));
+        let account = ProviderAccount {
+            key: AccountKey {
+                provider: ProviderId::Codex,
+                account_id: 2,
+            },
+            label: "Work".into(),
+            auth_source: AuthSource::ProviderManaged,
+            auto_failover: false,
+        };
+        let path = editur_sessions_path_in(data.path(), &account, Path::new("/work/project"));
         let mut sessions = EditurSessions::load(Some(path.clone()));
         sessions.remember("editur-session").unwrap();
 
@@ -6178,6 +6485,76 @@ mod tests {
             "Claude turn failed"
         );
         assert!(acp_error(ProviderId::Cursor, "turn failed", &secret).contains(secret));
+    }
+
+    #[test]
+    fn structured_turn_failures_enable_only_pinned_exhaustion_contracts() {
+        let error =
+            |data: serde_json::Value| agent_client_protocol::Error::internal_error().data(data);
+
+        assert_eq!(
+            classify_turn_failure(
+                ProviderId::Codex,
+                &error(serde_json::json!({"codexErrorInfo": "usageLimitExceeded"})),
+                None,
+            ),
+            TurnFailureKind::UsageExhausted { reset_at: None }
+        );
+        assert_eq!(
+            classify_turn_failure(
+                ProviderId::Codex,
+                &error(serde_json::json!({"message": "429 quota limit"})),
+                None,
+            ),
+            TurnFailureKind::Other
+        );
+        assert_eq!(
+            classify_turn_failure(
+                ProviderId::Claude,
+                &error(serde_json::json!({"errorKind": "rate_limit"})),
+                Some("rejected"),
+            ),
+            TurnFailureKind::UsageExhausted { reset_at: None }
+        );
+        for (status, error_kind) in [
+            (Some("allowed"), "rate_limit"),
+            (None, "rate_limit"),
+            (Some("rejected"), "billing_error"),
+            (Some("rejected"), "overloaded"),
+            (Some("rejected"), "max_output_tokens"),
+        ] {
+            assert_eq!(
+                classify_turn_failure(
+                    ProviderId::Claude,
+                    &error(serde_json::json!({"errorKind": error_kind})),
+                    status,
+                ),
+                TurnFailureKind::Other,
+                "{status:?} {error_kind}"
+            );
+        }
+        assert_eq!(
+            classify_turn_failure(
+                ProviderId::Cursor,
+                &error(serde_json::json!({"codexErrorInfo": "usageLimitExceeded"})),
+                Some("rejected"),
+            ),
+            TurnFailureKind::Other
+        );
+
+        let auth = agent_client_protocol::Error::auth_required();
+        assert_eq!(
+            classify_turn_failure(ProviderId::Claude, &auth, Some("rejected")),
+            TurnFailureKind::Authentication
+        );
+        assert_eq!(
+            classify_turn_failure(
+                ProviderId::Claude,
+                &error(serde_json::json!({"errorKind": "authentication_failed"})),
+                Some("rejected"),
+            ),
+            TurnFailureKind::Authentication
+        );
     }
 
     #[test]
@@ -7336,7 +7713,7 @@ mod tests {
     #[test]
     fn terminal_auth_reuses_the_agent_command_and_appends_the_method_contract() {
         let agent = AcpAgentConfig::new("/managed/editur")
-            .args(["--agent-process", "claude", "/project"])
+            .args(["--agent-process", "claude", "8", "/project"])
             .env("BASE", "one");
         let method = AuthMethodTerminal::new("claude-ai-login", "Claude Subscription")
             .args(vec![
@@ -7355,6 +7732,7 @@ mod tests {
             [
                 "--agent-process",
                 "claude",
+                "8",
                 "/project",
                 "--cli",
                 "auth",

@@ -1,5 +1,27 @@
 use super::*;
 
+pub(super) fn next_failover_account(
+    accounts: &[ProviderAccount],
+    provider: ProviderId,
+    attempted: &HashSet<u64>,
+    exhausted: &HashMap<AccountKey, Option<SystemTime>>,
+    now: SystemTime,
+) -> Option<AccountKey> {
+    accounts
+        .iter()
+        .find(|account| {
+            account.key.provider == provider
+                && account.auto_failover
+                && !attempted.contains(&account.key.account_id)
+                && match exhausted.get(&account.key) {
+                    None => true,
+                    Some(Some(reset_at)) => *reset_at <= now,
+                    Some(None) => false,
+                }
+        })
+        .map(|account| account.key)
+}
+
 fn scoped_agent_id(
     agentic_mode: bool,
     pane: PaneId,
@@ -138,9 +160,25 @@ impl EditorApp {
         self.available_providers = crate::agent::provision::embedded_bundle()
             .map(|bundle| bundle.available())
             .unwrap_or_else(|_| vec![ProviderId::Cursor]);
-        self.selected_provider = data_dir().map_or(ProviderId::Cursor, |directory| {
-            crate::agent::provider::load_selected(&directory, &self.available_providers)
-        });
+        if let Ok(directory) = data_dir() {
+            match crate::agent::provider::load_accounts(&directory, &self.available_providers) {
+                Ok(accounts) => self.accounts = accounts,
+                Err(error) => self.show_error(error),
+            }
+        }
+        self.selected_account = self
+            .accounts
+            .account(self.accounts.selected)
+            .filter(|account| self.available_providers.contains(&account.key.provider))
+            .or_else(|| {
+                self.accounts
+                    .accounts
+                    .iter()
+                    .find(|account| self.available_providers.contains(&account.key.provider))
+            })
+            .map(|account| account.key)
+            .unwrap_or(self.accounts.selected);
+        self.selected_provider = self.selected_account.provider;
     }
 
     pub(super) fn warm_providers(&mut self, ctx: &egui::Context) {
@@ -154,13 +192,32 @@ impl EditorApp {
         ctx: &egui::Context,
         fresh_session: bool,
     ) {
-        if self.agent_controllers.contains_key(&provider) {
+        let Some(account) = self
+            .accounts
+            .accounts_for(provider)
+            .find(|account| account.key == self.selected_account)
+            .or_else(|| self.accounts.accounts_for(provider).next())
+            .cloned()
+        else {
+            return;
+        };
+        self.start_account(account, ctx, fresh_session);
+    }
+
+    fn start_account(
+        &mut self,
+        account: ProviderAccount,
+        ctx: &egui::Context,
+        fresh_session: bool,
+    ) {
+        let key = account.key;
+        if self.agent_controllers.contains_key(&key) {
             return;
         }
-        let state = if provider == self.selected_provider {
+        let state = if key == self.selected_account {
             &mut self.agent
         } else {
-            self.provider_agents.entry(provider).or_default()
+            self.provider_agents.entry(key).or_default()
         };
         state.session_ready = false;
         state.active = false;
@@ -168,9 +225,9 @@ impl EditorApp {
         let preferred_session = state.session_id.clone();
         let wake = ctx.clone();
         self.agent_controllers.insert(
-            provider,
-            AgentController::start_with_wake(
-                provider,
+            key,
+            AgentController::start_account_with_wake(
+                account,
                 self.tree.root.clone(),
                 preferred_session,
                 fresh_session,
@@ -180,7 +237,7 @@ impl EditorApp {
     }
 
     pub(super) fn reconnect_agent(&mut self, ctx: &egui::Context) {
-        if let Some(controller) = self.agent_controllers.remove(&self.selected_provider) {
+        if let Some(controller) = self.agent_controllers.remove(&self.selected_account) {
             drop(controller);
         }
         let provider = self.selected_provider;
@@ -191,12 +248,47 @@ impl EditorApp {
         if target == self.selected_provider || !self.available_providers.contains(&target) {
             return;
         }
-        if let Some(controller) = self.agent_controllers.remove(&self.selected_provider) {
+        let Some(target) = self
+            .accounts
+            .accounts_for(target)
+            .next()
+            .map(|account| account.key)
+        else {
+            return;
+        };
+        self.request_account_switch(target, ctx);
+    }
+
+    pub(super) fn can_switch_accounts(&self) -> bool {
+        !self.agent.active && !self.agent.waiting_permission()
+    }
+
+    /// Every account plus one placeholder row for any catalog provider the
+    /// registry does not know yet.
+    fn provider_menu_row_count(&self) -> usize {
+        provider_catalog()
+            .iter()
+            .map(|provider| self.accounts.accounts_for(provider.id).count().max(1))
+            .sum()
+    }
+
+    pub(super) fn request_account_switch(&mut self, target: AccountKey, ctx: &egui::Context) {
+        if target == self.selected_account
+            || !self.available_providers.contains(&target.provider)
+            || self.accounts.account(target).is_none()
+            || !self.can_switch_accounts()
+        {
+            return;
+        }
+        if let Some(controller) = self.agent_controllers.remove(&self.selected_account) {
             drop(controller);
         }
-        self.select_provider_state(target);
+        self.agent_failover = None;
+        self.exhausted_accounts.remove(&target);
+        self.select_account_state(target);
+        self.accounts.selected = target;
         if let Ok(directory) = data_dir()
-            && let Err(error) = crate::agent::provider::save_selected(&directory, target)
+            && let Err(error) = crate::agent::provider::save_accounts(&directory, &self.accounts)
         {
             self.show_error(error);
         }
@@ -208,20 +300,70 @@ impl EditorApp {
         self.agent_find.dirty = true;
         self.attachment_file_picker = None;
         self.agent_run_everything = None;
-        self.start_provider(target, ctx, false);
+        self.start_provider(target.provider, ctx, false);
     }
 
+    #[cfg(test)]
     pub(super) fn select_provider_state(&mut self, target: ProviderId) {
-        if target == self.selected_provider {
+        let Some(target) = self
+            .accounts
+            .accounts_for(target)
+            .next()
+            .map(|account| account.key)
+        else {
+            return;
+        };
+        self.select_account_state(target);
+    }
+
+    pub(super) fn select_account_state(&mut self, target: AccountKey) {
+        if target == self.selected_account || self.accounts.account(target).is_none() {
             return;
         }
         let draft = std::mem::take(&mut self.agent.prompt);
         let mut next = self.provider_agents.remove(&target).unwrap_or_default();
         next.prompt = draft;
         let previous = std::mem::replace(&mut self.agent, next);
-        self.provider_agents
-            .insert(self.selected_provider, previous);
-        self.selected_provider = target;
+        self.provider_agents.insert(self.selected_account, previous);
+        self.selected_account = target;
+        self.selected_provider = target.provider;
+    }
+
+    fn commit_accounts(&mut self, accounts: AccountRegistry) -> Result<(), String> {
+        let directory = data_dir()?;
+        crate::agent::provider::save_accounts(&directory, &accounts)?;
+        self.accounts = accounts;
+        Ok(())
+    }
+
+    pub(super) fn finish_account_prompt(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let Some(prompt) = self.account_prompt.as_ref() else {
+            return Ok(());
+        };
+        let mut accounts = self.accounts.clone();
+        match prompt.action {
+            AccountPromptAction::Add(provider) => {
+                let key = accounts.add_account(
+                    provider,
+                    prompt.label.trim().to_owned(),
+                    AuthSource::ProviderManaged,
+                )?;
+                self.commit_accounts(accounts)?;
+                self.account_prompt = None;
+                self.request_account_switch(key, ctx);
+            }
+            AccountPromptAction::Rename(key) => {
+                let account = accounts
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.key == key)
+                    .ok_or_else(|| "account no longer exists".to_owned())?;
+                account.label = prompt.label.trim().to_owned();
+                self.commit_accounts(accounts)?;
+                self.account_prompt = None;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn poll_agent_panes(&mut self, ctx: &egui::Context) -> bool {
@@ -240,12 +382,12 @@ impl EditorApp {
 
     pub(super) fn poll_agent(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
-        for (&provider, controller) in &self.agent_controllers {
+        for (&account, controller) in &self.agent_controllers {
             for _ in 0..8 {
                 let Ok(event) = controller.events().try_recv() else {
                     break;
                 };
-                events.push((provider, event));
+                events.push((account, event));
             }
         }
         if events.len() >= 8 {
@@ -254,8 +396,21 @@ impl EditorApp {
         let mut changed_paths = HashSet::new();
         let mut reconcile_all = false;
         let mut refresh_providers = HashSet::new();
-        for (provider, event) in events {
-            let selected = provider == self.selected_provider;
+        for (account, event) in events {
+            let selected = account == self.selected_account;
+            let usage_exhausted = match &event {
+                AgentEvent::TurnFailed {
+                    kind: TurnFailureKind::UsageExhausted { reset_at },
+                    ..
+                } => Some(*reset_at),
+                _ => None,
+            };
+            let failover_ready = matches!(event, AgentEvent::SessionReady { .. });
+            let failover_start_failed = matches!(
+                &event,
+                AgentEvent::ConnectionChanged(ConnectionState::AuthenticationRequired(_))
+                    | AgentEvent::ProcessExited { .. }
+            );
             if selected {
                 self.agent_find.dirty = true;
             }
@@ -304,15 +459,43 @@ impl EditorApp {
                 self.agent.apply(event);
             } else {
                 self.provider_agents
-                    .entry(provider)
+                    .entry(account)
                     .or_default()
                     .apply(event);
+            }
+            if selected && let Some(reset_at) = usage_exhausted {
+                self.exhausted_accounts.insert(account, reset_at);
+                if let Some(attempt) = &mut self.agent_failover
+                    && matches!(attempt.stage, FailoverStage::Running)
+                {
+                    attempt.pending_exhaustion = true;
+                }
+            }
+            if selected && failover_ready {
+                self.finish_failover_start(ctx);
+            } else if selected && failover_start_failed {
+                self.skip_failed_failover_candidate(ctx);
+            }
+            if selected && turn_finished {
+                if self
+                    .agent_failover
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.pending_exhaustion)
+                {
+                    self.start_next_failover(ctx, true);
+                } else if self
+                    .agent_failover
+                    .as_ref()
+                    .is_some_and(|attempt| matches!(attempt.stage, FailoverStage::Running))
+                {
+                    self.agent_failover = None;
+                }
             }
             if turn_finished {
                 reconcile_all = true;
             }
             if refresh_project {
-                refresh_providers.insert(provider);
+                refresh_providers.insert(account);
             }
         }
         if reconcile_all {
@@ -322,9 +505,143 @@ impl EditorApp {
             self.reconcile_open_paths(&changed_paths);
             self.refresh_agentic_diff_paths(&changed_paths);
         }
-        for provider in refresh_providers {
-            self.refresh_after_agent(provider);
+        for account in refresh_providers {
+            self.refresh_after_agent(account);
         }
+    }
+
+    fn start_next_failover(&mut self, ctx: &egui::Context, rebuild_handoff: bool) {
+        let Some(mut attempt) = self.agent_failover.take() else {
+            return;
+        };
+        if rebuild_handoff {
+            attempt.pending_exhaustion = false;
+            let from = self.account_display_name(self.selected_account);
+            attempt.visible_transcript = Some(self.agent.transcript.clone());
+            attempt.from_label = Some(from);
+        }
+        let Some(target) = next_failover_account(
+            &self.accounts.accounts,
+            attempt.provider,
+            &attempt.attempted_accounts,
+            &self.exhausted_accounts,
+            SystemTime::now(),
+        ) else {
+            if let Some(transcript) = attempt.visible_transcript.take() {
+                self.agent.restore_account_handoff(transcript);
+            }
+            self.agent.apply(AgentEvent::Error(
+                "All enabled accounts for this provider are exhausted or unavailable. Select an account or retry after its plan resets."
+                    .into(),
+            ));
+            return;
+        };
+        let Some(account) = self.accounts.account(target).cloned() else {
+            return;
+        };
+        if let Some(transcript) = attempt.visible_transcript.clone() {
+            self.agent.restore_account_handoff(transcript);
+        }
+        let from = attempt.from_label.as_deref().unwrap_or("Previous account");
+        let to = self.account_display_name(target);
+        attempt.handoff =
+            match self
+                .agent
+                .account_handoff_prompt(from, &to, &attempt.original_prompt.text)
+            {
+                Ok(handoff) => Some(handoff),
+                Err(error) => {
+                    self.show_error(error);
+                    return;
+                }
+            };
+        attempt.attempted_accounts.insert(target.account_id);
+        if let Some(controller) = self.agent_controllers.remove(&self.selected_account) {
+            drop(controller);
+        }
+        self.select_account_state(target);
+        self.accounts.selected = target;
+        if let Ok(directory) = data_dir()
+            && let Err(error) = crate::agent::provider::save_accounts(&directory, &self.accounts)
+        {
+            self.show_error(error);
+        }
+        self.start_account(account, ctx, true);
+        if let Some(transcript) = attempt.visible_transcript.clone() {
+            self.agent.restore_account_handoff(transcript);
+        }
+        self.agent_follow_transcript = true;
+        self.agent_find.dirty = true;
+        attempt.stage = FailoverStage::Starting(target);
+        self.agent_failover = Some(attempt);
+    }
+
+    fn finish_failover_start(&mut self, ctx: &egui::Context) {
+        let Some(mut attempt) = self.agent_failover.take() else {
+            return;
+        };
+        let FailoverStage::Starting(target) = attempt.stage else {
+            self.agent_failover = Some(attempt);
+            return;
+        };
+        if target != self.selected_account {
+            self.agent_failover = Some(attempt);
+            return;
+        }
+        let Some(handoff) = attempt.handoff.take() else {
+            return;
+        };
+        if let Some(transcript) = attempt.visible_transcript.take() {
+            self.agent.restore_account_handoff(transcript);
+        }
+        let from = attempt
+            .from_label
+            .take()
+            .unwrap_or_else(|| "Previous account".into());
+        let to = self.account_display_name(target);
+        self.agent.record_account_switch(from, to);
+        let result = self
+            .agent_controllers
+            .get(&target)
+            .ok_or_else(|| "replacement account controller did not start".to_owned())
+            .and_then(|controller| {
+                controller.send(AgentCommand::HiddenPromptWithAttachments {
+                    text: handoff.clone(),
+                    attachments: attempt.original_prompt.attachments.clone(),
+                })
+            });
+        match result {
+            Ok(()) => {
+                self.agent.active = true;
+                attempt.stage = FailoverStage::Running;
+                self.agent_failover = Some(attempt);
+            }
+            Err(error) => {
+                attempt.handoff = Some(handoff);
+                attempt.visible_transcript = Some(self.agent.transcript.clone());
+                self.agent_failover = Some(attempt);
+                self.show_error(error);
+                self.skip_failed_failover_candidate(ctx);
+            }
+        }
+    }
+
+    fn skip_failed_failover_candidate(&mut self, ctx: &egui::Context) {
+        if self
+            .agent_failover
+            .as_ref()
+            .is_some_and(|attempt| matches!(attempt.stage, FailoverStage::Starting(_)))
+        {
+            self.start_next_failover(ctx, false);
+        }
+    }
+
+    fn account_display_name(&self, key: AccountKey) -> String {
+        let provider = provider_descriptor(key.provider).display_name;
+        self.accounts.account(key).map_or_else(
+            || format!("{provider} · Account {}", key.account_id),
+            |account| format!("{provider} · {}", account.label),
+        )
     }
 
     pub(super) fn reconcile_open_buffer(&mut self) {
@@ -388,15 +705,15 @@ impl EditorApp {
         }
     }
 
-    pub(super) fn refresh_after_agent(&mut self, provider: ProviderId) {
+    pub(super) fn refresh_after_agent(&mut self, account: AccountKey) {
         self.schedule_git_refresh();
-        let changed = if provider == self.selected_provider {
+        let changed = if account == self.selected_account {
             std::mem::take(&mut self.agent.refresh_queue)
         } else {
             std::mem::take(
                 &mut self
                     .provider_agents
-                    .entry(provider)
+                    .entry(account)
                     .or_default()
                     .refresh_queue,
             )
@@ -452,7 +769,7 @@ impl EditorApp {
     }
 
     pub(super) fn send_agent_prompt(&mut self) {
-        let Some(controller) = self.agent_controllers.get(&self.selected_provider) else {
+        let Some(controller) = self.agent_controllers.get(&self.selected_account) else {
             return;
         };
         let prompt = self.agent.prompt.trim().to_owned();
@@ -463,18 +780,42 @@ impl EditorApp {
             return;
         }
         let was_active = self.agent.active;
+        let attachments = self
+            .agent_attachments
+            .iter()
+            .map(|attachment| attachment.file.clone())
+            .collect::<Vec<_>>();
+        let envelope = PromptEnvelope {
+            text: prompt.clone(),
+            attachments: attachments.clone(),
+        };
         self.agent.active = true;
         match controller.send(AgentCommand::PromptWithAttachments {
             text: prompt,
-            attachments: self
-                .agent_attachments
-                .iter()
-                .map(|attachment| attachment.file.clone())
-                .collect(),
+            attachments,
         }) {
             Ok(()) => {
                 self.agent_prompt_history_index = None;
                 self.agent_prompt_history_draft.clear();
+                if !was_active {
+                    self.exhausted_accounts.remove(&self.selected_account);
+                    self.agent_failover = self
+                        .accounts
+                        .accounts_for(self.selected_provider)
+                        .any(|account| {
+                            account.key != self.selected_account && account.auto_failover
+                        })
+                        .then(|| FailoverAttempt {
+                            provider: self.selected_provider,
+                            attempted_accounts: HashSet::from([self.selected_account.account_id]),
+                            original_prompt: envelope,
+                            pending_exhaustion: false,
+                            stage: FailoverStage::Running,
+                            handoff: None,
+                            visible_transcript: None,
+                            from_label: None,
+                        });
+                }
             }
             Err(error) => {
                 self.agent.active = was_active;
@@ -647,7 +988,9 @@ impl EditorApp {
                 header.left() + if self.agentic_mode { 76.0 } else { 14.0 }
             }
         };
-        if !self.agentic_mode && provider_selector_visible(&self.available_providers) {
+        if !self.agentic_mode
+            && provider_selector_visible(&self.available_providers, self.accounts.accounts.len())
+        {
             let provider_rect = egui::Rect::from_min_max(
                 egui::pos2(header.left() + 10.0, header.top() + 3.0),
                 egui::pos2(
@@ -705,7 +1048,7 @@ impl EditorApp {
                 self.agent_menu = (self.agent_menu.as_ref() != Some(&menu)).then_some(menu.clone());
                 session_menu_toggled = true;
                 if self.agent_menu.is_some()
-                    && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+                    && let Some(controller) = self.agent_controllers.get(&self.selected_account)
                 {
                     let _ = controller.send(AgentCommand::RefreshSessions);
                 }
@@ -1246,9 +1589,10 @@ impl EditorApp {
                     let output = ScrollArea::vertical()
                         .id_salt("agent_transcript")
                         .auto_shrink([false, false])
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            mouse_wheel: !menu_owns_wheel,
-                            ..Default::default()
+                        .scroll_source(if menu_owns_wheel {
+                            egui::scroll_area::ScrollSource::NONE
+                        } else {
+                            egui::scroll_area::ScrollSource::default()
                         })
                         .content_margin(egui::Margin {
                             left: 0,
@@ -1372,6 +1716,29 @@ impl EditorApp {
                                                         }
                                                     });
                                                 }
+                                            });
+                                    }
+                                    TranscriptItem::AccountSwitch { from, to } => {
+                                        egui::Frame::new()
+                                            .fill(theme::surface().raised)
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                theme::border::hairline_color(),
+                                            ))
+                                            .inner_margin(egui::Margin::same(10))
+                                            .corner_radius(6)
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.add(
+                                                    Label::new(
+                                                        RichText::new(format!(
+                                                            "Switched from {from} to {to} after {from} reached its usage limit."
+                                                        ))
+                                                        .small()
+                                                        .color(theme::text().muted),
+                                                    )
+                                                    .wrap(),
+                                                );
                                             });
                                     }
                                     TranscriptItem::Assistant(text) => {
@@ -2492,7 +2859,12 @@ impl EditorApp {
         let mut config_changes = Vec::new();
         let mut run_everything_change = None;
         let mut goal_action = None;
+        let mut account_change = None;
         let mut provider_change = None;
+        let mut account_toggle = None;
+        let mut account_move = None;
+        let mut account_add = None;
+        let mut account_rename = None;
         let mut session_load = None;
         let mut session_remove = None;
         let has_config_mode = self.agent.config_options.iter().any(|option| {
@@ -2517,11 +2889,17 @@ impl EditorApp {
         };
         let mut open_menu = self.agent_menu.clone();
         if (!self.agent.session_ready || self.agent.active)
-            && !matches!(open_menu, Some(AgentMenu::Providers))
+            && !matches!(
+                open_menu,
+                Some(AgentMenu::Providers | AgentMenu::AddAccount)
+            )
         {
             open_menu = None;
         }
-        let mut menu_anchor = if matches!(open_menu, Some(AgentMenu::Providers)) {
+        let mut menu_anchor = if matches!(
+            open_menu,
+            Some(AgentMenu::Providers | AgentMenu::AddAccount)
+        ) {
             self.provider_menu_anchor
         } else {
             session_menu_anchor
@@ -2928,7 +3306,8 @@ impl EditorApp {
         let mut menu_popup = None;
         if let (Some(menu), Some(anchor)) = (open_menu.as_ref(), menu_anchor) {
             let item_count = match menu {
-                AgentMenu::Providers => Some(provider_catalog().len()),
+                AgentMenu::Providers => Some(self.provider_menu_row_count() + 1),
+                AgentMenu::AddAccount => Some(provider_catalog().len() + 1),
                 AgentMenu::Sessions => self
                     .agent
                     .sessions
@@ -2994,7 +3373,7 @@ impl EditorApp {
                     self.agent_menu_scroll_y = 0.0;
                 }
                 let row_height = match menu {
-                    AgentMenu::Providers => AGENT_PROVIDER_ROW_HEIGHT,
+                    AgentMenu::Providers | AgentMenu::AddAccount => AGENT_PROVIDER_ROW_HEIGHT,
                     AgentMenu::Commands(_) => AGENT_COMMAND_ROW_HEIGHT,
                     AgentMenu::Mentions(_) => AGENT_MENTION_ROW_HEIGHT,
                     AgentMenu::Sessions => AGENT_SESSION_ROW_HEIGHT,
@@ -3005,13 +3384,21 @@ impl EditorApp {
                 } else {
                     8.0
                 };
+                let content_height = match menu {
+                    AgentMenu::Providers => {
+                        self.provider_menu_row_count() as f32 * AGENT_PROVIDER_ROW_HEIGHT
+                            + AGENT_PROVIDER_FOOTER_HEIGHT
+                    }
+                    AgentMenu::AddAccount => {
+                        AGENT_PROVIDER_HEADING_HEIGHT
+                            + provider_catalog().len() as f32 * AGENT_PROVIDER_ROW_HEIGHT
+                    }
+                    _ => item_count as f32 * row_height,
+                };
                 let popup = match menu {
-                    AgentMenu::Providers => agent_provider_menu_rect(
-                        ui.ctx().content_rect(),
-                        anchor,
-                        item_count,
-                        row_height,
-                    ),
+                    AgentMenu::Providers | AgentMenu::AddAccount => {
+                        agent_provider_menu_rect(ui.ctx().content_rect(), anchor, content_height)
+                    }
                     AgentMenu::Sessions => agent_session_menu_rect(
                         transcript,
                         anchor,
@@ -3039,9 +3426,8 @@ impl EditorApp {
                     ),
                 };
                 menu_popup = Some(popup);
-                let max_scroll = (item_count as f32 * row_height
-                    - (popup.height() - 2.0 * menu_padding_y))
-                    .max(0.0);
+                let max_scroll =
+                    (content_height - (popup.height() - 2.0 * menu_padding_y)).max(0.0);
                 let wheel_delta = ui.input(|input| {
                     input
                         .pointer
@@ -3049,7 +3435,7 @@ impl EditorApp {
                         .filter(|pointer| popup.contains(*pointer))
                         .map_or(0.0, |_| input.smooth_scroll_delta.y)
                 });
-                if wheel_delta != 0.0 {
+                if wheel_delta != 0.0 && max_scroll > 1.0 {
                     self.agent_menu_scroll_y =
                         (self.agent_menu_scroll_y - wheel_delta).clamp(0.0, max_scroll);
                     ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
@@ -3057,6 +3443,7 @@ impl EditorApp {
                 }
                 self.agent_menu_scroll_y = self.agent_menu_scroll_y.min(max_scroll);
                 let mut selected = false;
+                let mut drill_to_add = false;
                 let mut scroll_y = self.agent_menu_scroll_y;
                 ui.scope_builder(
                     UiBuilder::new()
@@ -3092,14 +3479,197 @@ impl EditorApp {
                                     .id_salt(("agent_menu_values", menu))
                                     .max_height(list_height)
                                     .auto_shrink([false, false])
+                                    .scroll_bar_visibility(if max_scroll <= 1.0 {
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                                    } else {
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+                                    })
                                     .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
                                     .vertical_scroll_offset(scroll_y)
                                     .show(ui, |ui| {
                                         ui.spacing_mut().interact_size.y = row_height;
                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                        match menu {
+                                                match menu {
                                             AgentMenu::Providers => {
-                                                for provider in provider_catalog() {
+                                                for provider in provider_catalog().iter() {
+                                                    let packaged = self
+                                                        .available_providers
+                                                        .contains(&provider.id);
+                                                    let reason =
+                                                        provider.unavailable_reason.or_else(|| {
+                                                            (!packaged).then_some(
+                                                                "Unavailable in this build",
+                                                            )
+                                                        });
+                                                    let accounts = self
+                                                        .accounts
+                                                        .accounts_for(provider.id)
+                                                        .cloned()
+                                                        .collect::<Vec<_>>();
+                                                    if accounts.is_empty() {
+                                                        // The registry backfills a legacy
+                                                        // account per available provider at
+                                                        // startup; keep the provider reachable
+                                                        // even when that has not happened.
+                                                        let response = ui
+                                                            .add_enabled_ui(
+                                                                packaged
+                                                                    && reason.is_none()
+                                                                    && self.can_switch_accounts(),
+                                                                |ui| {
+                                                                    provider_pick_row(
+                                                                        ui,
+                                                                        provider,
+                                                                        &format!(
+                                                                            "Switch to {}",
+                                                                            provider.display_name
+                                                                        ),
+                                                                    )
+                                                                },
+                                                            )
+                                                            .inner;
+                                                        if response.clicked() {
+                                                            provider_change = Some(provider.id);
+                                                            selected = true;
+                                                        }
+                                                        continue;
+                                                    }
+                                                    for (priority, account) in
+                                                        accounts.iter().enumerate()
+                                                    {
+                                                        let exhaustion = self
+                                                            .exhausted_accounts
+                                                            .get(&account.key)
+                                                            .filter(|reset_at| {
+                                                                reset_at.is_none_or(|reset_at| {
+                                                                    reset_at > SystemTime::now()
+                                                                })
+                                                            });
+                                                        // Only states worth acting on are shown;
+                                                        // a healthy account is simply quiet.
+                                                        let status: Option<(
+                                                            String,
+                                                            AccountStatusTone,
+                                                        )> = if let Some(reset_at) = exhaustion {
+                                                            let text = match reset_at {
+                                                                None => "Exhausted".to_owned(),
+                                                                Some(reset_at) => {
+                                                                    let seconds = reset_at
+                                                                        .duration_since(
+                                                                            SystemTime::now(),
+                                                                        )
+                                                                        .unwrap_or_default()
+                                                                        .as_secs();
+                                                                    format!(
+                                                                        "Exhausted · {}m",
+                                                                        seconds.div_ceil(60)
+                                                                    )
+                                                                }
+                                                            };
+                                                            Some((
+                                                                text,
+                                                                AccountStatusTone::Negative,
+                                                            ))
+                                                        } else if account.key
+                                                            == self.selected_account
+                                                        {
+                                                            match &self.agent.connection {
+                                                                ConnectionState::Ready => None,
+                                                                ConnectionState::AuthenticationRequired(
+                                                                    _,
+                                                                ) => Some((
+                                                                    "Sign in required".into(),
+                                                                    AccountStatusTone::Caution,
+                                                                )),
+                                                                ConnectionState::Provisioning {
+                                                                    ..
+                                                                }
+                                                                | ConnectionState::Starting => Some((
+                                                                    "Starting…".into(),
+                                                                    AccountStatusTone::Neutral,
+                                                                )),
+                                                                ConnectionState::Failed(_) => Some((
+                                                                    "Unavailable".into(),
+                                                                    AccountStatusTone::Negative,
+                                                                )),
+                                                                ConnectionState::Disconnected => Some((
+                                                                    "Disconnected".into(),
+                                                                    AccountStatusTone::Neutral,
+                                                                )),
+                                                            }
+                                                        } else {
+                                                            None
+                                                        };
+                                                        // A provider's only account reads as the
+                                                        // provider itself; named accounts show
+                                                        // the label the user gave them.
+                                                        let title = if accounts.len() == 1 {
+                                                            provider.display_name
+                                                        } else {
+                                                            account.label.as_str()
+                                                        };
+                                                        let enabled = packaged
+                                                            && reason.is_none()
+                                                            && self.can_switch_accounts();
+                                                        let action = ui
+                                                            .add_enabled_ui(enabled, |ui| {
+                                                                account_menu_row(
+                                                                    ui,
+                                                                    provider,
+                                                                    account,
+                                                                    AccountRowModel {
+                                                                        title,
+                                                                        selected: self
+                                                                            .selected_account
+                                                                            == account.key,
+                                                                        status: status.as_ref().map(
+                                                                            |(text, tone)| {
+                                                                                AccountStatus {
+                                                                                    text,
+                                                                                    tone: *tone,
+                                                                                }
+                                                                            },
+                                                                        ),
+                                                                        priority: priority + 1,
+                                                                        account_count: accounts
+                                                                            .len(),
+                                                                    },
+                                                                )
+                                                            })
+                                                            .inner;
+                                                        if action.select {
+                                                            account_change = Some(account.key);
+                                                            selected = true;
+                                                        }
+                                                        if action.toggle_failover {
+                                                            account_toggle = Some(account.key);
+                                                        }
+                                                        if action.move_up {
+                                                            account_move =
+                                                                Some((account.key, -1));
+                                                        }
+                                                        if action.move_down {
+                                                            account_move = Some((account.key, 1));
+                                                        }
+                                                        if action.rename {
+                                                            account_rename = Some(account.key);
+                                                            selected = true;
+                                                        }
+                                                    }
+                                                }
+                                                let add = ui
+                                                    .add_enabled_ui(
+                                                        self.can_switch_accounts(),
+                                                        add_account_menu_row,
+                                                    )
+                                                    .inner;
+                                                if add.clicked() {
+                                                    drill_to_add = true;
+                                                }
+                                            }
+                                            AgentMenu::AddAccount => {
+                                                provider_menu_heading(ui, "Add an account for");
+                                                for provider in provider_catalog().iter() {
                                                     let packaged = self
                                                         .available_providers
                                                         .contains(&provider.id);
@@ -3111,20 +3681,23 @@ impl EditorApp {
                                                         });
                                                     let response = ui
                                                         .add_enabled_ui(
-                                                            packaged && reason.is_none(),
+                                                            packaged
+                                                                && reason.is_none()
+                                                                && self.can_switch_accounts(),
                                                             |ui| {
-                                                                provider_menu_option(
+                                                                provider_pick_row(
                                                                     ui,
                                                                     provider,
-                                                                    packaged,
-                                                                    self.selected_provider
-                                                                        == provider.id,
+                                                                    &format!(
+                                                                        "Add {} account",
+                                                                        provider.display_name
+                                                                    ),
                                                                 )
                                                             },
                                                         )
                                                         .inner;
                                                     if response.clicked() {
-                                                        provider_change = Some(provider.id);
+                                                        account_add = Some(provider.id);
                                                         selected = true;
                                                     }
                                                 }
@@ -3543,6 +4116,9 @@ impl EditorApp {
                 if close {
                     open_menu = None;
                 }
+                if drill_to_add {
+                    open_menu = Some(AgentMenu::AddAccount);
+                }
             } else {
                 open_menu = None;
             }
@@ -3571,7 +4147,7 @@ impl EditorApp {
 
         for (request_id, option_id) in permission_decisions {
             if self.agent.decide_permission(request_id, &option_id)
-                && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+                && let Some(controller) = self.agent_controllers.get(&self.selected_account)
             {
                 let _ = controller.send(AgentCommand::DecidePermission {
                     request_id,
@@ -3581,7 +4157,7 @@ impl EditorApp {
         }
         for (request_id, response) in interaction_responses {
             if self.agent.answer_interaction(request_id)
-                && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+                && let Some(controller) = self.agent_controllers.get(&self.selected_account)
             {
                 let _ = controller.send(AgentCommand::RespondInteraction {
                     request_id,
@@ -3599,7 +4175,7 @@ impl EditorApp {
             self.open_agent_diff(path);
         }
         if let Some(enabled) = run_everything_change
-            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+            && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             match controller.send(AgentCommand::SetRunEverything(enabled)) {
                 Ok(()) => {
@@ -3608,10 +4184,50 @@ impl EditorApp {
                 Err(error) => self.show_error(error),
             }
         }
-        if let Some(provider) = provider_change {
+        if let Some(key) = account_toggle {
+            let mut accounts = self.accounts.clone();
+            if let Some(account) = accounts
+                .accounts
+                .iter_mut()
+                .find(|account| account.key == key)
+            {
+                account.auto_failover = !account.auto_failover;
+                if let Err(error) = self.commit_accounts(accounts) {
+                    self.show_error(error);
+                }
+            }
+        }
+        if let Some((key, offset)) = account_move {
+            let mut accounts = self.accounts.clone();
+            if accounts.move_account(key, offset)
+                && let Err(error) = self.commit_accounts(accounts)
+            {
+                self.show_error(error);
+            }
+        }
+        if let Some(key) = account_rename
+            && let Some(account) = self.accounts.account(key)
+        {
+            self.account_prompt = Some(AccountPrompt {
+                action: AccountPromptAction::Rename(key),
+                label: account.label.clone(),
+                focus: true,
+            });
+        }
+        if let Some(provider) = account_add {
+            let number = self.accounts.accounts_for(provider).count() + 1;
+            self.account_prompt = Some(AccountPrompt {
+                action: AccountPromptAction::Add(provider),
+                label: format!("Account {number}"),
+                focus: true,
+            });
+        }
+        if let Some(account) = account_change {
+            self.request_account_switch(account, ui.ctx());
+        } else if let Some(provider) = provider_change {
             self.request_provider_switch(provider, ui.ctx());
         }
-        if let Some(controller) = self.agent_controllers.get(&self.selected_provider) {
+        if let Some(controller) = self.agent_controllers.get(&self.selected_account) {
             if let Some(session_id) = session_remove {
                 let _ = controller.send(AgentCommand::RemoveSession(session_id));
             }
@@ -3634,7 +4250,7 @@ impl EditorApp {
         if send || submit_shortcut {
             self.queue_agent_prompt();
         }
-        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+        if new_session && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::NewSession);
         }
@@ -3642,7 +4258,7 @@ impl EditorApp {
             self.open_agent_session_pane();
         }
         if let Some(method) = authenticate
-            && let Some(controller) = self.agent_controllers.get(&self.selected_provider)
+            && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::Authenticate(method));
         }

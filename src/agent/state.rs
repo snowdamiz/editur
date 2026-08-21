@@ -13,6 +13,7 @@ use super::controller::{
     PlanProposal, Question, QuestionOption, SessionChoice, SessionTranscriptMessage, ToolActivity,
     ToolDetail, ToolOutput,
 };
+use super::external_sessions::{BoundedHandoff, ExternalMessage, ExternalTool};
 
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
@@ -27,6 +28,10 @@ const MAX_BASELINE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
+    AccountSwitch {
+        from: String,
+        to: String,
+    },
     Thought(String),
     Content {
         role: ContentRole,
@@ -235,6 +240,52 @@ impl AgentState {
         })
     }
 
+    pub fn account_handoff_prompt(
+        &mut self,
+        from: &str,
+        to: &str,
+        original_prompt: &str,
+    ) -> Result<String, String> {
+        self.load_latest_transcript()?;
+        let marker = account_handoff_marker(from, to)?;
+        let prefix = format!(
+            "{marker}\nContinue the interrupted conversation below in the current workspace. Treat it as prior context and do not repeat completed work.\n\n<editur-account-conversation>\n"
+        );
+        let original_prompt = bounded_handoff_original(original_prompt);
+        let suffix = format!(
+            "\n</editur-account-conversation>\n\n<interrupted-user-message>\n{original_prompt}\n</interrupted-user-message>\n\nThe previous account's usage plan was exhausted during the active turn. Inspect the current workspace before editing, continue the unfinished work, and do not repeat changes already completed."
+        );
+        let mut handoff = BoundedHandoff::new(prefix, suffix)?;
+        for record in self.transcript_archive.earlier.clone() {
+            let item = self.transcript_archive.load(record)?;
+            if let Some(message) = transcript_handoff_message(&item) {
+                handoff.push(message);
+            }
+        }
+        for item in &self.transcript {
+            if let Some(message) = transcript_handoff_message(item) {
+                handoff.push(message);
+            }
+        }
+        Ok(handoff.finish())
+    }
+
+    pub fn restore_account_handoff(&mut self, transcript: VecDeque<TranscriptItem>) {
+        self.transcript.clear();
+        self.transcript_bytes = 0;
+        self.transcript_records.clear();
+        self.transcript_archive = TranscriptArchive::default();
+        for item in transcript {
+            self.push(item);
+        }
+        self.trim();
+    }
+
+    pub fn record_account_switch(&mut self, from: String, to: String) {
+        self.push(TranscriptItem::AccountSwitch { from, to });
+        self.trim();
+    }
+
     pub fn decide_permission(&mut self, request_id: u64, option_id: &str) -> bool {
         let Some(index) = self.transcript.iter().position(
             |item| matches!(item, TranscriptItem::Permission(card) if card.request_id == request_id),
@@ -435,7 +486,11 @@ impl AgentState {
                 for message in messages {
                     match message {
                         SessionTranscriptMessage::User(text) => {
-                            self.push(TranscriptItem::User(bounded(text)));
+                            if let Some((from, to)) = parse_account_handoff_marker(&text) {
+                                self.push(TranscriptItem::AccountSwitch { from, to });
+                            } else {
+                                self.push(TranscriptItem::User(bounded(text)));
+                            }
                         }
                         SessionTranscriptMessage::Assistant(text) => {
                             self.push(TranscriptItem::Assistant(bounded(text)));
@@ -489,7 +544,9 @@ impl AgentState {
             Event::UserMessage(text) => {
                 self.active = true;
                 self.prompt.clear();
-                if !text.is_empty() {
+                if let Some((from, to)) = parse_account_handoff_marker(&text) {
+                    self.push(TranscriptItem::AccountSwitch { from, to });
+                } else if !text.is_empty() {
                     self.push(TranscriptItem::User(bounded(text)));
                 }
             }
@@ -765,6 +822,9 @@ impl AgentState {
                     tokens_used: goal.tokens_used,
                     time_used_seconds: goal.time_used_seconds,
                 });
+            }
+            Event::TurnFailed { message, .. } => {
+                self.push(TranscriptItem::Error(bounded(message)));
             }
             Event::TurnFinished { cancelled } => {
                 self.active = false;
@@ -1406,12 +1466,143 @@ fn append_bounded(buffer: &mut String, text: &str) {
     buffer.push('…');
 }
 
+const ACCOUNT_HANDOFF_MARKER: &str = "<!-- editur-account-handoff:v1 ";
+const MAX_HANDOFF_ORIGINAL_PROMPT_BYTES: usize = 8 * 1024;
+
+fn bounded_handoff_original(text: &str) -> &str {
+    let mut end = text.len().min(MAX_HANDOFF_ORIGINAL_PROMPT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+#[derive(Deserialize, Serialize)]
+struct AccountHandoffMarker<'a> {
+    from: &'a str,
+    to: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OwnedAccountHandoffMarker {
+    from: String,
+    to: String,
+}
+
+fn account_handoff_marker(from: &str, to: &str) -> Result<String, String> {
+    let marker = serde_json::to_string(&AccountHandoffMarker { from, to })
+        .map_err(|error| format!("cannot encode account handoff marker: {error}"))?;
+    Ok(format!("{ACCOUNT_HANDOFF_MARKER}{marker} -->"))
+}
+
+fn parse_account_handoff_marker(text: &str) -> Option<(String, String)> {
+    let line = text.lines().next()?;
+    let json = line
+        .strip_prefix(ACCOUNT_HANDOFF_MARKER)?
+        .strip_suffix(" -->")?;
+    let marker = serde_json::from_str::<OwnedAccountHandoffMarker>(json).ok()?;
+    (!marker.from.is_empty() && !marker.to.is_empty()).then_some((marker.from, marker.to))
+}
+
+fn transcript_handoff_message(item: &TranscriptItem) -> Option<ExternalMessage> {
+    match item {
+        TranscriptItem::User(text) => Some(ExternalMessage::User(text.clone())),
+        TranscriptItem::Assistant(text) => Some(ExternalMessage::Assistant(text.clone())),
+        TranscriptItem::Content {
+            role,
+            content: DisplayContent::TextResource { uri, text, .. },
+        } => {
+            let text = format!("Resource {uri}:\n{text}");
+            match role {
+                ContentRole::User => Some(ExternalMessage::User(text)),
+                ContentRole::Assistant => Some(ExternalMessage::Assistant(text)),
+                ContentRole::Thought => None,
+            }
+        }
+        TranscriptItem::Tool(tool) => Some(ExternalMessage::Tool(ExternalTool {
+            id: tool.id.clone(),
+            name: tool.display_title().into_owned(),
+            status: tool.status.clone(),
+            kind: tool.kind.clone(),
+            input: tool.detail.as_ref().and_then(|detail| detail.input.clone()),
+            output: tool.detail.as_ref().and_then(handoff_tool_output),
+            paths: tool.paths.iter().map(|path| path.path.clone()).collect(),
+            diffs: Vec::new(),
+        })),
+        TranscriptItem::Thought(_)
+        | TranscriptItem::AccountSwitch { .. }
+        | TranscriptItem::Content { .. }
+        | TranscriptItem::Plan(_)
+        | TranscriptItem::Permission(_)
+        | TranscriptItem::Interaction(_)
+        | TranscriptItem::Error(_) => None,
+    }
+}
+
+fn handoff_tool_output(detail: &ToolDetail) -> Option<String> {
+    use std::fmt::Write as _;
+
+    if let Some(output) = &detail.output {
+        return Some(output.clone());
+    }
+    let mut output = String::new();
+    for content in &detail.content {
+        match content {
+            ToolOutput::Text(text) | ToolOutput::Terminal(text) => {
+                let _ = writeln!(output, "{text}");
+            }
+            ToolOutput::Log { label, text } => {
+                let _ = writeln!(output, "{label}: {text}");
+            }
+            ToolOutput::Diff { path, .. } => {
+                let _ = writeln!(output, "Changed {}", path.display());
+            }
+            ToolOutput::Todo {
+                content, status, ..
+            } => {
+                let _ = writeln!(output, "{status}: {content}");
+            }
+            ToolOutput::Task {
+                description,
+                activity,
+                ..
+            } => {
+                let _ = writeln!(
+                    output,
+                    "{}{}",
+                    description,
+                    activity
+                        .as_deref()
+                        .map_or(String::new(), |activity| format!(": {activity}"))
+                );
+            }
+            ToolOutput::GeneratedImage {
+                description,
+                file_path,
+                ..
+            } => {
+                let _ = writeln!(
+                    output,
+                    "{}{}",
+                    description,
+                    file_path
+                        .as_ref()
+                        .map_or(String::new(), |path| format!(" at {}", path.display()))
+                );
+            }
+            ToolOutput::Content(_) => {}
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
 fn item_size(item: &TranscriptItem) -> usize {
     match item {
         TranscriptItem::User(text)
         | TranscriptItem::Assistant(text)
         | TranscriptItem::Thought(text)
         | TranscriptItem::Error(text) => text.len(),
+        TranscriptItem::AccountSwitch { from, to } => from.len() + to.len(),
         TranscriptItem::Content { content, .. } => display_content_size(content),
         TranscriptItem::Plan(plan) => plan
             .iter()

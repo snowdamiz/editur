@@ -31,6 +31,7 @@ pub(crate) enum Icon {
     Terminal,
     SourceControl,
     Gear,
+    Edit,
     ArrowUp,
     Download,
     Refresh,
@@ -166,6 +167,17 @@ const GEAR: &[Segment] = &[
         inner: 4.0,
         outer: 6.4,
     },
+];
+const EDIT: &[Segment] = &[
+    Segment::Line(&[
+        (3.0, 13.0),
+        (5.8, 12.4),
+        (12.8, 5.4),
+        (10.6, 3.2),
+        (3.6, 10.2),
+        (3.0, 13.0),
+    ]),
+    Segment::Line(&[(9.6, 4.2), (11.8, 6.4)]),
 ];
 const ARROW_UP: &[Segment] = &[
     Segment::Line(&[(8.0, 12.8), (8.0, 3.4)]),
@@ -356,6 +368,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
         Icon::Terminal => TERMINAL,
         Icon::SourceControl => SOURCE_CONTROL,
         Icon::Gear => GEAR,
+        Icon::Edit => EDIT,
         Icon::ArrowUp => ARROW_UP,
         Icon::Download => DOWNLOAD,
         Icon::Refresh => REFRESH,
@@ -374,7 +387,7 @@ fn segments(icon: Icon) -> &'static [Segment] {
 
 /// Every variant, for the tests that keep the family honest.
 #[cfg(test)]
-pub(crate) const ALL: [Icon; 30] = [
+pub(crate) const ALL: [Icon; 31] = [
     Icon::ChevronUp,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -392,6 +405,7 @@ pub(crate) const ALL: [Icon; 30] = [
     Icon::Terminal,
     Icon::SourceControl,
     Icon::Gear,
+    Icon::Edit,
     Icon::ArrowUp,
     Icon::Download,
     Icon::Refresh,
