@@ -599,11 +599,12 @@ impl EditorApp {
                             if entries.is_empty() {
                                 continue;
                             }
-                            let pending = entries.iter().any(|entry| {
-                                self.git_state
-                                    .pending_paths
-                                    .contains(&(repository.root.clone(), entry.path.clone()))
-                            });
+                            let pending = !self.git_state.pending_paths.is_empty()
+                                && entries.iter().any(|entry| {
+                                    self.git_state
+                                        .pending_paths
+                                        .contains(&(repository.root.clone(), entry.path.clone()))
+                                });
                             if row_is_visible(ui, theme::control::COMPACT + theme::space::TIGHT) {
                                 if let Some(found) = source_group_header(
                                     ui,
