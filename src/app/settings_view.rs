@@ -75,7 +75,9 @@ impl EditorApp {
     }
 
     pub(super) fn draw_settings(&mut self, root: &mut egui::Ui, window: egui::Rect) {
-        let rail_width = 270.0_f32.min((window.width() * 0.38).max(210.0));
+        // The rail matches the main sidebar's default width so leaving and
+        // re-entering settings does not make the left column jump.
+        let rail_width = 248.0_f32.min((window.width() * 0.38).max(210.0));
         let rail = egui::Rect::from_min_max(
             window.left_top(),
             egui::pos2(window.left() + rail_width, window.bottom()),
@@ -93,11 +95,24 @@ impl EditorApp {
             rail.y_range(),
             egui::Stroke::new(1.0, theme::border::hairline_color()),
         );
+        // On macOS the traffic lights overlay the rail's top-left corner, so
+        // the rail starts one step lower; anything more reads as dead space.
+        #[cfg(target_os = "macos")]
+        let rail_top = rail.top() + theme::space::XWIDE;
+        #[cfg(not(target_os = "macos"))]
+        let rail_top = rail.top() + theme::space::LARGE;
+        let rail_content = egui::Rect::from_min_max(
+            egui::pos2(rail.left() + theme::space::LARGE, rail_top),
+            egui::pos2(
+                rail.right() - theme::space::LARGE,
+                rail.bottom() - theme::space::LARGE,
+            ),
+        );
         let mut actions = Vec::new();
         root.scope_builder(
             UiBuilder::new()
                 .id_salt("settings_rail")
-                .max_rect(rail.shrink2(egui::vec2(20.0, 18.0))),
+                .max_rect(rail_content),
             |ui| {
                 ui.set_width(ui.available_width());
                 let back = settings_quiet_button(ui, "settings_back", "Back to app", 16.0);
@@ -105,42 +120,36 @@ impl EditorApp {
                     ui.painter(),
                     Icon::ChevronLeft,
                     egui::Rect::from_center_size(
-                        egui::pos2(back.rect.left() + 11.0, back.rect.center().y),
+                        egui::pos2(back.rect.left() + icons::GRID * 0.375, back.rect.center().y),
                         egui::Vec2::splat(icons::GRID * 0.75),
                     ),
                     if back.hovered() {
                         theme::text().primary
                     } else {
-                        theme::text().secondary
+                        theme::text().muted
                     },
                 );
                 if back.clicked() {
                     actions.push(SettingsAction::Back);
                 }
-                ui.add_space(10.0);
+                ui.add_space(theme::space::MEDIUM);
                 ui.label(
                     RichText::new("Settings")
                         .size(theme::typography::TITLE_SIZE)
                         .strong()
                         .color(theme::text().primary),
                 );
-                ui.add_space(14.0);
+                ui.add_space(theme::space::MEDIUM);
                 ui.add(
                     TextEdit::singleline(&mut self.settings_search)
                         .hint_text("Search settings…")
                         .margin(egui::Margin::symmetric(10, 7))
                         .desired_width(f32::INFINITY),
                 );
-                ui.add_space(24.0);
-                ui.label(
-                    RichText::new("EDITOR")
-                        .size(theme::typography::MICRO_SIZE)
-                        .strong()
-                        .color(theme::text().muted),
-                );
-                ui.add_space(8.0);
+                ui.add_space(theme::space::WIDE);
+                settings_section_label(ui, "Editor");
                 ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.spacing_mut().item_spacing.y = theme::space::HAIR;
                     if settings_navigation_row(
                         ui,
                         "settings_appearance",
@@ -174,14 +183,22 @@ impl EditorApp {
                         self.settings_section = SettingsSection::LanguageServers;
                         self.settings_search.clear();
                     }
-                    ui.add_space(20.0);
-                    ui.label(
-                        RichText::new("INTEGRATIONS")
-                            .size(theme::typography::MICRO_SIZE)
-                            .strong()
-                            .color(theme::text().muted),
-                    );
-                    ui.add_space(8.0);
+                });
+                ui.add_space(theme::space::LARGE);
+                settings_section_label(ui, "Integrations");
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = theme::space::HAIR;
+                    if settings_navigation_row(
+                        ui,
+                        "settings_providers",
+                        "Providers",
+                        self.settings_section == SettingsSection::Providers,
+                    )
+                    .clicked()
+                    {
+                        self.settings_section = SettingsSection::Providers;
+                        self.settings_search.clear();
+                    }
                     if settings_navigation_row(
                         ui,
                         "settings_devin",
@@ -197,6 +214,8 @@ impl EditorApp {
                 });
             },
         );
+        let content_top = theme::space::XWIDE + theme::space::LARGE;
+        let content_bottom = theme::space::XWIDE + theme::space::SMALL;
         root.scope_builder(
             UiBuilder::new()
                 .id_salt("settings_content")
@@ -206,25 +225,32 @@ impl EditorApp {
                     .id_salt("settings_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let width = ui.available_width().min(780.0);
+                        let width = ui.available_width().min(720.0);
                         ui.horizontal(|ui| {
-                            ui.add_space(((ui.available_width() - width) * 0.5).max(20.0));
+                            ui.add_space(
+                                ((ui.available_width() - width) * 0.5).max(theme::space::WIDE),
+                            );
                             ui.vertical(|ui| {
                                 ui.set_width(width.min(ui.available_width()));
-                                ui.add_space(40.0);
+                                ui.add_space(content_top);
                                 if self.settings_section == SettingsSection::Keybindings {
                                     self.draw_keybinding_settings(ui);
-                                    ui.add_space(34.0);
+                                    ui.add_space(content_bottom);
                                     return;
                                 }
                                 if self.settings_section == SettingsSection::Appearance {
                                     self.draw_appearance_settings(ui);
-                                    ui.add_space(34.0);
+                                    ui.add_space(content_bottom);
                                     return;
                                 }
                                 if self.settings_section == SettingsSection::Devin {
                                     self.draw_devin_settings(ui, &mut actions);
-                                    ui.add_space(34.0);
+                                    ui.add_space(content_bottom);
+                                    return;
+                                }
+                                if self.settings_section == SettingsSection::Providers {
+                                    self.draw_provider_settings(ui, &mut actions);
+                                    ui.add_space(content_bottom);
                                     return;
                                 }
                                 settings_page_header(
@@ -299,13 +325,13 @@ impl EditorApp {
                                     );
                                 }
                                 if let Some(error) = &self.settings_error {
-                                    ui.add_space(12.0);
+                                    ui.add_space(theme::space::MEDIUM);
                                     ui.colored_label(
                                         theme::ink(theme::semantic().danger),
                                         format!("Settings were not changed: {error}"),
                                     );
                                 }
-                                ui.add_space(34.0);
+                                ui.add_space(content_bottom);
                             });
                         });
                     });
@@ -315,8 +341,211 @@ impl EditorApp {
             self.apply_settings_action(action, root.ctx());
         }
         self.draw_keybinding_dialogs(root.ctx());
+        self.draw_cursor_cloud_key_dialog(root.ctx());
         if self.lsp_sync_needed {
             root.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn draw_provider_settings(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        self.ensure_provider_catalog();
+        self.ensure_cursor_cloud_keys();
+        settings_page_header(
+            ui,
+            "Providers",
+            "Accounts for each agent, plus the optional Cursor Cloud key used to stream progress.",
+        );
+        let query = self.settings_search.trim().to_ascii_lowercase();
+        let mut shown = 0;
+        for provider in provider_catalog() {
+            let accounts = self
+                .accounts
+                .accounts_for(provider.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let packaged = self.available_providers.contains(&provider.id);
+            if accounts.is_empty() && !packaged {
+                continue;
+            }
+            if !query.is_empty() {
+                let provider_hit = [provider.display_name, provider.description]
+                    .iter()
+                    .any(|label| label.to_ascii_lowercase().contains(&query))
+                    || (provider.id == ProviderId::Cursor
+                        && ["api key", "cloud", "cursor cloud"]
+                            .iter()
+                            .any(|label| label.contains(query.as_str())));
+                let account_hit = accounts.iter().any(|account| {
+                    account.label.to_ascii_lowercase().contains(&query)
+                        || provider_account_detail(account)
+                            .to_ascii_lowercase()
+                            .contains(&query)
+                });
+                if !provider_hit && !account_hit {
+                    continue;
+                }
+            }
+            shown += 1;
+            settings_identity_header(
+                ui,
+                provider.display_name,
+                provider.description,
+                |painter, rect, color| {
+                    super::paint_provider_icon(painter, rect, provider.icon, color);
+                },
+            );
+            settings_stack_card(ui, |ui| {
+                if accounts.is_empty() {
+                    ui.add_space(theme::space::SMALL);
+                    ui.label(
+                        RichText::new(format!("No {} accounts yet", provider.display_name))
+                            .font(theme::typography::small())
+                            .color(theme::text().muted),
+                    );
+                    ui.add_space(theme::space::SMALL);
+                }
+                for (index, account) in accounts.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+                    let key = account.key;
+                    let selected = key == self.selected_account;
+                    // A saved cloud key is a trait of the account, so it reads
+                    // as part of the account's detail line; the key form
+                    // itself lives in a dialog behind one quiet action.
+                    let mut detail = provider_account_detail(account);
+                    if self.cursor_cloud_key_accounts.contains(&key) {
+                        detail.push_str(" · Cloud key saved");
+                    }
+                    settings_account_row(ui, &account.label, &detail, |ui| {
+                        if settings_secondary_button(
+                            ui,
+                            ("settings_provider_rename", key.provider, key.account_id),
+                            "Rename",
+                        )
+                        .clicked()
+                        {
+                            actions.push(SettingsAction::RenameProviderAccount(key));
+                        }
+                        if selected {
+                            ui.label(
+                                RichText::new("In use")
+                                    .size(theme::typography::MICRO_SIZE)
+                                    .color(theme::accent()),
+                            );
+                        } else if settings_secondary_button(
+                            ui,
+                            ("settings_provider_select", key.provider, key.account_id),
+                            "Use",
+                        )
+                        .clicked()
+                        {
+                            actions.push(SettingsAction::SelectProviderAccount(key));
+                        }
+                        if key.provider == ProviderId::Cursor
+                            && settings_secondary_button(
+                                ui,
+                                ("settings_cursor_cloud_key", key.account_id),
+                                "Cloud key…",
+                            )
+                            .on_hover_text(
+                                "Optional API key that streams Cursor Cloud progress for this \
+                                 account.",
+                            )
+                            .clicked()
+                        {
+                            actions.push(SettingsAction::EditCursorCloudKey(key));
+                        }
+                    });
+                }
+                ui.separator();
+                if settings_card_action(
+                    ui,
+                    ("settings_provider_add", provider.id),
+                    Icon::Plus,
+                    "Add account",
+                )
+                .clicked()
+                {
+                    actions.push(SettingsAction::AddProviderAccount(provider.id));
+                }
+            });
+            // Providers are separate groups, so they sit a step farther apart
+            // than sections within one page do.
+            ui.add_space(theme::space::XWIDE + theme::space::SMALL);
+        }
+        if shown == 0 {
+            ui.label(RichText::new("No matching settings").color(theme::text().muted));
+        }
+        if let Some(error) = &self.settings_error {
+            ui.colored_label(
+                theme::ink(theme::semantic().danger),
+                format!("Provider settings were not changed: {error}"),
+            );
+        }
+    }
+
+    /// The modal that owns one account's optional Cursor Cloud API key: the
+    /// explanation, the paste field, and — once a key is saved — replace and
+    /// remove. The stored key never renders back.
+    fn draw_cursor_cloud_key_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.cursor_cloud_key_prompt else {
+            return;
+        };
+        let key = prompt.account;
+        let error = prompt.error.clone();
+        let focus = std::mem::take(&mut prompt.focus);
+        let has_key = self.cursor_cloud_key_accounts.contains(&key);
+        let account = self.accounts.account(key).map_or_else(
+            || "this account".to_owned(),
+            |account| account.label.clone(),
+        );
+        let draft = self.cursor_cloud_key_drafts.entry(key).or_default();
+        let mut dialog = Dialog::new("cursor_cloud_key_dialog", "Cursor Cloud API key")
+            .body(format!(
+                "Streams Cursor Cloud progress for {account}. Sign-in still uses your browser.",
+            ))
+            .primary(if has_key { "Replace key" } else { "Save key" })
+            .primary_enabled(!draft.trim().is_empty());
+        if has_key {
+            dialog = dialog.destructive("Remove key");
+        }
+        let outcome = dialog.show_with(ctx, |ui| {
+            ui.add_space(theme::space::TIGHT);
+            let response = ui.add(
+                TextEdit::singleline(draft)
+                    .id(Id::new("cursor_cloud_key_input"))
+                    .password(true)
+                    .hint_text("Paste from Cursor Dashboard → API Keys")
+                    .margin(egui::Margin::symmetric(10, 7))
+                    .desired_width(f32::INFINITY),
+            );
+            if focus {
+                response.request_focus();
+            }
+            if let Some(error) = &error {
+                ui.colored_label(theme::ink(theme::semantic().danger), error);
+            }
+        });
+        let result = match outcome {
+            Outcome::Primary => Some(self.save_cursor_cloud_key(key)),
+            Outcome::Destructive => Some(self.remove_cursor_cloud_key(key)),
+            Outcome::Cancel | Outcome::Dismissed => {
+                // A dismissed draft is a secret the user chose not to keep.
+                self.cursor_cloud_key_drafts.remove(&key);
+                self.cursor_cloud_key_prompt = None;
+                None
+            }
+            Outcome::Open | Outcome::Neutral => None,
+        };
+        match result {
+            Some(Ok(())) => self.cursor_cloud_key_prompt = None,
+            Some(Err(error)) => {
+                if let Some(prompt) = &mut self.cursor_cloud_key_prompt {
+                    prompt.error = Some(error);
+                }
+            }
+            None => {}
         }
     }
 
@@ -839,163 +1068,152 @@ impl EditorApp {
                 ui.add_space(theme::space::SMALL);
             }
             shown += 1;
-            egui::Frame::new()
-                .fill(settings_card_fill())
-                .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
-                .corner_radius(theme::radius::CARD)
-                .inner_margin(egui::Margin::symmetric(16, 12))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(220.0);
-                            ui.label(
-                                RichText::new(info.label)
-                                    .strong()
-                                    .color(theme::text().primary),
-                            );
-                            ui.label(
-                                RichText::new(info.id)
-                                    .monospace()
-                                    .size(theme::typography::MICRO_SIZE)
-                                    .color(theme::text().muted),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            settings_stack_card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(220.0);
+                        ui.label(
+                            RichText::new(info.label)
+                                .strong()
+                                .color(theme::text().primary),
+                        );
+                        ui.label(
+                            RichText::new(info.id)
+                                .monospace()
+                                .size(theme::typography::MICRO_SIZE)
+                                .color(theme::text().muted),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if settings_secondary_button(ui, ("add_binding", info.id), "Add binding")
+                            .clicked()
+                        {
+                            self.shortcut_recorder = Some(ShortcutRecorder {
+                                command: info.command,
+                                strokes: Vec::new(),
+                                logical_keys: Vec::new(),
+                                physical_keys: Vec::new(),
+                                scope: info.scopes[0],
+                                platform: None,
+                                replace_index: None,
+                                disable_id: None,
+                                error: None,
+                                can_replace: false,
+                            });
+                        }
+                        if modified {
+                            ui.add_space(theme::space::TIGHT);
                             if settings_secondary_button(
                                 ui,
-                                ("add_binding", info.id),
-                                "Add binding",
+                                ("reset_command", info.id),
+                                "Reset command",
+                            )
+                            .clicked()
+                            {
+                                action = Some(KeybindingUiAction::ResetCommand(info.command));
+                            }
+                        }
+                    });
+                });
+                if bindings.is_empty() {
+                    ui.label(RichText::new("Unbound").color(theme::text().muted));
+                }
+                for binding in &bindings {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        chip(
+                            ui,
+                            &binding.rule.label(
+                                binding
+                                    .rule
+                                    .platform
+                                    .unwrap_or_else(KeybindingPlatform::current),
+                            ),
+                        );
+                        ui.add_space(theme::space::TIGHT);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} · {}",
+                                binding.rule.platform.map_or_else(
+                                    || "All platforms".to_owned(),
+                                    |platform| platform.to_string(),
+                                ),
+                                binding.rule.scope.label(),
+                                match binding.source {
+                                    BindingSource::BuiltIn => "Built-in",
+                                    BindingSource::Custom => "Custom",
+                                },
+                            ))
+                            .size(theme::typography::MICRO_SIZE)
+                            .color(theme::text().muted),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if binding.source == BindingSource::Custom {
+                                if settings_secondary_button(
+                                    ui,
+                                    ("binding_remove", binding.id.as_str()),
+                                    "Remove",
+                                )
+                                .clicked()
+                                    && let Some(index) = binding
+                                        .id
+                                        .strip_prefix("custom-")
+                                        .and_then(|index| index.parse().ok())
+                                {
+                                    action = Some(KeybindingUiAction::Remove(index));
+                                }
+                                ui.add_space(theme::space::TIGHT);
+                            } else if custom_active {
+                                if settings_secondary_button(
+                                    ui,
+                                    ("binding_disable", binding.id.as_str()),
+                                    "Disable",
+                                )
+                                .clicked()
+                                {
+                                    action = Some(KeybindingUiAction::Disable(binding.id.clone()));
+                                }
+                                ui.add_space(theme::space::TIGHT);
+                            }
+                            if settings_secondary_button(
+                                ui,
+                                ("binding_change", binding.id.as_str()),
+                                "Change",
                             )
                             .clicked()
                             {
                                 self.shortcut_recorder = Some(ShortcutRecorder {
                                     command: info.command,
-                                    strokes: Vec::new(),
-                                    logical_keys: Vec::new(),
-                                    physical_keys: Vec::new(),
-                                    scope: info.scopes[0],
-                                    platform: None,
-                                    replace_index: None,
-                                    disable_id: None,
+                                    strokes: binding.rule.sequence.clone(),
+                                    logical_keys: binding
+                                        .rule
+                                        .sequence
+                                        .iter()
+                                        .map(|stroke| stroke.key.clone())
+                                        .collect(),
+                                    physical_keys: vec![None; binding.rule.sequence.len()],
+                                    scope: binding.rule.scope,
+                                    platform: binding.rule.platform,
+                                    replace_index: binding
+                                        .id
+                                        .strip_prefix("custom-")
+                                        .and_then(|index| index.parse().ok()),
+                                    disable_id: (binding.source == BindingSource::BuiltIn)
+                                        .then(|| binding.id.clone()),
                                     error: None,
                                     can_replace: false,
                                 });
                             }
-                            if modified {
-                                ui.add_space(theme::space::TIGHT);
-                                if settings_secondary_button(
-                                    ui,
-                                    ("reset_command", info.id),
-                                    "Reset command",
-                                )
-                                .clicked()
-                                {
-                                    action = Some(KeybindingUiAction::ResetCommand(info.command));
-                                }
-                            }
                         });
                     });
-                    if bindings.is_empty() {
-                        ui.label(RichText::new("Unbound").color(theme::text().muted));
-                    }
-                    for binding in &bindings {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            chip(
-                                ui,
-                                &binding.rule.label(
-                                    binding
-                                        .rule
-                                        .platform
-                                        .unwrap_or_else(KeybindingPlatform::current),
-                                ),
-                            );
-                            ui.add_space(theme::space::TIGHT);
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} · {}",
-                                    binding.rule.platform.map_or_else(
-                                        || "All platforms".to_owned(),
-                                        |platform| platform.to_string(),
-                                    ),
-                                    binding.rule.scope.label(),
-                                    match binding.source {
-                                        BindingSource::BuiltIn => "Built-in",
-                                        BindingSource::Custom => "Custom",
-                                    },
-                                ))
-                                .size(theme::typography::MICRO_SIZE)
-                                .color(theme::text().muted),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if binding.source == BindingSource::Custom {
-                                    if settings_secondary_button(
-                                        ui,
-                                        ("binding_remove", binding.id.as_str()),
-                                        "Remove",
-                                    )
-                                    .clicked()
-                                        && let Some(index) = binding
-                                            .id
-                                            .strip_prefix("custom-")
-                                            .and_then(|index| index.parse().ok())
-                                    {
-                                        action = Some(KeybindingUiAction::Remove(index));
-                                    }
-                                    ui.add_space(theme::space::TIGHT);
-                                } else if custom_active {
-                                    if settings_secondary_button(
-                                        ui,
-                                        ("binding_disable", binding.id.as_str()),
-                                        "Disable",
-                                    )
-                                    .clicked()
-                                    {
-                                        action =
-                                            Some(KeybindingUiAction::Disable(binding.id.clone()));
-                                    }
-                                    ui.add_space(theme::space::TIGHT);
-                                }
-                                if settings_secondary_button(
-                                    ui,
-                                    ("binding_change", binding.id.as_str()),
-                                    "Change",
-                                )
-                                .clicked()
-                                {
-                                    self.shortcut_recorder = Some(ShortcutRecorder {
-                                        command: info.command,
-                                        strokes: binding.rule.sequence.clone(),
-                                        logical_keys: binding
-                                            .rule
-                                            .sequence
-                                            .iter()
-                                            .map(|stroke| stroke.key.clone())
-                                            .collect(),
-                                        physical_keys: vec![None; binding.rule.sequence.len()],
-                                        scope: binding.rule.scope,
-                                        platform: binding.rule.platform,
-                                        replace_index: binding
-                                            .id
-                                            .strip_prefix("custom-")
-                                            .and_then(|index| index.parse().ok()),
-                                        disable_id: (binding.source == BindingSource::BuiltIn)
-                                            .then(|| binding.id.clone()),
-                                        error: None,
-                                        can_replace: false,
-                                    });
-                                }
-                            });
-                        });
-                    }
-                });
+                }
+            });
         }
         if shown == 0 {
             ui.label(RichText::new("No matching commands").color(theme::text().muted));
         }
         if let Some(error) = &self.settings_error {
-            ui.add_space(12.0);
+            ui.add_space(theme::space::MEDIUM);
             ui.colored_label(
                 theme::ink(theme::semantic().danger),
                 format!("Settings were not changed: {error}"),
@@ -1554,7 +1772,7 @@ impl EditorApp {
                 ui.set_width(ui.available_width());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     settings_mode_combo(ui, preset.id, &mut mode);
-                    ui.add_space(12.0);
+                    ui.add_space(theme::space::MEDIUM);
                     ui.label(
                         RichText::new(self.server_status_label(preset.id))
                             .size(theme::typography::MICRO_SIZE)
@@ -1583,7 +1801,7 @@ impl EditorApp {
                     .settings_drafts
                     .entry(preset.id)
                     .or_insert_with(default);
-                ui.add_space(2.0);
+                ui.add_space(theme::space::HAIR);
                 ui.label(
                     RichText::new("Executable")
                         .small()
@@ -1595,7 +1813,7 @@ impl EditorApp {
                         .margin(egui::Margin::symmetric(9, 7))
                         .desired_width(f32::INFINITY),
                 );
-                ui.add_space(10.0);
+                ui.add_space(theme::space::MEDIUM);
                 ui.label(
                     RichText::new("Arguments (one per line)")
                         .small()
@@ -1608,7 +1826,7 @@ impl EditorApp {
                         .desired_rows(3)
                         .desired_width(f32::INFINITY),
                 );
-                ui.add_space(12.0);
+                ui.add_space(theme::space::MEDIUM);
                 ui.horizontal(|ui| {
                     if settings_primary_button(
                         ui,
@@ -1634,7 +1852,7 @@ impl EditorApp {
                         actions.push(SettingsAction::Reset(preset.id));
                     }
                 });
-                ui.add_space(16.0);
+                ui.add_space(theme::space::LARGE);
             }
             let detail = match self.lsp_status.get(&preset.id) {
                 Some(ServerStatus::Failed(error)) => Some(
@@ -1645,7 +1863,7 @@ impl EditorApp {
                 _ => self.lsp_detail.get(&preset.id).cloned(),
             };
             if let Some(detail) = detail {
-                ui.add_space(5.0);
+                ui.add_space(theme::space::SNUG);
                 ui.colored_label(
                     theme::ink(theme::semantic().danger),
                     truncate_lines(&detail, 3),
@@ -1680,6 +1898,36 @@ impl EditorApp {
                 if !self.devin_sidebar {
                     self.send_devin(DevinCommand::SetVisible(false));
                 }
+            }
+            SettingsAction::AddProviderAccount(provider) => {
+                let number = self.accounts.accounts_for(provider).count() + 1;
+                self.account_prompt = Some(AccountPrompt {
+                    action: AccountPromptAction::Add(provider),
+                    label: format!("Account {number}"),
+                    cursor_api_key: String::new(),
+                    focus: true,
+                });
+            }
+            SettingsAction::RenameProviderAccount(key) => {
+                if let Some(account) = self.accounts.account(key) {
+                    self.account_prompt = Some(AccountPrompt {
+                        action: AccountPromptAction::Rename(key),
+                        label: account.label.clone(),
+                        cursor_api_key: String::new(),
+                        focus: true,
+                    });
+                }
+            }
+            SettingsAction::SelectProviderAccount(key) => self.request_account_switch(key, ctx),
+            SettingsAction::EditCursorCloudKey(key) => {
+                // The dialog always opens on an empty field; a saved key never
+                // renders back.
+                self.cursor_cloud_key_drafts.remove(&key);
+                self.cursor_cloud_key_prompt = Some(CursorCloudKeyPrompt {
+                    account: key,
+                    error: None,
+                    focus: true,
+                });
             }
             SettingsAction::OpenDevin => {
                 self.ensure_devin_controller(ctx);
@@ -1859,5 +2107,13 @@ impl EditorApp {
         ctx.options_mut(|options| options.zoom_with_keyboard = false);
         ctx.set_zoom_factor(f32::from(appearance.ui_scale_percent) / 100.0);
         theme::apply(ctx);
+    }
+}
+
+fn provider_account_detail(account: &ProviderAccount) -> String {
+    match &account.auth_source {
+        AuthSource::Legacy => "Signed in on this device".to_owned(),
+        AuthSource::ProviderManaged => "Separate browser sign-in".to_owned(),
+        AuthSource::Environment { variable } => format!("Uses {variable}"),
     }
 }

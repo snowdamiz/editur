@@ -64,6 +64,24 @@ fn click_response(
     }])
 }
 
+fn wait_for_ui_output(
+    draw: &mut impl FnMut(Vec<Event>) -> egui::FullOutput,
+    ready: impl Fn(&egui::FullOutput) -> bool,
+) -> egui::FullOutput {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let output = draw(Vec::new());
+        if ready(&output) {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background UI work did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn finish_devin_initial_load(app: &mut EditorApp, session_id: &str, generation: u64) {
     app.devin_state.apply(DevinEvent::ActivityLoaded {
         session_id: session_id.into(),
@@ -165,16 +183,25 @@ fn agent_search_covers_output_paths_and_diffs_but_not_thoughts() {
 
     let changed_paths = std::collections::HashMap::new();
     assert_eq!(
-        agent_search_matches(&transcript, &changed_paths, "renderer"),
-        vec![1]
+        agent_search_matches(&transcript, &changed_paths, "renderer").items,
+        [super::AgentFindItemMatches {
+            item_index: 1,
+            cumulative_end: 1,
+        }]
     );
     assert_eq!(
-        agent_search_matches(&transcript, &changed_paths, "state.rs"),
-        vec![2, 2]
+        agent_search_matches(&transcript, &changed_paths, "state.rs").items,
+        [super::AgentFindItemMatches {
+            item_index: 2,
+            cumulative_end: 2,
+        }]
     );
     assert_eq!(
-        agent_search_matches(&transcript, &changed_paths, "extension"),
-        vec![2, 2]
+        agent_search_matches(&transcript, &changed_paths, "extension").items,
+        [super::AgentFindItemMatches {
+            item_index: 2,
+            cumulative_end: 2,
+        }]
     );
     assert!(agent_search_matches(&transcript, &changed_paths, "private").is_empty());
 }
@@ -189,10 +216,57 @@ fn agent_search_returns_every_occurrence_in_transcript_order() {
         TranscriptItem::Assistant("page after page".into()),
     ]);
 
+    let matches = agent_search_matches(&transcript, &std::collections::HashMap::new(), "page");
+    assert_eq!(matches.len(), 3);
+    assert_eq!(matches.resolve(0), Some((0, 0)));
+    assert_eq!(matches.resolve(1), Some((1, 0)));
+    assert_eq!(matches.resolve(2), Some((1, 1)));
+}
+
+#[test]
+fn agent_search_compacts_occurrences_and_resolves_global_selection() {
+    use crate::agent::state::TranscriptItem;
+    use std::collections::{HashMap, VecDeque};
+
+    let transcript = VecDeque::from([
+        TranscriptItem::User("Needle NEEDLE needle".into()),
+        TranscriptItem::Assistant("no match here".into()),
+        TranscriptItem::Assistant("needle".into()),
+    ]);
+    let changed_paths = HashMap::from([
+        ("needle-one.rs".into(), FileChange::default()),
+        ("needle-two-needle.rs".into(), FileChange::default()),
+    ]);
+
+    let matches = agent_search_matches(&transcript, &changed_paths, "nEeDlE");
+
+    assert_eq!(matches.len(), 7, "the find bar must retain the total count");
     assert_eq!(
-        agent_search_matches(&transcript, &std::collections::HashMap::new(), "page"),
-        vec![0, 1, 1]
+        matches.items,
+        [
+            super::AgentFindItemMatches {
+                item_index: 0,
+                cumulative_end: 3,
+            },
+            super::AgentFindItemMatches {
+                item_index: 2,
+                cumulative_end: 4,
+            },
+            super::AgentFindItemMatches {
+                item_index: transcript.len(),
+                cumulative_end: 7,
+            },
+        ],
+        "storage should scale with matching items, not occurrences"
     );
+    assert_eq!(matches.resolve(0), Some((0, 0)));
+    assert_eq!(matches.resolve(2), Some((0, 2)));
+    assert_eq!(matches.resolve(3), Some((2, 0)));
+    assert_eq!(matches.resolve(4), Some((transcript.len(), 0)));
+    assert_eq!(matches.resolve(6), Some((transcript.len(), 2)));
+    assert_eq!(matches.resolve(7), None);
+    assert_eq!(next_find_match(6, matches.len(), false), 0);
+    assert_eq!(next_find_match(0, matches.len(), true), 6);
 }
 
 #[test]
@@ -463,37 +537,26 @@ fn settings_search_filters_unmatched_sections_and_server_rows() {
 }
 
 #[test]
-fn settings_navigation_has_no_button_backgrounds() {
-    fn collect(shape: &Shape, labels: &mut Vec<Rect>, fills: &mut Vec<(Rect, Color32)>) {
+fn settings_navigation_marks_the_active_section_like_the_sessions_rail() {
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
         match shape {
-            Shape::Text(text)
-                if text.pos.x < 270.0
-                    && matches!(
-                        text.galley.text(),
-                        "←  Back to app"
-                            | "Back to app"
-                            | "Appearance"
-                            | "Keybindings"
-                            | "Language Servers"
-                    ) =>
-            {
-                labels.push(text.visual_bounding_rect());
+            Shape::Text(text) if text.pos.x < 270.0 && text.galley.text() == expected => {
+                Some(text.visual_bounding_rect())
             }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+    fn collect_selected_fills(shape: &Shape, fills: &mut Vec<(Rect, egui::CornerRadius)>) {
+        match shape {
             Shape::Rect(rect)
-                if [
-                    theme::surface().input,
-                    theme::state::selected(),
-                    theme::state::hover(),
-                ]
-                .contains(&rect.fill) =>
+                if rect.rect.left() < 270.0 && rect.fill == theme::state::selected() =>
             {
-                fills.push((rect.rect, rect.fill));
+                fills.push((rect.rect, rect.corner_radius));
             }
-            Shape::Vec(shapes) => {
-                shapes
-                    .iter()
-                    .for_each(|shape| collect(shape, labels, fills));
-            }
+            Shape::Vec(shapes) => shapes
+                .iter()
+                .for_each(|shape| collect_selected_fills(shape, fills)),
             _ => {}
         }
     }
@@ -516,21 +579,87 @@ fn settings_navigation_has_no_button_backgrounds() {
         },
         |root| app.ui(root),
     );
-    let (mut labels, mut fills) = (Vec::new(), Vec::new());
+    let find = |expected| {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, expected))
+            .expect(expected)
+    };
+    let mut fills = Vec::new();
     output
         .shapes
         .iter()
-        .for_each(|shape| collect(&shape.shape, &mut labels, &mut fills));
+        .for_each(|shape| collect_selected_fills(&shape.shape, &mut fills));
 
+    // The default section wears the same rounded selected fill as a session
+    // row in the main sidebar; everything else stays quiet text at rest.
+    let active = find("Language Servers");
+    let (fill, corner) = fills
+        .iter()
+        .find(|(fill, _)| fill.contains_rect(active))
+        .expect("the active section row wears a selected fill");
+    assert_eq!(*corner, theme::corner(theme::radius::CONTROL));
     assert!(
-        labels.len() >= 2,
-        "the rail has to name Back and at least one section"
+        fill.width() > active.width() + theme::space::SMALL,
+        "the fill spans the row, not just the label"
+    );
+    for idle in ["Appearance", "Keybindings", "Back to app"] {
+        let label = find(idle);
+        assert!(
+            fills.iter().all(|(fill, _)| !fill.contains_rect(label)),
+            "{idle} must stay unfilled at rest"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn settings_rail_starts_below_the_traffic_lights() {
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(text.visual_bounding_rect())
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.settings_open = true;
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1_200.0, 800.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let back = output
+        .shapes
+        .iter()
+        .find_map(|shape| text_rect(&shape.shape, "Back to app"))
+        .expect("back control");
+
+    // The traffic lights occupy roughly the top 28 points of the window's
+    // left corner; the back label must start below that band without pushing
+    // the whole rail down.
+    assert!(
+        back.top() >= 28.0,
+        "the back control sits under the traffic lights: {back:?}"
     );
     assert!(
-        labels
-            .iter()
-            .all(|label| fills.iter().all(|(fill, _)| !fill.contains_rect(*label))),
-        "navigation rows stay text, never chip-backed"
+        back.top() <= TITLEBAR_HEIGHT + theme::space::SMALL,
+        "the rail leaves dead space above the back control: {back:?}"
     );
 }
 
@@ -573,7 +702,7 @@ fn settings_navigation_tabs_use_compact_vertical_rhythm() {
     });
 
     assert!(
-        centers.windows(2).all(|pair| pair[1] - pair[0] <= 40.0),
+        centers.windows(2).all(|pair| pair[1] - pair[0] <= 36.0),
         "settings tabs are too far apart: {centers:?}"
     );
 }
@@ -780,6 +909,148 @@ fn devin_settings_offer_connection_fields() {
             .iter()
             .any(|shape| has_accent_fill(&shape.shape, connect))
     );
+}
+
+#[test]
+fn provider_settings_keep_the_cursor_cloud_key_behind_one_quiet_action() {
+    fn contains_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.settings_open = true;
+    app.settings_section = SettingsSection::Providers;
+    let context = theme::test_context();
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Default::default(),
+                    Vec2::new(1_200.0, 800.0),
+                )),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let has = |output: &egui::FullOutput, expected: &str| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains_text(&shape.shape, expected))
+    };
+    let click = |app: &mut EditorApp, position| {
+        let _ = draw(
+            app,
+            vec![
+                Event::PointerMoved(position),
+                Event::PointerButton {
+                    pos: position,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(
+            app,
+            vec![Event::PointerButton {
+                pos: position,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+    };
+
+    // The Cursor card reads exactly like the other provider cards: account
+    // rows plus one quiet action each, never an always-open key form.
+    let output = draw(&mut app, Vec::new());
+    assert!(has(&output, "Providers"));
+    assert!(has(&output, "Current login"));
+    assert!(has(&output, "Signed in on this device"));
+    assert!(has(&output, "In use"));
+    assert!(has(&output, "Add account"));
+    assert!(has(&output, "Cursor's ACP coding agent"));
+    assert!(has(&output, "Cloud key…"));
+    assert!(!has(&output, "Paste from Cursor Dashboard → API Keys"));
+    assert!(
+        context
+            .read_response(Id::new("cursor_cloud_key_input"))
+            .is_none(),
+        "the key field only exists inside the dialog"
+    );
+
+    // The action opens a dialog that explains the key and focuses its field.
+    let action = context
+        .read_response(Id::new(("settings_cursor_cloud_key", 1_u64)))
+        .expect("cloud key action")
+        .rect;
+    click(&mut app, action.center());
+    let output = draw(&mut app, Vec::new());
+    assert!(app.cursor_cloud_key_prompt.is_some());
+    assert!(has(&output, "Cursor Cloud API key"));
+    assert!(has(&output, "Save key"));
+    assert!(!has(&output, "Remove key"));
+    assert!(
+        context
+            .read_response(Id::new("cursor_cloud_key_input"))
+            .is_some()
+    );
+    assert_eq!(
+        context.memory(|memory| memory.focused()),
+        Some(Id::new("cursor_cloud_key_input")),
+        "the field focuses so a key can be pasted immediately"
+    );
+
+    // Dismissing drops the typed draft instead of keeping the secret around.
+    let _ = draw(&mut app, vec![Event::Text("half-typed-secret".into())]);
+    assert!(
+        app.cursor_cloud_key_drafts
+            .values()
+            .any(|draft| draft == "half-typed-secret")
+    );
+    let _ = draw(
+        &mut app,
+        vec![Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert!(app.cursor_cloud_key_prompt.is_none());
+    assert!(app.cursor_cloud_key_drafts.is_empty());
+
+    // A saved key reads as part of the account row, and the dialog switches
+    // to replacing or removing it; the key itself never renders back.
+    app.cursor_cloud_key_accounts.insert(AccountKey {
+        provider: ProviderId::Cursor,
+        account_id: 1,
+    });
+    let output = draw(&mut app, Vec::new());
+    assert!(has(&output, "Signed in on this device · Cloud key saved"));
+    let action = context
+        .read_response(Id::new(("settings_cursor_cloud_key", 1_u64)))
+        .expect("cloud key action")
+        .rect;
+    click(&mut app, action.center());
+    let output = draw(&mut app, Vec::new());
+    assert!(has(&output, "Replace key"));
+    assert!(has(&output, "Remove key"));
+    assert!(!has(&output, "Save key"));
 }
 
 #[test]
@@ -1010,7 +1281,7 @@ fn dragging_a_pane_border_in_the_app_updates_the_split() {
     );
 
     let available = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
-    assert!(app.pane_layout.rects(available)[0].1.width() > 400.0);
+    assert!(app.editor_panes.layout.rects(available)[0].1.width() > 400.0);
 }
 
 #[test]
@@ -1200,7 +1471,7 @@ fn dropping_a_tab_at_the_bottom_moves_it_into_a_new_pane() {
         (
             app.tabs[0].pane,
             app.tabs[1].pane,
-            app.pane_layout.rects(Rect::EVERYTHING).len(),
+            app.editor_panes.layout.rects(Rect::EVERYTHING).len(),
         ),
         (PaneId(0), PaneId(1), 2)
     );
@@ -1259,7 +1530,7 @@ fn drag_preview_restructures_without_committing_the_layout() {
 
     assert_eq!(preview.len(), 2);
     assert_eq!(preview[1].0, dragged);
-    assert_eq!(app.pane_layout.rects(available).len(), 1);
+    assert_eq!(app.editor_panes.layout.rects(available).len(), 1);
 }
 
 #[test]
@@ -1379,7 +1650,7 @@ fn moving_the_last_tab_out_of_a_pane_collapses_the_empty_split() {
 
     app.drop_tab(1, PaneId(0), DropZone::Center);
 
-    assert_eq!(app.pane_layout.rects(Rect::EVERYTHING).len(), 1);
+    assert_eq!(app.editor_panes.layout.rects(Rect::EVERYTHING).len(), 1);
 }
 
 #[test]
@@ -1876,6 +2147,7 @@ fn account_dialog_explains_plan_logins_without_environment_credentials() {
     let prompt = |provider| super::AccountPrompt {
         action: super::AccountPromptAction::Add(provider),
         label: "Work".into(),
+        cursor_api_key: String::new(),
         focus: false,
     };
 
@@ -1912,6 +2184,15 @@ fn account_dialog_explains_plan_logins_without_environment_credentials() {
     assert!(
         has("its own Cursor sign-in"),
         "Cursor accounts default to an isolated plan sign-in"
+    );
+    assert!(has("Cursor Cloud API key (optional)"));
+    assert!(has(
+        "Used only to stream Cursor Cloud progress in Editur. Cursor sign-in still uses your browser."
+    ));
+    assert!(
+        context
+            .read_response(Id::new("agent_account_cloud_api_key"))
+            .is_some()
     );
     assert!(has("Add and sign in"));
     assert!(!has("Use an environment variable instead"));
@@ -3983,13 +4264,31 @@ fn devin_attachments_render_like_the_agent_composer_and_prompt() {
     finish_devin_initial_load(&mut app, "waiting", generation);
     let context = theme::test_context();
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
-    let output = context.run_ui(
-        RawInput {
-            screen_rect: Some(screen),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let output = wait_for_ui_output(&mut draw, |output| {
+        let Some(prompt) = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_rect(&shape.shape, &|text| text.contains("Use this mock")))
+        else {
+            return false;
+        };
+        image_bounds(output).iter().any(|rect| {
+            (rect.width() - rect.height()).abs() <= 0.5
+                && rect.width() > 48.5
+                && rect.width() <= 96.0
+                && rect.top() > prompt.top()
+        })
+    });
 
     assert!(
         output
@@ -4590,6 +4889,68 @@ fn claude_missing_credentials_show_setup_and_retry_without_subscription_login() 
 }
 
 #[test]
+fn cursor_login_explains_and_accepts_the_optional_cloud_key() {
+    fn has_text(shape: &Shape, expected: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == expected,
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.cursor_cloud_keys_loaded = true;
+    app.agent.connection = ConnectionState::AuthenticationRequired(vec![AuthChoice {
+        id: "cursor-login".into(),
+        name: "Sign in with Cursor".into(),
+        description: None,
+        kind: AuthKind::Agent,
+        setup: None,
+        can_authenticate: true,
+    }]);
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 760.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    for expected in [
+        "Cursor Cloud API key (optional)",
+        "Used only to stream Cursor Cloud progress in Editur. Cursor sign-in still uses your browser.",
+    ] {
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, expected)),
+            "missing {expected}"
+        );
+    }
+    assert!(
+        context
+            .read_response(Id::new((
+                "agent_auth_cloud_api_key",
+                ProviderId::Cursor,
+                1_u64,
+            )))
+            .is_some()
+    );
+}
+
+#[test]
 fn disconnected_acp_provider_uses_centered_connect_state() {
     fn has_text(shape: &Shape, expected: &str) -> bool {
         match shape {
@@ -4834,21 +5195,42 @@ fn failover_selection_is_ordered_and_never_retries_an_account() {
 }
 
 #[test]
-fn ampersand_routes_only_cursor_prompts_without_attachments_to_cloud() {
+fn session_location_routes_only_explicit_cursor_cloud_prompts() {
     assert_eq!(
-        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "& Fix cloud", false),
+        super::agent_view::cursor_cloud_prompt(
+            super::AgentRunLocation::Cloud,
+            ProviderId::Cursor,
+            "Fix cloud",
+            false
+        ),
         Ok(Some("Fix cloud".into()))
     );
     assert_eq!(
-        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "Fix locally", false),
+        super::agent_view::cursor_cloud_prompt(
+            super::AgentRunLocation::Local,
+            ProviderId::Cursor,
+            "& Fix locally",
+            false
+        ),
         Ok(None)
     );
     assert_eq!(
-        super::agent_view::cursor_cloud_prompt(ProviderId::Codex, "& Stay local", false),
+        super::agent_view::cursor_cloud_prompt(
+            super::AgentRunLocation::Cloud,
+            ProviderId::Codex,
+            "Stay local",
+            false
+        ),
         Ok(None)
     );
     assert!(
-        super::agent_view::cursor_cloud_prompt(ProviderId::Cursor, "& Fix cloud", true).is_err()
+        super::agent_view::cursor_cloud_prompt(
+            super::AgentRunLocation::Cloud,
+            ProviderId::Cursor,
+            "Fix cloud",
+            true
+        )
+        .is_err()
     );
 }
 
@@ -5051,7 +5433,7 @@ fn ui_scale_change_rebuilds_hidden_markdown_preview() {
     let preview = |output: &egui::FullOutput| {
         fn find(shape: &Shape) -> Option<std::sync::Arc<egui::Galley>> {
             match shape {
-                Shape::Text(text) if text.galley.text() == "cached preview paragraph\n" => {
+                Shape::Text(text) if text.galley.text() == "cached preview paragraph" => {
                     Some(std::sync::Arc::clone(&text.galley))
                 }
                 Shape::Vec(shapes) => shapes.iter().find_map(find),
@@ -7446,7 +7828,7 @@ fn terminal_tool_output_combines_streamed_chunks_without_raw_metadata() {
     };
 
     assert_eq!(
-        super::agent_terminal_output(&tool).as_deref(),
+        super::agent_terminal_output(&tool, true).as_deref(),
         Some("Compiling editur\nFinished dev\n")
     );
 }
@@ -7469,7 +7851,7 @@ fn terminal_tool_output_extracts_stdout_from_raw_provider_results() {
     };
 
     assert_eq!(
-        super::agent_terminal_output(&tool).as_deref(),
+        super::agent_terminal_output(&tool, true).as_deref(),
         Some("Finished dev\n")
     );
 }
@@ -7511,18 +7893,34 @@ fn expanded_command_rows_render_ansi_terminal_output() {
             }),
         }));
     app.agent_find.query = "Compiling".into();
-    app.agent_find.matches = vec![0];
+    app.agent_find.matches =
+        super::agent_search_matches(&app.agent.transcript, &app.agent.changed_paths, "Compiling");
     app.agent_find.dirty = false;
-    let output = theme::test_context().run_ui(
-        RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                pos2(0.0, 0.0),
-                Vec2::new(1000.0, 720.0),
-            )),
-            ..RawInput::default()
-        },
-        |root| app.ui(root),
-    );
+    fn contains(shape: &Shape, needle: &str) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text().contains(needle),
+            Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, needle)),
+            _ => false,
+        }
+    }
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 720.0));
+    let mut draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let output = wait_for_ui_output(&mut draw, |output| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| contains(&shape.shape, "$ cargo build"))
+    });
     fn text_color(shape: &Shape, needle: &str) -> Option<Color32> {
         match shape {
             Shape::Text(text) => {
@@ -7538,14 +7936,6 @@ fn expanded_command_rows_render_ansi_terminal_output() {
             _ => None,
         }
     }
-    fn contains(shape: &Shape, needle: &str) -> bool {
-        match shape {
-            Shape::Text(text) => text.galley.text().contains(needle),
-            Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, needle)),
-            _ => false,
-        }
-    }
-
     assert!(
         output
             .shapes
@@ -7958,9 +8348,7 @@ fn read_and_edit_tool_cards_do_not_repeat_their_paths_in_the_body() {
     );
     fn path_count(shape: &Shape) -> usize {
         match shape {
-            Shape::Text(text) => {
-                usize::from(text.galley.text().starts_with("/workspace/src/file-"))
-            }
+            Shape::Text(text) => usize::from(text.galley.text().contains("/workspace/src/file-")),
             Shape::Vec(shapes) => shapes.iter().map(path_count).sum(),
             _ => 0,
         }
@@ -8625,6 +9013,65 @@ fn agentic_diff_panel_keeps_multiple_open_files_as_tabs() {
 }
 
 #[test]
+fn agentic_diff_panel_matches_the_editor_tab_style() {
+    fn label_style(shape: &Shape, expected: &str) -> Option<(Rect, egui::text::LayoutSection)> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => Some((
+                Rect::from_min_size(text.pos, text.galley.size()),
+                text.galley.job.sections[0].clone(),
+            )),
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| label_style(shape, expected)),
+            _ => None,
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("current.rs");
+    fs::write(&path, "new\n").unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root,
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.open_agent_diff("current.rs".into());
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1200.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let tab = context
+        .read_response(Id::new(("agentic_diff_tab", &path)))
+        .expect("agentic diff tab")
+        .rect;
+    let (label, section) = output
+        .shapes
+        .iter()
+        .find_map(|shape| label_style(&shape.shape, "current.rs"))
+        .expect("agentic diff tab label");
+
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape,
+        Shape::Rect(rect) if rect.rect == tab && rect.fill == theme::surface().editor
+    )));
+    assert_eq!(section.format.font_id, theme::typography::strong());
+    assert_eq!(section.format.color, theme::text().primary);
+    assert_eq!(
+        label.left(),
+        tab.left() + theme::space::MEDIUM + super::TAB_DOT
+    );
+}
+
+#[test]
 fn agentic_diff_tabs_switch_and_close_files_independently() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -8782,9 +9229,8 @@ fn the_agentic_diff_panel_renders_beside_the_conversation() {
             .find_map(|shape| find_text(&shape.shape, expected))
     };
 
-    // The file header lives in the titlebar strip beside the session
-    // title, so the two columns wear one continuous header.
-    for label in ["lib.rs", "MODIFIED"] {
+    // The file and its only useful metadata share the titlebar strip.
+    for label in ["lib.rs", "+1", "−1"] {
         let rect = find(label).unwrap_or_else(|| panic!("{label} is not on screen"));
         assert!(
             (rect.center().y - TITLEBAR_HEIGHT * 0.5).abs() <= 1.0,
@@ -8864,6 +9310,31 @@ fn changed_files_render_as_a_summary_card_with_line_stats() {
     assert!(texts.contains("README.md"), "{texts}");
     assert!(texts.contains("+2"), "{texts}");
     assert!(texts.contains("−1"), "{texts}");
+}
+
+#[test]
+fn changed_files_summary_keeps_its_card_chrome() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let changed = HashMap::from([(
+        root.join("src/lib.rs"),
+        FileChange {
+            added: 2,
+            removed: 1,
+        },
+    )]);
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        draw_agent_changed_files(ui, &root, &changed, None);
+    });
+
+    assert!(output.shapes.iter().any(|shape| match &shape.shape {
+        Shape::Rect(rect) => {
+            rect.fill == theme::surface().raised
+                && rect.stroke.color == theme::border::hairline_color()
+                && rect.corner_radius.nw > 0
+        }
+        _ => false,
+    }));
 }
 
 #[test]
@@ -9297,6 +9768,87 @@ fn agent_diff_uses_detected_syntax() {
 }
 
 #[test]
+fn agent_diff_uses_one_gutter_inside_a_bordered_code_surface() {
+    let syntaxes = SyntaxManager::built_in().unwrap();
+    let highlighter = Highlighter::new().unwrap();
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        draw_agent_diff(
+            ui,
+            Id::new("simple_diff"),
+            std::path::Path::new("main.rs"),
+            Some("before"),
+            "after",
+            &highlighter,
+            &syntaxes,
+            None,
+            false,
+        );
+    });
+    let mut removed = None;
+    let mut bordered = false;
+    for shape in &output.shapes {
+        match &shape.shape {
+            Shape::Text(text) if text.galley.text().contains("before") => {
+                removed = Some(text.galley.text().to_owned());
+            }
+            Shape::Rect(rect)
+                if rect.fill == theme::surface().input
+                    && rect.stroke.color == theme::border::strong_color()
+                    && rect.corner_radius.nw > 0 =>
+            {
+                bordered = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(removed.as_deref(), Some("1  − before"));
+    assert!(bordered, "diff code needs one quiet rounded border");
+}
+
+#[test]
+fn full_page_diff_rows_are_flush_with_the_editor_canvas() {
+    let syntaxes = SyntaxManager::built_in().unwrap();
+    let highlighter = Highlighter::new().unwrap();
+    let diff = build_agent_diff(Some("before"), "after");
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |ui| {
+            super::draw_agent_diff_body(
+                ui,
+                Id::new("full_page_diff"),
+                std::path::Path::new("main.rs"),
+                &diff,
+                Some("before"),
+                "after",
+                &highlighter,
+                &syntaxes,
+            );
+        },
+    );
+    let removed = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            Shape::Rect(rect) if rect.fill == theme::diff::removed() => Some(rect.rect),
+            _ => None,
+        })
+        .expect("removed diff row");
+
+    assert_eq!(removed.x_range(), screen.x_range());
+    assert!(output.shapes.iter().all(|shape| !matches!(
+        &shape.shape,
+        Shape::Rect(rect)
+            if rect.stroke.color == theme::border::strong_color()
+                && rect.corner_radius.nw > 0
+    )));
+}
+
+#[test]
 fn agent_file_edits_are_collapsed_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -9505,13 +10057,6 @@ fn agent_transcript_constrains_response_and_tool_text_to_the_sidebar() {
             _ => None,
         }
     }
-    fn tool_card_rect(shape: &Shape) -> Option<Rect> {
-        match shape {
-            Shape::Rect(rect) if rect.fill == theme::surface().raised => Some(rect.rect),
-            Shape::Vec(shapes) => shapes.iter().find_map(tool_card_rect),
-            _ => None,
-        }
-    }
     let metrics = |expected| {
         output.shapes.iter().find_map(|shape| {
             text_metrics(&shape.shape, expected).map(|(rect, rows)| (rect, rows, shape.clip_rect))
@@ -9520,17 +10065,8 @@ fn agent_transcript_constrains_response_and_tool_text_to_the_sidebar() {
 
     let (command_rect, command_rows, command_clip) =
         metrics("`python3 -c \"").expect("compact command title");
-    let card_rect = output
-        .shapes
-        .iter()
-        .find_map(|shape| tool_card_rect(&shape.shape))
-        .expect("tool card");
     assert_eq!(command_rows, 1);
     assert!(command_rect.right() <= command_clip.right());
-    assert!(
-        card_rect.bottom() - command_rect.bottom() <= command_rect.top() - card_rect.top() + 0.5,
-        "card={card_rect:?} command={command_rect:?}"
-    );
     let (response_rect, response_rows, response_clip) = metrics(response).expect("Cursor response");
     assert!(
         command_rect.left() <= response_rect.left() + 48.0,
@@ -9637,12 +10173,12 @@ fn agent_transcript_culls_offscreen_items_and_restores_them_when_scrolled_into_v
         ..RawInput::default()
     };
     let context = theme::test_context();
-    // First frame measures every item; the second starts from cached
-    // heights with the view pinned to the newest reply.
+    // Unknown rows start with estimated heights; only the visible region is
+    // measured before the view pins to the newest reply.
     let _ = context.run_ui(input(), |root| app.ui(root));
-    assert_eq!(
-        app.agent_transcript_rendered, 120,
-        "the measuring frame lays out every item"
+    assert!(
+        app.agent_transcript_rendered < 60,
+        "the cold frame must only measure visible transcript items"
     );
     let output = context.run_ui(input(), |root| app.ui(root));
     let last = output
@@ -9687,6 +10223,39 @@ fn agent_transcript_culls_offscreen_items_and_restores_them_when_scrolled_into_v
     assert!(
         oldest_visible,
         "scrolling up must bring culled items back into the transcript"
+    );
+}
+
+#[test]
+fn normal_agent_activity_transition_keeps_transcript_height_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent
+        .transcript
+        .extend((0..120).map(|index| TranscriptItem::Assistant(format!("Reply number {index}"))));
+    let context = theme::test_context();
+    let input = || RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(760.0, 700.0))),
+        ..RawInput::default()
+    };
+
+    let _ = context.run_ui(input(), |root| app.ui(root));
+    let _ = context.run_ui(input(), |root| app.ui(root));
+    assert!(app.agent_transcript_rendered < 60);
+    app.agent.active = true;
+    let _ = context.run_ui(input(), |root| app.ui(root));
+
+    assert!(
+        app.agent_transcript_rendered < 60,
+        "normal mode activity should not remeasure the whole transcript"
     );
 }
 
@@ -9840,7 +10409,7 @@ fn collapsed_dense_work_clusters_keep_their_trailing_gap_when_culled() {
 }
 
 #[test]
-fn switching_sessions_remeasures_the_new_transcript_before_culling() {
+fn switching_sessions_only_measures_visible_rows_before_culling() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = EditorApp::new(OpenTarget {
         root: temp.path().canonicalize().unwrap(),
@@ -9878,7 +10447,10 @@ fn switching_sessions_remeasures_the_new_transcript_before_culling() {
         .collect();
     let _ = draw(&mut app, vec![Event::PointerMoved(pos2(700.0, 350.0))]);
 
-    assert_eq!(app.agent_transcript_rendered, 120);
+    assert!(
+        app.agent_transcript_rendered < 60,
+        "the new session must only measure visible transcript items"
+    );
 }
 
 #[test]
@@ -10137,7 +10709,8 @@ fn find_navigation_scrolls_the_matching_diff_row_into_view() {
     app.agent_find.query = "needle".to_owned();
     app.agent_find.matches =
         super::agent_search_matches(&app.agent.transcript, &app.agent.changed_paths, "needle");
-    assert_eq!(app.agent_find.matches, vec![0], "the diff holds the match");
+    assert_eq!(app.agent_find.matches.len(), 1, "the diff holds the match");
+    assert_eq!(app.agent_find.matches.resolve(0), Some((0, 0)));
     app.agent_find.selected = 0;
     app.agent_find.scroll_to_match = true;
     app.agent_follow_transcript = false;
@@ -10198,28 +10771,17 @@ fn detail_less_tool_cards_are_not_expandable() {
         .shapes
         .iter()
         .find_map(|shape| match &shape.shape {
-            Shape::Text(text) if text.galley.text() == "/tmp/validate.py" => {
+            Shape::Text(text) if text.galley.text().contains("/tmp/validate.py") => {
                 Some(Rect::from_min_size(text.pos, text.galley.size()))
             }
             _ => None,
         })
         .expect("tool title");
-    let card = output
-        .shapes
-        .iter()
-        .find_map(|shape| match &shape.shape {
-            Shape::Rect(rect)
-                if rect.fill == theme::surface().raised && rect.rect.contains(title.center()) =>
-            {
-                Some(rect.rect)
-            }
-            _ => None,
-        })
-        .expect("tool card");
     let has_disclosure = output.shapes.iter().any(|shape| match &shape.shape {
         Shape::Path(path) if !path.closed && path.points.len() == 3 => {
             let center = path.visual_bounding_rect().center();
-            card.contains(center) && center.x < title.left()
+            (title.left() - 30.0..title.left()).contains(&center.x)
+                && title.y_range().contains(center.y)
         }
         _ => false,
     });
@@ -10228,7 +10790,7 @@ fn detail_less_tool_cards_are_not_expandable() {
 }
 
 #[test]
-fn successful_tool_card_has_no_status_mark_and_keeps_compact_disclosure() {
+fn successful_tool_row_has_no_status_mark_and_keeps_compact_disclosure() {
     let output = theme::test_context().run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(400.0, 100.0))),
@@ -10253,7 +10815,6 @@ fn successful_tool_card_has_no_status_mark_and_keeps_compact_disclosure() {
     let mut chevron_bounds = Rect::NOTHING;
     let mut chevron_paths = 0;
     let mut filled_triangle = false;
-    let mut card_radius = None;
     let mut done_text = false;
     let mut completion_circle = false;
     let mut completion_check = false;
@@ -10287,13 +10848,6 @@ fn successful_tool_card_has_no_status_mark_and_keeps_compact_disclosure() {
             {
                 filled_triangle = true;
             }
-            Shape::Rect(rect)
-                if rect.rect.width() > 300.0
-                    && rect.rect.height() > 30.0
-                    && rect.fill != Color32::TRANSPARENT =>
-            {
-                card_radius = Some(rect.corner_radius.nw);
-            }
             _ => {}
         }
     }
@@ -10305,10 +10859,49 @@ fn successful_tool_card_has_no_status_mark_and_keeps_compact_disclosure() {
     );
     assert_eq!(chevron_paths, 1, "the disclosure is one mitred path");
     assert!(!filled_triangle);
-    assert!(card_radius.unwrap() <= theme::radius::CONTROL);
     assert!(!done_text);
     assert!(!completion_circle);
     assert!(!completion_check);
+}
+
+#[test]
+fn tool_activity_is_a_flat_disclosure_row() {
+    let output = theme::test_context().run_ui(RawInput::default(), |ui| {
+        agent_collapsing_header(
+            ui,
+            "flat-tool",
+            "Edit src/lib.rs",
+            Some("Completed"),
+            Some(FileChange {
+                added: 0,
+                removed: 1,
+            }),
+            340.0,
+            None,
+            true,
+            true,
+            |ui| {
+                ui.label("body");
+            },
+        );
+    });
+    let mut text = String::new();
+    let mut raised_card = false;
+    for shape in &output.shapes {
+        match &shape.shape {
+            Shape::Text(value) => text.push_str(value.galley.text()),
+            Shape::Rect(rect)
+                if rect.fill == theme::surface().raised && rect.rect.width() > 300.0 =>
+            {
+                raised_card = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!raised_card);
+    assert!(text.contains("−1"));
+    assert!(!text.contains("+0"));
 }
 
 #[test]
@@ -10354,7 +10947,7 @@ fn failed_tool_card_shows_a_red_error_icon() {
 }
 
 #[test]
-fn overflowing_tool_path_marquees_on_hover_without_moving_the_action() {
+fn overflowing_tool_titles_stay_put_and_use_one_row() {
     let context = theme::test_context();
     let path = "/Users/example/Documents/project/src/a-very-long-file-name.rs";
     let draw = |time| {
@@ -10381,33 +10974,28 @@ fn overflowing_tool_path_marquees_on_hover_without_moving_the_action() {
             },
         )
     };
-    fn positions(shape: &Shape, path: &str) -> (Option<f32>, Option<f32>) {
+    fn metrics(shape: &Shape, path: &str) -> Option<(f32, usize)> {
         match shape {
-            Shape::Text(text) if text.galley.text().trim() == "Edit" => (Some(text.pos.x), None),
-            Shape::Text(text) if text.galley.text() == path => (None, Some(text.pos.x)),
-            Shape::Vec(shapes) => shapes.iter().fold((None, None), |found, shape| {
-                let next = positions(shape, path);
-                (found.0.or(next.0), found.1.or(next.1))
-            }),
-            _ => (None, None),
+            Shape::Text(text) if text.galley.text().contains(path) => {
+                Some((text.pos.x, text.galley.rows.len()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| metrics(shape, path)),
+            _ => None,
         }
     }
     let locate = |output: &egui::FullOutput| {
-        output.shapes.iter().fold((None, None), |found, shape| {
-            let next = positions(&shape.shape, path);
-            (found.0.or(next.0), found.1.or(next.1))
-        })
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| metrics(&shape.shape, path))
+            .expect("tool title")
     };
     let _ = draw(0.0);
     let before = locate(&draw(0.1));
     let after = locate(&draw(2.1));
-    let (before_action, before_path) = (before.0.unwrap(), before.1.unwrap());
-    let (after_action, after_path) = (after.0.unwrap(), after.1.unwrap());
 
-    assert!(
-        (before_action - after_action).abs() < 0.1 && after_path < before_path - 5.0,
-        "action {before_action}->{after_action}, path {before_path}->{after_path}"
-    );
+    assert_eq!(before.1, 1);
+    assert!((before.0 - after.0).abs() < 0.1, "title moved on hover");
 }
 
 #[test]
@@ -10763,31 +11351,27 @@ fn embedded_session_image_is_painted_in_the_transcript() {
     use crate::agent::controller::DisplayContent;
 
     let context = theme::test_context();
-    let output = context.run_ui(
-        RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 700.0))),
-            ..RawInput::default()
-        },
-        |ui| {
-            super::draw_agent_content(
-                ui,
-                &DisplayContent::Image {
-                    mime_type: "image/png".into(),
-                    uri: None,
-                    encoded_bytes: 0,
-                    data: Some(std::sync::Arc::from(
-                        include_bytes!("../../assets/icons/editur.png").as_slice(),
-                    )),
-                },
-                None,
-            );
-        },
-    );
-
-    let bounds = output
-        .shapes
-        .iter()
-        .find_map(|shape| match &shape.shape {
+    let content = DisplayContent::Image {
+        mime_type: "image/png".into(),
+        uri: None,
+        encoded_bytes: 0,
+        data: Some(std::sync::Arc::from(
+            include_bytes!("../../assets/icons/editur.png").as_slice(),
+        )),
+    };
+    let mut draw = |_| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 700.0))),
+                ..RawInput::default()
+            },
+            |ui| {
+                super::draw_agent_content(ui, &content, None);
+            },
+        )
+    };
+    let image_bounds = |output: &egui::FullOutput| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
             Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
                 Some(mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
                     bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
@@ -10796,7 +11380,9 @@ fn embedded_session_image_is_painted_in_the_transcript() {
             Shape::Rect(rect) if rect.brush.is_some() => Some(rect.rect),
             _ => None,
         })
-        .expect("embedded image texture");
+    };
+    let output = wait_for_ui_output(&mut draw, |output| image_bounds(output).is_some());
+    let bounds = image_bounds(&output).expect("embedded image texture");
 
     assert!(bounds.width() <= 240.0 && bounds.height() <= 180.0);
 }
@@ -10901,7 +11487,11 @@ fn user_prompt_image_is_a_square_inside_the_prompt_and_opens_a_lightbox() {
             bounds
         }
 
-        let initial = draw(Vec::new());
+        let initial = wait_for_ui_output(&mut draw, |output| {
+            image_bounds(output)
+                .iter()
+                .any(|rect| rect.width() <= 96.0 && rect.height() <= 96.0)
+        });
         let thumbnail = image_bounds(&initial)
             .into_iter()
             .find(|rect| rect.width() <= 96.0 && rect.height() <= 96.0)
@@ -10926,7 +11516,14 @@ fn user_prompt_image_is_a_square_inside_the_prompt_and_opens_a_lightbox() {
             pressed: false,
             modifiers: Modifiers::NONE,
         }]);
-        let lightbox = draw(Vec::new());
+        let lightbox = wait_for_ui_output(&mut draw, |output| {
+            context
+                .read_response(Id::new("agent_image_lightbox_close"))
+                .is_some()
+                && image_bounds(output)
+                    .iter()
+                    .any(|rect| rect.width() > 240.0 || rect.height() > 180.0)
+        });
 
         context
             .read_response(Id::new("agent_image_lightbox_close"))
@@ -11015,12 +11612,19 @@ fn agent_originated_image_starts_collapsed() {
                 modifiers: Modifiers::NONE,
             },
         ]);
-        let expanded = draw(vec![Event::PointerButton {
+        let _ = draw(vec![Event::PointerButton {
             pos: header.center(),
             button: PointerButton::Primary,
             pressed: false,
             modifiers: Modifiers::NONE,
         }]);
+        let expanded = wait_for_ui_output(&mut draw, |output| {
+            output.shapes.iter().any(|shape| match &shape.shape {
+                Shape::Mesh(mesh) => mesh.texture_id != egui::TextureId::default(),
+                Shape::Rect(rect) => rect.brush.is_some(),
+                _ => false,
+            })
+        });
         let thumbnail = expanded
             .shapes
             .iter()
@@ -12392,7 +12996,7 @@ fn composer_combines_model_and_thinking_in_one_selector() {
     }
 
     let output = draw(&mut app);
-    for label in ["Ask", "Agent", "Auto · Extra High"] {
+    for label in ["Local", "Ask", "Agent", "Auto · Extra High"] {
         assert!(
             output
                 .shapes
@@ -12414,10 +13018,11 @@ fn composer_combines_model_and_thinking_in_one_selector() {
         .read_response(Id::new("agent_attach"))
         .expect("the composer lost its attach control")
         .rect;
+    let location = find("Local");
     let permissions = find("Ask");
     let mode = find("Agent");
     let model = find("Auto · Extra High");
-    for selector in [permissions, mode, model] {
+    for selector in [location, permissions, mode, model] {
         assert!(
             (selector.center().y - attach.center().y).abs() <= 2.0,
             "selector {selector:?} is off the attach control's line at {attach:?}"
@@ -12446,8 +13051,10 @@ fn composer_combines_model_and_thinking_in_one_selector() {
     assert!((left_gap - theme::space::MEDIUM).abs() <= 2.0);
     assert!((bottom_gap - (theme::space::SMALL - 5.0)).abs() <= 2.0);
     assert!(
-        mode.left() > permissions.right() && model.left() > mode.right(),
-        "selectors overlap: permissions={permissions:?}, mode={mode:?}, model={model:?}"
+        permissions.left() > location.right()
+            && mode.left() > permissions.right()
+            && model.left() > mode.right(),
+        "selectors overlap: location={location:?}, permissions={permissions:?}, mode={mode:?}, model={model:?}"
     );
     assert!(
         output
@@ -12506,6 +13113,14 @@ fn composer_combines_model_and_thinking_in_one_selector() {
             .shapes
             .iter()
             .any(|shape| text_rect(&shape.shape, "Allow all").is_some())
+    );
+
+    app.agent_menu = Some(super::AgentMenu::RunLocation);
+    assert!(
+        draw(&mut app)
+            .shapes
+            .iter()
+            .any(|shape| text_rect(&shape.shape, "Cursor Cloud").is_some())
     );
 
     app.agent_menu = Some(super::AgentMenu::Config("model".into()));
@@ -13811,7 +14426,7 @@ fn pane_resize_paints_the_current_pointer_position_in_the_same_frame() {
         create: false,
     })
     .unwrap();
-    app.pane_layout.split(PaneId(0), DropZone::Right);
+    app.editor_panes.layout.split(PaneId(0), DropZone::Right);
     let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
     let (_, editor, _) = split_workspace(
         screen,
@@ -13820,7 +14435,10 @@ fn pane_resize_paints_the_current_pointer_position_in_the_same_frame() {
         app.agent_sidebar,
         app.agent_sidebar_width,
     );
-    let start = app.pane_layout.split_handles(editor_column_content(editor))[0]
+    let start = app
+        .editor_panes
+        .layout
+        .split_handles(editor_column_content(editor))[0]
         .hit_rect
         .center();
     let context = theme::test_context();
@@ -14514,7 +15132,7 @@ fn titlebar_buttons_order_files_terminal_source_control_then_agent() {
 }
 
 #[test]
-fn git_diff_preview_refreshes_in_place_without_creating_tabs() {
+fn source_control_diffs_open_as_distinct_tabs_and_refresh_in_place() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let mut app = EditorApp::new(OpenTarget {
@@ -14533,7 +15151,7 @@ fn git_diff_preview_refreshes_in_place_without_creating_tabs() {
         generation: 1,
     });
     assert!(app.tabs.is_empty());
-    assert!(app.git_diff.is_some());
+    assert_eq!(app.git_diffs.len(), 1);
 
     app.open_git_diff(crate::git::controller::GitEvent::Diff {
         repository: root.clone(),
@@ -14544,7 +15162,7 @@ fn git_diff_preview_refreshes_in_place_without_creating_tabs() {
         generation: 2,
     });
     assert_eq!(
-        app.git_diff.as_ref().map(|diff| diff.new.as_str()),
+        app.git_diffs.first().map(|diff| diff.new.as_str()),
         Some("newer\n")
     );
 
@@ -14558,13 +15176,191 @@ fn git_diff_preview_refreshes_in_place_without_creating_tabs() {
     });
     assert!(app.tabs.is_empty());
     assert_eq!(
-        app.git_diff.as_ref().map(|diff| diff.area),
+        app.git_diffs.last().map(|diff| diff.area),
         Some(crate::git::controller::DiffArea::Staged)
+    );
+    assert_eq!(app.git_diffs.len(), 2);
+    let staged = app.git_panes.active(PaneId(0)).cloned();
+    app.open_git_diff(crate::git::controller::GitEvent::Diff {
+        repository: app.git_diffs[0].repository.clone(),
+        path: "file.rs".into(),
+        area: crate::git::controller::DiffArea::Worktree,
+        old: Some("old\n".into()),
+        new: "newest\n".into(),
+        generation: 3,
+    });
+    assert_eq!(app.git_panes.active(PaneId(0)), staged.as_ref());
+}
+
+#[test]
+fn source_control_tabs_use_the_shared_pane_system() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    for (path, generation) in [("first.rs", 1), ("second.rs", 2)] {
+        app.open_git_diff(crate::git::controller::GitEvent::Diff {
+            repository: root.clone(),
+            path: path.into(),
+            area: crate::git::controller::DiffArea::Worktree,
+            old: Some("old\n".into()),
+            new: "new\n".into(),
+            generation,
+        });
+    }
+
+    app.drop_git_diff(1, PaneId(0), DropZone::Right);
+
+    assert_eq!(app.git_diffs[0].pane, PaneId(0));
+    assert_eq!(app.git_diffs[1].pane, PaneId(1));
+    assert_eq!(app.git_panes.layout.panes(), vec![PaneId(0), PaneId(1)]);
+    assert_eq!(app.git_panes.active_pane, PaneId(1));
+
+    app.close_active_git_diff();
+
+    assert_eq!(app.git_diffs.len(), 1);
+    assert_eq!(app.git_panes.layout.panes(), vec![PaneId(0)]);
+}
+
+#[test]
+fn source_control_split_panes_have_no_focus_outline() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    for path in ["first.rs", "second.rs"] {
+        app.open_git_diff(crate::git::controller::GitEvent::Diff {
+            repository: root.clone(),
+            path: path.into(),
+            area: crate::git::controller::DiffArea::Worktree,
+            old: Some("old\n".into()),
+            new: "new\n".into(),
+            generation: 1,
+        });
+    }
+    app.drop_git_diff(1, PaneId(0), DropZone::Right);
+
+    let output = theme::test_context().run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Default::default(),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+
+    assert!(!output.shapes.iter().any(|shape| matches!(
+        &shape.shape,
+        Shape::Rect(rect)
+            if rect.stroke.color == theme::border::focus_color()
+                && rect.stroke.width == 1.0
+    )));
+}
+
+#[test]
+fn source_control_split_drag_highlights_the_landing_area() {
+    fn has_highlight(shape: &Shape, expected: Rect) -> bool {
+        match shape {
+            Shape::Rect(rect) => {
+                rect.rect == expected && rect.fill == theme::subtle(theme::accent())
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| has_highlight(shape, expected)),
+            _ => false,
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: root.clone(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    for path in ["first.rs", "second.rs"] {
+        app.open_git_diff(crate::git::controller::GitEvent::Diff {
+            repository: root.clone(),
+            path: path.into(),
+            area: crate::git::controller::DiffArea::Worktree,
+            old: Some("old\n".into()),
+            new: "new\n".into(),
+            generation: 1,
+        });
+    }
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1000.0, 700.0));
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let _ = draw(&mut app, Vec::new());
+    let tab = context
+        .read_response(Id::new((
+            "git_diff_tab",
+            &root,
+            Path::new("second.rs"),
+            crate::git::controller::DiffArea::Worktree,
+        )))
+        .expect("source-control tab")
+        .rect
+        .center();
+    let target = pos2(screen.right() - 4.0, screen.center().y);
+
+    let _ = draw(
+        &mut app,
+        vec![
+            Event::PointerMoved(tab),
+            Event::PointerButton {
+                pos: tab,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let _ = draw(&mut app, vec![Event::PointerMoved(target)]);
+    let output = draw(&mut app, Vec::new());
+    let drop = app.git_panes.drop.expect("split drop target");
+
+    assert_ne!(drop.zone, DropZone::Center);
+    assert!(
+        output
+            .shapes
+            .iter()
+            .any(|shape| has_highlight(&shape.shape, drop.preview.shrink(4.0))),
+        "source-control split target should paint its landing area"
     );
 }
 
 #[test]
-fn git_diff_preview_does_not_render_editor_tabs() {
+fn git_diff_preview_uses_the_editor_tab_style() {
+    fn label_style(shape: &Shape, expected: &str) -> Option<(Rect, egui::text::LayoutSection)> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == expected => Some((
+                Rect::from_min_size(text.pos, text.galley.size()),
+                text.galley.job.sections[0].clone(),
+            )),
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| label_style(shape, expected)),
+            _ => None,
+        }
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let file = root.join("open.rs");
@@ -14576,7 +15372,15 @@ fn git_diff_preview_does_not_render_editor_tabs() {
     })
     .unwrap();
     app.open_git_diff(crate::git::controller::GitEvent::Diff {
-        repository: root,
+        repository: root.clone(),
+        path: "first.rs".into(),
+        area: crate::git::controller::DiffArea::Worktree,
+        old: Some("fn before() {}\n".into()),
+        new: "fn after() {}\n".into(),
+        generation: 1,
+    });
+    app.open_git_diff(crate::git::controller::GitEvent::Diff {
+        repository: root.clone(),
         path: "changed.rs".into(),
         area: crate::git::controller::DiffArea::Worktree,
         old: Some("fn old() {}\n".into()),
@@ -14584,18 +15388,71 @@ fn git_diff_preview_does_not_render_editor_tabs() {
         generation: 1,
     });
     let context = theme::test_context();
-    let _ = context.run_ui(
+    let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(900.0, 700.0))),
             ..RawInput::default()
         },
         |ui| app.ui(ui),
     );
+    let path = PathBuf::from("changed.rs");
+    assert!(
+        context
+            .read_response(Id::new((
+                "git_diff_tab",
+                &root,
+                Path::new("first.rs"),
+                crate::git::controller::DiffArea::Worktree,
+            )))
+            .is_some(),
+        "each source-control diff should remain open as a tab"
+    );
+    let tab = context
+        .read_response(Id::new((
+            "git_diff_tab",
+            &root,
+            &path,
+            crate::git::controller::DiffArea::Worktree,
+        )))
+        .expect("version-control diff tab")
+        .rect;
+    let (label, section) = output
+        .shapes
+        .iter()
+        .find_map(|shape| label_style(&shape.shape, "changed.rs"))
+        .expect("version-control diff tab label");
 
     assert!(
         context
             .read_response(Id::new(("file_tab", file.display().to_string())))
             .is_none()
+    );
+    assert_eq!((tab.top(), tab.bottom()), (0.0, TITLEBAR_HEIGHT));
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape,
+        Shape::Rect(rect) if rect.rect == tab && rect.fill == theme::surface().editor
+    )));
+    assert_eq!(section.format.font_id, theme::typography::strong());
+    assert_eq!(section.format.color, theme::text().primary);
+    assert_eq!(
+        label.left(),
+        tab.left() + theme::space::MEDIUM + super::TAB_DOT
+    );
+    assert!(
+        context
+            .read_response(Id::new((
+                "git_diff_tab_close",
+                &root,
+                &path,
+                crate::git::controller::DiffArea::Worktree,
+            )))
+            .is_some()
+    );
+    assert!(
+        output
+            .shapes
+            .iter()
+            .all(|shape| label_style(&shape.shape, "Back to editor").is_none())
     );
 }
 
@@ -14940,7 +15797,7 @@ fn scrolling_an_inactive_pane_focuses_it() {
         ],
     );
 
-    assert_eq!(app.active_pane, PaneId(0));
+    assert_eq!(app.editor_panes.active_pane, PaneId(0));
     let focus = output
         .shapes
         .iter()
@@ -16601,7 +17458,7 @@ fn the_pane_header_states_what_is_wrong_in_the_color_of_the_problem() {
 
     let pill = |name: &str, text: &str| {
         let rect = context
-            .read_response(Id::new((name, app.active_pane.0)))
+            .read_response(Id::new((name, app.editor_panes.active_pane.0)))
             .unwrap_or_else(|| panic!("{name} pill"))
             .rect;
         output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -16917,7 +17774,10 @@ fn dragging_a_tab_into_the_editor_creates_a_split_pane() {
     );
 
     assert_eq!(
-        (app.tabs[1].pane, app.pane_layout.rects(editor).len()),
+        (
+            app.tabs[1].pane,
+            app.editor_panes.layout.rects(editor).len(),
+        ),
         (PaneId(1), 2)
     );
 }

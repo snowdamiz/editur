@@ -1,3 +1,5 @@
+use std::{collections::HashMap, hash::Hash};
+
 use egui::{CursorIcon, Id, Sense};
 
 use crate::theme;
@@ -56,6 +58,103 @@ pub(crate) struct TabDrop {
     pub(crate) target: PaneId,
     pub(crate) zone: DropZone,
     pub(crate) preview: egui::Rect,
+}
+
+/// Tab selection and drag state shared by every pane-based workspace.
+#[derive(Clone)]
+pub(crate) struct PaneTabs<K> {
+    pub(crate) layout: PaneLayout,
+    pub(crate) active_pane: PaneId,
+    pub(crate) active_tabs: HashMap<PaneId, K>,
+    pub(crate) drag: Option<K>,
+    pub(crate) drop: Option<TabDrop>,
+}
+
+impl<K> Default for PaneTabs<K> {
+    fn default() -> Self {
+        Self {
+            layout: PaneLayout::default(),
+            active_pane: PaneId(0),
+            active_tabs: HashMap::new(),
+            drag: None,
+            drop: None,
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash> PaneTabs<K> {
+    pub(crate) fn activate(&mut self, pane: PaneId, tab: K) {
+        self.active_pane = pane;
+        self.active_tabs.insert(pane, tab);
+    }
+
+    pub(crate) fn active(&self, pane: PaneId) -> Option<&K> {
+        self.active_tabs.get(&pane)
+    }
+
+    pub(crate) fn clear_pane(&mut self, pane: PaneId) {
+        self.active_tabs.remove(&pane);
+        self.layout.remove(pane);
+        if self.active_pane == pane {
+            self.active_pane = self.layout.panes().into_iter().next().unwrap_or(PaneId(0));
+        }
+    }
+
+    pub(crate) fn update_drag(
+        &mut self,
+        ctx: &egui::Context,
+        panes: &[(PaneId, egui::Rect)],
+        source: Option<PaneId>,
+        source_tab_count: usize,
+        tab_height: f32,
+    ) -> Option<(K, TabDrop)> {
+        let Some(tab) = self.drag.clone() else {
+            self.drop = None;
+            return None;
+        };
+        let previous = self.drop;
+        self.drop = ctx.pointer_hover_pos().and_then(|pointer| {
+            panes.iter().find_map(|(target, rect)| {
+                rect.contains(pointer).then(|| {
+                    let previous = previous
+                        .filter(|drop| drop.target == *target)
+                        .map(|drop| drop.zone);
+                    let zone = if pointer.y <= rect.top() + tab_height
+                        && previous.unwrap_or(DropZone::Center) == DropZone::Center
+                    {
+                        DropZone::Center
+                    } else {
+                        stable_tab_drop_zone(*rect, pointer, previous)
+                    };
+                    TabDrop {
+                        target: *target,
+                        zone,
+                        preview: tab_drop_preview(*rect, zone),
+                    }
+                })
+            })
+        });
+        if self.drop.is_some_and(|drop| {
+            drop.zone != DropZone::Center && source == Some(drop.target) && source_tab_count == 1
+        }) {
+            self.drop = None;
+        }
+        let released = ctx.input(|input| input.pointer.primary_released());
+        let down = ctx.input(|input| input.pointer.primary_down());
+        if released {
+            let drop = self.drop.take();
+            self.drag = None;
+            drop.map(|drop| (tab, drop))
+        } else {
+            if !down {
+                self.drag = None;
+                self.drop = None;
+            } else {
+                ctx.request_repaint();
+            }
+            None
+        }
+    }
 }
 
 impl Default for PaneLayout {

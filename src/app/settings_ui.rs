@@ -8,6 +8,8 @@ use crate::{
     theme,
 };
 
+/// Bare text that brightens on hover: no fill, no padding, just the label
+/// (and room for a leading icon) sitting flush with its neighbours.
 pub(super) fn settings_quiet_button(
     ui: &mut egui::Ui,
     id: impl egui::AsId,
@@ -16,39 +18,43 @@ pub(super) fn settings_quiet_button(
 ) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
-        theme::typography::body(),
-        theme::text().secondary,
+        theme::typography::small_strong(),
+        theme::text().muted,
     );
     let (_, rect) = ui.allocate_space(egui::vec2(
-        (galley.size().x + icon_space + 20.0).max(40.0),
-        40.0,
+        galley.size().x + icon_space,
+        theme::control::ROW,
     ));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    let color = if response.hovered() {
-        theme::text().primary
-    } else {
-        theme::text().secondary
-    };
     ui.painter().text(
-        egui::pos2(rect.left() + 10.0 + icon_space, rect.center().y),
+        egui::pos2(rect.left() + icon_space, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        theme::typography::body(),
-        color,
+        theme::typography::small_strong(),
+        if response.hovered() {
+            theme::text().primary
+        } else {
+            theme::text().muted
+        },
     );
     response
 }
 
+/// A rail section: the same rounded selected fill and weight shift a session
+/// row uses in the main sidebar, so the two rails read as one family.
 pub(super) fn settings_navigation_row(
     ui: &mut egui::Ui,
     id: impl egui::AsId,
     label: &str,
     selected: bool,
 ) -> egui::Response {
-    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
+    let (_, rect) = ui.allocate_space(egui::vec2(
+        ui.available_width(),
+        theme::control::ROW + theme::space::TIGHT,
+    ));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -60,19 +66,26 @@ pub(super) fn settings_navigation_row(
     });
     if selected {
         ui.painter().rect_filled(
-            egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 1.0, rect.center().y),
-                egui::vec2(2.0, 18.0),
-            ),
-            1.0,
-            theme::accent(),
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::selected(),
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
         );
     }
     ui.painter().text(
-        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::pos2(rect.left() + theme::space::SMALL, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        theme::typography::body(),
+        if selected {
+            theme::typography::strong()
+        } else {
+            theme::typography::body()
+        },
         if selected || response.hovered() {
             theme::text().primary
         } else {
@@ -107,7 +120,7 @@ pub(super) fn settings_page_header(ui: &mut egui::Ui, title: &str, subtitle: &st
             .strong()
             .color(theme::text().primary),
     );
-    ui.add_space(6.0);
+    ui.add_space(theme::space::SNUG);
     ui.label(
         RichText::new(subtitle)
             .font(theme::typography::small())
@@ -131,11 +144,19 @@ pub(super) fn settings_section_label(ui: &mut egui::Ui, label: &str) {
 }
 
 pub(super) fn settings_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    settings_card_margin(ui, egui::Margin::symmetric(16, 8), add);
+}
+
+pub(super) fn settings_stack_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    settings_card_margin(ui, egui::Margin::symmetric(16, 12), add);
+}
+
+fn settings_card_margin(ui: &mut egui::Ui, margin: egui::Margin, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(settings_card_fill())
         .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
         .corner_radius(theme::radius::CARD)
-        .inner_margin(egui::Margin::symmetric(18, 8))
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
@@ -146,10 +167,103 @@ pub(super) fn settings_card_fill() -> Color32 {
     theme::settings().card
 }
 
+/// Provider mark, title, and one-line description above a settings card.
+pub(super) fn settings_identity_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    paint_mark: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) {
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 36.0));
+    let mark = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::Vec2::splat(32.0),
+    );
+    ui.painter().rect_filled(
+        mark,
+        theme::corner(theme::radius::CONTROL),
+        theme::state::hover(),
+    );
+    paint_mark(ui.painter(), mark.shrink(7.0), theme::text().secondary);
+    ui.painter().text(
+        egui::pos2(mark.right() + theme::space::SMALL, rect.center().y - 8.0),
+        Align2::LEFT_CENTER,
+        title,
+        theme::typography::title(),
+        theme::text().primary,
+    );
+    ui.painter().text(
+        egui::pos2(mark.right() + theme::space::SMALL, rect.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        detail,
+        theme::typography::small(),
+        theme::text().muted,
+    );
+    ui.add_space(theme::space::MEDIUM);
+}
+
+pub(super) fn settings_card_action(
+    ui: &mut egui::Ui,
+    id: impl egui::AsId,
+    icon: Icon,
+    label: &str,
+) -> egui::Response {
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), theme::control::PRIMARY));
+    let response = ui.interact(rect, Id::new(id), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter().rect_filled(
+            rect,
+            theme::corner(theme::radius::CONTROL),
+            theme::state::hover(),
+        );
+    }
+    let color = if hovered {
+        theme::text().primary
+    } else {
+        theme::text().secondary
+    };
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + icons::GRID * 0.5, rect.center().y),
+        egui::Vec2::splat(icons::GRID),
+    );
+    icons::paint(ui.painter(), icon, icon_rect, color);
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + theme::space::SNUG, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::typography::body(),
+        color,
+    );
+    response
+}
+
 pub(super) fn settings_row(
     ui: &mut egui::Ui,
     title: &str,
     detail: &str,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    settings_named_row(ui, title, detail, theme::typography::body(), control);
+}
+
+pub(super) fn settings_account_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    settings_named_row(ui, title, detail, theme::typography::strong(), control);
+}
+
+fn settings_named_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    detail: &str,
+    title_font: egui::FontId,
     control: impl FnOnce(&mut egui::Ui),
 ) {
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 56.0));
@@ -157,7 +271,7 @@ pub(super) fn settings_row(
         egui::pos2(rect.left(), rect.center().y - 10.0),
         Align2::LEFT_CENTER,
         title,
-        theme::typography::body(),
+        title_font,
         theme::text().primary,
     );
     ui.painter().text(
@@ -266,7 +380,10 @@ pub(super) fn settings_secondary_button(
         theme::typography::small(),
         theme::text().secondary,
     );
-    let (_, rect) = ui.allocate_space(egui::vec2((galley.size().x + 22.0).max(64.0), 30.0));
+    let (_, rect) = ui.allocate_space(egui::vec2(
+        (galley.size().x + theme::space::MEDIUM * 2.0).max(64.0),
+        theme::control::ROW,
+    ));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
@@ -315,7 +432,10 @@ pub(super) fn settings_danger_button(
         theme::typography::small(),
         theme::ink(theme::semantic().danger),
     );
-    let (_, rect) = ui.allocate_space(egui::vec2((galley.size().x + 22.0).max(64.0), 30.0));
+    let (_, rect) = ui.allocate_space(egui::vec2(
+        (galley.size().x + theme::space::MEDIUM * 2.0).max(64.0),
+        theme::control::ROW,
+    ));
     let response = ui.interact(rect, Id::new(id), Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
@@ -354,23 +474,46 @@ pub(super) fn settings_primary_button(
     id: impl egui::AsId,
     label: &str,
 ) -> egui::Response {
+    let enabled = ui.is_enabled();
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         theme::typography::small(),
         theme::text().on_accent,
     );
-    let (_, rect) = ui.allocate_space(egui::vec2((galley.size().x + 24.0).max(88.0), 40.0));
+    let (_, rect) = ui.allocate_space(egui::vec2(
+        (galley.size().x + theme::space::MEDIUM * 2.0).max(76.0),
+        theme::control::ROW,
+    ));
     let response = ui.interact(rect, Id::new(id), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    ui.painter().rect_filled(rect, 6.0, theme::accent());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let (fill, stroke, text) = if !enabled {
+        (
+            theme::settings().control,
+            egui::Stroke::new(1.0, theme::border::hairline_color()),
+            theme::text_disabled(),
+        )
+    } else if response.hovered() {
+        (
+            theme::composite(theme::state::hover(), theme::accent()),
+            egui::Stroke::NONE,
+            theme::text().on_accent,
+        )
+    } else {
+        (theme::accent(), egui::Stroke::NONE, theme::text().on_accent)
+    };
+    ui.painter().rect(
+        rect,
+        theme::corner(theme::radius::CONTROL),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         theme::typography::small(),
-        theme::text().on_accent,
+        text,
     );
     response
 }
@@ -384,7 +527,7 @@ pub(super) fn settings_combo_box(
 ) -> egui::Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(11.0, 7.0);
-        ui.spacing_mut().interact_size.y = 34.0;
+        ui.spacing_mut().interact_size.y = theme::control::STANDARD;
         let control = theme::settings().control;
         let visuals = &mut ui.style_mut().visuals.widgets;
         visuals.inactive.weak_bg_fill = control;

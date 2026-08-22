@@ -75,7 +75,7 @@ fn cursor_cloud_prompt_uses_the_cursor_cli_handoff() {
         matches!(
             event,
             Event::AssistantDelta(text)
-                if text == "Cursor Cloud started [bc-fixture](https://cursor.com/agents/bc-fixture)."
+                if text == "Cursor Cloud started [bc-fixture](https://cursor.com/agents/bc-fixture).\n\n"
         )
     }));
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     hint::black_box,
     path::PathBuf,
@@ -11,11 +12,17 @@ use egui::{RawInput, Rect, Vec2, pos2};
 use serde::Serialize;
 
 use super::{
-    ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES, AssistantImagePathCache, EditorApp, WorkspaceFilePicker,
-    assistant_embedded_image_texture,
+    ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES, AgentMenu, AssistantImagePathCache, EditorApp, PaneId,
+    WorkspaceFilePicker, agent_search_matches, assistant_embedded_image_texture,
 };
 use crate::{
-    agent::{controller::ConnectionState, state::TranscriptItem},
+    agent::{
+        controller::{
+            ConnectionState, ContentRole, DisplayContent, Event, SessionChoice, ToolActivity,
+            ToolDetail, ToolOutput,
+        },
+        state::TranscriptItem,
+    },
     buffer::Buffer,
     devin::{Activity, DevinMessage, SessionSummary, StatusCategory},
     editor_surface::{DocumentMetrics, EditorSurface},
@@ -173,12 +180,167 @@ fn app_fixture() -> (tempfile::TempDir, EditorApp) {
     (directory, app)
 }
 
+fn fill_agent_scroll_fixture(app: &mut EditorApp) {
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    for index in 0..2_048 {
+        app.agent.transcript.push_back(match index % 4 {
+            0 => TranscriptItem::User(format!("Question {index}")),
+            1 => TranscriptItem::Thought(format!("Reasoning step {index}")),
+            2 => TranscriptItem::Tool(ToolActivity {
+                id: format!("tool-{index}"),
+                title: Some(format!("Read src/generated/file-{index}.rs")),
+                status: Some("Completed".into()),
+                kind: Some("read".into()),
+                paths: vec![format!("src/generated/file-{index}.rs").into()],
+                detail: None,
+            }),
+            _ => TranscriptItem::Assistant(format!("Answer {index} with **markdown**.")),
+        });
+    }
+}
+
 fn frame_summary(config: Config, mut draw: impl FnMut(&mut egui::Ui)) -> Summary {
     let context = theme::test_context();
     sample(config, || {
         let output = context.run_ui(input(), |ui| draw(ui));
         black_box(output.shapes.len());
     })
+}
+
+fn scrolling_frame_summary(
+    config: Config,
+    scroll_delta: f32,
+    mut draw: impl FnMut(&mut egui::Ui),
+) -> Summary {
+    let context = theme::test_context();
+    let _ = context.run_ui(input(), |ui| draw(ui));
+    sample(config, || {
+        let mut frame = input();
+        frame.events = vec![
+            egui::Event::PointerMoved(pos2(600.0, 400.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, scroll_delta),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let output = context.run_ui(frame, |ui| draw(ui));
+        black_box(output.shapes.len());
+    })
+}
+
+fn wait_for_embedded_image(context: &egui::Context, source: &Arc<[u8]>) -> egui::TextureHandle {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut texture = None;
+        let _ = context.run_ui(input(), |ui| {
+            texture = assistant_embedded_image_texture(ui, source);
+        });
+        if let Some(texture) = texture {
+            return texture;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background image decode did not finish"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn shape_contains_text(shape: &egui::Shape, expected: &str) -> bool {
+    match shape {
+        egui::Shape::Text(text) => text.galley.text().contains(expected),
+        egui::Shape::Vec(shapes) => shapes
+            .iter()
+            .any(|shape| shape_contains_text(shape, expected)),
+        _ => false,
+    }
+}
+
+fn wait_for_transcript_terminal(context: &egui::Context, output: &Arc<str>, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = context.run_ui(input(), |ui| {
+            crate::terminal::show_transcript_terminal(ui, Some("benchmark"), output);
+        });
+        if frame
+            .shapes
+            .iter()
+            .any(|shape| shape_contains_text(&shape.shape, expected))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background terminal parse did not finish"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn archive_boundary_frame(
+    payload: &str,
+    item_count: usize,
+    resident_len: usize,
+    completes_archive: bool,
+) -> Duration {
+    let (_directory, mut app) = app_fixture();
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    for index in 0..item_count {
+        app.agent
+            .apply(Event::UserMessage(format!("{index:04}{payload}")));
+    }
+    app.agent.apply(Event::TurnFinished { cancelled: false });
+    assert!(
+        app.agent.has_earlier_transcript(),
+        "archive fixture must evict one full page"
+    );
+    assert_eq!(app.agent.transcript.len(), resident_len);
+    assert!(
+        matches!(app.agent.transcript.front(), Some(TranscriptItem::User(text)) if text.starts_with("0256"))
+    );
+    let context = theme::test_context();
+    let _ = context.run_ui(input(), |ui| app.draw_agent(ui, ui.max_rect()));
+    let mut frame = input();
+    frame.events = vec![
+        egui::Event::PointerMoved(pos2(600.0, 400.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, 1_000_000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    let started = Instant::now();
+    let output = context.run_ui(frame, |ui| app.draw_agent(ui, ui.max_rect()));
+    let elapsed = started.elapsed();
+    black_box(output.shapes.len());
+    assert_eq!(
+        app.agent.has_earlier_transcript(),
+        !completes_archive,
+        "boundary fixture must respect the per-frame archive budget"
+    );
+    assert!(app.agent.has_later_transcript());
+    assert!(!app.agent_follow_transcript);
+    assert_eq!(app.agent.transcript.len(), resident_len);
+    if completes_archive {
+        assert!(
+            matches!(app.agent.transcript.front(), Some(TranscriptItem::User(text)) if text.starts_with("0000"))
+        );
+        let last = format!("{:04}", resident_len - 1);
+        assert!(
+            matches!(app.agent.transcript.back(), Some(TranscriptItem::User(text)) if text.starts_with(&last))
+        );
+    } else {
+        assert!(
+            matches!(app.agent.transcript.front(), Some(TranscriptItem::User(text)) if !text.starts_with("0256")),
+            "bounded paging must still make forward progress"
+        );
+    }
+    elapsed
 }
 
 #[test]
@@ -504,6 +666,504 @@ fn benchmark_ui_histories_and_lists() {
         16.7,
         "culled Agent transcript metadata should fit inside one 60 Hz frame",
     ));
+
+    let (_directory, mut app) = app_fixture();
+    fill_agent_scroll_fixture(&mut app);
+    let cold_samples = (0..if config.quick { 1 } else { 10 }).map(|_| {
+        let (_directory, mut app) = app_fixture();
+        fill_agent_scroll_fixture(&mut app);
+        let context = theme::test_context();
+        let started = Instant::now();
+        let output = context.run_ui(input(), |ui| app.draw_agent(ui, ui.max_rect()));
+        black_box(output.shapes.len());
+        started.elapsed()
+    });
+    let cold_summary = summarize(cold_samples);
+    let cold_sample_count = if config.quick { 1 } else { 10 };
+    emit(timed_record(
+        "ui",
+        "agent-transcript-cold",
+        2_048,
+        cold_summary,
+        cold_sample_count,
+        8.0,
+        16.7,
+        "opening a full Agent transcript should fit inside one 60 Hz frame",
+    ));
+    let summary = scrolling_frame_summary(config, 96.0, |ui| app.draw_agent(ui, ui.max_rect()));
+    assert!(
+        !app.agent_follow_transcript,
+        "benchmark must exercise upward transcript scrolling"
+    );
+    emit(timed_record(
+        "ui",
+        "agent-transcript-scroll",
+        2_048,
+        summary,
+        config.samples,
+        4.0,
+        8.0,
+        "tool-heavy Agent scrolling should react inside half a 60 Hz frame",
+    ));
+
+    let (_directory, mut app) = app_fixture();
+    let sessions = (0..128)
+        .map(|index| SessionChoice {
+            id: format!("session-{index}"),
+            title: Some(format!("Session {index}")),
+            updated_at: Some(index.to_string()),
+            started_in_editur: true,
+        })
+        .collect::<Vec<_>>();
+    let summary = scrolling_frame_summary(config, -96.0, |ui| {
+        let rect = ui.max_rect();
+        app.draw_agent_session_picker(ui, rect, PaneId(1), &sessions);
+    });
+    emit(timed_record(
+        "ui",
+        "agent-session-picker-scroll",
+        sessions.len(),
+        summary,
+        config.samples,
+        4.0,
+        8.0,
+        "Agent session history scrolling should react inside half a 60 Hz frame",
+    ));
+}
+
+#[test]
+#[ignore = "manual release-mode performance benchmark"]
+fn benchmark_agent_hitch_paths() {
+    let config = config();
+    let cold_samples = if config.quick { 1 } else { 5 };
+
+    let pixels = image::RgbaImage::from_pixel(4_096, 4_096, image::Rgba([24, 48, 96, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("benchmark PNG");
+    let source = Arc::<[u8]>::from(png);
+    let cold_image = summarize((0..cold_samples).map(|_| {
+        let context = theme::test_context();
+        let mut loaded = false;
+        let started = Instant::now();
+        let output = context.run_ui(input(), |ui| {
+            loaded = assistant_embedded_image_texture(ui, &source).is_some();
+        });
+        let elapsed = started.elapsed();
+        black_box(output.textures_delta.set.len());
+        assert!(!loaded, "cold image fixture must queue its preview");
+        let _ = black_box(wait_for_embedded_image(&context, &source));
+        elapsed
+    }));
+    emit(timed_record(
+        "ui",
+        "agent-image-preview-cold",
+        4_096,
+        cold_image,
+        cold_samples,
+        8.3,
+        16.7,
+        "first-visible Agent image decode should fit inside one 60 Hz frame",
+    ));
+
+    let image_scroll = summarize((0..cold_samples).map(|_| {
+        let (_directory, mut app) = app_fixture();
+        app.agent.connection = ConnectionState::Ready;
+        app.agent.session_ready = true;
+        app.agent.transcript.extend(
+            (0..32).map(|index| TranscriptItem::Assistant(format!("Before image {index}"))),
+        );
+        app.agent
+            .transcript
+            .push_back(TranscriptItem::User("IMAGE_REVEAL_SENTINEL".into()));
+        app.agent.transcript.push_back(TranscriptItem::Content {
+            role: ContentRole::User,
+            content: DisplayContent::Image {
+                mime_type: "image/png".into(),
+                uri: None,
+                encoded_bytes: source.len(),
+                data: Some(Arc::clone(&source)),
+            },
+        });
+        app.agent
+            .transcript
+            .extend((0..32).map(|index| TranscriptItem::Assistant(format!("After image {index}"))));
+        let context = theme::test_context();
+        let _ = context.run_ui(input(), |ui| app.draw_agent(ui, ui.max_rect()));
+        let texture_count = || {
+            context
+                .tex_manager()
+                .read()
+                .allocated()
+                .filter(|(_, metadata)| metadata.name.starts_with("agent_embedded_image_"))
+                .count()
+        };
+        assert_eq!(texture_count(), 0, "offscreen image decoded during setup");
+        let mut reveal = None;
+        for _ in 0..64 {
+            let mut frame = input();
+            frame.events = vec![
+                egui::Event::PointerMoved(pos2(600.0, 400.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, 96.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let started = Instant::now();
+            let output = context.run_ui(frame, |ui| app.draw_agent(ui, ui.max_rect()));
+            let elapsed = started.elapsed();
+            black_box(output.shapes.len());
+            let queued = context.memory_mut(|memory| {
+                memory
+                    .caches
+                    .cache::<super::AssistantImageCache>()
+                    .entries
+                    .len()
+                    == 1
+            });
+            if queued {
+                reveal = Some(elapsed);
+                break;
+            }
+        }
+        let _ = black_box(wait_for_embedded_image(&context, &source));
+        let decoded_bytes = context
+            .tex_manager()
+            .read()
+            .allocated()
+            .filter(|(_, metadata)| metadata.name.starts_with("agent_embedded_image_"))
+            .map(|(_, metadata)| metadata.bytes_used())
+            .sum::<usize>();
+        assert_eq!(decoded_bytes, 640 * 640 * 4);
+        reveal.expect("scroll fixture must reveal and decode the image")
+    }));
+    emit(timed_record(
+        "ui",
+        "agent-image-scroll-cold-reveal",
+        4_096,
+        image_scroll,
+        cold_samples,
+        8.3,
+        16.7,
+        "the wheel frame revealing a cold Agent image should fit inside one frame",
+    ));
+
+    let context = theme::test_context();
+    let _ = black_box(wait_for_embedded_image(&context, &source));
+    let warm_image = sample(config, || {
+        let output = context.run_ui(input(), |ui| {
+            black_box(assistant_embedded_image_texture(ui, &source));
+        });
+        black_box(output.textures_delta.set.len());
+    });
+    emit(timed_record(
+        "ui",
+        "agent-image-preview-warm",
+        4_096,
+        warm_image,
+        config.samples,
+        1.0,
+        4.0,
+        "cached Agent image previews should not be decoded again",
+    ));
+
+    let small_archive_payload = " archived transcript payload".repeat(32);
+    let archive_page = summarize(
+        (0..cold_samples)
+            .map(|_| archive_boundary_frame(&small_archive_payload, 2_304, 2_048, true)),
+    );
+    emit(timed_record(
+        "ui",
+        "agent-archive-page-boundary",
+        256,
+        archive_page,
+        cold_samples,
+        8.3,
+        16.7,
+        "loading 256 archived rows at the scroll boundary should fit inside one frame",
+    ));
+
+    let large_archive_payload = "x".repeat(64 * 1024);
+    let large_archive_page = summarize(
+        (0..cold_samples).map(|_| archive_boundary_frame(&large_archive_payload, 512, 256, false)),
+    );
+    emit(timed_record(
+        "ui",
+        "agent-archive-page-boundary-64k-items",
+        256,
+        large_archive_page,
+        cold_samples,
+        8.3,
+        16.7,
+        "one large archived-history page should fit comfortably inside one frame",
+    ));
+
+    let (_directory, mut app) = app_fixture();
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    let terminal_chunk = "terminal output line\n".repeat(3_277);
+    app.agent.apply(Event::ToolCallUpdated(ToolActivity {
+        id: "large-terminal".into(),
+        title: Some("Run benchmark".into()),
+        status: Some("Completed".into()),
+        kind: Some("Execute".into()),
+        paths: Vec::new(),
+        detail: Some(ToolDetail {
+            input: Some("benchmark".into()),
+            content: (0..128)
+                .map(|_| ToolOutput::Log {
+                    label: "Terminal output".into(),
+                    text: terminal_chunk.clone(),
+                })
+                .collect(),
+            output: None,
+        }),
+    }));
+    let terminal_bytes = app
+        .agent
+        .transcript
+        .back()
+        .and_then(|item| match item {
+            TranscriptItem::Tool(tool) => tool.detail.as_ref(),
+            _ => None,
+        })
+        .map(|detail| {
+            detail
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    ToolOutput::Log { text, .. } => Some(text.len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        })
+        .expect("terminal benchmark detail");
+    assert!(terminal_bytes >= 7 * 1024 * 1024);
+    let collapsed_terminal = frame_summary(config, |ui| app.draw_agent(ui, ui.max_rect()));
+    emit(timed_record(
+        "ui",
+        "agent-terminal-collapsed",
+        terminal_bytes,
+        collapsed_terminal,
+        config.samples,
+        4.0,
+        8.3,
+        "a collapsed terminal card should not rebuild its full output each frame",
+    ));
+
+    let terminal_output = Arc::<str>::from(format!(
+        "{}terminal-ready-sentinel\n",
+        "terminal output line\n".repeat(419_431)
+    ));
+    let cold_terminal = summarize((0..cold_samples).map(|_| {
+        let context = theme::test_context();
+        let started = Instant::now();
+        let frame = context.run_ui(input(), |ui| {
+            crate::terminal::show_transcript_terminal(ui, Some("benchmark"), &terminal_output);
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            !frame
+                .shapes
+                .iter()
+                .any(|shape| shape_contains_text(&shape.shape, "terminal-ready-sentinel")),
+            "cold terminal frame must defer parsing"
+        );
+        wait_for_transcript_terminal(&context, &terminal_output, "terminal-ready-sentinel");
+        elapsed
+    }));
+    emit(timed_record(
+        "ui",
+        "agent-terminal-expanded-cold",
+        terminal_output.len(),
+        cold_terminal,
+        cold_samples,
+        8.3,
+        16.7,
+        "first terminal expansion should queue parsing inside one 60 Hz frame",
+    ));
+
+    let context = theme::test_context();
+    wait_for_transcript_terminal(&context, &terminal_output, "terminal-ready-sentinel");
+    let expanded_terminal = sample(config, || {
+        let frame = context.run_ui(input(), |ui| {
+            crate::terminal::show_transcript_terminal(ui, Some("benchmark"), &terminal_output);
+        });
+        black_box(frame.shapes.len());
+    });
+    emit(timed_record(
+        "ui",
+        "agent-terminal-expanded",
+        terminal_output.len(),
+        expanded_terminal,
+        config.samples,
+        8.3,
+        16.7,
+        "an expanded terminal card should render inside one 60 Hz frame",
+    ));
+
+    let search_chunk = "a".repeat(64 * 1024);
+    let search_transcript = (0..256)
+        .map(|_| TranscriptItem::Assistant(search_chunk.clone()))
+        .collect::<VecDeque<_>>();
+    let search = sample(config, || {
+        let matches = agent_search_matches(&search_transcript, &Default::default(), "a");
+        assert_eq!(matches.len(), 16 * 1024 * 1024);
+        assert_eq!(matches.items.len(), search_transcript.len());
+        black_box(matches);
+    });
+    emit(timed_record(
+        "ui",
+        "agent-find-common-query",
+        16 * 1024 * 1024,
+        search,
+        config.samples,
+        8.3,
+        16.7,
+        "Agent Find should not allocate one index per text occurrence",
+    ));
+
+    let (_directory, mut app) = app_fixture();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    app.agent.sessions = Some(
+        (0..128)
+            .map(|index| SessionChoice {
+                id: format!("session-{index}"),
+                title: Some(format!("Session {index}")),
+                updated_at: Some(index.to_string()),
+                started_in_editur: true,
+            })
+            .collect(),
+    );
+    app.agent_menu = Some(AgentMenu::Sessions);
+    let context = theme::test_context();
+    let _ = context.run_ui(input(), |ui| app.ui(ui));
+    let popup = app.agent_menu_popup.expect("session menu benchmark popup");
+    let session_menu = sample(config, || {
+        let mut frame = input();
+        frame.events = vec![
+            egui::Event::PointerMoved(popup.center()),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, -96.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let output = context.run_ui(frame, |ui| app.ui(ui));
+        black_box(output.shapes.len());
+    });
+    assert!(
+        app.agent_menu_scroll_y > 0.0,
+        "session menu benchmark must consume wheel input"
+    );
+    emit(timed_record(
+        "ui",
+        "agent-session-menu-scroll",
+        128,
+        session_menu,
+        config.samples,
+        4.0,
+        8.3,
+        "the real Agent session menu should react inside half a 60 Hz frame",
+    ));
+
+    fn text_top(shape: &egui::Shape, expected: &str) -> Option<f32> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == expected => Some(text.pos.y),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_top(shape, expected)),
+            _ => None,
+        }
+    }
+
+    let (_directory, mut app) = app_fixture();
+    app.agentic_mode = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.history_available = true;
+    let account = app.selected_account;
+    let active_project = app.agent_project_root.clone();
+    let mut projects = vec![active_project.clone()];
+    projects.extend((1..10).map(|index| app.tree.root.join(format!("project-{index}"))));
+    app.recent_projects.clone_from(&projects);
+    for (project_index, project) in projects.iter().enumerate() {
+        let sessions = (0..128)
+            .map(|session_index| SessionChoice {
+                id: format!("project-{project_index}-session-{session_index}"),
+                title: Some(format!("Project {project_index} session {session_index}")),
+                updated_at: Some(session_index.to_string()),
+                started_in_editur: true,
+            })
+            .collect::<Vec<_>>();
+        app.agent_project_sessions
+            .insert((account, project.clone()), Some(sessions.clone()));
+        app.agent_project_session_limits
+            .insert((account, project.clone()), sessions.len());
+        if project == &active_project {
+            app.agent.sessions = Some(sessions);
+        }
+    }
+    let session_label = "Project 0 session 2";
+    let context = theme::test_context();
+    let initial = context.run_ui(input(), |ui| app.ui(ui));
+    let session_before = initial
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, session_label))
+        .expect("session row before scroll");
+    let pointer = context
+        .read_response(egui::Id::new(("agent_session_open", "project-0-session-0")))
+        .expect("sidebar session response")
+        .rect
+        .center();
+    let scroll_frame = |app: &mut EditorApp, delta| {
+        let mut frame = input();
+        frame.events = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, delta),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        context.run_ui(frame, |ui| app.ui(ui))
+    };
+    let _ = scroll_frame(&mut app, -96.0);
+    let scrolled = context.run_ui(input(), |ui| app.ui(ui));
+    let session_after = scrolled
+        .shapes
+        .iter()
+        .find_map(|shape| text_top(&shape.shape, session_label))
+        .expect("session row after scroll");
+    assert!(
+        session_after < session_before,
+        "sidebar did not consume wheel input"
+    );
+    let _ = scroll_frame(&mut app, 96.0);
+    let _ = context.run_ui(input(), |ui| app.ui(ui));
+    let mut down = true;
+    let project_sidebar = sample(config, || {
+        let output = scroll_frame(&mut app, if down { -96.0 } else { 96.0 });
+        down = !down;
+        black_box(output.shapes.len());
+    });
+    emit(timed_record(
+        "ui",
+        "agent-project-sidebar-scroll",
+        10 * 128,
+        project_sidebar,
+        config.samples,
+        4.0,
+        8.3,
+        "a fully expanded Agent project sidebar should react inside half a frame",
+    ));
 }
 
 #[test]
@@ -604,6 +1264,39 @@ fn benchmark_image_cache_retention() {
 }
 
 #[test]
+fn cold_image_decode_is_deferred_until_a_later_frame() {
+    let context = theme::test_context();
+    let pixels = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("test PNG");
+    let source = Arc::<[u8]>::from(png);
+    let mut first = None;
+    let _ = context.run_ui(input(), |ui| {
+        first = assistant_embedded_image_texture(ui, &source);
+    });
+
+    assert!(
+        first.is_none(),
+        "cold decoding must not block the reveal frame"
+    );
+}
+
+#[test]
+fn background_image_decode_becomes_available_on_a_later_frame() {
+    let context = theme::test_context();
+    let pixels = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("test PNG");
+    let source = Arc::<[u8]>::from(png);
+
+    assert_eq!(wait_for_embedded_image(&context, &source).size(), [1, 1]);
+}
+
+#[test]
 fn image_cache_reuses_recent_texture_and_remains_bounded() {
     let context = theme::test_context();
     let pixels = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
@@ -612,25 +1305,24 @@ fn image_cache_reuses_recent_texture_and_remains_bounded() {
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("test PNG");
     let source = Arc::<[u8]>::from(png);
-    let mut original = None;
-    let _ = context.run_ui(input(), |ui| {
-        original = assistant_embedded_image_texture(ui, &source).map(|texture| texture.id());
-    });
+    let original = wait_for_embedded_image(&context, &source).id();
     let _ = context.run_ui(input(), |_| {});
     let mut reused = None;
     let _ = context.run_ui(input(), |ui| {
         reused = assistant_embedded_image_texture(ui, &source).map(|texture| texture.id());
     });
-    assert_eq!(reused, original, "one offscreen frame should not re-decode");
+    assert_eq!(
+        reused,
+        Some(original),
+        "one offscreen frame should not re-decode"
+    );
 
     let sources = (0..65)
         .map(|_| Arc::<[u8]>::from(source.as_ref()))
         .collect::<Vec<_>>();
-    let _ = context.run_ui(input(), |ui| {
-        for source in &sources {
-            assert!(assistant_embedded_image_texture(ui, source).is_some());
-        }
-    });
+    for source in &sources {
+        let _ = black_box(wait_for_embedded_image(&context, source));
+    }
 
     let retained = context
         .tex_manager()

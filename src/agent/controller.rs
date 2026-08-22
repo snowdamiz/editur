@@ -721,7 +721,7 @@ pub enum Command {
     #[doc(hidden)]
     TerminalAuthFinished(Result<(), String>),
     #[doc(hidden)]
-    CursorCloudStarted(Result<(String, String), String>),
+    CursorCloudFinished(Result<(), String>),
     #[doc(hidden)]
     ResumeTurn,
 }
@@ -2252,23 +2252,54 @@ async fn run_connection(
                                 );
                                 continue;
                             }
-                            send_event(&events, Event::UserMessage(format!("& {text}")));
+                            send_event(&events, Event::UserMessage(text.clone()));
                             let project_root = project_root.clone();
                             let cloud_agent = auth_config.clone();
+                            let cloud_account = project_account.as_ref().map(|account| account.key);
+                            let cloud_events = events.clone();
                             let cloud_shutdown = Arc::clone(&shutdown);
                             let internal_commands = internal_commands.clone();
                             if let Err(error) = thread::Builder::new()
                                 .name("editur-cursor-cloud".into())
                                 .spawn(move || {
-                                    let result = cursor_cloud::start(
-                                        &cloud_agent,
-                                        &project_root,
-                                        &text,
-                                        &cloud_shutdown,
-                                    )
-                                    .map(|started| (started.id, started.url));
+                                    let result = (|| {
+                                        let started = cursor_cloud::start(
+                                            &cloud_agent,
+                                            &project_root,
+                                            &text,
+                                            &cloud_shutdown,
+                                        )?;
+                                        send_event(
+                                            &cloud_events,
+                                            Event::AssistantDelta(format!(
+                                                "Cursor Cloud started [{}]({}).\n\n",
+                                                started.id, started.url
+                                            )),
+                                        );
+                                        let api_key = cloud_account
+                                            .map(|account| {
+                                                crate::data_dir().and_then(|directory| {
+                                                    crate::agent::cursor_credentials::load_from(
+                                                        &directory, account,
+                                                    )
+                                                })
+                                            })
+                                            .transpose()?
+                                            .flatten();
+                                        if let Some(api_key) = api_key {
+                                            cursor_cloud::stream(
+                                                &started,
+                                                &api_key,
+                                                &cloud_shutdown,
+                                                |event| {
+                                                    send_cursor_stream_event(&cloud_events, event)
+                                                },
+                                            )?;
+                                        }
+                                        Ok(())
+                                    })();
                                     let _ = internal_commands
-                                        .send_blocking(Command::CursorCloudStarted(result));
+                                        .send_blocking(Command::CursorCloudFinished(result));
                                 })
                             {
                                 active.store(false, Ordering::Release);
@@ -2689,16 +2720,10 @@ async fn run_connection(
                                 }
                             }
                         }
-                        Command::CursorCloudStarted(result) => {
+                        Command::CursorCloudFinished(result) => {
                             active.store(false, Ordering::Release);
-                            match result {
-                                Ok((agent_id, url)) => send_event(
-                                    &events,
-                                    Event::AssistantDelta(format!(
-                                        "Cursor Cloud started [{agent_id}]({url})."
-                                    )),
-                                ),
-                                Err(error) => send_event(&events, Event::Error(error)),
+                            if let Err(error) = result {
+                                send_event(&events, Event::Error(error));
                             }
                             send_event(
                                 &events,
@@ -5946,6 +5971,32 @@ fn send_event(events: &EventSender, event: Event) {
     }
     let _ = events.event_tx.send(event);
     (events.wake)();
+}
+
+fn send_cursor_stream_event(events: &EventSender, event: cursor_cloud::StreamEvent) {
+    let event = match event {
+        cursor_cloud::StreamEvent::Assistant(text) => Event::AssistantDelta(text),
+        cursor_cloud::StreamEvent::Thinking(text) => Event::ThoughtDelta(text),
+        cursor_cloud::StreamEvent::Tool {
+            call_id,
+            name,
+            status,
+            args,
+            result,
+        } => Event::ToolCallUpdated(ToolActivity {
+            id: call_id,
+            title: Some(name),
+            status: Some(status),
+            kind: None,
+            paths: Vec::new(),
+            detail: (args.is_some() || result.is_some()).then(|| ToolDetail {
+                input: args.as_ref().map(bounded_json),
+                content: Vec::new(),
+                output: result.as_ref().map(bounded_json),
+            }),
+        }),
+    };
+    send_event(events, event);
 }
 
 fn tool_display_title<'a>(

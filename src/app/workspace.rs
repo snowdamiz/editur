@@ -16,7 +16,7 @@ impl EditorApp {
     }
 
     pub(super) fn buffer(&self) -> Option<&Buffer> {
-        if self.git_diff.is_some() {
+        if !self.git_diffs.is_empty() {
             return None;
         }
         self.active_tab
@@ -28,19 +28,19 @@ impl EditorApp {
         if index >= self.tabs.len() {
             return;
         }
-        self.git_diff = None;
+        self.git_diffs.clear();
+        self.git_panes = PaneTabs::default();
         let changed = self.active_tab != Some(index);
         self.active_tab = Some(index);
-        self.active_pane = self.tabs[index].pane;
-        self.pane_active_tabs
-            .insert(self.active_pane, self.tabs[index].buffer.path.clone());
+        self.editor_panes
+            .activate(self.tabs[index].pane, self.tabs[index].buffer.path.clone());
         self.tree.select(Some(self.tabs[index].buffer.path.clone()));
         if changed {
             self.lsp_completion = None;
             self.lsp_definitions = None;
             self.lsp_pending_completion = None;
             self.lsp_pending_definition = None;
-            if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+            if let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) {
                 find.match_revision = u64::MAX;
                 find.scroll_to_match = find.open;
             }
@@ -67,7 +67,8 @@ impl EditorApp {
         };
         match buffer {
             Ok(buffer) => {
-                self.tabs.push(FileTab::new(buffer, self.active_pane));
+                self.tabs
+                    .push(FileTab::new(buffer, self.editor_panes.active_pane));
                 self.activate_tab(self.tabs.len() - 1);
                 self.lsp_sync_needed = true;
             }
@@ -86,16 +87,17 @@ impl EditorApp {
             self.active_tab = self.active_tab.map(|active| active - 1);
         }
         let next_in_pane = self.tabs.iter().position(|tab| tab.pane == removed.pane);
-        if self.pane_active_tabs.get(&removed.pane) == Some(&removed.buffer.path) {
+        if self.editor_panes.active(removed.pane) == Some(&removed.buffer.path) {
             if let Some(next) = next_in_pane {
-                self.pane_active_tabs
+                self.editor_panes
+                    .active_tabs
                     .insert(removed.pane, self.tabs[next].buffer.path.clone());
             } else {
-                self.pane_active_tabs.remove(&removed.pane);
+                self.editor_panes.active_tabs.remove(&removed.pane);
             }
         }
         if next_in_pane.is_none() {
-            self.pane_layout.remove(removed.pane);
+            self.editor_panes.layout.remove(removed.pane);
             self.pane_find.remove(&removed.pane);
         }
         if was_active {
@@ -144,7 +146,7 @@ impl EditorApp {
         let moved_path = self.tabs[index].buffer.path.clone();
         let pane = if zone == DropZone::Center {
             target
-        } else if let Some(pane) = self.pane_layout.split(target, zone) {
+        } else if let Some(pane) = self.editor_panes.layout.split(target, zone) {
             pane
         } else {
             target
@@ -152,13 +154,14 @@ impl EditorApp {
         self.tabs[index].pane = pane;
         if source != pane {
             if let Some(tab) = self.tabs.iter().find(|tab| tab.pane == source) {
-                if self.pane_active_tabs.get(&source) == Some(&moved_path) {
-                    self.pane_active_tabs
+                if self.editor_panes.active(source) == Some(&moved_path) {
+                    self.editor_panes
+                        .active_tabs
                         .insert(source, tab.buffer.path.clone());
                 }
             } else {
-                self.pane_active_tabs.remove(&source);
-                self.pane_layout.remove(source);
+                self.editor_panes.active_tabs.remove(&source);
+                self.editor_panes.layout.remove(source);
                 self.pane_find.remove(&source);
             }
         }
@@ -286,7 +289,7 @@ impl EditorApp {
         let Some(index) = self.active_tab else {
             return true;
         };
-        if self.git_diff.is_some() {
+        if !self.git_diffs.is_empty() {
             return true;
         }
         let save_as = destination.is_some();

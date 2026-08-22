@@ -1,19 +1,20 @@
 use super::*;
 
 pub(super) fn cursor_cloud_prompt(
+    location: AgentRunLocation,
     provider: ProviderId,
     prompt: &str,
     has_attachments: bool,
 ) -> Result<Option<String>, String> {
-    if provider != ProviderId::Cursor || !prompt.starts_with('&') {
+    if location != AgentRunLocation::Cloud || provider != ProviderId::Cursor {
         return Ok(None);
     }
     if has_attachments {
         return Err("Cursor Cloud prompts do not support local attachments".into());
     }
-    let prompt = prompt[1..].trim();
+    let prompt = prompt.trim();
     if prompt.is_empty() {
-        return Err("enter a prompt after & to start Cursor Cloud".into());
+        return Err("enter a prompt to start Cursor Cloud".into());
     }
     Ok(Some(prompt.to_owned()))
 }
@@ -201,6 +202,38 @@ impl EditorApp {
         self.selected_provider = self.selected_account.provider;
     }
 
+    pub(super) fn ensure_cursor_cloud_keys(&mut self) {
+        if self.cursor_cloud_keys_loaded {
+            return;
+        }
+        self.cursor_cloud_keys_loaded = true;
+        match data_dir()
+            .and_then(|directory| crate::agent::cursor_credentials::configured_from(&directory))
+        {
+            Ok(accounts) => self.cursor_cloud_key_accounts = accounts,
+            Err(error) => self.settings_error = Some(error),
+        }
+    }
+
+    pub(super) fn save_cursor_cloud_key(&mut self, account: AccountKey) -> Result<(), String> {
+        let api_key = self
+            .cursor_cloud_key_drafts
+            .get(&account)
+            .map(String::as_str)
+            .unwrap_or_default();
+        crate::agent::cursor_credentials::save_to(&data_dir()?, account, api_key)?;
+        self.cursor_cloud_key_accounts.insert(account);
+        self.cursor_cloud_key_drafts.remove(&account);
+        Ok(())
+    }
+
+    pub(super) fn remove_cursor_cloud_key(&mut self, account: AccountKey) -> Result<(), String> {
+        crate::agent::cursor_credentials::remove_from(&data_dir()?, account)?;
+        self.cursor_cloud_key_accounts.remove(&account);
+        self.cursor_cloud_key_drafts.remove(&account);
+        Ok(())
+    }
+
     pub(super) fn warm_providers(&mut self, ctx: &egui::Context) {
         self.ensure_provider_catalog();
         self.start_provider(self.selected_provider, ctx, false);
@@ -360,12 +393,27 @@ impl EditorApp {
         let mut accounts = self.accounts.clone();
         match prompt.action {
             AccountPromptAction::Add(provider) => {
+                let api_key = (provider == ProviderId::Cursor)
+                    .then_some(prompt.cursor_api_key.trim())
+                    .filter(|api_key| !api_key.is_empty())
+                    .map(str::to_owned);
                 let key = accounts.add_account(
                     provider,
                     prompt.label.trim().to_owned(),
                     AuthSource::ProviderManaged,
                 )?;
-                self.commit_accounts(accounts)?;
+                if let Some(api_key) = api_key.as_deref() {
+                    crate::agent::cursor_credentials::save_to(&data_dir()?, key, api_key)?;
+                }
+                if let Err(error) = self.commit_accounts(accounts) {
+                    if api_key.is_some() {
+                        let _ = crate::agent::cursor_credentials::remove_from(&data_dir()?, key);
+                    }
+                    return Err(error);
+                }
+                if api_key.is_some() {
+                    self.cursor_cloud_key_accounts.insert(key);
+                }
                 self.account_prompt = None;
                 self.request_account_switch(key, ctx);
             }
@@ -816,14 +864,18 @@ impl EditorApp {
             .iter()
             .map(|attachment| attachment.file.clone())
             .collect::<Vec<_>>();
-        let cloud_prompt =
-            match cursor_cloud_prompt(self.selected_provider, &prompt, !attachments.is_empty()) {
-                Ok(prompt) => prompt,
-                Err(error) => {
-                    self.show_error(error);
-                    return;
-                }
-            };
+        let cloud_prompt = match cursor_cloud_prompt(
+            self.agent_run_location,
+            self.selected_provider,
+            &prompt,
+            !attachments.is_empty(),
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
         let Some(controller) = self.agent_controllers.get(&self.selected_account) else {
             return;
         };
@@ -1217,6 +1269,7 @@ impl EditorApp {
 
         let mut reconnect = false;
         let mut authenticate = None;
+        let mut save_cursor_cloud_key = false;
         let mut permission_decisions = Vec::new();
         let mut interaction_responses = Vec::new();
         let mut open_path_request: Option<(PathBuf, Option<u32>)> = None;
@@ -1277,6 +1330,9 @@ impl EditorApp {
                     );
                 }
                 ConnectionState::AuthenticationRequired(methods) => {
+                    if self.selected_provider == ProviderId::Cursor {
+                        self.ensure_cursor_cloud_keys();
+                    }
                     let environment_only = !methods.is_empty()
                         && methods.iter().all(|method| {
                             method.kind == AuthKind::Environment && !method.can_authenticate
@@ -1287,7 +1343,16 @@ impl EditorApp {
                     let width = region.width().min(288.0);
                     let height = region
                         .height()
-                        .min(132.0 + methods.len() as f32 * 92.0 + if environment_only { 52.0 } else { 0.0 });
+                        .min(
+                            132.0
+                                + methods.len() as f32 * 92.0
+                                + if environment_only { 52.0 } else { 0.0 }
+                                + if self.selected_provider == ProviderId::Cursor {
+                                    174.0
+                                } else {
+                                    0.0
+                                },
+                        );
                     let top = region.top() + (region.height() - height).max(0.0) * 0.42;
                     let block = egui::Rect::from_min_size(
                         egui::pos2(region.center().x - width * 0.5, top),
@@ -1421,6 +1486,60 @@ impl EditorApp {
                                     reconnect = true;
                                 }
                             }
+                            if self.selected_provider == ProviderId::Cursor {
+                                let key = self.selected_account;
+                                let has_key = self.cursor_cloud_key_accounts.contains(&key);
+                                ui.add_space(theme::space::XWIDE);
+                                ui.separator();
+                                ui.add_space(theme::space::MEDIUM);
+                                ui.label(
+                                    RichText::new("Cursor Cloud API key (optional)")
+                                        .font(theme::typography::small_strong())
+                                        .color(theme::text().secondary),
+                                );
+                                ui.add_space(theme::space::TIGHT);
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(
+                                            "Used only to stream Cursor Cloud progress in Editur. Cursor sign-in still uses your browser.",
+                                        )
+                                        .font(theme::typography::small())
+                                        .color(theme::text().muted),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add_space(theme::space::MEDIUM);
+                                ui.add(
+                                    TextEdit::singleline(
+                                        self.cursor_cloud_key_drafts.entry(key).or_default(),
+                                    )
+                                    .id(Id::new((
+                                        "agent_auth_cloud_api_key",
+                                        key.provider,
+                                        key.account_id,
+                                    )))
+                                    .password(true)
+                                    .hint_text(if has_key {
+                                        "Enter a new key to replace the saved key"
+                                    } else {
+                                        "Paste from Cursor Dashboard → API Keys"
+                                    })
+                                    .desired_width(width),
+                                );
+                                let can_save = self
+                                    .cursor_cloud_key_drafts
+                                    .get(&key)
+                                    .is_some_and(|api_key| !api_key.trim().is_empty());
+                                ui.add_space(theme::space::SMALL);
+                                ui.add_enabled_ui(can_save, |ui| {
+                                    if ui
+                                        .button(if has_key { "Replace key" } else { "Save key" })
+                                        .clicked()
+                                    {
+                                        save_cursor_cloud_key = true;
+                                    }
+                                });
+                            }
                         },
                     );
                 }
@@ -1546,16 +1665,11 @@ impl EditorApp {
                     if scrolling_up {
                         self.agent_follow_transcript = false;
                     }
-                    let find_matches = self.agent_find.matches.clone();
-                    let selected_find_item = find_matches
-                        .get(self.agent_find.selected)
-                        .copied();
-                    let selected_find_occurrence = selected_find_item.map(|item| {
-                        find_matches[..self.agent_find.selected]
-                            .iter()
-                            .filter(|&&candidate| candidate == item)
-                            .count()
-                    });
+                    let find_matches = std::mem::take(&mut self.agent_find.matches);
+                    let selected_find_match = find_matches.resolve(self.agent_find.selected);
+                    let selected_find_item = selected_find_match.map(|(item, _)| item);
+                    let selected_find_occurrence =
+                        selected_find_match.map(|(_, occurrence)| occurrence);
                     let find_query = self.agent_find.query.clone();
                     let should_scroll_to_find = self.agent_find.scroll_to_match;
                     let mut scrolled_to_find = false;
@@ -1569,7 +1683,7 @@ impl EditorApp {
                         transcript_width.round().to_bits(),
                         theme::paint_appearance(ui.pixels_per_point()),
                         dense_agent,
-                        self.agent.active,
+                        dense_agent && self.agent.active,
                         session_hasher.finish(),
                     );
                     if self.agent_transcript_heights_key != heights_key
@@ -1580,8 +1694,8 @@ impl EditorApp {
                     }
                     let mut item_heights = std::mem::take(&mut self.agent_transcript_heights);
                     let transcript_len = self.agent.transcript.len();
-                    let mut user_prompt_images = vec![Vec::new(); transcript_len];
-                    let mut merged_user_images = vec![false; transcript_len];
+                    let mut user_prompt_images = HashMap::<usize, Vec<Arc<[u8]>>>::new();
+                    let mut merged_user_images = HashSet::new();
                     let mut user_prompt_index = None;
                     for (index, item) in self.agent.transcript.iter().enumerate() {
                         match item {
@@ -1591,10 +1705,13 @@ impl EditorApp {
                                 content: DisplayContent::Image {
                                     data: Some(data), ..
                                 },
-                            } => {
+                                } => {
                                 if let Some(prompt_index) = user_prompt_index {
-                                    user_prompt_images[prompt_index].push(Arc::clone(data));
-                                    merged_user_images[index] = true;
+                                    user_prompt_images
+                                        .entry(prompt_index)
+                                        .or_default()
+                                        .push(Arc::clone(data));
+                                    merged_user_images.insert(index);
                                 }
                             }
                             TranscriptItem::Content {
@@ -1606,21 +1723,25 @@ impl EditorApp {
                     }
                     let transcript_has_footer =
                         !self.agent.changed_paths.is_empty() || self.agent.active;
-                    item_heights.resize(transcript_len, f32::NAN);
+                    item_heights.resize(transcript_len, AGENT_ESTIMATED_ITEM_HEIGHT);
                     let mut rendered_items = 0_usize;
                     let tool_changes = &self.agent.tool_changes;
-                    let active_work_start = self.agent.active.then(|| {
+                    let active_work_start = (dense_agent && self.agent.active).then(|| {
                         self.agent
                             .transcript
                             .iter()
                             .rposition(|item| matches!(item, TranscriptItem::User(_)))
                             .map_or(0, |index| index + 1)
                     });
-                    let dense_work_clusters = dense_agent_work_clusters(
-                        &self.agent.transcript,
-                        tool_changes,
-                        active_work_start,
-                    );
+                    let dense_work_clusters = if dense_agent {
+                        dense_agent_work_clusters(
+                            &self.agent.transcript,
+                            tool_changes,
+                            active_work_start,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     let dense_final_responses = if dense_agent {
                         dense_agent_final_response_starts(
                             &self.agent.transcript,
@@ -1665,7 +1786,7 @@ impl EditorApp {
                                     for (item_index, item) in
                                         self.agent.transcript.iter_mut().enumerate()
                                     {
-                                if merged_user_images[item_index] {
+                                if merged_user_images.contains(&item_index) {
                                     item_heights[item_index] = 0.0;
                                     continue;
                                 }
@@ -1719,7 +1840,7 @@ impl EditorApp {
                                 }
                                 rendered_items += 1;
                                 let mut item_scrolled = false;
-                                let item_matches = find_matches.binary_search(&item_index).is_ok();
+                                let item_matches = find_matches.contains_item(item_index);
                                 let item_search = item_matches.then_some((
                                     find_query.as_str(),
                                     item_is_selected
@@ -1748,12 +1869,12 @@ impl EditorApp {
                                 match item {
                                     TranscriptItem::User(text) => {
                                         chat_user_message(ui, text, item_search, |ui| {
-                                                if !user_prompt_images[item_index].is_empty() {
+                                                if let Some(images) = user_prompt_images.get(&item_index) {
                                                     if !text.is_empty() {
                                                         ui.add_space(theme::space::MEDIUM);
                                                     }
                                                     ui.horizontal_wrapped(|ui| {
-                                                        for data in &user_prompt_images[item_index] {
+                                                        for data in images {
                                                             if assistant_prompt_image_preview(ui, data)
                                                                 .is_some_and(|preview| {
                                                                     preview.clicked()
@@ -1984,8 +2105,6 @@ impl EditorApp {
                                         let contains_diff = tool_contains_diff(tool);
                                         let is_subagent = tool_is_subagent(tool);
                                         let is_terminal = agent_tool_is_terminal(tool);
-                                        let terminal_command = tool.command();
-                                        let terminal_output = agent_terminal_output(tool);
                                         let change = is_file_edit
                                             .then(|| tool_changes.get(&tool.id).copied())
                                             .flatten();
@@ -2062,10 +2181,15 @@ impl EditorApp {
                                                 }
                                                 if let Some(detail) = &tool.detail {
                                                     if is_terminal {
+                                                        let terminal_command = tool.command();
+                                                        let terminal_output =
+                                                            cached_agent_terminal_output(
+                                                                ui.ctx(), tool, is_terminal,
+                                                            );
                                                         crate::terminal::show_transcript_terminal(
                                                             ui,
                                                             terminal_command.as_deref(),
-                                                            terminal_output.as_deref().unwrap_or_default(),
+                                                            &terminal_output,
                                                         );
                                                     }
                                                     for (content_index, content) in
@@ -2771,8 +2895,7 @@ impl EditorApp {
                                         ))
                                         .or_else(|| {
                                             find_matches
-                                                .binary_search(&self.agent.transcript.len())
-                                                .is_ok()
+                                                .contains_item(self.agent.transcript.len())
                                                 .then_some((find_query.as_str(), None))
                                         }),
                                 ) {
@@ -2810,6 +2933,7 @@ impl EditorApp {
                         });
                     self.agent_transcript_heights = item_heights;
                     self.agent_transcript_rendered = rendered_items;
+                    self.agent_find.matches = find_matches;
                     if scrolled_to_find {
                         self.agent_find.scroll_to_match = false;
                         self.agent_follow_transcript = false;
@@ -2840,7 +2964,7 @@ impl EditorApp {
                                 self.agent_transcript_heights.clear();
                                 self.agent_find.dirty = true;
                                 self.agent_follow_transcript = false;
-                                ui.ctx().request_discard("page the agent transcript");
+                                ui.ctx().request_repaint();
                             }
                             Ok(false) => {}
                             Err(error) => self.show_error(error),
@@ -2913,6 +3037,7 @@ impl EditorApp {
         );
 
         let mut mode_change = None;
+        let mut run_location_change = None;
         let mut config_changes = Vec::new();
         let mut run_everything_change = None;
         let mut goal_action = None;
@@ -2933,20 +3058,22 @@ impl EditorApp {
         let mut mention_attach = None;
         let composer_enabled =
             self.agent.session_ready && (!self.agent.active || self.agent.steering);
-        let composer_hint =
-            if self.agent.session_ready && self.selected_provider == ProviderId::Cursor {
-                "Ask Cursor Agent… · & for Cloud".to_owned()
-            } else if self.agent.session_ready {
-                format!(
-                    "Ask {} Agent…",
-                    provider_descriptor(self.selected_provider).display_name
-                )
-            } else {
-                format!(
-                    "Connect {} to start…",
-                    provider_descriptor(self.selected_provider).display_name
-                )
-            };
+        let composer_hint = if self.agent.session_ready
+            && self.selected_provider == ProviderId::Cursor
+            && self.agent_run_location == AgentRunLocation::Cloud
+        {
+            "Ask Cursor Cloud Agent…".to_owned()
+        } else if self.agent.session_ready {
+            format!(
+                "Ask {} Agent…",
+                provider_descriptor(self.selected_provider).display_name
+            )
+        } else {
+            format!(
+                "Connect {} to start…",
+                provider_descriptor(self.selected_provider).display_name
+            )
+        };
         let mut open_menu = self.agent_menu.clone();
         if (!self.agent.session_ready || self.agent.active)
             && !matches!(
@@ -3176,6 +3303,20 @@ impl EditorApp {
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing.x = theme::space::SMALL;
+                ui.add_enabled_ui(!self.agent.active, |ui| {
+                    if self.selected_provider == ProviderId::Cursor {
+                        let menu = AgentMenu::RunLocation;
+                        let selector = agent_selector_button(ui, self.agent_run_location.label())
+                            .on_hover_text("Choose where Cursor Agent runs");
+                        if selector.clicked() {
+                            open_menu = (open_menu.as_ref() != Some(&menu)).then_some(menu.clone());
+                            menu_toggled = true;
+                        }
+                        if open_menu.as_ref() == Some(&menu) {
+                            menu_anchor = Some(selector.rect);
+                        }
+                    }
+                });
                 if let Some(goal) = &self.agent.goal {
                     ui.label(
                         RichText::new(format!("Goal: {}", goal.status))
@@ -3383,6 +3524,7 @@ impl EditorApp {
                 ),
                 AgentMenu::Mentions(_) => Some(self.agent_mention_matches.len().max(1)),
                 AgentMenu::Permissions => Some(2),
+                AgentMenu::RunLocation => Some(2),
                 AgentMenu::Mode => Some(self.agent.modes.len()),
                 AgentMenu::Config(id) => self
                     .agent
@@ -3546,7 +3688,7 @@ impl EditorApp {
                                     })
                                     .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
                                     .vertical_scroll_offset(scroll_y)
-                                    .show(ui, |ui| {
+                                    .show_viewport(ui, |ui, viewport| {
                                         ui.spacing_mut().interact_size.y = row_height;
                                         ui.spacing_mut().item_spacing.y = 0.0;
                                                 match menu {
@@ -3778,23 +3920,46 @@ impl EditorApp {
                                                             ),
                                                         );
                                                     }
-                                                    for session in sessions {
-                                                        let (open, remove, _) = agent_session_row(
-                                                            ui,
-                                                            session,
-                                                            false,
-                                                            false,
-                                                            &[],
-                                                            true,
+                                                    if !sessions.is_empty() {
+                                                        ui.set_height(content_height);
+                                                        let first = (viewport.top() / row_height)
+                                                            .floor()
+                                                            as usize;
+                                                        let first = first.min(sessions.len());
+                                                        let end = ((viewport.bottom() / row_height)
+                                                            .ceil() as usize
+                                                            + 1)
+                                                            .min(sessions.len());
+                                                        let rows = egui::Rect::from_min_max(
+                                                            egui::pos2(
+                                                                ui.max_rect().left(),
+                                                                ui.max_rect().top()
+                                                                    + first as f32 * row_height,
+                                                            ),
+                                                            egui::pos2(
+                                                                ui.max_rect().right(),
+                                                                ui.max_rect().top()
+                                                                    + end as f32 * row_height,
+                                                            ),
                                                         );
-                                                        if open {
-                                                            session_load = Some(session.id.clone());
-                                                            selected = true;
-                                                        }
-                                                        if remove {
-                                                            session_remove =
-                                                                Some(session.id.clone());
-                                                        }
+                                                        ui.scope_builder(
+                                                            UiBuilder::new().max_rect(rows),
+                                                            |ui| {
+                                                                ui.skip_ahead_auto_ids(first);
+                                                                for session in &sessions[first..end] {
+                                                                    let (open, remove, _) = agent_session_row(
+                                                                        ui, session, false, false, &[], true,
+                                                                    );
+                                                                    if open {
+                                                                        session_load = Some(session.id.clone());
+                                                                        selected = true;
+                                                                    }
+                                                                    if remove {
+                                                                        session_remove = Some(session.id.clone());
+                                                                    }
+                                                                }
+                                                            },
+                                                        );
                                                     }
                                                 }
                                             }
@@ -3899,6 +4064,24 @@ impl EditorApp {
                                                     .clicked()
                                                     {
                                                         run_everything_change = Some(enabled);
+                                                        selected = true;
+                                                    }
+                                                }
+                                            }
+                                            AgentMenu::RunLocation => {
+                                                for (location, label) in [
+                                                    (AgentRunLocation::Local, "Local"),
+                                                    (AgentRunLocation::Cloud, "Cursor Cloud"),
+                                                ] {
+                                                    if agent_menu_option(
+                                                        ui,
+                                                        label,
+                                                        self.agent_run_location == location,
+                                                        row_height,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        run_location_change = Some(location);
                                                         selected = true;
                                                     }
                                                 }
@@ -4235,6 +4418,9 @@ impl EditorApp {
         if let Some(path) = open_diff_request {
             self.open_agent_diff(path);
         }
+        if let Some(location) = run_location_change {
+            self.agent_run_location = location;
+        }
         if let Some(enabled) = run_everything_change
             && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
@@ -4272,6 +4458,7 @@ impl EditorApp {
             self.account_prompt = Some(AccountPrompt {
                 action: AccountPromptAction::Rename(key),
                 label: account.label.clone(),
+                cursor_api_key: String::new(),
                 focus: true,
             });
         }
@@ -4280,6 +4467,7 @@ impl EditorApp {
             self.account_prompt = Some(AccountPrompt {
                 action: AccountPromptAction::Add(provider),
                 label: format!("Account {number}"),
+                cursor_api_key: String::new(),
                 focus: true,
             });
         }
@@ -4322,6 +4510,11 @@ impl EditorApp {
             && let Some(controller) = self.agent_controllers.get(&self.selected_account)
         {
             let _ = controller.send(AgentCommand::Authenticate(method));
+        }
+        if save_cursor_cloud_key
+            && let Err(error) = self.save_cursor_cloud_key(self.selected_account)
+        {
+            self.show_error(error);
         }
         if reconnect {
             self.reconnect_agent(ui.ctx());

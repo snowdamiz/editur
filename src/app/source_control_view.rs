@@ -89,45 +89,45 @@ impl EditorApp {
             }
             self.git_state.apply(&event);
             if let GitEvent::Status(snapshot) = &event {
-                self.refresh_active_git_diff(snapshot.generation);
+                self.refresh_open_git_diffs(snapshot.generation);
             }
         }
     }
 
-    fn refresh_active_git_diff(&mut self, generation: u64) {
-        let Some(diff) = self
-            .git_diff
-            .as_ref()
+    fn refresh_open_git_diffs(&mut self, generation: u64) {
+        let stale = self
+            .git_diffs
+            .iter()
             .filter(|diff| diff.generation < generation)
             .cloned()
-        else {
-            return;
-        };
-        let still_changed = self
-            .git_state
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .repositories
-                    .iter()
-                    .find(|repository| repository.root == diff.repository)
-            })
-            .is_some_and(|repository| {
-                repository.entries.iter().any(|entry| {
-                    entry.path == diff.path
-                        && match diff.area {
-                            DiffArea::Staged => entry.index.is_some(),
-                            DiffArea::Worktree => entry.worktree.is_some(),
-                        }
+            .collect::<Vec<_>>();
+        for diff in stale {
+            let still_changed = self
+                .git_state
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .repositories
+                        .iter()
+                        .find(|repository| repository.root == diff.repository)
                 })
-            });
-        if still_changed {
-            self.send_git(GitCommand::LoadDiff {
-                repository: diff.repository,
-                path: diff.path,
-                area: diff.area,
-            });
+                .is_some_and(|repository| {
+                    repository.entries.iter().any(|entry| {
+                        entry.path == diff.path
+                            && match diff.area {
+                                DiffArea::Staged => entry.index.is_some(),
+                                DiffArea::Worktree => entry.worktree.is_some(),
+                            }
+                    })
+                });
+            if still_changed {
+                self.send_git(GitCommand::LoadDiff {
+                    repository: diff.repository,
+                    path: diff.path,
+                    area: diff.area,
+                });
+            }
         }
     }
 
@@ -204,7 +204,18 @@ impl EditorApp {
         old.hash(&mut content);
         new.hash(&mut content);
         generation.hash(&mut content);
+        let key = GitDiffKey {
+            repository: repository.clone(),
+            path: path.clone(),
+            area,
+        };
+        let existing = self.git_diffs.iter().position(|diff| diff.key == key);
+        let pane = existing.map_or(self.git_panes.active_pane, |index| {
+            self.git_diffs[index].pane
+        });
         let diff = GitDiffPreview {
+            key: key.clone(),
+            pane,
             repository,
             path,
             area,
@@ -214,8 +225,106 @@ impl EditorApp {
             content_revision: content.finish(),
             unsaved_editor_changes,
         };
-        self.git_diff = Some(diff);
+        let index = if let Some(index) = existing {
+            self.git_diffs[index] = diff;
+            index
+        } else {
+            self.git_diffs.push(diff);
+            self.git_diffs.len() - 1
+        };
+        if existing.is_none() {
+            self.activate_git_diff(index);
+        }
         self.focus_editor = false;
+    }
+
+    pub(super) fn active_git_diff(&self, pane: PaneId) -> Option<&GitDiffPreview> {
+        let key = self.git_panes.active(pane)?;
+        self.git_diffs.iter().find(|diff| &diff.key == key)
+    }
+
+    pub(super) fn activate_git_diff_key(&mut self, key: &GitDiffKey) {
+        if let Some(index) = self.git_diffs.iter().position(|diff| &diff.key == key) {
+            self.activate_git_diff(index);
+        }
+    }
+
+    pub(super) fn activate_git_diff(&mut self, index: usize) {
+        let Some(diff) = self.git_diffs.get(index) else {
+            return;
+        };
+        self.git_panes.activate(diff.pane, diff.key.clone());
+        self.focus_editor = false;
+    }
+
+    pub(super) fn close_git_diff(&mut self, index: usize) {
+        if index >= self.git_diffs.len() {
+            return;
+        }
+        let removed = self.git_diffs.remove(index);
+        if self.git_panes.active(removed.pane) == Some(&removed.key) {
+            if let Some(next) = self.git_diffs.iter().find(|diff| diff.pane == removed.pane) {
+                self.git_panes.activate(removed.pane, next.key.clone());
+            } else {
+                self.git_panes.clear_pane(removed.pane);
+            }
+        }
+        if self.git_diffs.is_empty() {
+            self.git_panes = PaneTabs::default();
+            self.focus_editor = self.active_tab.is_some();
+        }
+    }
+
+    pub(super) fn close_active_git_diff(&mut self) {
+        let Some(key) = self.git_panes.active(self.git_panes.active_pane).cloned() else {
+            return;
+        };
+        if let Some(index) = self.git_diffs.iter().position(|diff| diff.key == key) {
+            self.close_git_diff(index);
+        }
+    }
+
+    pub(super) fn move_git_diff(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.git_diffs.len() || to >= self.git_diffs.len() {
+            return;
+        }
+        let diff = self.git_diffs.remove(from);
+        self.git_diffs.insert(to, diff);
+    }
+
+    pub(super) fn drop_git_diff(&mut self, index: usize, target: PaneId, zone: DropZone) {
+        let Some(source) = self.git_diffs.get(index).map(|diff| diff.pane) else {
+            return;
+        };
+        if source == target
+            && zone != DropZone::Center
+            && self
+                .git_diffs
+                .iter()
+                .filter(|diff| diff.pane == source)
+                .count()
+                == 1
+        {
+            return;
+        }
+        let pane = if zone == DropZone::Center {
+            target
+        } else if let Some(pane) = self.git_panes.layout.split(target, zone) {
+            pane
+        } else {
+            target
+        };
+        let key = self.git_diffs[index].key.clone();
+        self.git_diffs[index].pane = pane;
+        if source != pane && !self.git_diffs.iter().any(|diff| diff.pane == source) {
+            self.git_panes.clear_pane(source);
+        } else if source != pane
+            && self.git_panes.active(source) == Some(&key)
+            && let Some(next) = self.git_diffs.iter().find(|diff| diff.pane == source)
+        {
+            self.git_panes.activate(source, next.key.clone());
+        }
+        self.activate_git_diff(index);
     }
 
     pub(super) fn draw_source_control(&mut self, ui: &mut egui::Ui) {
@@ -678,6 +787,11 @@ impl EditorApp {
                 });
             }
             SourceControlAction::Diff(repository, path, area) => {
+                self.activate_git_diff_key(&GitDiffKey {
+                    repository: repository.clone(),
+                    path: path.clone(),
+                    area,
+                });
                 self.send_git(GitCommand::LoadDiff {
                     repository,
                     path,

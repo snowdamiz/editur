@@ -12,7 +12,10 @@ use agent_client_protocol::AcpAgentConfig;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const AGENT_URL_PREFIX: &str = "https://cursor.com/agents/";
+#[cfg(feature = "network")]
+const API_URL: &str = "https://api.cursor.com/v1/agents";
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -20,6 +23,134 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 pub(super) struct StartedAgent {
     pub id: String,
     pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum StreamEvent {
+    Assistant(String),
+    Thinking(String),
+    Tool {
+        call_id: String,
+        name: String,
+        status: String,
+        args: Option<serde_json::Value>,
+        result: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    assistant_seen: bool,
+    done: bool,
+}
+
+impl SseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<StreamEvent>, String> {
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        while let Some((end, delimiter)) = sse_delimiter(&self.buffer) {
+            if end > MAX_SSE_EVENT_BYTES {
+                return Err("Cursor Cloud sent an oversized progress event".into());
+            }
+            let event = self.buffer.drain(..end).collect::<Vec<_>>();
+            self.buffer.drain(..delimiter);
+            if let Some(event) = self.parse_event(&event)? {
+                output.push(event);
+            }
+        }
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
+            return Err("Cursor Cloud sent an oversized progress event".into());
+        }
+        Ok(output)
+    }
+
+    fn parse_event(&mut self, bytes: &[u8]) -> Result<Option<StreamEvent>, String> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| "Cursor Cloud sent invalid progress data".to_owned())?;
+        let mut kind = "message";
+        let mut data = String::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                kind = value.trim();
+            } else if let Some(value) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        if matches!(kind, "heartbeat" | "status" | "interaction_update") {
+            return Ok(None);
+        }
+        if kind == "done" {
+            self.done = true;
+            return Ok(None);
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|_| "Cursor Cloud sent invalid progress data".to_owned())?;
+        let string = |field: &str, limit: usize| {
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| value.len() <= limit)
+                .map(str::to_owned)
+        };
+        match kind {
+            "assistant" => {
+                let text = string("text", MAX_SSE_EVENT_BYTES)
+                    .ok_or_else(|| "Cursor Cloud sent invalid assistant progress".to_owned())?;
+                self.assistant_seen = true;
+                Ok(Some(StreamEvent::Assistant(text)))
+            }
+            "thinking" => Ok(Some(StreamEvent::Thinking(
+                string("text", MAX_SSE_EVENT_BYTES)
+                    .ok_or_else(|| "Cursor Cloud sent invalid thinking progress".to_owned())?,
+            ))),
+            "tool_call" => Ok(Some(StreamEvent::Tool {
+                call_id: string("callId", 256)
+                    .ok_or_else(|| "Cursor Cloud sent an invalid tool call".to_owned())?,
+                name: string("name", 256)
+                    .ok_or_else(|| "Cursor Cloud sent an invalid tool call".to_owned())?,
+                status: string("status", 32)
+                    .ok_or_else(|| "Cursor Cloud sent an invalid tool call".to_owned())?,
+                args: value.get("args").cloned(),
+                result: value.get("result").cloned(),
+            })),
+            "result" => {
+                let status = string("status", 32)
+                    .ok_or_else(|| "Cursor Cloud sent an invalid run result".to_owned())?;
+                match status.as_str() {
+                    "FINISHED" => {}
+                    "CANCELLED" => return Err("Cursor Cloud run was cancelled".into()),
+                    "EXPIRED" => return Err("Cursor Cloud run expired".into()),
+                    "ERROR" => return Err("Cursor Cloud run failed".into()),
+                    _ => return Err("Cursor Cloud sent an invalid run status".into()),
+                }
+                Ok((!self.assistant_seen)
+                    .then(|| string("text", MAX_SSE_EVENT_BYTES))
+                    .flatten()
+                    .map(StreamEvent::Assistant))
+            }
+            "error" => Err("Cursor Cloud stream failed".into()),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn sse_delimiter(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes.windows(2).position(|window| window == b"\n\n");
+    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(left), Some(right)) if left <= right => Some((left, 2)),
+        (Some(left), Some(_)) => Some((left, 2)),
+        (None, Some(right)) => Some((right, 4)),
+        (Some(left), None) => Some((left, 2)),
+        (None, None) => None,
+    }
 }
 
 fn safe_id(id: &str) -> bool {
@@ -245,6 +376,99 @@ pub(super) fn start(
     }
 }
 
+#[cfg(feature = "network")]
+pub(super) fn stream(
+    started: &StartedAgent,
+    api_key: &str,
+    shutdown: &AtomicBool,
+    mut on_event: impl FnMut(StreamEvent),
+) -> Result<(), String> {
+    if !safe_id(&started.id) {
+        return Err("Cursor Cloud returned an invalid agent ID".into());
+    }
+    let client: ureq::Agent = ureq::Agent::config_builder()
+        .user_agent(format!("editur/{}", env!("CARGO_PKG_VERSION")))
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let authorization = format!("Bearer {api_key}");
+    let mut agent = client
+        .get(format!("{API_URL}/{}", started.id))
+        .header("Authorization", &authorization)
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|_| "cannot connect to the Cursor Cloud progress API".to_owned())?;
+    cursor_api_status(agent.status().as_u16())?;
+    let bytes = agent
+        .body_mut()
+        .with_config()
+        .limit((MAX_OUTPUT_BYTES + 1) as u64)
+        .read_to_vec()
+        .map_err(|_| "cannot read the Cursor Cloud agent record".to_owned())?;
+    if bytes.len() > MAX_OUTPUT_BYTES {
+        return Err("Cursor Cloud returned an oversized agent record".into());
+    }
+    let run_id = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("latestRunId")?.as_str().map(str::to_owned))
+        .filter(|run_id| safe_id(run_id))
+        .ok_or_else(|| "Cursor Cloud did not return a valid run ID".to_owned())?;
+
+    let mut response = client
+        .get(format!("{API_URL}/{}/runs/{run_id}/stream", started.id))
+        .header("Authorization", &authorization)
+        .header("Accept", "text/event-stream")
+        .call()
+        .map_err(|_| "cannot connect to the Cursor Cloud progress stream".to_owned())?;
+    cursor_api_status(response.status().as_u16())?;
+    let mut reader = response.body_mut().as_reader();
+    let mut decoder = SseDecoder::default();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| "Cursor Cloud progress stream disconnected".to_owned())?;
+        if count == 0 {
+            return if decoder.done {
+                Ok(())
+            } else {
+                Err("Cursor Cloud progress stream ended early".into())
+            };
+        }
+        for event in decoder.push(&buffer[..count])? {
+            on_event(event);
+        }
+        if decoder.done {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(feature = "network")]
+fn cursor_api_status(status: u16) -> Result<(), String> {
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err("Cursor Cloud API key was rejected".into()),
+        404 => Err("Cursor Cloud agent is not available to this API key".into()),
+        429 => Err("Cursor Cloud progress API is rate limited".into()),
+        _ => Err(format!("Cursor Cloud progress API returned HTTP {status}")),
+    }
+}
+
+#[cfg(not(feature = "network"))]
+pub(super) fn stream(
+    _started: &StartedAgent,
+    _api_key: &str,
+    _shutdown: &AtomicBool,
+    _on_event: impl FnMut(StreamEvent),
+) -> Result<(), String> {
+    Err("live Cursor Cloud progress is unavailable in this build".into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, process::Command};
@@ -331,6 +555,36 @@ mod tests {
             &["/editur", "--agent-process", "cursor", "7", "/project"]
                 .map(std::ffi::OsString::from)
                 .to_vec()
+        );
+    }
+
+    #[test]
+    fn parses_fragmented_cursor_cloud_progress_without_repeating_the_result() {
+        let mut decoder = super::SseDecoder::default();
+        let mut events = decoder
+            .push(b"event: thinking\ndata: {\"text\":\"Checking the project\"}\n\nevent: ass")
+            .unwrap();
+        events.extend(
+            decoder
+                .push(
+                    b"istant\ndata: {\"text\":\"I found it.\"}\n\nevent: tool_call\ndata: {\"callId\":\"call-1\",\"name\":\"Read\",\"status\":\"completed\",\"args\":{\"path\":\"README.md\"}}\n\nevent: result\ndata: {\"status\":\"FINISHED\",\"text\":\"I found it.\"}\n\nevent: done\ndata: {}\n\n",
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                super::StreamEvent::Thinking("Checking the project".into()),
+                super::StreamEvent::Assistant("I found it.".into()),
+                super::StreamEvent::Tool {
+                    call_id: "call-1".into(),
+                    name: "Read".into(),
+                    status: "completed".into(),
+                    args: Some(serde_json::json!({"path": "README.md"})),
+                    result: None,
+                },
+            ]
         );
     }
 }

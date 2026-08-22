@@ -2,13 +2,19 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     path::Path,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     time::Duration,
 };
 
 use egui::{
     Align2, Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Layout, Modifiers, RichText,
-    Sense, TextFormat, UiBuilder, text::LayoutJob,
+    Sense, TextFormat, UiBuilder,
+    cache::{ComputerMut, FrameCache},
+    text::LayoutJob,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -28,6 +34,114 @@ const CURSOR_BLINK_INTERVAL: f64 = 0.5;
 const MAX_OUTPUT_CHUNKS_PER_FRAME: usize = 16;
 const TRANSCRIPT_TERMINAL_ROWS: u16 = 400;
 const TRANSCRIPT_TERMINAL_VISIBLE_ROWS: f32 = 12.0;
+const TRANSCRIPT_TERMINAL_QUEUE_CAPACITY: usize = 2;
+
+#[cfg(test)]
+std::thread_local! {
+    static TRANSCRIPT_TERMINAL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TRANSCRIPT_TERMINAL_ROW_JOB_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptTerminalCacheKey<'a> {
+    command: Option<&'a str>,
+    output: &'a Arc<str>,
+    cols: u16,
+}
+
+impl std::hash::Hash for TranscriptTerminalCacheKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.command, state);
+        // Transcript output is held by a stable `Arc<str>` between revisions;
+        // identity avoids hashing several megabytes on every frame.
+        std::hash::Hash::hash(&self.output.as_ptr(), state);
+        std::hash::Hash::hash(&self.output.len(), state);
+        std::hash::Hash::hash(&self.cols, state);
+    }
+}
+
+#[derive(Default)]
+struct TranscriptTerminalComputer;
+
+impl<'a> ComputerMut<TranscriptTerminalCacheKey<'a>, Arc<PendingTranscriptTerminal>>
+    for TranscriptTerminalComputer
+{
+    fn compute(&mut self, key: TranscriptTerminalCacheKey<'a>) -> Arc<PendingTranscriptTerminal> {
+        Arc::new(PendingTranscriptTerminal {
+            command: key.command.map(Arc::from),
+            output: Arc::clone(key.output),
+            cols: key.cols,
+            screen: OnceLock::new(),
+            queued: AtomicBool::new(false),
+            ready_presented: AtomicBool::new(false),
+        })
+    }
+}
+
+type TranscriptTerminalCache =
+    FrameCache<Arc<PendingTranscriptTerminal>, TranscriptTerminalComputer>;
+
+struct PendingTranscriptTerminal {
+    command: Option<Arc<str>>,
+    output: Arc<str>,
+    cols: u16,
+    screen: OnceLock<Arc<vt100::Screen>>,
+    queued: AtomicBool,
+    ready_presented: AtomicBool,
+}
+
+impl PendingTranscriptTerminal {
+    fn enqueue(self: &Arc<Self>, ctx: &egui::Context) {
+        if self.screen.get().is_some()
+            || self
+                .queued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let job = TranscriptTerminalJob {
+            terminal: Arc::clone(self),
+            repaint: ctx.clone(),
+        };
+        match transcript_terminal_sender().try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.queued.store(false, Ordering::Release);
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+    }
+}
+
+struct TranscriptTerminalJob {
+    terminal: Arc<PendingTranscriptTerminal>,
+    repaint: egui::Context,
+}
+
+fn transcript_terminal_sender() -> &'static SyncSender<TranscriptTerminalJob> {
+    static SENDER: OnceLock<SyncSender<TranscriptTerminalJob>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) =
+            mpsc::sync_channel::<TranscriptTerminalJob>(TRANSCRIPT_TERMINAL_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("transcript-terminal-parser".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let terminal = &job.terminal;
+                    let parser = transcript_terminal_parser(
+                        terminal.command.as_deref(),
+                        &terminal.output,
+                        terminal.cols,
+                    );
+                    let _ = terminal.screen.set(Arc::new(parser.screen().clone()));
+                    job.repaint.request_repaint();
+                }
+            })
+            .expect("spawn transcript terminal parser");
+        sender
+    })
+}
 
 pub(crate) struct TerminalPanel {
     sessions: Vec<TerminalSession>,
@@ -75,6 +189,9 @@ fn drain_output(output: &Receiver<Vec<u8>>, parser: &mut vt100::Parser) -> bool 
 }
 
 fn transcript_terminal_parser(command: Option<&str>, output: &str, cols: u16) -> vt100::Parser {
+    #[cfg(test)]
+    TRANSCRIPT_TERMINAL_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+
     let mut bytes =
         Vec::with_capacity(command.map_or(0, |command| command.len() + 4) + output.len());
     if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
@@ -111,7 +228,26 @@ fn transcript_terminal_parser(command: Option<&str>, output: &str, cols: u16) ->
     }
 }
 
-pub(crate) fn show_transcript_terminal(ui: &mut egui::Ui, command: Option<&str>, output: &str) {
+fn pending_transcript_terminal(
+    ui: &egui::Ui,
+    command: Option<&str>,
+    output: &Arc<str>,
+    cols: u16,
+) -> Arc<PendingTranscriptTerminal> {
+    let key = TranscriptTerminalCacheKey {
+        command,
+        output,
+        cols,
+    };
+    ui.ctx()
+        .memory_mut(|memory| Arc::clone(memory.caches.cache::<TranscriptTerminalCache>().get(key)))
+}
+
+pub(crate) fn show_transcript_terminal(
+    ui: &mut egui::Ui,
+    command: Option<&str>,
+    output: &Arc<str>,
+) {
     let font = FontId::monospace(FONT_SIZE);
     let cell_width = ui.fonts_mut(|fonts| {
         fonts
@@ -122,9 +258,8 @@ pub(crate) fn show_transcript_terminal(ui: &mut egui::Ui, command: Option<&str>,
     let cols = ((ui.available_width() - CONTENT_PADDING * 2.0) / cell_width.max(1.0))
         .floor()
         .clamp(2.0, u16::MAX as f32) as u16;
-    let parser = transcript_terminal_parser(command, output, cols);
-    let screen = parser.screen();
-    let rows = screen.size().0;
+    let terminal = pending_transcript_terminal(ui, command, output, cols);
+    terminal.enqueue(ui.ctx());
     egui::Frame::new()
         .fill(theme::state::content_material())
         .stroke(theme::border::hairline())
@@ -132,21 +267,42 @@ pub(crate) fn show_transcript_terminal(ui: &mut egui::Ui, command: Option<&str>,
         .inner_margin(CONTENT_PADDING)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            egui::ScrollArea::vertical()
-                .max_height(LINE_HEIGHT * TRANSCRIPT_TERMINAL_VISIBLE_ROWS)
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for row in 0..rows {
-                        ui.add(
-                            egui::Label::new(terminal_row_job(
-                                screen, row, cols, &font, None, 0, None,
-                            ))
-                            .selectable(true)
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                    }
-                });
+            if let Some(screen) = terminal.screen.get() {
+                if !terminal.ready_presented.swap(true, Ordering::AcqRel) {
+                    ui.ctx().request_repaint();
+                }
+                let rows = screen.size().0;
+                egui::ScrollArea::vertical()
+                    .max_height(LINE_HEIGHT * TRANSCRIPT_TERMINAL_VISIBLE_ROWS)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show_rows(ui, LINE_HEIGHT, usize::from(rows), |ui, visible_rows| {
+                        for row in visible_rows {
+                            ui.add(
+                                egui::Label::new(terminal_row_job(
+                                    screen, row as u16, cols, &font, None, 0, None,
+                                ))
+                                .selectable(true)
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        }
+                    });
+            } else {
+                let (pending, _) = ui.allocate_exact_size(
+                    egui::vec2(
+                        ui.available_width(),
+                        LINE_HEIGHT * TRANSCRIPT_TERMINAL_VISIBLE_ROWS,
+                    ),
+                    Sense::hover(),
+                );
+                ui.painter().text(
+                    pending.center(),
+                    Align2::CENTER_CENTER,
+                    "Rendering terminal output…",
+                    font,
+                    theme::text().muted,
+                );
+            }
         });
 }
 
@@ -1105,6 +1261,9 @@ fn terminal_row_job(
     visible_buffer_start: usize,
     cursor: Option<(u16, u16)>,
 ) -> LayoutJob {
+    #[cfg(test)]
+    TRANSCRIPT_TERMINAL_ROW_JOB_COUNT.with(|count| count.set(count.get() + 1));
+
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     for col in 0..cols {
@@ -1408,6 +1567,7 @@ mod tests {
             }
         }
 
+        let transcript = std::sync::Arc::<str>::from("/tmp\n");
         let output = theme::test_context().run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1416,7 +1576,7 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| super::show_transcript_terminal(ui, Some("pwd"), "/tmp\n"),
+            |ui| super::show_transcript_terminal(ui, Some("pwd"), &transcript),
         );
         let frame = output
             .shapes
@@ -1431,6 +1591,145 @@ mod tests {
             "terminal frame was only {} points tall",
             frame.height()
         );
+    }
+
+    #[test]
+    fn transcript_terminal_lays_out_only_viewport_rows() {
+        let transcript = std::sync::Arc::<str>::from(
+            (0..500)
+                .map(|row| format!("row {row:03}\n"))
+                .collect::<String>(),
+        );
+        super::TRANSCRIPT_TERMINAL_ROW_JOB_COUNT.with(|count| count.set(0));
+        let context = theme::test_context();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = context.run_ui(input(), |ui| {
+                super::show_transcript_terminal(ui, None, &transcript);
+            });
+            if super::TRANSCRIPT_TERMINAL_ROW_JOB_COUNT.with(std::cell::Cell::get) > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background terminal parse did not finish"
+            );
+            std::thread::yield_now();
+        }
+        let laid_out_rows = super::TRANSCRIPT_TERMINAL_ROW_JOB_COUNT.with(std::cell::Cell::get);
+
+        assert!(
+            laid_out_rows <= super::TRANSCRIPT_TERMINAL_VISIBLE_ROWS as usize + 3,
+            "laid out {laid_out_rows} retained rows for a 12-row viewport"
+        );
+    }
+
+    #[test]
+    fn transcript_terminal_reuses_pending_parse_for_stable_output() {
+        let transcript = std::sync::Arc::<str>::from("stable output\n");
+        let context = theme::test_context();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let mut first = None;
+        let _ = context.run_ui(input(), |ui| {
+            first = Some(super::pending_transcript_terminal(
+                ui,
+                Some("cargo test"),
+                &transcript,
+                80,
+            ));
+        });
+        let first = first.expect("first pending terminal");
+        first.enqueue(&context);
+        let mut second = None;
+        let _ = context.run_ui(input(), |ui| {
+            second = Some(super::pending_transcript_terminal(
+                ui,
+                Some("cargo test"),
+                &transcript,
+                80,
+            ));
+        });
+        let second = second.expect("second pending terminal");
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn cold_transcript_terminal_parses_off_ui_thread_and_eventually_renders_tail() {
+        fn text_color(shape: &egui::Shape, needle: &str) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let start = text.galley.text().find(needle)?;
+                    text.galley
+                        .job
+                        .sections
+                        .iter()
+                        .find(|section| section.byte_range.contains(&egui::text::ByteIndex(start)))
+                        .map(|section| section.format.color)
+                }
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| text_color(shape, needle))
+                }
+                _ => None,
+            }
+        }
+
+        let mut transcript = (0..499)
+            .map(|row| format!("row {row:03}\n"))
+            .collect::<String>();
+        transcript.push_str("\x1b[31mtail-ready\x1b[0m");
+        let transcript = std::sync::Arc::<str>::from(transcript);
+        let context = theme::test_context();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        super::TRANSCRIPT_TERMINAL_PARSE_COUNT.with(|count| count.set(0));
+
+        let _ = context.run_ui(input(), |ui| {
+            super::show_transcript_terminal(ui, Some("cargo test"), &transcript);
+        });
+        assert_eq!(
+            super::TRANSCRIPT_TERMINAL_PARSE_COUNT.with(std::cell::Cell::get),
+            0,
+            "cold terminal output parsed on the UI thread"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = context.run_ui(input(), |ui| {
+                super::show_transcript_terminal(ui, Some("cargo test"), &transcript);
+            });
+            if let Some(color) = output
+                .shapes
+                .iter()
+                .find_map(|shape| text_color(&shape.shape, "tail-ready"))
+            {
+                assert_eq!(color, theme::color::ansi()[1]);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background terminal parse did not render its ANSI tail"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[cfg(unix)]

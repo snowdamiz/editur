@@ -6,7 +6,8 @@ use std::{
     io::{BufRead, Cursor, IsTerminal, Seek},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -112,8 +113,8 @@ use crate::{
     },
     markdown,
     pane::{
-        DropZone, PaneId, PaneLayout, TabDrop, paint_pane_resize_handles, resize_divider_stroke,
-        resize_dragged_pane_handle, stable_tab_drop_zone, tab_drop_preview,
+        DropZone, PaneId, PaneLayout, PaneTabs, TabDrop, paint_pane_resize_handles,
+        resize_divider_stroke, resize_dragged_pane_handle, stable_tab_drop_zone, tab_drop_preview,
     },
     renderer::Renderer,
     search::{SearchController, SearchHit, SearchResults},
@@ -353,6 +354,9 @@ const UPDATE_BUTTON_SIZE: f32 = 22.0;
 /// How far past the visible transcript viewport items are still rendered
 /// rather than replaced by a spacer of their cached height.
 const AGENT_CULL_MARGIN: f32 = 200.0;
+// ponytail: Unknown rows start with a coarse height; retain per-kind averages if
+// scrollbar correction becomes visible with unusually tall transcript items.
+const AGENT_ESTIMATED_ITEM_HEIGHT: f32 = 64.0;
 /// Above this many highlighted lines per file side, an expanded diff renders
 /// as plain diff-inked text: syntect over a wholly rewritten file costs
 /// seconds on the frame that expands it.
@@ -531,9 +535,111 @@ fn tool_contains_diff(tool: &crate::agent::controller::ToolActivity) -> bool {
     })
 }
 
-fn agent_terminal_output(tool: &crate::agent::controller::ToolActivity) -> Option<String> {
+const AGENT_TERMINAL_OUTPUT_CACHE_MAX_ENTRIES: usize = 64;
+const AGENT_TERMINAL_OUTPUT_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct AgentTerminalOutputCache {
+    generation: u64,
+    entries: HashMap<u64, (u64, Arc<str>)>,
+}
+
+impl AgentTerminalOutputCache {
+    fn get(&mut self, key: u64) -> Option<Arc<str>> {
+        let (generation, output) = self.entries.get_mut(&key)?;
+        *generation = self.generation;
+        Some(Arc::clone(output))
+    }
+
+    fn insert(&mut self, key: u64, output: Arc<str>) {
+        self.entries.insert(key, (self.generation, output));
+        while self.entries.len() > AGENT_TERMINAL_OUTPUT_CACHE_MAX_ENTRIES
+            || self.entries.values().fold(0_usize, |total, (_, output)| {
+                total.saturating_add(output.len())
+            }) > AGENT_TERMINAL_OUTPUT_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (generation, _))| generation)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+impl CacheTrait for AgentTerminalOutputCache {
+    fn update(&mut self) {
+        let generation = self.generation;
+        self.entries.retain(|_, (used_generation, _)| {
+            generation.saturating_sub(*used_generation) <= ASSISTANT_IMAGE_CACHE_UNUSED_FRAMES
+        });
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn agent_terminal_output_key(tool: &crate::agent::controller::ToolActivity, terminal: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tool.id.hash(&mut hasher);
+    terminal.hash(&mut hasher);
+    if let Some(detail) = &tool.detail {
+        detail.content.len().hash(&mut hasher);
+        for content in &detail.content {
+            match content {
+                ToolOutput::Log { label, text }
+                    if label.eq_ignore_ascii_case("Terminal output") =>
+                {
+                    0_u8.hash(&mut hasher);
+                    label.hash(&mut hasher);
+                    text.as_ptr().hash(&mut hasher);
+                    text.len().hash(&mut hasher);
+                }
+                ToolOutput::Text(text) if terminal => {
+                    1_u8.hash(&mut hasher);
+                    text.as_ptr().hash(&mut hasher);
+                    text.len().hash(&mut hasher);
+                }
+                _ => {}
+            }
+        }
+        if let Some(raw) = &detail.output {
+            raw.as_ptr().hash(&mut hasher);
+            raw.len().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn cached_agent_terminal_output(
+    ctx: &egui::Context,
+    tool: &crate::agent::controller::ToolActivity,
+    terminal: bool,
+) -> Arc<str> {
+    let key = agent_terminal_output_key(tool, terminal);
+    ctx.memory_mut(|memory| {
+        let cache = memory.caches.cache::<AgentTerminalOutputCache>();
+        if let Some(output) = cache.get(key) {
+            return output;
+        }
+        let output = agent_terminal_output(tool, terminal)
+            .map_or_else(|| Arc::<str>::from(""), Arc::<str>::from);
+        cache.insert(key, Arc::clone(&output));
+        output
+    })
+}
+
+fn agent_terminal_output(
+    tool: &crate::agent::controller::ToolActivity,
+    terminal: bool,
+) -> Option<String> {
     let detail = tool.detail.as_ref()?;
-    let terminal = agent_tool_is_terminal(tool);
     let mut output = String::new();
     for content in &detail.content {
         match content {
@@ -637,14 +743,34 @@ const ASSISTANT_PROMPT_IMAGE_THUMBNAIL_SIZE: egui::Vec2 = egui::vec2(72.0, 72.0)
 #[derive(Clone)]
 enum AssistantImagePreview {
     Unavailable,
+    Pending(Arc<Mutex<Option<Option<AssistantImagePixels>>>>),
     Loaded(egui::TextureHandle),
+}
+
+struct AssistantImagePixels {
+    name: String,
+    size: [usize; 2],
+    pixels: Vec<u8>,
+}
+
+enum AssistantImageDecodeSource {
+    Bytes(Arc<[u8]>),
+    Path(PathBuf),
+}
+
+struct AssistantImageDecodeJob {
+    source: AssistantImageDecodeSource,
+    name: String,
+    max_edge: u32,
+    result: Arc<Mutex<Option<Option<AssistantImagePixels>>>>,
+    ctx: egui::Context,
 }
 
 #[derive(Clone, Copy)]
 enum AssistantImageCacheKey<'a> {
     Bytes {
         ctx: &'a egui::Context,
-        data: &'a [u8],
+        data: &'a Arc<[u8]>,
         identity: usize,
         max_edge: u32,
     },
@@ -703,7 +829,7 @@ impl AssistantImageCache {
 
     fn insert(&mut self, key: u64, preview: AssistantImagePreview) {
         let bytes = match &preview {
-            AssistantImagePreview::Unavailable => 0,
+            AssistantImagePreview::Unavailable | AssistantImagePreview::Pending(_) => 0,
             AssistantImagePreview::Loaded(texture) => texture.size()[0]
                 .saturating_mul(texture.size()[1])
                 .saturating_mul(4),
@@ -807,51 +933,108 @@ fn assistant_image_path_fingerprint(path: &Path) -> (Option<SystemTime>, u64) {
     )
 }
 
-fn load_cached_assistant_image(key: AssistantImageCacheKey<'_>) -> AssistantImagePreview {
-    let loaded = match key {
+fn assistant_image_decode_sender() -> Option<&'static mpsc::Sender<AssistantImageDecodeJob>> {
+    static SENDER: OnceLock<Option<mpsc::Sender<AssistantImageDecodeJob>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (sender, jobs) = mpsc::channel::<AssistantImageDecodeJob>();
+            thread::Builder::new()
+                .name("assistant-image-decode".into())
+                .spawn(move || {
+                    while let Ok(job) = jobs.recv() {
+                        let decoded = match job.source {
+                            AssistantImageDecodeSource::Bytes(bytes) => {
+                                decode_assistant_image_bytes(job.name, &bytes, job.max_edge)
+                            }
+                            AssistantImageDecodeSource::Path(path) => {
+                                decode_assistant_image_path(job.name, &path, job.max_edge)
+                            }
+                        };
+                        if let Ok(mut result) = job.result.lock() {
+                            *result = Some(decoded);
+                        }
+                        job.ctx.request_repaint();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+fn start_cached_assistant_image(key: AssistantImageCacheKey<'_>) -> AssistantImagePreview {
+    let (ctx, source, name, max_edge) = match key {
         AssistantImageCacheKey::Bytes {
             ctx,
             data,
             identity,
             max_edge,
-        } => load_assistant_image_bytes(
-            ctx,
-            &format!(
-                "{}_{identity:x}_{}",
-                if max_edge == ASSISTANT_IMAGE_PREVIEW_EDGE {
-                    "agent_embedded_image"
-                } else {
-                    "agent_image_lightbox"
-                },
-                data.len()
-            ),
-            data,
-            max_edge,
-        ),
+        } => {
+            if data.is_empty() || data.len() as u64 > ASSISTANT_IMAGE_PREVIEW_MAX_BYTES {
+                return AssistantImagePreview::Unavailable;
+            }
+            (
+                ctx,
+                AssistantImageDecodeSource::Bytes(Arc::clone(data)),
+                format!(
+                    "{}_{identity:x}_{}",
+                    if max_edge == ASSISTANT_IMAGE_PREVIEW_EDGE {
+                        "agent_embedded_image"
+                    } else {
+                        "agent_image_lightbox"
+                    },
+                    data.len()
+                ),
+                max_edge,
+            )
+        }
         AssistantImageCacheKey::Path {
             ctx,
             path,
             max_edge,
             ..
-        } => load_assistant_image_path(ctx, path, max_edge),
+        } => (
+            ctx,
+            AssistantImageDecodeSource::Path(path.to_path_buf()),
+            path.display().to_string(),
+            max_edge,
+        ),
     };
-    loaded.map_or(
-        AssistantImagePreview::Unavailable,
-        AssistantImagePreview::Loaded,
-    )
+    let max_edge = max_edge.min(ctx.input(|input| input.max_texture_side) as u32);
+    let result = Arc::new(Mutex::new(None));
+    let Some(sender) = assistant_image_decode_sender() else {
+        return AssistantImagePreview::Unavailable;
+    };
+    let job = AssistantImageDecodeJob {
+        source,
+        name,
+        max_edge,
+        result: Arc::clone(&result),
+        ctx: ctx.clone(),
+    };
+    if sender.send(job).is_err() {
+        return AssistantImagePreview::Unavailable;
+    }
+    AssistantImagePreview::Pending(result)
 }
 
-fn cached_assistant_image(key: AssistantImageCacheKey<'_>) -> Option<egui::TextureHandle> {
+enum AssistantImageLoad {
+    Unavailable,
+    Pending,
+    Loaded(egui::TextureHandle),
+}
+
+fn cached_assistant_image_state(key: AssistantImageCacheKey<'_>) -> AssistantImageLoad {
     let ctx = match key {
         AssistantImageCacheKey::Bytes { ctx, .. } | AssistantImageCacheKey::Path { ctx, .. } => ctx,
     };
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let hash = hasher.finish();
-    let preview = ctx
+    let mut preview = ctx
         .memory_mut(|memory| memory.caches.cache::<AssistantImageCache>().get(hash))
         .unwrap_or_else(|| {
-            let preview = load_cached_assistant_image(key);
+            let preview = start_cached_assistant_image(key);
             ctx.memory_mut(|memory| {
                 memory
                     .caches
@@ -860,10 +1043,55 @@ fn cached_assistant_image(key: AssistantImageCacheKey<'_>) -> Option<egui::Textu
             });
             preview
         });
-    match preview {
-        AssistantImagePreview::Unavailable => None,
-        AssistantImagePreview::Loaded(texture) => Some(texture),
+    if let AssistantImagePreview::Pending(result) = &preview
+        && let Some(decoded) = result.lock().ok().and_then(|mut result| result.take())
+    {
+        preview = decoded.map_or(AssistantImagePreview::Unavailable, |decoded| {
+            AssistantImagePreview::Loaded(ctx.load_texture(
+                decoded.name,
+                egui::ColorImage::from_rgba_unmultiplied(decoded.size, &decoded.pixels),
+                egui::TextureOptions::LINEAR,
+            ))
+        });
+        ctx.memory_mut(|memory| {
+            memory
+                .caches
+                .cache::<AssistantImageCache>()
+                .insert(hash, preview.clone());
+        });
     }
+    match preview {
+        AssistantImagePreview::Unavailable => AssistantImageLoad::Unavailable,
+        AssistantImagePreview::Pending(_) => AssistantImageLoad::Pending,
+        AssistantImagePreview::Loaded(texture) => AssistantImageLoad::Loaded(texture),
+    }
+}
+
+fn cached_assistant_image(key: AssistantImageCacheKey<'_>) -> Option<egui::TextureHandle> {
+    match cached_assistant_image_state(key) {
+        AssistantImageLoad::Loaded(texture) => Some(texture),
+        AssistantImageLoad::Unavailable | AssistantImageLoad::Pending => None,
+    }
+}
+
+fn cached_assistant_image_path_state(
+    ctx: &egui::Context,
+    path: &Path,
+    max_edge: u32,
+) -> AssistantImageLoad {
+    let (modified, len) = ctx.memory_mut(|memory| {
+        memory
+            .caches
+            .cache::<AssistantImagePathCache>()
+            .fingerprint_at(path, max_edge, Instant::now())
+    });
+    cached_assistant_image_state(AssistantImageCacheKey::Path {
+        ctx,
+        path,
+        modified,
+        len,
+        max_edge,
+    })
 }
 
 fn cached_assistant_image_path(
@@ -871,19 +1099,10 @@ fn cached_assistant_image_path(
     path: &Path,
     max_edge: u32,
 ) -> Option<egui::TextureHandle> {
-    let (modified, len) = ctx.memory_mut(|memory| {
-        memory
-            .caches
-            .cache::<AssistantImagePathCache>()
-            .fingerprint_at(path, max_edge, Instant::now())
-    });
-    cached_assistant_image(AssistantImageCacheKey::Path {
-        ctx,
-        path,
-        modified,
-        len,
-        max_edge,
-    })
+    match cached_assistant_image_path_state(ctx, path, max_edge) {
+        AssistantImageLoad::Loaded(texture) => Some(texture),
+        AssistantImageLoad::Unavailable | AssistantImageLoad::Pending => None,
+    }
 }
 
 fn assistant_image_thumbnail(ui: &mut egui::Ui, texture: &egui::TextureHandle) -> egui::Response {
@@ -978,11 +1197,11 @@ fn agent_generated_image_preview(ui: &mut egui::Ui, path: &Path) -> Option<egui:
     Some(assistant_image_thumbnail(ui, &texture))
 }
 
-fn load_assistant_image_path(
-    ctx: &egui::Context,
+fn decode_assistant_image_path(
+    name: String,
     path: &Path,
     max_edge: u32,
-) -> Option<egui::TextureHandle> {
+) -> Option<AssistantImagePixels> {
     let metadata = fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > ASSISTANT_IMAGE_PREVIEW_MAX_BYTES {
         return None;
@@ -991,31 +1210,44 @@ fn load_assistant_image_path(
         .ok()?
         .with_guessed_format()
         .ok()?;
-    decode_assistant_image_preview(ctx, path.display().to_string(), reader, max_edge)
+    decode_assistant_image_preview(name, reader, max_edge)
 }
 
+#[cfg(test)]
 fn load_assistant_image_bytes(
     ctx: &egui::Context,
     name: &str,
     bytes: &[u8],
     max_edge: u32,
 ) -> Option<egui::TextureHandle> {
+    let max_edge = max_edge.min(ctx.input(|input| input.max_texture_side) as u32);
+    let decoded = decode_assistant_image_bytes(name.to_owned(), bytes, max_edge)?;
+    Some(ctx.load_texture(
+        decoded.name,
+        egui::ColorImage::from_rgba_unmultiplied(decoded.size, &decoded.pixels),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn decode_assistant_image_bytes(
+    name: String,
+    bytes: &[u8],
+    max_edge: u32,
+) -> Option<AssistantImagePixels> {
     if bytes.is_empty() || bytes.len() as u64 > ASSISTANT_IMAGE_PREVIEW_MAX_BYTES {
         return None;
     }
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
-    decode_assistant_image_preview(ctx, name.to_owned(), reader, max_edge)
+    decode_assistant_image_preview(name, reader, max_edge)
 }
 
 fn decode_assistant_image_preview<R: BufRead + Seek>(
-    ctx: &egui::Context,
     name: String,
     mut reader: image::ImageReader<R>,
     max_edge: u32,
-) -> Option<egui::TextureHandle> {
-    let max_edge = max_edge.min(ctx.input(|input| input.max_texture_side) as u32);
+) -> Option<AssistantImagePixels> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
@@ -1028,12 +1260,11 @@ fn decode_assistant_image_preview<R: BufRead + Seek>(
         image
     };
     let size = [image.width() as usize, image.height() as usize];
-    let pixels = image.into_rgba8();
-    Some(ctx.load_texture(
+    Some(AssistantImagePixels {
         name,
-        egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw()),
-        egui::TextureOptions::LINEAR,
-    ))
+        size,
+        pixels: image.into_rgba8().into_raw(),
+    })
 }
 
 fn agent_tool_status(status: Option<&str>) -> (&'static str, Color32) {
@@ -1572,128 +1803,6 @@ fn draw_agent_session_selector(ui: &mut egui::Ui, rect: egui::Rect, title: &str)
     response
 }
 
-fn agent_tool_title(
-    ui: &mut egui::Ui,
-    id: Id,
-    title: &str,
-    width: f32,
-    search: Option<(&str, Option<usize>)>,
-) -> egui::Response {
-    if search.is_some() {
-        return ui
-            .allocate_ui_with_layout(
-                egui::vec2(width, 24.0),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.set_width(width);
-                    ui.add(
-                        Label::new(agent_text_job(
-                            title,
-                            width,
-                            theme::typography::body(),
-                            theme::text().primary,
-                            search,
-                        ))
-                        .truncate()
-                        .sense(Sense::click()),
-                    )
-                },
-            )
-            .inner;
-    }
-    let Some((action, path)) = title.split_once(' ').filter(|(action, path)| {
-        !path.is_empty()
-            && (action.eq_ignore_ascii_case("Read") || action.eq_ignore_ascii_case("Edit"))
-    }) else {
-        return ui
-            .allocate_ui_with_layout(
-                egui::vec2(width, 24.0),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.set_width(width);
-                    ui.add(
-                        Label::new(
-                            RichText::new(title)
-                                .size(theme::typography::BODY_SIZE)
-                                .color(theme::text().primary),
-                        )
-                        .truncate()
-                        .sense(Sense::click()),
-                    )
-                },
-            )
-            .inner;
-    };
-
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), title)
-    });
-    let font = theme::typography::body();
-    let action =
-        ui.painter()
-            .layout_no_wrap(format!("{action} "), font.clone(), theme::text().primary);
-    let path = ui
-        .painter()
-        .layout_no_wrap(path.to_owned(), font, theme::text().primary);
-    let y = rect.center().y - action.size().y * 0.5;
-    ui.painter().with_clip_rect(rect).galley(
-        egui::pos2(rect.left(), y),
-        action.clone(),
-        theme::text().primary,
-    );
-    let path_left = (rect.left() + action.size().x).min(rect.right());
-    let path_rect =
-        egui::Rect::from_min_max(egui::pos2(path_left, rect.top()), rect.right_bottom());
-    let overflow = (path.size().x - path_rect.width()).max(0.0);
-    let animation_id = id.with("path_marquee");
-    if response.hovered() && overflow > 0.0 {
-        let now = ui.input(|input| input.time);
-        let started = ui.data_mut(|data| {
-            data.get_temp::<f64>(animation_id).unwrap_or_else(|| {
-                data.insert_temp(animation_id, now);
-                now
-            })
-        });
-        let pause = 0.6;
-        let travel = f64::from(overflow) / 24.0;
-        let phase = (now - started).rem_euclid(pause + travel + 0.8);
-        let offset = if phase < pause {
-            0.0
-        } else if phase < pause + travel {
-            ((phase - pause) * 24.0) as f32
-        } else {
-            overflow
-        };
-        ui.painter().with_clip_rect(path_rect).galley(
-            egui::pos2(path_rect.left() - offset, y),
-            path,
-            theme::text().primary,
-        );
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
-    } else {
-        ui.data_mut(|data| data.remove::<f64>(animation_id));
-        let path = egui::WidgetText::from(
-            RichText::new(path.text())
-                .font(theme::typography::body())
-                .color(theme::text().primary),
-        )
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Truncate),
-            path_rect.width(),
-            egui::FontSelection::Default,
-        );
-        ui.painter().with_clip_rect(path_rect).galley(
-            egui::pos2(path_rect.left(), y),
-            path,
-            theme::text().primary,
-        );
-    }
-    response
-}
-
-// Keeping the header's layout inputs explicit avoids a one-off parameter type.
 #[expect(clippy::too_many_arguments)]
 fn agent_collapsing_header(
     ui: &mut egui::Ui,
@@ -1701,159 +1810,16 @@ fn agent_collapsing_header(
     title: &str,
     status: Option<&str>,
     change: Option<FileChange>,
-    width: f32,
+    _width: f32,
     search: Option<(&str, Option<usize>)>,
     has_body: bool,
     default_open: bool,
     add_body: impl FnOnce(&mut egui::Ui),
 ) {
     let id = ui.make_persistent_id(id_salt);
-    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        default_open,
-    );
-    if has_body && search.is_some() {
-        state.set_open(true);
-    }
-    let title_line = title
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or("Tool activity");
-    let frame = egui::Frame::new()
-        .fill(theme::surface().raised)
-        .stroke(egui::Stroke::new(1.0, theme::border::hairline_color()))
-        .corner_radius(5);
-    let content_width = (width - frame.total_margin().sum().x).max(0.0);
-    frame.show(ui, |ui| {
-        ui.set_width(content_width);
-        let card_right = ui.max_rect().right();
-        egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: 8,
-                right: 8,
-                top: 8,
-                bottom: 6,
-            })
-            .show(ui, |ui| {
-                let (label, color) = agent_tool_status(status);
-                let failed = status == Some("Failed");
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.spacing_mut().icon_width = 24.0;
-                    if has_body
-                        && state
-                            .show_toggle_button(ui, paint_agent_disclosure)
-                            .clicked()
-                    {
-                        ui.ctx().request_discard("tool card disclosure changed");
-                    }
-                    let status_width = if failed {
-                        24.0
-                    } else if label.is_empty() {
-                        0.0
-                    } else {
-                        52.0
-                    };
-                    let counts = change.map(|change| {
-                        let added = ui.painter().layout_no_wrap(
-                            format!("+{}", change.added),
-                            theme::typography::code_small(),
-                            theme::ink(theme::semantic().success),
-                        );
-                        let removed = ui.painter().layout_no_wrap(
-                            format!("−{}", change.removed),
-                            theme::typography::code_small(),
-                            theme::ink(theme::semantic().danger),
-                        );
-                        (added, removed)
-                    });
-                    let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
-                        added.size().x + theme::space::SMALL + removed.size().x
-                    });
-                    let trailing_items =
-                        usize::from(counts.is_some()) + usize::from(status_width > 0.0);
-                    let title_width = (ui.available_width()
-                        - status_width
-                        - counts_width
-                        - trailing_items as f32 * ui.spacing().item_spacing.x)
-                        .max(0.0);
-                    let response = agent_tool_title(ui, id, title_line, title_width, search);
-                    if has_body && response.clicked() {
-                        state.toggle(ui);
-                        ui.ctx().request_discard("tool card disclosure changed");
-                    }
-                    if let Some((added, removed)) = counts {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(counts_width, 24.0), Sense::hover());
-                        let y = rect.center().y - added.size().y * 0.5;
-                        ui.painter().galley(
-                            egui::pos2(rect.left(), y),
-                            added.clone(),
-                            theme::ink(theme::semantic().success),
-                        );
-                        ui.painter().galley(
-                            egui::pos2(rect.left() + added.size().x + theme::space::SMALL, y),
-                            removed,
-                            theme::ink(theme::semantic().danger),
-                        );
-                    }
-                    if failed {
-                        let (rect, response) =
-                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
-                        response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Label,
-                                ui.is_enabled(),
-                                label,
-                            )
-                        });
-                        icons::paint(
-                            ui.painter(),
-                            Icon::Error,
-                            egui::Rect::from_center_size(
-                                rect.center(),
-                                egui::Vec2::splat(icons::GRID),
-                            ),
-                            color,
-                        );
-                    } else if !label.is_empty() {
-                        ui.add_sized(
-                            egui::vec2(status_width, 24.0),
-                            Label::new(
-                                RichText::new(label)
-                                    .size(theme::typography::MICRO_SIZE)
-                                    .color(color),
-                            ),
-                        );
-                    }
-                });
-            });
-        if has_body {
-            state.show_body_unindented(ui, |ui| {
-                ui.set_width((card_right - ui.cursor().left()).max(0.0));
-                ui.painter().hline(
-                    ui.available_rect_before_wrap().x_range(),
-                    ui.cursor().top(),
-                    egui::Stroke::new(1.0, theme::border::hairline_color()),
-                );
-                if default_open {
-                    add_body(ui);
-                } else {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(9, 8))
-                        .show(ui, |ui| {
-                            let width = ui.available_width();
-                            ui.set_width(width);
-                            ui.set_max_width(width);
-                            add_body(ui);
-                        });
-                }
-            });
-        }
-    });
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
+        .store(ui.ctx());
+    assistant_dense_tool(ui, id, title, status, change, search, has_body, add_body);
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -2071,21 +2037,31 @@ fn assistant_dense_disclosure_row(
     } else {
         theme::text().secondary
     };
-    let counts = change.map(|change| {
-        let added = ui.painter().layout_no_wrap(
-            format!("+{}", change.added),
-            theme::typography::code_small(),
-            theme::ink(theme::semantic().success),
-        );
-        let removed = ui.painter().layout_no_wrap(
-            format!("−{}", change.removed),
-            theme::typography::code_small(),
-            theme::ink(theme::semantic().danger),
-        );
-        (added, removed)
+    let counts = change.and_then(|change| {
+        let added = (change.added > 0).then(|| {
+            ui.painter().layout_no_wrap(
+                format!("+{}", change.added),
+                theme::typography::code_small(),
+                theme::ink(theme::semantic().success),
+            )
+        });
+        let removed = (change.removed > 0).then(|| {
+            ui.painter().layout_no_wrap(
+                format!("−{}", change.removed),
+                theme::typography::code_small(),
+                theme::ink(theme::semantic().danger),
+            )
+        });
+        (added.is_some() || removed.is_some()).then_some((added, removed))
     });
     let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
-        added.size().x + theme::space::SMALL + removed.size().x
+        added.as_ref().map_or(0.0, |text| text.size().x)
+            + removed.as_ref().map_or(0.0, |text| text.size().x)
+            + if added.is_some() && removed.is_some() {
+                theme::space::SMALL
+            } else {
+                0.0
+            }
     });
     let title_left = rect.left() + 4.0;
     let chevron_size = icons::GRID * 0.7;
@@ -2114,17 +2090,29 @@ fn assistant_dense_disclosure_row(
         );
     let counts_left = title_left + title_width + title_gap;
     if let Some((added, removed)) = counts {
-        let y = rect.center().y - added.size().y * 0.5;
-        ui.painter().galley(
-            egui::pos2(counts_left, y),
-            added.clone(),
-            theme::ink(theme::semantic().success),
-        );
-        ui.painter().galley(
-            egui::pos2(counts_left + added.size().x + theme::space::SMALL, y),
-            removed,
-            theme::ink(theme::semantic().danger),
-        );
+        let mut x = counts_left;
+        if let Some(added) = added {
+            let y = rect.center().y - added.size().y * 0.5;
+            ui.painter().galley(
+                egui::pos2(x, y),
+                added.clone(),
+                theme::ink(theme::semantic().success),
+            );
+            x += added.size().x
+                + if removed.is_some() {
+                    theme::space::SMALL
+                } else {
+                    0.0
+                };
+        }
+        if let Some(removed) = removed {
+            let y = rect.center().y - removed.size().y * 0.5;
+            ui.painter().galley(
+                egui::pos2(x, y),
+                removed,
+                theme::ink(theme::semantic().danger),
+            );
+        }
     }
     let chevron_left = counts_left + counts_width + theme::space::TIGHT;
     icons::paint(
@@ -2446,21 +2434,31 @@ fn assistant_dense_tool(
             title_color,
         );
     }
-    let counts = change.map(|change| {
-        let added = ui.painter().layout_no_wrap(
-            format!("+{}", change.added),
-            theme::typography::code_small(),
-            theme::ink(theme::semantic().success),
-        );
-        let removed = ui.painter().layout_no_wrap(
-            format!("−{}", change.removed),
-            theme::typography::code_small(),
-            theme::ink(theme::semantic().danger),
-        );
-        (added, removed)
+    let counts = change.and_then(|change| {
+        let added = (change.added > 0).then(|| {
+            ui.painter().layout_no_wrap(
+                format!("+{}", change.added),
+                theme::typography::code_small(),
+                theme::ink(theme::semantic().success),
+            )
+        });
+        let removed = (change.removed > 0).then(|| {
+            ui.painter().layout_no_wrap(
+                format!("−{}", change.removed),
+                theme::typography::code_small(),
+                theme::ink(theme::semantic().danger),
+            )
+        });
+        (added.is_some() || removed.is_some()).then_some((added, removed))
     });
     let counts_width = counts.as_ref().map_or(0.0, |(added, removed)| {
-        added.size().x + theme::space::SMALL + removed.size().x
+        added.as_ref().map_or(0.0, |text| text.size().x)
+            + removed.as_ref().map_or(0.0, |text| text.size().x)
+            + if added.is_some() && removed.is_some() {
+                theme::space::SMALL
+            } else {
+                0.0
+            }
     });
     let (status_label, status_color) = agent_tool_status(status);
     let failed = status == Some("Failed");
@@ -2529,18 +2527,29 @@ fn assistant_dense_tool(
         );
     }
     if let Some((added, removed)) = counts {
-        let x = rect.right() - theme::space::SMALL - counts_width;
-        let y = rect.center().y - added.size().y * 0.5;
-        ui.painter().galley(
-            egui::pos2(x, y),
-            added.clone(),
-            theme::ink(theme::semantic().success),
-        );
-        ui.painter().galley(
-            egui::pos2(x + added.size().x + theme::space::SMALL, y),
-            removed,
-            theme::ink(theme::semantic().danger),
-        );
+        let mut x = rect.right() - theme::space::SMALL - counts_width;
+        if let Some(added) = added {
+            let y = rect.center().y - added.size().y * 0.5;
+            ui.painter().galley(
+                egui::pos2(x, y),
+                added.clone(),
+                theme::ink(theme::semantic().success),
+            );
+            x += added.size().x
+                + if removed.is_some() {
+                    theme::space::SMALL
+                } else {
+                    0.0
+                };
+        }
+        if let Some(removed) = removed {
+            let y = rect.center().y - removed.size().y * 0.5;
+            ui.painter().galley(
+                egui::pos2(x, y),
+                removed,
+                theme::ink(theme::semantic().danger),
+            );
+        }
     }
     state.store(ui.ctx());
     if has_body && open {
@@ -2623,12 +2632,18 @@ fn draw_agentic_diff_tabs(
                                 label.as_ref(),
                             )
                         });
-                        if is_active || response.hovered() {
+                        let hovered = ui.input(|input| {
+                            input
+                                .pointer
+                                .hover_pos()
+                                .is_some_and(|pointer| tab.contains(pointer))
+                        });
+                        if is_active || hovered {
                             ui.painter().rect_filled(
                                 tab,
                                 0.0,
                                 if is_active {
-                                    theme::surface().input
+                                    theme::surface().editor
                                 } else {
                                     theme::state::hover()
                                 },
@@ -2646,7 +2661,7 @@ fn draw_agentic_diff_tabs(
                             egui::Vec2::splat(TAB_CLOSE),
                         );
                         let text_rect = egui::Rect::from_min_max(
-                            egui::pos2(tab.left() + theme::space::MEDIUM, tab.top()),
+                            egui::pos2(tab.left() + theme::space::MEDIUM + TAB_DOT, tab.top()),
                             egui::pos2(close_rect.left() - theme::space::SMALL, tab.bottom()),
                         );
                         let color = if is_active {
@@ -2691,7 +2706,7 @@ fn draw_agentic_diff_tabs(
                                 format!("Close {label}"),
                             )
                         });
-                        if is_active || response.hovered() || close.hovered() {
+                        if is_active || hovered {
                             icons::paint_button(
                                 ui.painter(),
                                 Icon::Close,
@@ -2716,10 +2731,155 @@ fn draw_agentic_diff_tabs(
     (selected, closed)
 }
 
+fn draw_editor_tab(
+    ui: &mut egui::Ui,
+    tab: egui::Rect,
+    id: Id,
+    close_id: Id,
+    label: &str,
+    selected: bool,
+    dirty: bool,
+) -> (egui::Response, bool) {
+    let response = ui.interact(tab, id, Sense::click_and_drag());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    let hovered = ui.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|pointer| tab.contains(pointer))
+    });
+    if selected || hovered || response.dragged() {
+        ui.painter().rect_filled(
+            tab,
+            0.0,
+            if response.dragged() {
+                theme::state::selected()
+            } else if selected {
+                theme::surface().editor
+            } else {
+                theme::state::hover()
+            },
+        );
+    }
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(tab.right() - theme::space::LARGE, tab.center().y),
+        egui::Vec2::splat(TAB_CLOSE),
+    );
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(tab.left() + theme::space::MEDIUM + TAB_DOT, tab.top()),
+        egui::pos2(close_rect.left() - theme::space::SMALL, tab.bottom()),
+    );
+    let text_color = if selected {
+        theme::text().primary
+    } else {
+        theme::text().muted
+    };
+    let galley = egui::WidgetText::from(
+        RichText::new(label)
+            .font(if selected {
+                theme::typography::strong()
+            } else {
+                theme::typography::small()
+            })
+            .color(text_color),
+    )
+    .into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        text_rect.width(),
+        egui::FontSelection::Default,
+    );
+    ui.painter().galley(
+        egui::pos2(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        text_color,
+    );
+    if dirty {
+        ui.painter().circle_filled(
+            egui::pos2(
+                tab.left() + theme::space::MEDIUM + TAB_DOT * 0.5,
+                tab.center().y,
+            ),
+            3.0,
+            theme::ink(theme::semantic().warning),
+        );
+    }
+    let close = ui
+        .interact(close_rect, close_id, Sense::click())
+        .on_hover_text(format!("Close {label}"));
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Close {label}"),
+        )
+    });
+    if hovered || selected {
+        icons::paint_button(
+            ui.painter(),
+            Icon::Close,
+            close_rect,
+            &close,
+            ui.is_enabled(),
+            theme::text().secondary,
+        );
+    }
+    (response, close.clicked())
+}
+
+fn draw_diff_summary(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    added: usize,
+    removed: usize,
+) {
+    ui.scope_builder(
+        UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect)
+            .layout(Layout::right_to_left(Align::Center)),
+        |ui| {
+            if removed > 0 {
+                ui.label(
+                    RichText::new(format!("−{removed}"))
+                        .font(theme::typography::code_small())
+                        .color(theme::diff::removed_ink()),
+                );
+            }
+            if added > 0 {
+                ui.label(
+                    RichText::new(format!("+{added}"))
+                        .font(theme::typography::code_small())
+                        .color(theme::diff::added_ink()),
+                );
+            }
+        },
+    );
+}
+
 fn drag_label(path: &Path) -> Cow<'_, str> {
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
+}
+
+fn git_diff_label(path: &Path, area: DiffArea) -> String {
+    let name = drag_label(path);
+    match area {
+        DiffArea::Staged => format!("{name} (Staged)"),
+        DiffArea::Worktree => name.into_owned(),
+    }
 }
 
 fn draw_dragged_pane_preview(painter: &egui::Painter, rect: egui::Rect, path: Option<&Path>) {
@@ -3420,9 +3580,8 @@ fn append_display_search_text(text: &mut String, content: &DisplayContent) {
     }
 }
 
-fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
+fn agent_searchable_text(item: &TranscriptItem) -> Option<Cow<'_, str>> {
     use std::fmt::Write as _;
-    let mut text = String::new();
     match item {
         TranscriptItem::Thought(_)
         | TranscriptItem::Content {
@@ -3431,7 +3590,11 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
         } => return None,
         TranscriptItem::User(content)
         | TranscriptItem::Assistant(content)
-        | TranscriptItem::Error(content) => text.push_str(content),
+        | TranscriptItem::Error(content) => return Some(Cow::Borrowed(content)),
+        _ => {}
+    }
+    let mut text = String::new();
+    match item {
         TranscriptItem::AccountSwitch { from, to } => {
             let _ = writeln!(text, "Switched from {from} to {to}");
         }
@@ -3581,33 +3744,96 @@ fn agent_searchable_text(item: &TranscriptItem) -> Option<String> {
                 let _ = writeln!(text, "{title}\n{url}");
             }
         },
+        TranscriptItem::Thought(_)
+        | TranscriptItem::User(_)
+        | TranscriptItem::Assistant(_)
+        | TranscriptItem::Error(_) => unreachable!(),
     }
-    Some(text)
+    Some(Cow::Owned(text))
 }
 
 fn agent_search_matches(
     transcript: &std::collections::VecDeque<TranscriptItem>,
     changed_paths: &HashMap<PathBuf, FileChange>,
     query: &str,
-) -> Vec<usize> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let mut matches = Vec::new();
+) -> AgentFindMatches {
+    let Some(counter) = AsciiCaseInsensitiveMatchCounter::new(query) else {
+        return AgentFindMatches::default();
+    };
+    let mut matches = AgentFindMatches::default();
     for (index, item) in transcript.iter().enumerate() {
         let count = agent_searchable_text(item)
-            .map(|text| match_spans(&text, query).len())
+            .map(|text| counter.count(&text))
             .unwrap_or(0);
-        matches.extend(std::iter::repeat_n(index, count));
+        matches.push(index, count);
     }
     let changed_index = transcript.len();
     let mut paths = changed_paths.keys().collect::<Vec<_>>();
     paths.sort();
     for path in paths {
-        let count = match_spans(&path.display().to_string(), query).len();
-        matches.extend(std::iter::repeat_n(changed_index, count));
+        let count = counter.count(&path.display().to_string());
+        matches.push(changed_index, count);
     }
     matches
+}
+
+/// Counts non-overlapping ASCII-case-insensitive matches without allocating a
+/// range for every occurrence. The prefix table is shared across every Agent
+/// transcript item searched for the same query.
+struct AsciiCaseInsensitiveMatchCounter<'a> {
+    query: &'a [u8],
+    prefix: Vec<usize>,
+}
+
+impl<'a> AsciiCaseInsensitiveMatchCounter<'a> {
+    fn new(query: &'a str) -> Option<Self> {
+        if query.is_empty() {
+            return None;
+        }
+        let query = query.as_bytes();
+        let mut prefix = vec![0; query.len()];
+        for index in 1..query.len() {
+            let mut matched = prefix[index - 1];
+            while matched > 0 && !query[index].eq_ignore_ascii_case(&query[matched]) {
+                matched = prefix[matched - 1];
+            }
+            if query[index].eq_ignore_ascii_case(&query[matched]) {
+                matched += 1;
+            }
+            prefix[index] = matched;
+        }
+        Some(Self { query, prefix })
+    }
+
+    fn count(&self, text: &str) -> usize {
+        if self.query.len() > text.len() {
+            return 0;
+        }
+        if let [needle] = self.query {
+            let lower = needle.to_ascii_lowercase();
+            let upper = needle.to_ascii_uppercase();
+            return text
+                .as_bytes()
+                .iter()
+                .filter(|byte| **byte == lower || **byte == upper)
+                .count();
+        }
+        let mut count = 0_usize;
+        let mut matched = 0_usize;
+        for byte in text.as_bytes() {
+            while matched > 0 && !byte.eq_ignore_ascii_case(&self.query[matched]) {
+                matched = self.prefix[matched - 1];
+            }
+            if byte.eq_ignore_ascii_case(&self.query[matched]) {
+                matched += 1;
+            }
+            if matched == self.query.len() {
+                count = count.saturating_add(1);
+                matched = 0;
+            }
+        }
+        count
+    }
 }
 
 fn paint_agent_search_item(ui: &mut egui::Ui, top: f32, selected: bool, scroll: bool) -> bool {
@@ -3652,6 +3878,7 @@ enum AgentMenu {
     Commands(String),
     Mentions(String),
     Permissions,
+    RunLocation,
     Mode,
     Config(String),
 }
@@ -3832,10 +4059,22 @@ struct GalleyKey {
     bracket_pair: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
 }
 
-type MarkdownLayoutCache = Option<((u64, u32, u64), Arc<egui::Galley>)>;
+/// The parsed preview document, keyed by buffer revision and appearance. The
+/// galleys themselves are laid out per frame so width and scale changes never
+/// go stale.
+type MarkdownLayoutCache = Option<((u64, u64), Arc<markdown::Document>)>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GitDiffKey {
+    repository: PathBuf,
+    path: PathBuf,
+    area: DiffArea,
+}
 
 #[derive(Clone)]
 struct GitDiffPreview {
+    key: GitDiffKey,
+    pane: PaneId,
     repository: PathBuf,
     path: PathBuf,
     area: DiffArea,
@@ -3871,11 +4110,69 @@ struct PaneFind {
     scroll_to_match: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AgentFindItemMatches {
+    item_index: usize,
+    cumulative_end: usize,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct AgentFindMatches {
+    items: Vec<AgentFindItemMatches>,
+}
+
+impl AgentFindMatches {
+    fn push(&mut self, item_index: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let cumulative_end = self.len().saturating_add(count);
+        if let Some(last) = self.items.last_mut()
+            && last.item_index == item_index
+        {
+            last.cumulative_end = cumulative_end;
+        } else {
+            self.items.push(AgentFindItemMatches {
+                item_index,
+                cumulative_end,
+            });
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.items.last().map_or(0, |item| item.cumulative_end)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn resolve(&self, selected: usize) -> Option<(usize, usize)> {
+        if selected >= self.len() {
+            return None;
+        }
+        let index = self
+            .items
+            .partition_point(|item| item.cumulative_end <= selected);
+        let previous_end = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.items[previous].cumulative_end);
+        let item = self.items[index];
+        Some((item.item_index, selected - previous_end))
+    }
+
+    fn contains_item(&self, item_index: usize) -> bool {
+        self.items
+            .binary_search_by_key(&item_index, |item| item.item_index)
+            .is_ok()
+    }
+}
+
 struct AgentFind {
     open: bool,
     query: String,
     focus: bool,
-    matches: Vec<usize>,
+    matches: AgentFindMatches,
     selected: usize,
     scroll_to_match: bool,
     dirty: bool,
@@ -3887,7 +4184,7 @@ impl Default for AgentFind {
             open: false,
             query: String::new(),
             focus: false,
-            matches: Vec::new(),
+            matches: AgentFindMatches::default(),
             selected: 0,
             scroll_to_match: false,
             dirty: true,
@@ -3926,12 +4223,39 @@ enum AccountPromptAction {
 struct AccountPrompt {
     action: AccountPromptAction,
     label: String,
+    cursor_api_key: String,
     focus: bool,
 }
 
 impl AccountPrompt {
     fn incomplete(&self) -> bool {
         self.label.trim().is_empty()
+    }
+}
+
+/// The modal editor for one account's optional Cursor Cloud API key. Keeping
+/// the form here instead of on the Providers card lets the Cursor card read
+/// like every other provider; a saved key never renders back, so the dialog
+/// only ever accepts a new one or removes the stored one.
+struct CursorCloudKeyPrompt {
+    account: AccountKey,
+    error: Option<String>,
+    focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AgentRunLocation {
+    #[default]
+    Local,
+    Cloud,
+}
+
+impl AgentRunLocation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "Local",
+            Self::Cloud => "Cloud",
+        }
     }
 }
 
@@ -3954,6 +4278,7 @@ struct AgentPaneRuntime {
     agent_transcript_rendered: usize,
     agent_drop_hovered: bool,
     agent_run_everything: Option<bool>,
+    agent_run_location: AgentRunLocation,
     selected_provider: ProviderId,
     selected_account: AccountKey,
     provider_agents: HashMap<AccountKey, AgentState>,
@@ -3990,6 +4315,7 @@ impl AgentPaneRuntime {
             agent_transcript_rendered: 0,
             agent_drop_hovered: false,
             agent_run_everything: None,
+            agent_run_location: AgentRunLocation::Local,
             selected_provider: selected_account.provider,
             selected_account,
             provider_agents: HashMap::new(),
@@ -4041,6 +4367,10 @@ enum AttachmentTarget {
 
 enum SettingsAction {
     Back,
+    AddProviderAccount(ProviderId),
+    RenameProviderAccount(AccountKey),
+    SelectProviderAccount(AccountKey),
+    EditCursorCloudKey(AccountKey),
     OpenDevin,
     ConnectDevin,
     DisconnectDevin,
@@ -4057,6 +4387,7 @@ enum SettingsSection {
     Devin,
     Keybindings,
     LanguageServers,
+    Providers,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5084,11 +5415,7 @@ impl FileTab {
 pub struct EditorApp {
     tabs: Vec<FileTab>,
     active_tab: Option<usize>,
-    active_pane: PaneId,
-    pane_active_tabs: HashMap<PaneId, PathBuf>,
-    pane_layout: PaneLayout,
-    tab_drag: Option<PathBuf>,
-    tab_drop: Option<TabDrop>,
+    editor_panes: PaneTabs<PathBuf>,
     tree: TreeState,
     tree_surface: TreeSurface,
     recent_projects: Vec<PathBuf>,
@@ -5116,7 +5443,8 @@ pub struct EditorApp {
     sidebar_width: f32,
     sidebar_dragging: bool,
     git_state: GitState,
-    git_diff: Option<GitDiffPreview>,
+    git_diffs: Vec<GitDiffPreview>,
+    git_panes: PaneTabs<GitDiffKey>,
     git_controller: Option<GitController>,
     git_refresh_at: Option<Instant>,
     git_discard: Option<GitDiscardRequest>,
@@ -5203,10 +5531,15 @@ pub struct EditorApp {
     attachment_picker_target: AttachmentTarget,
     project_folder_picker: Option<WorkspaceFilePicker>,
     agent_run_everything: Option<bool>,
+    agent_run_location: AgentRunLocation,
     selected_provider: ProviderId,
     selected_account: AccountKey,
     accounts: AccountRegistry,
     account_prompt: Option<AccountPrompt>,
+    cursor_cloud_key_prompt: Option<CursorCloudKeyPrompt>,
+    cursor_cloud_key_accounts: HashSet<AccountKey>,
+    cursor_cloud_key_drafts: HashMap<AccountKey, String>,
+    cursor_cloud_keys_loaded: bool,
     exhausted_accounts: HashMap<AccountKey, Option<SystemTime>>,
     available_providers: Vec<ProviderId>,
     provider_agents: HashMap<AccountKey, AgentState>,
@@ -5310,11 +5643,10 @@ impl EditorApp {
         Ok(Self {
             tabs,
             active_tab,
-            active_pane: initial_pane,
-            pane_active_tabs,
-            pane_layout: PaneLayout::default(),
-            tab_drag: None,
-            tab_drop: None,
+            editor_panes: PaneTabs {
+                active_tabs: pane_active_tabs,
+                ..PaneTabs::default()
+            },
             tree: TreeState::new(target.root, selected)?,
             tree_surface: TreeSurface::default(),
             recent_projects: data_dir()
@@ -5342,7 +5674,8 @@ impl EditorApp {
             sidebar_width: 248.0,
             sidebar_dragging: false,
             git_state: GitState::default(),
-            git_diff: None,
+            git_diffs: Vec::new(),
+            git_panes: PaneTabs::default(),
             git_controller: None,
             git_refresh_at: None,
             git_discard: None,
@@ -5423,6 +5756,7 @@ impl EditorApp {
             attachment_picker_target: AttachmentTarget::Agent,
             project_folder_picker: None,
             agent_run_everything: None,
+            agent_run_location: AgentRunLocation::Local,
             selected_provider: ProviderId::Cursor,
             selected_account: AccountKey {
                 provider: ProviderId::Cursor,
@@ -5430,6 +5764,10 @@ impl EditorApp {
             },
             accounts: AccountRegistry::default(),
             account_prompt: None,
+            cursor_cloud_key_prompt: None,
+            cursor_cloud_key_accounts: HashSet::new(),
+            cursor_cloud_key_drafts: HashMap::new(),
+            cursor_cloud_keys_loaded: false,
             exhausted_accounts: HashMap::new(),
             available_providers: Vec::new(),
             provider_agents: HashMap::new(),
@@ -5652,28 +5990,57 @@ impl EditorApp {
             );
         }
         self.lsp_caret = None;
-        let pane_rects = self.pane_layout.rects(editor);
-        self.update_tab_drag(&ctx, &pane_rects);
-        let pane_resize_handles = if self.tab_drag.is_none() {
-            resize_dragged_pane_handle(
-                &ctx,
-                &mut self.pane_layout,
-                editor,
-                "pane_split_divider",
-                false,
-            )
+        let git_view = !self.git_diffs.is_empty();
+        let pane_rects = if git_view {
+            self.git_panes.layout.rects(editor)
         } else {
-            Vec::new()
+            self.editor_panes.layout.rects(editor)
         };
-        let mut pane_rects = self.pane_layout.rects(editor);
+        if git_view {
+            self.update_git_tab_drag(&ctx, &pane_rects);
+        } else {
+            self.update_tab_drag(&ctx, &pane_rects);
+        }
+        let pane_resize_handles = if git_view {
+            if self.git_panes.drag.is_none() {
+                resize_dragged_pane_handle(
+                    &ctx,
+                    &mut self.git_panes.layout,
+                    editor,
+                    "pane_split_divider",
+                    false,
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            if self.editor_panes.drag.is_none() {
+                resize_dragged_pane_handle(
+                    &ctx,
+                    &mut self.editor_panes.layout,
+                    editor,
+                    "pane_split_divider",
+                    false,
+                )
+            } else {
+                Vec::new()
+            }
+        };
+        let mut pane_rects = if git_view {
+            self.git_panes.layout.rects(editor)
+        } else {
+            self.editor_panes.layout.rects(editor)
+        };
         let mut dragged_pane = None;
-        if let (Some(path), Some(drop)) = (self.tab_drag.as_deref(), self.tab_drop)
+        if !git_view
+            && let (Some(path), Some(drop)) =
+                (self.editor_panes.drag.as_deref(), self.editor_panes.drop)
             && let Some((preview, pane)) = self.tab_drag_preview(editor, path, drop)
         {
             pane_rects = preview;
             dragged_pane = Some(pane);
         }
-        let dragged_path = self.tab_drag.clone();
+        let dragged_path = self.editor_panes.drag.clone();
         let dragged_source = dragged_path.as_deref().and_then(|path| {
             self.tabs
                 .iter()
@@ -5691,18 +6058,26 @@ impl EditorApp {
                 && ctx.input(|input| {
                     input.pointer.any_pressed() || input.smooth_scroll_delta != egui::Vec2::ZERO
                 });
-            if pane != self.active_pane
-                && pointer_interaction
-                && let Some(index) = self
-                    .pane_active_tabs
-                    .get(&pane)
-                    .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
-            {
-                self.activate_tab(index);
+            if pointer_interaction {
+                if git_view && pane != self.git_panes.active_pane {
+                    if let Some(key) = self.git_panes.active(pane).cloned() {
+                        self.activate_git_diff_key(&key);
+                    } else {
+                        self.git_panes.active_pane = pane;
+                    }
+                } else if !git_view
+                    && pane != self.editor_panes.active_pane
+                    && let Some(index) =
+                        self.editor_panes.active_tabs.get(&pane).and_then(|path| {
+                            self.tabs.iter().position(|tab| &tab.buffer.path == path)
+                        })
+                {
+                    self.activate_tab(index);
+                }
             }
             let (content, findbar) = split_pane_content(
                 content,
-                self.pane_find.get(&pane).is_some_and(|find| find.open),
+                !git_view && self.pane_find.get(&pane).is_some_and(|find| find.open),
             );
             if header.top() >= editor.top() - 0.5 {
                 root.scope_builder(
@@ -5813,11 +6188,12 @@ impl EditorApp {
             (agent_sidebar_at_frame_start, devin_sidebar_at_frame_start),
             dragged_pane,
         );
-        if !self.terminal.focused(&ctx)
+        if !git_view
+            && !self.terminal.focused(&ctx)
             && pane_rects.len() > 1
             && let Some((_, rect)) = pane_rects
                 .iter()
-                .find(|(pane, _)| *pane == self.active_pane)
+                .find(|(pane, _)| *pane == self.editor_panes.active_pane)
         {
             let (header, _) = pane_header_and_content(titlebar, editor, *rect);
             let focus_rect = egui::Rect::from_min_max(header.left_top(), rect.right_bottom());
@@ -5901,7 +6277,12 @@ impl EditorApp {
                 resize_divider_stroke(&ctx, active),
             );
         }
-        if let Some(drop) = self.tab_drop.filter(|drop| drop.zone == DropZone::Center) {
+        let tab_drop = if git_view {
+            self.git_panes.drop
+        } else {
+            self.editor_panes.drop
+        };
+        if let Some(drop) = tab_drop.filter(|drop| git_view || drop.zone == DropZone::Center) {
             root.painter().rect_filled(
                 drop.preview.shrink(4.0),
                 5.0,
@@ -5914,7 +6295,10 @@ impl EditorApp {
                 egui::StrokeKind::Inside,
             );
         }
-        if let Some(path) = self.tab_drag.as_deref() {
+        if let Some(key) = self.git_panes.drag.as_ref().filter(|_| git_view) {
+            draw_tab_drag_ghost(&ctx, &git_diff_label(&key.path, key.area));
+            ctx.set_cursor_icon(CursorIcon::Grabbing);
+        } else if let Some(path) = self.editor_panes.drag.as_deref() {
             draw_tab_drag_ghost(&ctx, &drag_label(path));
             ctx.set_cursor_icon(CursorIcon::Grabbing);
         }
@@ -6036,7 +6420,11 @@ impl EditorApp {
                 |ui| self.draw_agentic_sessions(ui),
             );
         }
-        let available_sessions = self.agent.sessions.clone().unwrap_or_default();
+        let available_sessions = self
+            .agent_pane_picker
+            .and(self.agent.sessions.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let agent_panes = self.agent_pane_layout.rects(agent);
         self.update_agent_session_drag(root.ctx(), &agent_panes);
         let agent_panes = self.agent_pane_layout.rects(agent);
@@ -6142,7 +6530,7 @@ impl EditorApp {
                     .max_rect(rect),
                 |ui| {
                     ui.painter()
-                        .rect_filled(ui.max_rect(), 0.0, theme::surface().input);
+                        .rect_filled(ui.max_rect(), 0.0, editor_background());
                     let panel = self
                         .agentic_diffs
                         .get(self.active_agentic_diff)
@@ -6181,31 +6569,12 @@ impl EditorApp {
                         &self.agentic_diffs,
                         self.active_agentic_diff,
                     );
-                    ui.scope_builder(
-                        UiBuilder::new()
-                            .id_salt("agentic_diff_summary")
-                            .max_rect(summary)
-                            .layout(Layout::right_to_left(Align::Center)),
-                        |ui| {
-                            ui.label(
-                                RichText::new(format!("+{}  −{}", diff.added, diff.removed))
-                                    .monospace()
-                                    .size(theme::typography::MICRO_SIZE)
-                                    .color(theme::text().muted),
-                            );
-                            ui.label(
-                                RichText::new(if panel.error.is_some() {
-                                    "UNAVAILABLE"
-                                } else if panel.baseline.is_some() {
-                                    "MODIFIED"
-                                } else {
-                                    "NEW FILE"
-                                })
-                                .size(theme::typography::MICRO_SIZE)
-                                .strong()
-                                .color(theme::accent()),
-                            );
-                        },
+                    draw_diff_summary(
+                        ui,
+                        summary,
+                        "agentic_diff_summary",
+                        diff.added,
+                        diff.removed,
                     );
                     ui.scope_builder(
                         UiBuilder::new()
@@ -6375,6 +6744,7 @@ impl EditorApp {
             agent_transcript_rendered: std::mem::take(&mut self.agent_transcript_rendered),
             agent_drop_hovered: std::mem::take(&mut self.agent_drop_hovered),
             agent_run_everything: self.agent_run_everything.take(),
+            agent_run_location: std::mem::take(&mut self.agent_run_location),
             selected_provider: std::mem::replace(&mut self.selected_provider, ProviderId::Cursor),
             selected_account: std::mem::replace(
                 &mut self.selected_account,
@@ -6411,6 +6781,7 @@ impl EditorApp {
         self.agent_transcript_rendered = runtime.agent_transcript_rendered;
         self.agent_drop_hovered = runtime.agent_drop_hovered;
         self.agent_run_everything = runtime.agent_run_everything;
+        self.agent_run_location = runtime.agent_run_location;
         self.selected_provider = runtime.selected_provider;
         self.selected_account = runtime.selected_account;
         self.provider_agents = runtime.provider_agents;
@@ -7201,7 +7572,8 @@ impl EditorApp {
         controls_right: f32,
         preview_path: Option<&Path>,
     ) -> (f32, f32) {
-        if preview_path.is_some() || self.tabs.iter().any(|tab| tab.pane == pane) {
+        let git_diff_open = self.git_diffs.iter().any(|diff| diff.pane == pane);
+        if preview_path.is_some() || self.tabs.iter().any(|tab| tab.pane == pane) || git_diff_open {
             ui.painter().rect_filled(rect, 0.0, theme::surface().chrome);
             ui.painter().hline(
                 rect.x_range(),
@@ -7211,11 +7583,46 @@ impl EditorApp {
         } else {
             ui.painter().rect_filled(rect, 0.0, editor_background());
         }
-        if self.git_diff.is_some() && pane == self.active_pane {
+        if git_diff_open {
+            let (added, removed) = {
+                let diff = self.active_git_diff(pane).expect("pane has a diff tab");
+                let id = Id::new(("git_diff_preview", &diff.repository, &diff.path, diff.area));
+                let rendered = cached_agent_diff_revision(
+                    ui,
+                    id,
+                    diff.content_revision,
+                    diff.old.as_deref(),
+                    &diff.new,
+                );
+                (rendered.added, rendered.removed)
+            };
+            let summary_width =
+                160.0_f32.min((controls_right - tabs_left - TAB_MIN_WIDTH).max(0.0));
+            let summary_left = controls_right - summary_width;
+            let tabs = egui::Rect::from_min_max(
+                egui::pos2(tabs_left, rect.top()),
+                egui::pos2(summary_left, rect.bottom()),
+            );
+            self.draw_git_diff_tabs(ui, tabs, pane);
+            draw_diff_summary(
+                ui,
+                egui::Rect::from_min_max(
+                    egui::pos2(summary_left, rect.top()),
+                    egui::pos2(controls_right, rect.bottom()),
+                )
+                .shrink2(egui::vec2(theme::space::MEDIUM, 0.0)),
+                "git_diff_summary",
+                added,
+                removed,
+            );
+            return (tabs.right(), summary_left);
+        }
+        if !self.git_diffs.is_empty() {
             return (tabs_left, controls_right);
         }
         let active = self
-            .pane_active_tabs
+            .editor_panes
+            .active_tabs
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
@@ -7348,9 +7755,10 @@ impl EditorApp {
         let controls_start = preview_button.map_or(controls_right, |button| button.left());
         let tabs_right = (controls_start - 8.0).max(tabs_left);
         let hidden_path = self
-            .tab_drop
+            .editor_panes
+            .drop
             .filter(|drop| drop.zone != DropZone::Center)
-            .and(self.tab_drag.as_deref())
+            .and(self.editor_panes.drag.as_deref())
             .filter(|path| {
                 self.tabs
                     .iter()
@@ -7408,7 +7816,7 @@ impl EditorApp {
         dragged_pane: Option<PaneId>,
     ) {
         let (agent_sidebar_open, devin_sidebar_open) = assistant_sidebars;
-        let dragged_path = self.tab_drag.clone();
+        let dragged_path = self.editor_panes.drag.clone();
         crate::renderer::mark_retained(
             ui.painter(),
             rect,
@@ -7554,62 +7962,46 @@ impl EditorApp {
     }
 
     fn update_tab_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) -> bool {
-        let Some(path) = self.tab_drag.clone() else {
-            self.tab_drop = None;
-            return false;
-        };
-        let index = self.tabs.iter().position(|tab| tab.buffer.path == path);
-        let pointer = ctx.pointer_hover_pos();
-        let previous = self.tab_drop;
-        self.tab_drop = pointer.and_then(|pointer| {
-            panes.iter().find_map(|(target, rect)| {
-                rect.contains(pointer).then(|| {
-                    let previous = previous
-                        .filter(|drop| drop.target == *target)
-                        .map(|drop| drop.zone);
-                    let zone = if pointer.y <= rect.top() + PANE_TAB_HEIGHT
-                        && previous.unwrap_or(DropZone::Center) == DropZone::Center
-                    {
-                        DropZone::Center
-                    } else {
-                        stable_tab_drop_zone(*rect, pointer, previous)
-                    };
-                    TabDrop {
-                        target: *target,
-                        zone,
-                        preview: tab_drop_preview(*rect, zone),
-                    }
-                })
-            })
+        let source = self.editor_panes.drag.as_ref().and_then(|path| {
+            self.tabs
+                .iter()
+                .find(|tab| &tab.buffer.path == path)
+                .map(|tab| tab.pane)
         });
-        if index.is_some_and(|index| {
-            self.tab_drop.is_some_and(|drop| {
-                drop.zone != DropZone::Center
-                    && drop.target == self.tabs[index].pane
-                    && self
-                        .tabs
-                        .iter()
-                        .filter(|tab| tab.pane == drop.target)
-                        .count()
-                        == 1
-            })
-        }) {
-            self.tab_drop = None;
+        let source_tab_count = source.map_or(0, |source| {
+            self.tabs.iter().filter(|tab| tab.pane == source).count()
+        });
+        if let Some((path, drop)) =
+            self.editor_panes
+                .update_drag(ctx, panes, source, source_tab_count, PANE_TAB_HEIGHT)
+        {
+            self.drop_path(path, drop.target, drop.zone);
+            return true;
         }
-        let released = ctx.input(|input| input.pointer.primary_released());
-        let down = ctx.input(|input| input.pointer.primary_down());
-        if released {
-            let drop = self.tab_drop.take();
-            self.tab_drag = None;
-            if let Some(drop) = drop {
-                self.drop_path(path, drop.target, drop.zone);
-                return true;
+        false
+    }
+
+    fn update_git_tab_drag(&mut self, ctx: &egui::Context, panes: &[(PaneId, egui::Rect)]) -> bool {
+        let source = self.git_panes.drag.as_ref().and_then(|key| {
+            self.git_diffs
+                .iter()
+                .find(|diff| &diff.key == key)
+                .map(|diff| diff.pane)
+        });
+        let source_tab_count = source.map_or(0, |source| {
+            self.git_diffs
+                .iter()
+                .filter(|diff| diff.pane == source)
+                .count()
+        });
+        if let Some((key, drop)) =
+            self.git_panes
+                .update_drag(ctx, panes, source, source_tab_count, PANE_TAB_HEIGHT)
+        {
+            if let Some(index) = self.git_diffs.iter().position(|diff| diff.key == key) {
+                self.drop_git_diff(index, drop.target, drop.zone);
             }
-        } else if !down {
-            self.tab_drag = None;
-            self.tab_drop = None;
-        } else {
-            ctx.request_repaint();
+            return true;
         }
         false
     }
@@ -7638,7 +8030,7 @@ impl EditorApp {
         {
             return None;
         }
-        let mut layout = self.pane_layout.clone();
+        let mut layout = self.editor_panes.layout.clone();
         let preview = layout.split(drop.target, drop.zone)?;
         if let Some(source) = source
             && self.tabs.iter().filter(|tab| tab.pane == source).count() == 1
@@ -7685,18 +8077,149 @@ impl EditorApp {
         }
     }
 
+    fn draw_git_diff_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect, pane: PaneId) {
+        let hidden = self
+            .git_panes
+            .drop
+            .filter(|drop| drop.zone != DropZone::Center)
+            .and(self.git_panes.drag.as_ref())
+            .filter(|key| {
+                self.git_diffs
+                    .iter()
+                    .any(|diff| diff.pane == pane && diff.key == **key)
+            });
+        let active = self
+            .git_panes
+            .active(pane)
+            .filter(|key| hidden != Some(*key))
+            .cloned();
+        let tabs = self
+            .git_diffs
+            .iter()
+            .enumerate()
+            .filter(|(_, diff)| diff.pane == pane && hidden != Some(&diff.key))
+            .map(|(index, diff)| {
+                (
+                    index,
+                    git_diff_label(&diff.path, diff.area),
+                    diff.key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut activate = None;
+        let mut close = None;
+        let mut reorder = None;
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt(("git_diff_tabs", pane.0))
+                .max_rect(rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.set_clip_rect(rect);
+                ScrollArea::horizontal()
+                    .id_salt(("git_diff_tabs_scroll", pane.0))
+                    .max_width(rect.width())
+                    .max_height(rect.height())
+                    .auto_shrink([false, false])
+                    .content_margin(egui::Margin::ZERO)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                        let widths = tabs
+                            .iter()
+                            .map(|(_, label, _)| tab_width(ui, label))
+                            .collect::<Vec<_>>();
+                        for (position, (index, label, key)) in tabs.iter().enumerate() {
+                            let (_, tab) =
+                                ui.allocate_space(egui::vec2(widths[position], rect.height()));
+                            let selected = active.as_ref() == Some(key);
+                            let (response, close_clicked) = draw_editor_tab(
+                                ui,
+                                tab,
+                                Id::new(("git_diff_tab", &key.repository, &key.path, key.area)),
+                                Id::new((
+                                    "git_diff_tab_close",
+                                    &key.repository,
+                                    &key.path,
+                                    key.area,
+                                )),
+                                label,
+                                selected,
+                                false,
+                            );
+                            let touches_active = selected
+                                || active.as_ref()
+                                    == Some(&tabs[(position + 1).min(tabs.len() - 1)].2);
+                            if !touches_active && position + 1 < tabs.len() {
+                                ui.painter().vline(
+                                    tab.right() - 0.5,
+                                    tab.y_range().shrink(theme::space::SNUG),
+                                    theme::border::hairline(),
+                                );
+                            }
+                            if close_clicked {
+                                close = Some(*index);
+                            } else if response.clicked() {
+                                activate = Some(*index);
+                            }
+                            if response.drag_started() {
+                                self.git_panes.drag = Some(key.clone());
+                                activate = Some(*index);
+                            }
+                            if response.dragged() {
+                                self.git_panes.drag = Some(key.clone());
+                                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                                if let Some(pointer) =
+                                    ui.input(|input| input.pointer.interact_pos())
+                                    && rect.contains(pointer)
+                                {
+                                    let first_left =
+                                        tab.left() - widths[..position].iter().sum::<f32>();
+                                    let mut edge = first_left;
+                                    let mut target_position = tabs.len() - 1;
+                                    for (candidate, width) in widths.iter().enumerate() {
+                                        edge += width;
+                                        if pointer.x < edge {
+                                            target_position = candidate;
+                                            break;
+                                        }
+                                    }
+                                    let target = tabs[target_position].0;
+                                    if target != *index {
+                                        reorder = Some((*index, target));
+                                    }
+                                }
+                            }
+                            if selected {
+                                response.scroll_to_me(Some(Align::Center));
+                            }
+                        }
+                    });
+            },
+        );
+        if let Some(index) = close {
+            self.close_git_diff(index);
+        } else if let Some((from, to)) = reorder {
+            self.move_git_diff(from, to);
+        } else if let Some(index) = activate {
+            self.activate_git_diff(index);
+        }
+    }
+
     fn draw_file_tabs(&mut self, ui: &mut egui::Ui, rect: egui::Rect, pane: PaneId) {
         let hidden_path = self
-            .tab_drop
+            .editor_panes
+            .drop
             .filter(|drop| drop.zone != DropZone::Center)
-            .and(self.tab_drag.as_deref())
+            .and(self.editor_panes.drag.as_deref())
             .filter(|path| {
                 self.tabs
                     .iter()
                     .any(|tab| tab.pane == pane && tab.buffer.path == **path)
             });
         let active = self
-            .pane_active_tabs
+            .editor_panes
+            .active_tabs
             .get(&pane)
             .filter(|path| hidden_path != Some(path.as_path()))
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
@@ -7755,41 +8278,16 @@ impl EditorApp {
                             let (_, tab) =
                                 ui.allocate_space(egui::vec2(widths[position], rect.height()));
                             let selected = active == Some(*index);
-                            let response = ui.interact(
+                            let (response, close_clicked) = draw_editor_tab(
+                                ui,
                                 tab,
                                 Id::new(("file_tab", path_display)),
-                                Sense::click_and_drag(),
+                                Id::new(("file_tab_close", path_display)),
+                                label,
+                                selected,
+                                *dirty,
                             );
-                            response.widget_info(|| {
-                                egui::WidgetInfo::selected(
-                                    egui::WidgetType::SelectableLabel,
-                                    ui.is_enabled(),
-                                    selected,
-                                    label.clone(),
-                                )
-                            });
-                            let hovered = ui.input(|input| {
-                                input
-                                    .pointer
-                                    .hover_pos()
-                                    .is_some_and(|pointer| tab.contains(pointer))
-                            });
                             let dragging = response.dragged();
-                            if selected || hovered || dragging {
-                                ui.painter().rect_filled(
-                                    tab,
-                                    0.0,
-                                    if dragging {
-                                        theme::state::selected()
-                                    } else if selected {
-                                        // The active tab is the top edge of the
-                                        // document, so it wears the document's fill.
-                                        theme::surface().editor
-                                    } else {
-                                        theme::state::hover()
-                                    },
-                                );
-                            }
                             // A divider only earns its place between two inactive
                             // tabs; beside the active one it competes with the bar.
                             let touches_active = selected
@@ -7801,85 +8299,17 @@ impl EditorApp {
                                     theme::border::hairline(),
                                 );
                             }
-                            let close_rect = egui::Rect::from_center_size(
-                                egui::pos2(tab.right() - theme::space::LARGE, tab.center().y),
-                                egui::Vec2::splat(TAB_CLOSE),
-                            );
-                            let text_rect = egui::Rect::from_min_max(
-                                egui::pos2(tab.left() + theme::space::MEDIUM + TAB_DOT, tab.top()),
-                                egui::pos2(close_rect.left() - theme::space::SMALL, tab.bottom()),
-                            );
-                            let text_color = if selected {
-                                theme::text().primary
-                            } else {
-                                theme::text().muted
-                            };
-                            let galley = egui::WidgetText::from(
-                                RichText::new(label)
-                                    .font(if selected {
-                                        theme::typography::strong()
-                                    } else {
-                                        theme::typography::small()
-                                    })
-                                    .color(text_color),
-                            )
-                            .into_galley(
-                                ui,
-                                Some(egui::TextWrapMode::Truncate),
-                                text_rect.width(),
-                                egui::FontSelection::Default,
-                            );
-                            let text_position = egui::pos2(
-                                text_rect.left(),
-                                text_rect.center().y - galley.size().y * 0.5,
-                            );
-                            ui.painter().galley(text_position, galley, text_color);
-                            if *dirty {
-                                ui.painter().circle_filled(
-                                    egui::pos2(
-                                        tab.left() + theme::space::MEDIUM + TAB_DOT * 0.5,
-                                        tab.center().y,
-                                    ),
-                                    3.0,
-                                    theme::ink(theme::semantic().warning),
-                                );
-                            }
-                            let show_close = hovered || selected;
-                            let close_response = ui
-                                .interact(
-                                    close_rect,
-                                    Id::new(("file_tab_close", path_display)),
-                                    Sense::click(),
-                                )
-                                .on_hover_text(format!("Close {label}"));
-                            close_response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    ui.is_enabled(),
-                                    format!("Close {label}"),
-                                )
-                            });
-                            if show_close {
-                                icons::paint_button(
-                                    ui.painter(),
-                                    Icon::Close,
-                                    close_rect,
-                                    &close_response,
-                                    ui.is_enabled(),
-                                    theme::text().secondary,
-                                );
-                            }
-                            if close_response.clicked() {
+                            if close_clicked {
                                 close = Some(*index);
                             } else if response.clicked() {
                                 activate = Some(*index);
                             }
                             if response.drag_started() {
-                                self.tab_drag = Some(path.clone());
+                                self.editor_panes.drag = Some(path.clone());
                                 activate = Some(*index);
                             }
                             if dragging {
-                                self.tab_drag = Some(path.clone());
+                                self.editor_panes.drag = Some(path.clone());
                                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                                 if let Some(pointer) =
                                     ui.input(|input| input.pointer.interact_pos())
@@ -8235,9 +8665,9 @@ impl EditorApp {
         let Some(source) = self.assistant_image_lightbox.clone() else {
             return;
         };
-        let texture = match &source {
+        let image = match &source {
             AssistantImageSource::Bytes(data) => {
-                cached_assistant_image(AssistantImageCacheKey::Bytes {
+                cached_assistant_image_state(AssistantImageCacheKey::Bytes {
                     ctx,
                     data,
                     identity: data.as_ptr() as usize,
@@ -8245,12 +8675,16 @@ impl EditorApp {
                 })
             }
             AssistantImageSource::Path(path) => {
-                cached_assistant_image_path(ctx, path, ASSISTANT_IMAGE_LIGHTBOX_EDGE)
+                cached_assistant_image_path_state(ctx, path, ASSISTANT_IMAGE_LIGHTBOX_EDGE)
             }
         };
-        let Some(texture) = texture else {
-            self.assistant_image_lightbox = None;
-            return;
+        let texture = match image {
+            AssistantImageLoad::Loaded(texture) => texture,
+            AssistantImageLoad::Pending => return,
+            AssistantImageLoad::Unavailable => {
+                self.assistant_image_lightbox = None;
+                return;
+            }
         };
 
         let screen = ctx.content_rect();
@@ -8466,8 +8900,8 @@ impl EditorApp {
                         ProviderId::Cursor => (
                             "Add and sign in",
                             "The new account gets its own Cursor sign-in, kept \
-                             separate from your other Cursor accounts. No API key is \
-                             needed.",
+                             separate from your other Cursor accounts. The optional API key \
+                             below enables live Cursor Cloud progress in Editur.",
                         ),
                         ProviderId::Codex => (
                             "Add and sign in",
@@ -8518,6 +8952,33 @@ impl EditorApp {
                     }
                     submitted_by_return =
                         response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                    if matches!(prompt.action, AccountPromptAction::Add(ProviderId::Cursor)) {
+                        ui.add_space(theme::space::LARGE);
+                        ui.label(
+                            RichText::new("Cursor Cloud API key (optional)")
+                                .font(theme::typography::small())
+                                .color(theme::text().muted),
+                        );
+                        ui.add(
+                            TextEdit::singleline(&mut prompt.cursor_api_key)
+                                .id(Id::new("agent_account_cloud_api_key"))
+                                .password(true)
+                                .hint_text("Paste from Cursor Dashboard → API Keys")
+                                .margin(egui::Margin::symmetric(10, 7))
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.add_space(theme::space::TIGHT);
+                        ui.add(
+                            Label::new(
+                                RichText::new(
+                                    "Used only to stream Cursor Cloud progress in Editur. Cursor sign-in still uses your browser.",
+                                )
+                                .font(theme::typography::small())
+                                .color(theme::text().muted),
+                            )
+                            .wrap(),
+                        );
+                    }
                 }
             });
             if (outcome == Outcome::Primary || submitted_by_return) && !invalid {
@@ -9962,34 +10423,38 @@ fn draw_markdown_preview(
     revision: u64,
     cache: &mut MarkdownLayoutCache,
     pane: PaneId,
+    highlighter: &Highlighter,
+    syntaxes: &SyntaxManager,
 ) {
     let rect = ui.available_rect_before_wrap();
     ui.painter().rect_filled(rect, 0.0, editor_background());
     let content_width = (rect.width() - 64.0).clamp(1.0, 860.0);
     let side = ((rect.width() - content_width) * 0.5).max(0.0);
-    let key = (
-        revision,
-        content_width.round().to_bits(),
-        theme::paint_appearance(ui.pixels_per_point()),
-    );
+    let key = (revision, theme::appearance());
     if cache.as_ref().is_none_or(|(current, _)| *current != key) {
-        let job = markdown::layout(source, content_width);
-        *cache = Some((key, ui.fonts_mut(|fonts| fonts.layout_job(job))));
+        *cache = Some((key, Arc::new(markdown::parse(source))));
     }
-    let galley = Arc::clone(&cache.as_ref().expect("Markdown layout was cached").1);
+    let document = Arc::clone(&cache.as_ref().expect("Markdown document was cached").1);
     ScrollArea::vertical()
         .id_salt(("markdown_preview", pane.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.add_space(24.0);
+            ui.add_space(32.0);
             ui.horizontal(|ui| {
                 ui.add_space(side);
                 ui.vertical(|ui| {
                     ui.set_width(content_width);
-                    ui.add(Label::new(galley).selectable(true).wrap());
+                    markdown::show(ui, &document, &mut |language, code| {
+                        let syntax = language
+                            .map(|language| syntaxes.detect_token(language))
+                            .unwrap_or_else(|| syntaxes.plain_text());
+                        highlighter
+                            .highlight_job(code, syntax, syntaxes.set(), f32::INFINITY)
+                            .ok()
+                    });
                 });
             });
-            ui.add_space(32.0);
+            ui.add_space(48.0);
         });
 }
 

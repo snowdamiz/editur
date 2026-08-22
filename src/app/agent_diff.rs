@@ -8,7 +8,7 @@ use egui::{
     Align, Color32, Id, Label, Layout, RichText, ScrollArea, Sense, TextFormat, text::LayoutJob,
 };
 
-use super::agent_text::{agent_syntax_lines, agent_text_job, append_agent_syntax_line};
+use super::agent_text::{agent_syntax_lines, append_agent_syntax_line};
 use super::{
     AGENT_CULL_MARGIN, AGENT_DIFF_HIGHLIGHT_MAX_LINES, AGENT_DIFF_PREVIEW_HEAD,
     AGENT_DIFF_PREVIEW_ROWS, find_highlighted_job, match_spans,
@@ -592,7 +592,6 @@ pub(super) fn draw_agent_diff(
     search: Option<(&str, Option<usize>)>,
     scroll_to_active: bool,
 ) -> (bool, bool) {
-    let mut path_clicked = false;
     let mut scrolled = false;
     let diff = cached_agent_diff(ui, id, old_text, new_text);
     let expanded_id = id.with("expanded");
@@ -603,56 +602,13 @@ pub(super) fn draw_agent_diff(
         .flatten()
         .unwrap_or(&diff.lines);
     let can_toggle = diff.lines.len() > AGENT_DIFF_PREVIEW_ROWS;
-    let file_name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy();
     ui.set_width(ui.available_width());
     egui::Frame::new()
         .fill(theme::surface().input)
+        .stroke(egui::Stroke::new(1.0, theme::border::strong_color()))
+        .corner_radius(theme::corner(theme::radius::CARD))
         .show(ui, |ui| {
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let header = ui
-                            .add(
-                                Label::new(agent_text_job(
-                                    file_name.as_ref(),
-                                    ui.available_width(),
-                                    theme::typography::strong(),
-                                    theme::text().primary,
-                                    search,
-                                ))
-                                .sense(Sense::click()),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        path_clicked |= header.clicked();
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("+{}  −{}", diff.added, diff.removed))
-                                    .monospace()
-                                    .size(theme::typography::MICRO_SIZE)
-                                    .color(theme::text().muted),
-                            );
-                            ui.label(
-                                RichText::new(if old_text.is_some() {
-                                    "MODIFIED"
-                                } else {
-                                    "NEW FILE"
-                                })
-                                .size(theme::typography::MICRO_SIZE)
-                                .strong()
-                                .color(theme::accent()),
-                            );
-                        });
-                    });
-                });
-            ui.painter().hline(
-                ui.available_rect_before_wrap().x_range(),
-                ui.cursor().top(),
-                egui::Stroke::new(1.0, theme::border::strong_color()),
-            );
+            ui.set_width(ui.available_width());
             let row_search = search.map(|(query, active)| {
                 let path_matches = match_spans(&path.display().to_string(), query).len();
                 (
@@ -694,7 +650,7 @@ pub(super) fn draw_agent_diff(
                 }
             }
         });
-    (path_clicked, scrolled)
+    (false, scrolled)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -747,8 +703,7 @@ pub(super) fn draw_agent_diff_rows(
         syntaxes,
         (diff.version, needed_new.len()),
     );
-    let old_digits = diff.old_line_count.max(1).ilog10() as usize + 1;
-    let new_digits = diff.new_line_count.max(1).ilog10() as usize + 1;
+    let digits = diff.old_line_count.max(diff.new_line_count).max(1).ilog10() as usize + 1;
     let longest = if lines.len() == diff.lines.len() {
         diff.longest_chars
     } else {
@@ -759,8 +714,7 @@ pub(super) fn draw_agent_diff_rows(
             .unwrap_or(0)
     };
     let content_width = ui.available_width();
-    let desired_width =
-        content_width.max(38.0 + (old_digits + new_digits + longest).min(240) as f32 * 7.3);
+    let desired_width = content_width.max(30.0 + (digits + longest).min(240) as f32 * 7.3);
     let heights_id = id.with("row_heights");
     let mut row_heights = ui
         .data(|data| data.get_temp::<(f32, f32)>(heights_id))
@@ -825,14 +779,12 @@ pub(super) fn draw_agent_diff_rows(
                             );
                             return;
                         }
-                        let old_number = line.old_number.map_or_else(
-                            || " ".repeat(old_digits),
-                            |number| format!("{number:>old_digits$}"),
-                        );
-                        let new_number = line.new_number.map_or_else(
-                            || " ".repeat(new_digits),
-                            |number| format!("{number:>new_digits$}"),
-                        );
+                        let number = match line.kind {
+                            AgentDiffKind::Removed => line.old_number,
+                            AgentDiffKind::Added | AgentDiffKind::Context => line.new_number,
+                            AgentDiffKind::Omitted => unreachable!(),
+                        }
+                        .map_or_else(|| " ".repeat(digits), |number| format!("{number:>digits$}"));
                         let (sign, color) = match line.kind {
                             AgentDiffKind::Added => ("+", theme::diff::added_ink()),
                             AgentDiffKind::Removed => ("−", theme::diff::removed_ink()),
@@ -847,7 +799,7 @@ pub(super) fn draw_agent_diff_rows(
                         };
                         let mut job = LayoutJob::default();
                         job.append(
-                            &format!("{old_number} {new_number}  "),
+                            &format!("{number}  "),
                             0.0,
                             TextFormat {
                                 font_id: theme::typography::code_small(),
@@ -931,7 +883,7 @@ pub(super) fn draw_agent_diff_rows(
 
 pub(super) fn agent_diff_view_header(
     ui: &mut egui::Ui,
-    root: &Path,
+    _root: &Path,
     path: &Path,
     diff: &AgentDiff,
     modified: bool,
@@ -942,25 +894,26 @@ pub(super) fn agent_diff_view_header(
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
-    let directory = path
-        .parent()
-        .map(|parent| parent.strip_prefix(root).unwrap_or(parent))
-        .map(|parent| parent.display().to_string())
-        .filter(|parent| !parent.is_empty());
     ui.label(
-        RichText::new(file_name.as_ref())
-            .size(theme::typography::BODY_SIZE)
-            .strong()
-            .color(theme::text().primary),
+        RichText::new(format!(
+            "{} {file_name}",
+            if modified { "Edited" } else { "Added" }
+        ))
+        .size(theme::typography::BODY_SIZE)
+        .color(theme::text().secondary),
     );
-    if let Some(directory) = directory {
-        ui.add(
-            Label::new(
-                RichText::new(directory)
-                    .size(theme::typography::MICRO_SIZE)
-                    .color(theme::text().muted),
-            )
-            .truncate(),
+    if diff.added > 0 {
+        ui.label(
+            RichText::new(format!("+{}", diff.added))
+                .font(theme::typography::code_small())
+                .color(theme::diff::added_ink()),
+        );
+    }
+    if diff.removed > 0 {
+        ui.label(
+            RichText::new(format!("−{}", diff.removed))
+                .font(theme::typography::code_small())
+                .color(theme::diff::removed_ink()),
         );
     }
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -975,18 +928,6 @@ pub(super) fn agent_diff_view_header(
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
-        ui.label(
-            RichText::new(format!("+{}  −{}", diff.added, diff.removed))
-                .monospace()
-                .size(theme::typography::MICRO_SIZE)
-                .color(theme::text().muted),
-        );
-        ui.label(
-            RichText::new(if modified { "MODIFIED" } else { "NEW FILE" })
-                .size(theme::typography::MICRO_SIZE)
-                .strong()
-                .color(theme::accent()),
-        );
     });
     dismissed
 }
@@ -1036,7 +977,7 @@ pub(super) fn draw_agent_diff_view(
 ) -> bool {
     let mut dismissed = false;
     ui.painter()
-        .rect_filled(ui.max_rect(), 0.0, theme::surface().input);
+        .rect_filled(ui.max_rect(), 0.0, theme::surface().editor);
     let diff = cached_agent_diff(ui, id, old_text, new_text);
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(14, 10))
@@ -1053,11 +994,6 @@ pub(super) fn draw_agent_diff_view(
                 );
             });
         });
-    ui.painter().hline(
-        ui.available_rect_before_wrap().x_range(),
-        ui.cursor().top(),
-        egui::Stroke::new(1.0, theme::border::strong_color()),
-    );
     draw_agent_diff_body(
         ui,
         id,

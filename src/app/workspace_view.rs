@@ -38,7 +38,7 @@ impl EditorApp {
             (
                 query_focused && input.key_pressed(Key::Enter),
                 input.modifiers.shift,
-                pane == self.active_pane && input.key_pressed(Key::Escape),
+                pane == self.editor_panes.active_pane && input.key_pressed(Key::Escape),
             )
         });
         let mut query_changed = false;
@@ -120,7 +120,8 @@ impl EditorApp {
             );
             find.scroll_to_match = true;
             if let Some(index) = self
-                .pane_active_tabs
+                .editor_panes
+                .active_tabs
                 .get(&pane)
                 .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             {
@@ -130,7 +131,7 @@ impl EditorApp {
         }
         if close {
             self.pane_find.get_mut(&pane).expect("open pane find").open = false;
-            if pane == self.active_pane {
+            if pane == self.editor_panes.active_pane {
                 self.focus_editor = self.active_tab.is_some();
             }
         }
@@ -618,7 +619,7 @@ impl EditorApp {
         }
         if let Some(index) = output.drag_started {
             let entry = &self.tree.visible[index].entry;
-            self.tab_drag = Some(entry.path.clone());
+            self.editor_panes.drag = Some(entry.path.clone());
             self.tree.select(Some(entry.path.clone()));
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         }
@@ -827,7 +828,7 @@ impl EditorApp {
                 tab.highlight_cache.valid = false;
             }
         }
-        for path in self.pane_active_tabs.values_mut() {
+        for path in self.editor_panes.active_tabs.values_mut() {
             if let Ok(relative) = path.strip_prefix(old) {
                 *path = new.join(relative);
             }
@@ -955,71 +956,49 @@ impl EditorApp {
         let active_tab = path_override
             .and_then(|path| self.tabs.iter().position(|tab| tab.buffer.path == path))
             .or_else(|| {
-                self.pane_active_tabs
+                self.editor_panes
+                    .active_tabs
                     .get(&pane)
                     .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             })
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
-        let active_pane = !preview && path_override.is_none() && pane == self.active_pane;
-        if active_pane && self.git_diff.is_some() {
-            let back = {
-                let diff = self.git_diff.as_ref().expect("checked above");
-                ui.painter()
-                    .rect_filled(ui.max_rect(), 0.0, editor_background());
-                let id = Id::new(("git_diff_preview", &diff.repository, &diff.path, diff.area));
-                let rendered = cached_agent_diff_revision(
-                    ui,
-                    id,
-                    diff.content_revision,
-                    diff.old.as_deref(),
-                    &diff.new,
-                );
-                let mut back = false;
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(14, 10))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            back = agent_diff_view_header(
-                                ui,
-                                &diff.repository,
-                                &diff.path,
-                                &rendered,
-                                diff.old.is_some(),
-                                "Back to editor",
-                            );
-                        });
-                    });
-                ui.painter().hline(
-                    ui.available_rect_before_wrap().x_range(),
-                    ui.cursor().top(),
-                    egui::Stroke::new(1.0, theme::border::strong_color()),
-                );
-                if diff.unsaved_editor_changes {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(14, 6))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("Unsaved editor changes are not shown.")
-                                    .font(theme::typography::small())
-                                    .color(theme::text().muted),
-                            );
-                        });
-                }
-                draw_agent_diff_body(
-                    ui,
-                    id,
-                    &diff.repository.join(&diff.path),
-                    &rendered,
-                    diff.old.as_deref(),
-                    &diff.new,
-                    &self.highlighter,
-                    &self.syntaxes,
-                );
-                back
+        let active_pane =
+            !preview && path_override.is_none() && pane == self.editor_panes.active_pane;
+        if !self.git_diffs.is_empty() {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, editor_background());
+            let Some(diff) = self.active_git_diff(pane) else {
+                return;
             };
-            if back {
-                self.git_diff = None;
+            let id = Id::new(("git_diff_preview", &diff.repository, &diff.path, diff.area));
+            let rendered = cached_agent_diff_revision(
+                ui,
+                id,
+                diff.content_revision,
+                diff.old.as_deref(),
+                &diff.new,
+            );
+            if diff.unsaved_editor_changes {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Unsaved editor changes are not shown.")
+                                .font(theme::typography::small())
+                                .color(theme::text().muted),
+                        );
+                    });
             }
+            draw_agent_diff_body(
+                ui,
+                id,
+                &diff.repository.join(&diff.path),
+                &rendered,
+                diff.old.as_deref(),
+                &diff.new,
+                &self.highlighter,
+                &self.syntaxes,
+            );
             return;
         }
         if let Some(index) = active_tab
@@ -1053,6 +1032,8 @@ impl EditorApp {
                 tab.buffer.revision,
                 &mut tab.markdown_layout,
                 pane,
+                &self.highlighter,
+                &self.syntaxes,
             );
             return;
         }

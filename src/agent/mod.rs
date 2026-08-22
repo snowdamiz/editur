@@ -1,5 +1,6 @@
 pub mod controller;
 mod cursor_cloud;
+pub(crate) mod cursor_credentials;
 pub(crate) mod external_sessions;
 pub mod provider;
 pub mod provision;

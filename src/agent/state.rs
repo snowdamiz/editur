@@ -19,6 +19,7 @@ const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_ITEMS: usize = 2_048;
 const TRANSCRIPT_PAGE_ITEMS: usize = 256;
+const TRANSCRIPT_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHANGED_PATHS: usize = 4_096;
 const MAX_CHOICES: usize = 128;
 pub(crate) const MAX_BASELINE_FILE_BYTES: usize = 1024 * 1024;
@@ -277,8 +278,8 @@ impl AgentState {
         self.transcript_archive = TranscriptArchive::default();
         for item in transcript {
             self.push(item);
+            self.trim();
         }
-        self.trim();
     }
 
     pub fn record_account_switch(&mut self, from: String, to: String) {
@@ -302,6 +303,7 @@ impl AgentState {
         card.selected = Some(option_id.to_owned());
         let after = item_size(&self.transcript[index]);
         self.replace_transcript_bytes(before, after);
+        self.invalidate_transcript_record(index);
         true
     }
 
@@ -326,6 +328,7 @@ impl AgentState {
         card.answered = true;
         let after = item_size(&self.transcript[index]);
         self.replace_transcript_bytes(before, after);
+        self.invalidate_transcript_record(index);
         true
     }
 
@@ -509,6 +512,7 @@ impl AgentState {
                             self.apply(Event::ToolCallUpdated(tool));
                         }
                     }
+                    self.trim();
                 }
             }
             Event::SessionTranscriptFinished => {
@@ -568,6 +572,7 @@ impl AgentState {
                     append_bounded(current, &text);
                     let after = item_size(&self.transcript[index]);
                     self.replace_transcript_bytes(before, after);
+                    self.invalidate_transcript_record(index);
                 } else {
                     self.push(TranscriptItem::Assistant(text));
                 }
@@ -589,6 +594,7 @@ impl AgentState {
                     append_bounded(current, &text);
                     let after = item_size(&self.transcript[index]);
                     self.replace_transcript_bytes(before, after);
+                    self.invalidate_transcript_record(index);
                 } else {
                     self.push(TranscriptItem::Thought(text));
                 }
@@ -623,6 +629,7 @@ impl AgentState {
                     self.transcript[index] = TranscriptItem::Plan(plan);
                     let after = item_size(&self.transcript[index]);
                     self.replace_transcript_bytes(before, after);
+                    self.invalidate_transcript_record(index);
                 } else {
                     self.push(TranscriptItem::Plan(plan));
                 }
@@ -744,6 +751,7 @@ impl AgentState {
                     }
                     let after = item_size(&self.transcript[index]);
                     self.replace_transcript_bytes(before, after);
+                    self.invalidate_transcript_record(index);
                 } else {
                     self.push(TranscriptItem::Tool(tool));
                 }
@@ -865,6 +873,7 @@ impl AgentState {
 
     fn trim_from_front(&mut self, keep_one: bool) -> Result<(), String> {
         self.sync_transcript_records();
+        let mut archived = false;
         while self.transcript.len() > usize::from(keep_one)
             && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS
                 || self.transcript_bytes > MAX_TRANSCRIPT_BYTES)
@@ -873,6 +882,10 @@ impl AgentState {
                 break;
             }
             self.archive_front()?;
+            archived = true;
+        }
+        if archived {
+            self.ensure_back_record()?;
         }
         Ok(())
     }
@@ -907,24 +920,36 @@ impl AgentState {
             return Ok(false);
         }
         self.sync_transcript_records();
+        let mut loaded_items = 0;
+        let mut loaded_bytes = 0_usize;
         for _ in 0..TRANSCRIPT_PAGE_ITEMS {
-            let Some(record) = self.transcript_archive.earlier.pop() else {
+            let Some(record) = self.transcript_archive.earlier.last().copied() else {
                 break;
             };
-            match self.transcript_archive.load(record) {
-                Ok(item) => {
-                    self.transcript_bytes = self.transcript_bytes.saturating_add(item_size(&item));
-                    self.transcript.push_front(item);
-                    self.transcript_records.push_front(Some(record));
-                }
-                Err(error) => {
-                    self.transcript_archive.earlier.push(record);
-                    return Err(error);
-                }
+            let record_bytes = usize::try_from(record.len).unwrap_or(usize::MAX);
+            if loaded_items > 0 && loaded_bytes.saturating_add(record_bytes) > TRANSCRIPT_PAGE_BYTES
+            {
+                break;
             }
+            let item = self.transcript_archive.load(record)?;
+            let size = item_size(&item);
+            if loaded_items > 0 && loaded_bytes.saturating_add(size) > TRANSCRIPT_PAGE_BYTES {
+                break;
+            }
+            while !self.transcript.is_empty()
+                && (self.transcript.len() >= MAX_TRANSCRIPT_ITEMS
+                    || self.transcript_bytes.saturating_add(size) > MAX_TRANSCRIPT_BYTES)
+            {
+                self.archive_back()?;
+            }
+            self.transcript_archive.earlier.pop();
+            self.transcript_bytes = self.transcript_bytes.saturating_add(size);
+            self.transcript.push_front(item);
+            self.transcript_records.push_front(Some(record));
+            loaded_items += 1;
+            loaded_bytes = loaded_bytes.saturating_add(size);
         }
-        self.trim_from_back()?;
-        Ok(true)
+        Ok(loaded_items > 0)
     }
 
     pub fn load_later_transcript(&mut self) -> Result<bool, String> {
@@ -932,24 +957,36 @@ impl AgentState {
             return Ok(false);
         }
         self.sync_transcript_records();
+        let mut loaded_items = 0;
+        let mut loaded_bytes = 0_usize;
         for _ in 0..TRANSCRIPT_PAGE_ITEMS {
-            let Some(record) = self.transcript_archive.later.pop() else {
+            let Some(record) = self.transcript_archive.later.last().copied() else {
                 break;
             };
-            match self.transcript_archive.load(record) {
-                Ok(item) => {
-                    self.transcript_bytes = self.transcript_bytes.saturating_add(item_size(&item));
-                    self.transcript.push_back(item);
-                    self.transcript_records.push_back(Some(record));
-                }
-                Err(error) => {
-                    self.transcript_archive.later.push(record);
-                    return Err(error);
-                }
+            let record_bytes = usize::try_from(record.len).unwrap_or(usize::MAX);
+            if loaded_items > 0 && loaded_bytes.saturating_add(record_bytes) > TRANSCRIPT_PAGE_BYTES
+            {
+                break;
             }
+            let item = self.transcript_archive.load(record)?;
+            let size = item_size(&item);
+            if loaded_items > 0 && loaded_bytes.saturating_add(size) > TRANSCRIPT_PAGE_BYTES {
+                break;
+            }
+            while !self.transcript.is_empty()
+                && (self.transcript.len() >= MAX_TRANSCRIPT_ITEMS
+                    || self.transcript_bytes.saturating_add(size) > MAX_TRANSCRIPT_BYTES)
+            {
+                self.archive_front()?;
+            }
+            self.transcript_archive.later.pop();
+            self.transcript_bytes = self.transcript_bytes.saturating_add(size);
+            self.transcript.push_back(item);
+            self.transcript_records.push_back(Some(record));
+            loaded_items += 1;
+            loaded_bytes = loaded_bytes.saturating_add(size);
         }
-        self.trim_from_front(true)?;
-        Ok(true)
+        Ok(loaded_items > 0)
     }
 
     pub fn load_latest_transcript(&mut self) -> Result<bool, String> {
@@ -962,6 +999,30 @@ impl AgentState {
 
     fn sync_transcript_records(&mut self) {
         self.transcript_records.resize(self.transcript.len(), None);
+    }
+
+    fn invalidate_transcript_record(&mut self, index: usize) {
+        if let Some(record) = self.transcript_records.get_mut(index) {
+            *record = None;
+        }
+    }
+
+    fn ensure_back_record(&mut self) -> Result<(), String> {
+        let Some(index) = self.transcript.len().checked_sub(1) else {
+            return Ok(());
+        };
+        if self
+            .transcript_records
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some()
+        {
+            return Ok(());
+        }
+        let record = self.transcript_archive.store(&self.transcript[index])?;
+        self.transcript_records[index] = Some(record);
+        Ok(())
     }
 
     fn archive_front(&mut self) -> Result<(), String> {
@@ -994,16 +1055,6 @@ impl AgentState {
         Ok(())
     }
 
-    fn trim_from_back(&mut self) -> Result<(), String> {
-        while self.transcript.len() > 1
-            && (self.transcript.len() > MAX_TRANSCRIPT_ITEMS
-                || self.transcript_bytes > MAX_TRANSCRIPT_BYTES)
-        {
-            self.archive_back()?;
-        }
-        Ok(())
-    }
-
     /// Tool updates only arrive while a turn runs, so once the turn ends any
     /// tool still pending or in progress can never complete and would show
     /// "Running" forever.
@@ -1021,6 +1072,7 @@ impl AgentState {
             if changed {
                 let after = item_size(&self.transcript[index]);
                 self.replace_transcript_bytes(before, after);
+                self.invalidate_transcript_record(index);
             }
         }
     }
@@ -1780,5 +1832,209 @@ fn display_content_size(content: &DisplayContent) -> usize {
             mime_type,
             text,
         } => uri.len() + mime_type.as_ref().map_or(0, String::len) + text.len(),
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    fn completed_tool(id: usize) -> ToolActivity {
+        ToolActivity {
+            id: id.to_string(),
+            title: Some(format!("Tool {id}")),
+            status: Some("Completed".into()),
+            kind: None,
+            paths: Vec::new(),
+            detail: None,
+        }
+    }
+
+    fn tool_id(item: Option<&TranscriptItem>) -> Option<&str> {
+        match item {
+            Some(TranscriptItem::Tool(tool)) => Some(tool.id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn earlier_page_swap_reuses_tail_records_without_growing_the_archive() {
+        let mut state = AgentState::default();
+        for id in 0..MAX_TRANSCRIPT_ITEMS + TRANSCRIPT_PAGE_ITEMS {
+            state.apply(Event::ToolCallUpdated(completed_tool(id)));
+        }
+
+        assert_eq!(state.transcript.len(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(tool_id(state.transcript.front()), Some("256"));
+        assert_eq!(tool_id(state.transcript.back()), Some("2303"));
+        assert!(state.has_earlier_transcript());
+        assert!(!state.has_later_transcript());
+        let archive_len = state
+            .transcript_archive
+            .file
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len();
+
+        assert!(state.load_earlier_transcript().unwrap());
+
+        assert_eq!(state.transcript.len(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(tool_id(state.transcript.front()), Some("0"));
+        assert_eq!(tool_id(state.transcript.back()), Some("2047"));
+        assert!(!state.has_earlier_transcript());
+        assert!(state.has_later_transcript());
+        assert_eq!(
+            state
+                .transcript_archive
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            archive_len,
+            "paging older records must reuse the resident tail's archive records"
+        );
+
+        assert!(state.load_later_transcript().unwrap());
+        assert_eq!(tool_id(state.transcript.front()), Some("256"));
+        assert_eq!(tool_id(state.transcript.back()), Some("2303"));
+        assert!(state.has_earlier_transcript());
+        assert!(!state.has_later_transcript());
+        assert_eq!(
+            state
+                .transcript_archive
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            archive_len,
+            "paging forward must also reuse existing archive records"
+        );
+    }
+
+    #[test]
+    fn bulk_restore_backs_each_new_tail_item_before_paging() {
+        let mut state = AgentState::default();
+        state.restore_account_handoff(
+            (0..MAX_TRANSCRIPT_ITEMS + TRANSCRIPT_PAGE_ITEMS)
+                .map(|id| TranscriptItem::Assistant(format!("Item {id}")))
+                .collect(),
+        );
+        let archive_len = state
+            .transcript_archive
+            .file
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len();
+
+        assert!(state.load_earlier_transcript().unwrap());
+
+        assert!(matches!(
+            state.transcript.front(),
+            Some(TranscriptItem::Assistant(text)) if text == "Item 0"
+        ));
+        assert_eq!(
+            state
+                .transcript_archive
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            archive_len,
+            "bulk restoration must not defer a full tail archive to the wheel frame"
+        );
+    }
+
+    #[test]
+    fn mutating_a_resident_backed_item_invalidates_its_record() {
+        let mut state = AgentState::default();
+        for id in 0..MAX_TRANSCRIPT_ITEMS + 1 {
+            state.apply(Event::ToolCallUpdated(completed_tool(id)));
+        }
+        state.apply(Event::ToolCallUpdated(ToolActivity {
+            title: Some("Updated tool".into()),
+            ..completed_tool(MAX_TRANSCRIPT_ITEMS)
+        }));
+
+        assert!(state.load_earlier_transcript().unwrap());
+        assert!(state.load_later_transcript().unwrap());
+
+        assert!(matches!(
+            state.transcript.back(),
+            Some(TranscriptItem::Tool(tool))
+                if tool.id == MAX_TRANSCRIPT_ITEMS.to_string()
+                    && tool.title.as_deref() == Some("Updated tool")
+        ));
+    }
+
+    #[test]
+    fn earlier_page_read_stops_at_the_transcript_byte_budget() {
+        const IMAGE_BYTES: usize = 9 * 1024 * 1024;
+        let mut state = AgentState::default();
+        for byte in 0..4 {
+            state.push(TranscriptItem::Content {
+                role: ContentRole::User,
+                content: DisplayContent::Image {
+                    mime_type: "image/png".into(),
+                    uri: None,
+                    encoded_bytes: IMAGE_BYTES,
+                    data: Some(std::sync::Arc::from(vec![byte; IMAGE_BYTES])),
+                },
+            });
+            state.trim();
+        }
+        assert_eq!(state.transcript_archive.earlier.len(), 3);
+
+        assert!(state.load_earlier_transcript().unwrap());
+
+        assert_eq!(
+            state.transcript_archive.earlier.len(),
+            2,
+            "one page must not deserialize more than the resident byte budget"
+        );
+        assert!(state.transcript_bytes <= MAX_TRANSCRIPT_BYTES);
+        assert!(matches!(
+            state.transcript.front(),
+            Some(TranscriptItem::Content {
+                content: DisplayContent::Image { data: Some(data), .. },
+                ..
+            }) if data.first() == Some(&2)
+        ));
+    }
+
+    #[test]
+    fn large_archive_pages_stay_bounded_and_all_history_remains_reachable() {
+        let mut state = AgentState::default();
+        let payload = "x".repeat(MAX_ITEM_BYTES);
+        for id in 0..TRANSCRIPT_PAGE_ITEMS * 2 {
+            state.apply(Event::UserMessage(format!("{id:04}{payload}")));
+        }
+        state.apply(Event::TurnFinished { cancelled: false });
+
+        assert_eq!(
+            state.transcript_archive.earlier.len(),
+            TRANSCRIPT_PAGE_ITEMS
+        );
+        assert!(state.load_earlier_transcript().unwrap());
+        assert!(
+            state.has_earlier_transcript(),
+            "one UI frame must not deserialize the full 16 MiB archive"
+        );
+        while state.has_earlier_transcript() {
+            assert!(state.load_earlier_transcript().unwrap());
+        }
+        assert!(matches!(
+            state.transcript.front(),
+            Some(TranscriptItem::User(text)) if text.starts_with("0000")
+        ));
     }
 }

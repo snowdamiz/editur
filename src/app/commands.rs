@@ -4,6 +4,7 @@ impl EditorApp {
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.shortcut_recorder.is_some()
             || self.new_profile.is_some()
+            || self.cursor_cloud_key_prompt.is_some()
             || self.vim_overlay.is_some()
         {
             return;
@@ -207,10 +208,13 @@ impl EditorApp {
         }
         if self
             .pane_find
-            .get(&self.active_pane)
+            .get(&self.editor_panes.active_pane)
             .is_some_and(|find| find.open)
             && ctx.memory(|memory| {
-                memory.has_focus(Id::new(("file_search_query", self.active_pane.0)))
+                memory.has_focus(Id::new((
+                    "file_search_query",
+                    self.editor_panes.active_pane.0,
+                )))
             })
         {
             return vec![Scope::Find];
@@ -238,7 +242,7 @@ impl EditorApp {
         paste: Option<&str>,
         ctx: &egui::Context,
     ) {
-        if self.git_diff.is_some()
+        if !self.git_diffs.is_empty()
             && (command.id().starts_with("editor.")
                 || command.id().starts_with("vim.")
                 || matches!(
@@ -294,7 +298,9 @@ impl EditorApp {
                 self.save(None);
             }
             KeybindingCommand::FileSaveAndClose => {
-                if self.save(None)
+                if !self.git_diffs.is_empty() {
+                    self.close_active_git_diff();
+                } else if self.save(None)
                     && let Some(index) = self.active_tab
                 {
                     self.request(PendingAction::CloseTab(index));
@@ -306,6 +312,8 @@ impl EditorApp {
                     if self.terminal.is_empty() {
                         self.terminal_open = false;
                     }
+                } else if !self.git_diffs.is_empty() {
+                    self.close_active_git_diff();
                 } else if let Some(index) = self.active_tab {
                     self.request(PendingAction::CloseTab(index));
                 } else {
@@ -335,7 +343,15 @@ impl EditorApp {
                 self.focus_pane(index);
             }
             KeybindingCommand::FileSplitEditor => {
-                self.pane_layout.split(self.active_pane, DropZone::Right);
+                if self.git_diffs.is_empty() {
+                    self.editor_panes
+                        .layout
+                        .split(self.editor_panes.active_pane, DropZone::Right);
+                } else {
+                    self.git_panes
+                        .layout
+                        .split(self.git_panes.active_pane, DropZone::Right);
+                }
             }
             KeybindingCommand::FileFocusNextPane | KeybindingCommand::FileFocusRightPane => {
                 self.focus_relative_pane(1);
@@ -407,7 +423,7 @@ impl EditorApp {
             KeybindingCommand::SearchClose => {
                 self.search_open = false;
                 self.agent_find.open = false;
-                if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                if let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) {
                     find.open = false;
                 }
                 self.focus_editor = self.active_tab.is_some();
@@ -476,23 +492,44 @@ impl EditorApp {
     }
 
     pub(super) fn focus_pane(&mut self, pane_index: usize) {
-        let Some(pane) = self.pane_layout.panes().get(pane_index).copied() else {
+        if !self.git_diffs.is_empty() {
+            let Some(pane) = self.git_panes.layout.panes().get(pane_index).copied() else {
+                return;
+            };
+            if let Some(key) = self.git_panes.active(pane).cloned() {
+                self.activate_git_diff_key(&key);
+            } else {
+                self.git_panes.active_pane = pane;
+            }
+            return;
+        }
+        let Some(pane) = self.editor_panes.layout.panes().get(pane_index).copied() else {
             return;
         };
         if let Some(index) = self
-            .pane_active_tabs
+            .editor_panes
+            .active_tabs
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
         {
             self.activate_tab(index);
         } else {
-            self.active_pane = pane;
+            self.editor_panes.active_pane = pane;
         }
     }
 
     pub(super) fn focus_relative_pane(&mut self, direction: isize) {
-        let panes = self.pane_layout.panes();
-        let Some(current) = panes.iter().position(|pane| *pane == self.active_pane) else {
+        let panes = if self.git_diffs.is_empty() {
+            self.editor_panes.layout.panes()
+        } else {
+            self.git_panes.layout.panes()
+        };
+        let active_pane = if self.git_diffs.is_empty() {
+            self.editor_panes.active_pane
+        } else {
+            self.git_panes.active_pane
+        };
+        let Some(current) = panes.iter().position(|pane| *pane == active_pane) else {
             return;
         };
         let next = (current as isize + direction).rem_euclid(panes.len() as isize) as usize;
@@ -512,7 +549,10 @@ impl EditorApp {
             tab.agent_diff = None;
         }
         self.search_open = false;
-        let find = self.pane_find.entry(self.active_pane).or_default();
+        let find = self
+            .pane_find
+            .entry(self.editor_panes.active_pane)
+            .or_default();
         find.open = true;
         find.focus = true;
         find.scroll_to_match = !find.matches.is_empty();
@@ -525,7 +565,7 @@ impl EditorApp {
         self.lsp_completion = None;
         self.lsp_definitions = None;
         self.search_open = true;
-        if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+        if let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) {
             find.open = false;
         }
         self.focus_search = true;
@@ -547,8 +587,8 @@ impl EditorApp {
             self.agent_find.scroll_to_match = true;
             return;
         }
-        self.refresh_find_matches(self.active_pane);
-        let Some(find) = self.pane_find.get_mut(&self.active_pane) else {
+        self.refresh_find_matches(self.editor_panes.active_pane);
+        let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) else {
             return;
         };
         if find.matches.is_empty() {
@@ -693,19 +733,22 @@ impl EditorApp {
         }
         self.vim_session.last_search.clone_from(&query);
         self.vim_session.search_direction = direction;
-        let find = self.pane_find.entry(self.active_pane).or_default();
+        let find = self
+            .pane_find
+            .entry(self.editor_panes.active_pane)
+            .or_default();
         find.open = true;
         find.query = query;
         find.focus = false;
         find.match_revision = u64::MAX;
-        self.refresh_find_matches(self.active_pane);
+        self.refresh_find_matches(self.editor_panes.active_pane);
         let Some(index) = self.active_tab else {
             return;
         };
         let cursor = self.tabs[index]
             .buffer
             .byte_index(self.tabs[index].editor_surface.cursor());
-        let Some(find) = self.pane_find.get_mut(&self.active_pane) else {
+        let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) else {
             return;
         };
         if find.matches.is_empty() {
@@ -789,7 +832,7 @@ impl EditorApp {
                 Ok(())
             }
             ExCommand::NoHighlight => {
-                if let Some(find) = self.pane_find.get_mut(&self.active_pane) {
+                if let Some(find) = self.pane_find.get_mut(&self.editor_panes.active_pane) {
                     find.open = false;
                 }
                 Ok(())
@@ -1164,7 +1207,8 @@ impl EditorApp {
 
     pub(super) fn refresh_find_matches(&mut self, pane: PaneId) {
         let index = self
-            .pane_active_tabs
+            .editor_panes
+            .active_tabs
             .get(&pane)
             .and_then(|path| self.tabs.iter().position(|tab| &tab.buffer.path == path))
             .or_else(|| self.tabs.iter().position(|tab| tab.pane == pane));
