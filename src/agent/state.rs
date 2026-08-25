@@ -13,7 +13,7 @@ use super::controller::{
     PlanProposal, Question, QuestionOption, SessionChoice, SessionTranscriptMessage, ToolActivity,
     ToolDetail, ToolOutput,
 };
-use super::external_sessions::{BoundedHandoff, ExternalMessage, ExternalTool};
+use super::external_sessions::{BoundedHandoff, ExternalMessage, ExternalTool, shortened_title};
 
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ITEM_BYTES: usize = 64 * 1024;
@@ -395,7 +395,9 @@ impl AgentState {
                 self.diagnostics = None;
             }
             Event::SessionsUpdated(sessions) => {
-                self.sessions = Some(sessions.into_iter().take(MAX_CHOICES).collect());
+                self.sessions = Some(normalize_session_choices(
+                    sessions.into_iter().take(MAX_CHOICES).collect(),
+                ));
             }
             Event::ProjectSessionsUpdated { .. } => {}
             Event::SessionLoading { title } => {
@@ -418,7 +420,7 @@ impl AgentState {
                 self.active = false;
                 self.transcript_streaming = false;
                 self.connection = ConnectionState::Starting;
-                self.title = title.map(bounded);
+                self.title = title.map(|title| shortened_title(&title));
             }
             Event::SessionLoadFailed => {
                 if let Some(backup) = self.session_load_backup.take() {
@@ -536,7 +538,7 @@ impl AgentState {
                     .collect();
             }
             Event::SessionTitleUpdated(title) => {
-                self.title = title.map(bounded);
+                self.title = title.map(|title| shortened_title(&title));
                 if let (Some(session_id), Some(title), Some(sessions)) =
                     (&self.session_id, &self.title, &mut self.sessions)
                     && let Some(session) = sessions
@@ -1474,6 +1476,13 @@ fn bounded_configs(options: Vec<ConfigChoice>) -> Vec<ConfigChoice> {
                 .collect(),
         })
         .collect()
+}
+
+pub(crate) fn normalize_session_choices(mut sessions: Vec<SessionChoice>) -> Vec<SessionChoice> {
+    for session in &mut sessions {
+        session.title = session.title.take().map(|title| shortened_title(&title));
+    }
+    sessions
 }
 
 fn bounded(mut text: String) -> String {

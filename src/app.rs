@@ -70,7 +70,7 @@ use crate::{
             ProviderIcon, ProviderId, catalog as provider_catalog,
             descriptor as provider_descriptor,
         },
-        state::{AgentState, FileChange, TranscriptItem},
+        state::{AgentState, FileChange, TranscriptItem, normalize_session_choices},
     },
     buffer::{Buffer, LARGE_FILE_BYTES},
     components::{
@@ -314,7 +314,11 @@ const ASSISTANT_HEADER_HEIGHT: f32 = TITLEBAR_HEIGHT;
 const AGENT_FIND_HEIGHT: f32 = FIND_BAR_HEIGHT;
 const ASSISTANT_COMPOSER_HEIGHT: f32 = 108.0;
 const ASSISTANT_COMPOSER_MAX_HEIGHT: f32 = 240.0;
-const ASSISTANT_ATTACHMENT_ROW_HEIGHT: f32 = 56.0;
+/// One staged attachment tile edge.
+const ASSISTANT_ATTACHMENT_TILE: f32 = 48.0;
+/// The attachment band: one tile row plus the gap that keeps tiles clear of
+/// the prompt text below them.
+const ASSISTANT_ATTACHMENT_ROW_HEIGHT: f32 = ASSISTANT_ATTACHMENT_TILE + theme::space::SMALL;
 const AGENT_MENU_WIDTH: f32 = 240.0;
 const AGENT_PROVIDER_MENU_WIDTH: f32 = 280.0;
 const AGENT_MENU_ROW_HEIGHT: f32 = 32.0;
@@ -4757,6 +4761,8 @@ struct AssistantComposerOutput {
     send: bool,
     cancel: bool,
     open_file_picker: bool,
+    /// A staged image tile was clicked; the index points into `attachments`.
+    preview: Option<usize>,
     input_rect: egui::Rect,
     controls_rect: egui::Rect,
     error: Option<String>,
@@ -4827,10 +4833,14 @@ impl AssistantComposer<'_> {
         } else {
             ASSISTANT_ATTACHMENT_ROW_HEIGHT
         };
+        let mut preview = None;
         if attachment_height > 0.0 {
+            // The scope is exactly one tile tall so tiles land flush with the
+            // content top; the band's remaining height is the gap before the
+            // prompt text.
             let attachments_rect = egui::Rect::from_min_max(
                 content.left_top(),
-                egui::pos2(content.right(), content.top() + attachment_height),
+                egui::pos2(content.right(), content.top() + ASSISTANT_ATTACHMENT_TILE),
             );
             let mut remove = None;
             ui.scope_builder(
@@ -4843,19 +4853,21 @@ impl AssistantComposer<'_> {
                         .id_salt(self.scroll_id.with("attachment_scroll"))
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                for (index, attachment) in attachments.iter().enumerate() {
-                                    if assistant_attachment_tile(ui, attachment).clicked() {
-                                        remove = Some(index);
-                                    }
+                            ui.spacing_mut().item_spacing.x = theme::space::SMALL;
+                            for (index, attachment) in attachments.iter().enumerate() {
+                                let tile = assistant_attachment_tile(ui, index, attachment);
+                                if tile.remove {
+                                    remove = Some(index);
+                                } else if tile.preview {
+                                    preview = Some(index);
                                 }
-                            });
+                            }
                         });
                 },
             );
             if let Some(index) = remove {
                 attachments.remove(index);
+                preview = None;
                 ui.ctx().request_repaint();
             }
         }
@@ -5017,6 +5029,7 @@ impl AssistantComposer<'_> {
             send,
             cancel,
             open_file_picker,
+            preview,
             input_rect,
             controls_rect,
             error,
@@ -5052,11 +5065,20 @@ fn load_assistant_thumbnail(
     ))
 }
 
+struct AttachmentTileAction {
+    /// The tile itself was clicked and the attachment has an image preview.
+    preview: bool,
+    /// The close badge was clicked.
+    remove: bool,
+}
+
 fn assistant_attachment_tile(
     ui: &mut egui::Ui,
+    index: usize,
     attachment: &AssistantComposerAttachment,
-) -> egui::Response {
-    let size = egui::vec2(48.0, 48.0);
+) -> AttachmentTileAction {
+    let size = egui::Vec2::splat(ASSISTANT_ATTACHMENT_TILE);
+    let can_preview = attachment.thumbnail.is_some();
     let response = if let Some(thumbnail) = &attachment.thumbnail {
         ui.add(
             egui::Image::from_texture((thumbnail.id(), size))
@@ -5064,6 +5086,8 @@ fn assistant_attachment_tile(
                 .corner_radius(7)
                 .sense(Sense::click()),
         )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Open preview")
     } else {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         ui.painter()
@@ -5099,16 +5123,41 @@ fn assistant_attachment_tile(
         egui::Stroke::new(1.0, theme::state::selected()),
         egui::StrokeKind::Inside,
     );
-    let close = response.rect.right_top() + egui::vec2(-8.0, 8.0);
-    ui.painter()
-        .circle_filled(close, 6.5, theme::surface().sunken.gamma_multiply(0.72));
+    let close_center = response.rect.right_top() + egui::vec2(-8.0, 8.0);
+    // The badge is registered after the tile, so it wins clicks over the
+    // preview underneath it.
+    let close = ui
+        .interact(
+            egui::Rect::from_center_size(close_center, egui::Vec2::splat(16.0)),
+            ui.id().with(("assistant_attachment_close", index)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Remove");
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Remove attachment",
+        )
+    });
+    ui.painter().circle_filled(
+        close_center,
+        6.5,
+        theme::surface()
+            .sunken
+            .gamma_multiply(if close.hovered() { 0.95 } else { 0.72 }),
+    );
     icons::paint(
         ui.painter(),
         Icon::Close,
-        egui::Rect::from_center_size(close, egui::Vec2::splat(icons::GRID * 0.55)),
+        egui::Rect::from_center_size(close_center, egui::Vec2::splat(icons::GRID * 0.55)),
         theme::text().primary,
     );
-    response
+    AttachmentTileAction {
+        preview: can_preview && response.clicked(),
+        remove: close.clicked(),
+    }
 }
 
 fn workspace_file_picker_row(
@@ -10157,7 +10206,9 @@ fn agentic_project_row_with_new_session(
         });
         response
     });
-    if response.hovered() || new_session.as_ref().is_some_and(egui::Response::hovered) {
+    let row_hovered =
+        response.hovered() || new_session.as_ref().is_some_and(egui::Response::hovered);
+    if row_hovered {
         ui.painter().rect_filled(
             rect,
             theme::corner(theme::radius::CONTROL),
@@ -10188,7 +10239,11 @@ fn agentic_project_row_with_new_session(
         theme::typography::strong(),
         color,
     );
-    if let Some(collapsed) = collapsed {
+    // The disclosure and new-session controls only surface while the pointer
+    // is on the row, so resting rows stay quiet.
+    if let Some(collapsed) = collapsed
+        && row_hovered
+    {
         icons::paint(
             ui.painter(),
             if collapsed {
@@ -10203,7 +10258,7 @@ fn agentic_project_row_with_new_session(
             color,
         );
     }
-    if let (Some(action), Some(action_response)) = (action, new_session.as_ref()) {
+    if row_hovered && let (Some(action), Some(action_response)) = (action, new_session.as_ref()) {
         if action_response.hovered() {
             ui.painter().rect_filled(
                 action,

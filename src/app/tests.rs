@@ -11162,30 +11162,65 @@ fn agent_permission_and_metadata_labels_explain_what_they_show() {
             .iter()
             .any(|shape| has_text(&shape.shape, expected))
     };
-    fn permission_width(shape: &Shape) -> Option<f32> {
+    fn text_rect(shape: &Shape, expected: &str) -> Option<Rect> {
         match shape {
-            Shape::Rect(rect) if rect.fill == theme::callout(theme::semantic().warning).fill => {
-                Some(rect.rect.width())
+            Shape::Text(text) if text.galley.text() == expected => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
             }
-            Shape::Vec(shapes) => shapes.iter().find_map(permission_width),
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, expected)),
+            _ => None,
+        }
+    }
+    fn card_rect(shape: &Shape, action: Rect) -> Option<Rect> {
+        match shape {
+            Shape::Rect(rect)
+                if rect.fill == theme::surface().raised && rect.rect.contains(action.center()) =>
+            {
+                Some(rect.rect)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| card_rect(shape, action)),
             _ => None,
         }
     }
 
     assert!(!has(&output, "Summary"));
     assert!(!has(&output, "Input"));
+    assert!(has(&output, "Allow"));
     assert!(has(&output, "Always allow"));
+    assert!(has(&output, "Reject"));
     assert!(!has(&output, "Always allow globally"));
     assert!(!has(
         &output,
         "Cursor saves global choices in ~/.cursor/cli-config.json."
     ));
-    let width = output
+    // The pending card sits on a calm raised surface instead of a warning
+    // wash, and keeps a readable column width.
+    let action = output
         .shapes
         .iter()
-        .find_map(|shape| permission_width(&shape.shape))
+        .find_map(|shape| text_rect(&shape.shape, "Edit .github/workflows/release.yml"))
+        .expect("permission action");
+    let card = output
+        .shapes
+        .iter()
+        .find_map(|shape| card_rect(&shape.shape, action))
         .expect("permission card surface");
-    assert!(width <= 300.0, "permission card was {width}px wide");
+    assert!(
+        card.width() <= 340.0,
+        "permission card was {}px wide",
+        card.width()
+    );
+    fn warning_wash(shape: &Shape) -> bool {
+        match shape {
+            Shape::Rect(rect) => rect.fill == theme::callout(theme::semantic().warning).fill,
+            Shape::Vec(shapes) => shapes.iter().any(warning_wash),
+            _ => false,
+        }
+    }
+    assert!(
+        !output.shapes.iter().any(|shape| warning_wash(&shape.shape)),
+        "the pending permission card should not be a warning callout"
+    );
 
     assert!(app.agent.decide_permission(1, "always"));
     let resolved = context.run_ui(
@@ -16843,6 +16878,45 @@ fn agentic_project_row_toggles_its_sessions() {
 }
 
 #[test]
+fn agentic_project_row_only_paints_controls_while_hovered() {
+    let context = theme::test_context();
+    let root = Path::new("/hovered-project");
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(320.0, 100.0));
+    let draw = |events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |ui| {
+                super::agentic_project_row_with_new_session(ui, root, true, Some(false));
+            },
+        )
+    };
+
+    let resting = draw(Vec::new());
+    let project = context
+        .read_response(Id::new(("agentic_project", root)))
+        .expect("project row")
+        .rect;
+    let controls = Rect::from_min_max(
+        pos2(project.right() - 2.0 * theme::space::MEDIUM, project.top()),
+        pos2(project.right() + theme::control::COMPACT, project.bottom()),
+    );
+    let has_controls = |output: &egui::FullOutput| {
+        [theme::text().primary, theme::text().secondary]
+            .into_iter()
+            .any(|color| crate::icons::probe::bounds(&output.shapes, controls, color).is_some())
+    };
+
+    assert!(!has_controls(&resting));
+    assert!(has_controls(&draw(vec![Event::PointerMoved(
+        project.center()
+    )])));
+}
+
+#[test]
 fn agentic_workspace_rows_share_one_neutral_typography() {
     fn text_style(shape: &Shape, expected: &str) -> Option<(egui::FontId, Color32)> {
         match shape {
@@ -18759,5 +18833,268 @@ fn narrow_agent_session_panes_use_the_sidebar_composer_style() {
             .map(|shape| floating_composers(&shape.shape))
             .sum::<usize>(),
         0
+    );
+}
+
+/// Stages one image attachment in the agent composer by dropping it, then
+/// returns the app plus a context sized like a comfortable agentic window.
+fn app_with_staged_composer_image(
+    temp: &tempfile::TempDir,
+    agentic: bool,
+    prompt: &str,
+) -> (EditorApp, egui::Context, Rect) {
+    let image = temp.path().join("reference.png");
+    fs::write(&image, include_bytes!("../../assets/icons/editur.png")).unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    if agentic {
+        app.agentic_mode = true;
+    } else {
+        app.agent_sidebar = true;
+    }
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.prompt = prompt.into();
+    let context = theme::test_context();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(1200.0, 700.0));
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            hovered_files: vec![HoveredFile {
+                path: Some(image.clone()),
+                ..HoveredFile::default()
+            }],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let _ = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            dropped_files: vec![DroppedFile {
+                path: Some(image),
+                ..DroppedFile::default()
+            }],
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    assert_eq!(app.agent_attachments.len(), 1, "attachment staged");
+    (app, context, screen)
+}
+
+/// The staged 48px tile, located by its painted size so the test stays
+/// independent of ids.
+fn staged_attachment_tile(output: &egui::FullOutput) -> Rect {
+    fn is_tile(bounds: Rect) -> bool {
+        (46.0..=50.0).contains(&bounds.width()) && (46.0..=50.0).contains(&bounds.height())
+    }
+    fn find(shape: &Shape) -> Option<Rect> {
+        match shape {
+            Shape::Rect(rect) if rect.brush.is_some() && is_tile(rect.rect) => Some(rect.rect),
+            Shape::Mesh(mesh) if !mesh.vertices.is_empty() => {
+                let bounds = mesh.vertices.iter().fold(Rect::NOTHING, |bounds, vertex| {
+                    bounds.union(Rect::from_min_max(vertex.pos, vertex.pos))
+                });
+                is_tile(bounds).then_some(bounds)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(find),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|shape| find(&shape.shape))
+        .expect("staged attachment tile")
+}
+
+#[test]
+fn composer_attachment_tile_keeps_clear_of_the_prompt_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let prompt = "1. Fix the broken layout and spacing when images are added to the composer\n2. Only show the chevron on hover\n3. Clicking a thumbnail should open it large\n4. Remove the goal button";
+    let (mut app, context, screen) = app_with_staged_composer_image(&temp, true, prompt);
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    let tile = staged_attachment_tile(&output);
+    fn find_text(shape: &Shape, needle: &str) -> Option<Rect> {
+        match shape {
+            Shape::Text(text) if text.galley.text().starts_with(needle) => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| find_text(shape, needle)),
+            _ => None,
+        }
+    }
+    fn find_panel(shape: &Shape, tile: Rect) -> Option<Rect> {
+        match shape {
+            Shape::Rect(rect)
+                if rect.fill == super::agentic_composer_fill()
+                    && rect.rect.contains(tile.center()) =>
+            {
+                Some(rect.rect)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|shape| find_panel(shape, tile)),
+            _ => None,
+        }
+    }
+    let text = output
+        .shapes
+        .iter()
+        .find_map(|shape| find_text(&shape.shape, "1. Fix the broken layout"))
+        .expect("prompt text");
+    let panel = output
+        .shapes
+        .iter()
+        .find_map(|shape| find_panel(&shape.shape, tile))
+        .expect("floating composer panel");
+
+    assert!(
+        (tile.top() - panel.top() - theme::space::MEDIUM).abs() <= 1.0,
+        "tile should sit one composer inset below the panel top, got tile {tile:?} in panel {panel:?}"
+    );
+    assert!(
+        text.top() - tile.bottom() >= theme::space::SMALL - 0.5,
+        "prompt text should clear the attachment tile, got tile {tile:?} and text {text:?}"
+    );
+}
+
+#[test]
+fn clicking_a_composer_attachment_previews_it_and_only_the_close_button_removes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut app, context, screen) = app_with_staged_composer_image(&temp, false, "look at this");
+    let draw = |app: &mut EditorApp, events| {
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        )
+    };
+    let output = draw(&mut app, Vec::new());
+    let tile = staged_attachment_tile(&output);
+
+    let click = |app: &mut EditorApp, position: Pos2| {
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    Event::PointerMoved(position),
+                    Event::PointerButton {
+                        pos: position,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerButton {
+                    pos: position,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+            |root| app.ui(root),
+        );
+    };
+
+    click(&mut app, tile.center());
+    assert_eq!(
+        app.agent_attachments.len(),
+        1,
+        "clicking the thumbnail must not remove the attachment"
+    );
+    assert!(
+        app.assistant_image_lightbox.is_some(),
+        "clicking the thumbnail should open the image preview"
+    );
+
+    // The lightbox decodes its texture off-thread; wait until it is on
+    // screen before dismissing it.
+    let _ = wait_for_ui_output(&mut |events| draw(&mut app, events), |_| {
+        context
+            .read_response(Id::new("agent_image_lightbox_close"))
+            .is_some()
+    });
+    let _ = draw(
+        &mut app,
+        vec![Event::Key {
+            key: Key::Escape,
+            physical_key: Some(Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert!(app.assistant_image_lightbox.is_none());
+    // One settle frame so the dismissed lightbox backdrop leaves the
+    // hit-test rects before the next click.
+    let _ = draw(&mut app, Vec::new());
+
+    click(&mut app, tile.right_top() + Vec2::new(-8.0, 8.0));
+    assert!(
+        app.agent_attachments.is_empty(),
+        "the close button should remove the attachment"
+    );
+    assert!(
+        app.assistant_image_lightbox.is_none(),
+        "removing must not open the preview"
+    );
+}
+
+#[test]
+fn the_composer_footer_offers_no_goal_shortcut() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = EditorApp::new(OpenTarget {
+        root: temp.path().canonicalize().unwrap(),
+        file: None,
+        create: false,
+    })
+    .unwrap();
+    app.agent_sidebar = true;
+    app.agent.connection = ConnectionState::Ready;
+    app.agent.session_ready = true;
+    app.agent.goal_actions = vec!["set".into()];
+    let context = theme::test_context();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
+            ..RawInput::default()
+        },
+        |root| app.ui(root),
+    );
+    fn has_goal(shape: &Shape) -> bool {
+        match shape {
+            Shape::Text(text) => text.galley.text() == "Goal",
+            Shape::Vec(shapes) => shapes.iter().any(has_goal),
+            _ => false,
+        }
+    }
+
+    assert!(
+        !output.shapes.iter().any(|shape| has_goal(&shape.shape)),
+        "the composer footer should not offer a dedicated Goal button"
     );
 }

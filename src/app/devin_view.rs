@@ -1334,6 +1334,13 @@ impl EditorApp {
         if let Some(error) = output.error {
             self.show_error(error);
         }
+        if let Some(index) = output.preview
+            && let Some(attachment) = self.devin_attachments.get(index)
+        {
+            self.assistant_image_lightbox = Some(AssistantImageSource::Path(
+                attachment.file.path().to_path_buf(),
+            ));
+        }
         if output.open_file_picker {
             self.open_devin_file_picker();
             ui.ctx().request_repaint();

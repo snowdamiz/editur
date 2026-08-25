@@ -1596,13 +1596,17 @@ fn claude_tool_diffs(
     }]
 }
 
-fn shortened_title(text: &str) -> String {
-    let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut end = title.len().min(120);
-    while !title.is_char_boundary(end) {
-        end -= 1;
+pub(super) fn shortened_title(text: &str) -> String {
+    let mut title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.len() > 120 {
+        let mut end = 120 - '…'.len_utf8();
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
+        title.push('…');
     }
-    title[..end].to_owned()
+    title
 }
 
 fn message_text(content: &serde_json::Value) -> Option<String> {

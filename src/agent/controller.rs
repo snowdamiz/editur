@@ -1681,7 +1681,8 @@ async fn run_connection(
                     &events,
                     Event::Capabilities {
                         history: supports_history || !discovered_external.is_empty(),
-                        allow_run_everything: extensions == ProviderExtensions::Cursor,
+                        allow_run_everything: extensions == ProviderExtensions::Cursor
+                            || provider == ProviderId::Codex,
                         steering: supports_steering,
                         goal_actions: goal_actions.clone(),
                     },
@@ -2218,7 +2219,9 @@ async fn run_connection(
                             }
                         }
                         Command::SetRunEverything(enabled) => {
-                            if extensions == ProviderExtensions::Cursor {
+                            if extensions == ProviderExtensions::Cursor
+                                || provider == ProviderId::Codex
+                            {
                                 auto_approve_permissions.store(enabled, Ordering::Release);
                             }
                         }

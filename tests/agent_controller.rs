@@ -544,10 +544,10 @@ fn claude_subscription_auth_uses_the_adapters_terminal_login() {
 }
 
 #[test]
-fn history_and_cursor_only_controls_are_capability_events() {
+fn history_and_permission_controls_are_capability_events() {
     for (provider, args, expected_history, expected_allow_all) in [
         (ProviderId::Cursor, vec!["--sessions".into()], true, true),
-        (ProviderId::Codex, Vec::new(), false, false),
+        (ProviderId::Codex, Vec::new(), false, true),
     ] {
         let project = tempfile::tempdir().unwrap();
         let controller = AgentController::start_process_for(
@@ -597,7 +597,7 @@ fn pinned_codex_fixture_drives_history_and_standard_session_controls() {
         event,
         Event::Capabilities {
             history: true,
-            allow_run_everything: false,
+            allow_run_everything: true,
             steering: true,
             goal_actions,
         } if goal_actions == &["set", "pause", "resume", "clear"]
@@ -1531,44 +1531,47 @@ fn run_everything_changes_without_starting_an_agent_turn() {
 
 #[test]
 fn run_everything_auto_approves_acp_permissions_with_allow_always() {
-    let project = tempfile::tempdir().unwrap();
-    let controller = AgentController::start_process(
-        project.path().to_path_buf(),
-        env!("CARGO_BIN_EXE_editur-fake-agent").into(),
-        Vec::new(),
-    );
-    receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(event, Event::SessionReady { .. })
-    });
+    for provider in [ProviderId::Cursor, ProviderId::Codex] {
+        let project = tempfile::tempdir().unwrap();
+        let controller = AgentController::start_process_for(
+            provider,
+            project.path().to_path_buf(),
+            env!("CARGO_BIN_EXE_editur-fake-agent").into(),
+            Vec::new(),
+        );
+        receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(event, Event::SessionReady { .. })
+        });
 
-    controller.send(Command::SetRunEverything(true)).unwrap();
-    controller
-        .send(Command::Prompt("permission-always".into()))
-        .unwrap();
-    let events = receive_until(&controller, Duration::from_secs(5), |event| {
-        matches!(
-            event,
-            Event::PermissionRequested(_) | Event::TurnFinished { .. }
-        )
-    });
+        controller.send(Command::SetRunEverything(true)).unwrap();
+        controller
+            .send(Command::Prompt("permission-always".into()))
+            .unwrap();
+        let events = receive_until(&controller, Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                Event::PermissionRequested(_) | Event::TurnFinished { .. }
+            )
+        });
 
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Event::PermissionRequested(_))),
-        "Yolo mode leaked a permission request to the UI: {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::AssistantDelta(text) if text == "allow_always"))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::TurnFinished { .. }))
-    );
-    controller.send(Command::Shutdown).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::PermissionRequested(_))),
+            "{provider:?} leaked a permission request to the UI: {events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::AssistantDelta(text) if text == "allow_always")
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        controller.send(Command::Shutdown).unwrap();
+    }
 }
 
 #[test]

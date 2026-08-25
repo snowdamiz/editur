@@ -1,7 +1,7 @@
 use editur::agent::{
     controller::{
         ConnectionState, ContentRole, DisplayContent, Event, InteractionKind, InteractionRequest,
-        PermissionChoice, PermissionRequest, PlanItem, Question, QuestionValueKind,
+        PermissionChoice, PermissionRequest, PlanItem, Question, QuestionValueKind, SessionChoice,
         SessionTranscriptMessage, ToolActivity, ToolDetail, ToolOutput,
     },
     state::{AgentState, FileChange, TranscriptItem},
@@ -103,6 +103,40 @@ fn loading_a_session_keeps_the_replayed_transcript() {
     assert_eq!(state.transcript.len(), 2);
     assert!(state.session_ready);
     assert!(!state.active);
+}
+
+#[test]
+fn session_titles_are_single_line_and_bounded() {
+    let mut state = AgentState::default();
+    state.apply(Event::SessionTitleUpdated(Some(format!(
+        "{}\n{}",
+        "a".repeat(90),
+        "b".repeat(90)
+    ))));
+
+    let title = state.title.expect("session title");
+    assert_eq!(title.len(), 120);
+    assert!(!title.contains('\n'));
+    assert!(title.ends_with('…'));
+}
+
+#[test]
+fn session_history_titles_are_single_line_and_bounded() {
+    let mut state = AgentState::default();
+    state.apply(Event::SessionsUpdated(vec![SessionChoice {
+        id: "session-1".into(),
+        title: Some(format!("{}\n{}", "a".repeat(90), "b".repeat(90))),
+        updated_at: None,
+        started_in_editur: true,
+    }]));
+
+    let title = state.sessions.unwrap()[0]
+        .title
+        .clone()
+        .expect("session title");
+    assert_eq!(title.len(), 120);
+    assert!(!title.contains('\n'));
+    assert!(title.ends_with('…'));
 }
 
 #[test]

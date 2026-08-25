@@ -464,10 +464,11 @@ impl EditorApp {
         for (account, event) in events {
             let selected = account == self.selected_account;
             if let AgentEvent::ProjectSessionsUpdated { project, sessions } = &event {
+                let sessions = normalize_session_choices(sessions.clone());
                 self.agent_project_sessions
                     .insert((account, project.clone()), Some(sessions.clone()));
                 if selected && project == &self.agent_project_root {
-                    self.agent.sessions = Some(sessions.clone());
+                    self.agent.sessions = Some(sessions);
                     self.agent_sidebar_history_pending = false;
                 }
             }
@@ -2510,22 +2511,41 @@ impl EditorApp {
                                                 ),
                                             };
                                             egui::Frame::new()
-                                            .fill(theme::surface().raised)
+                                                .fill(theme::surface().raised)
                                                 .stroke(egui::Stroke::new(
                                                     1.0,
                                                     theme::border::hairline_color(),
                                                 ))
-                                                .inner_margin(egui::Margin::same(8))
-                                                .corner_radius(7)
+                                                .inner_margin(egui::Margin::same(10))
+                                                .corner_radius(10)
                                                 .show(ui, |ui| {
-                                                    ui.set_width(ui.available_width().min(284.0));
-                                                    ui.label(
-                                                        RichText::new(status)
-                                                            .small()
-                                                            .strong()
-                                                            .color(color),
+                                                    ui.set_width(ui.available_width().min(300.0));
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x =
+                                                            theme::space::SNUG;
+                                                        let (dot, _) = ui.allocate_exact_size(
+                                                            egui::Vec2::splat(8.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        ui.painter().circle_filled(
+                                                            dot.center(),
+                                                            3.0,
+                                                            color,
+                                                        );
+                                                        ui.label(
+                                                            RichText::new(status)
+                                                                .small()
+                                                                .strong()
+                                                                .color(color),
+                                                        );
+                                                    });
+                                                    ui.add(
+                                                        Label::new(
+                                                            RichText::new(&card.action)
+                                                                .color(theme::text().secondary),
+                                                        )
+                                                        .wrap(),
                                                     );
-                                                    ui.add(Label::new(&card.action).wrap());
                                                 });
                                             item_heights[item_index] =
                                                 ui.cursor().top() - item_top;
@@ -2543,48 +2563,73 @@ impl EditorApp {
                                             continue;
                                         }
                                         egui::Frame::new()
-                                            .fill(theme::callout(theme::semantic().warning).fill)
+                                            .fill(theme::surface().raised)
                                             .stroke(egui::Stroke::new(
                                                 1.0,
-                                                theme::callout(theme::semantic().warning).border,
+                                                theme::border::hairline_color(),
                                             ))
-                                            .inner_margin(egui::Margin::same(10))
-                                            .corner_radius(8)
+                                            .inner_margin(egui::Margin::same(12))
+                                            .corner_radius(10)
                                             .show(ui, |ui| {
-                                                ui.set_width(ui.available_width().min(278.0));
-                                                ui.label(
-                                                    RichText::new("Permission required")
-                                                        .strong()
-                                                        .color(theme::ink(theme::semantic().warning)),
+                                                ui.set_width(ui.available_width().min(300.0));
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x =
+                                                        theme::space::SMALL;
+                                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                                        egui::Vec2::splat(icons::GRID),
+                                                        Sense::hover(),
+                                                    );
+                                                    icons::paint(
+                                                        ui.painter(),
+                                                        Icon::Warning,
+                                                        icon_rect,
+                                                        theme::ink(theme::semantic().warning),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new("Permission required")
+                                                            .strong()
+                                                            .color(theme::text().primary),
+                                                    );
+                                                });
+                                                ui.add_space(theme::space::TIGHT);
+                                                ui.add(
+                                                    Label::new(
+                                                        RichText::new(&card.action)
+                                                            .color(theme::text().secondary),
+                                                    )
+                                                    .wrap(),
                                                 );
-                                                ui.add_space(3.0);
-                                                ui.add(Label::new(&card.action).wrap());
-                                                ui.add_space(8.0);
+                                                ui.add_space(theme::space::MEDIUM);
                                                 ui.horizontal_wrapped(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                                    ui.spacing_mut().item_spacing = egui::vec2(
+                                                        theme::space::SMALL,
+                                                        theme::space::SMALL,
+                                                    );
                                                     for option in &card.options {
                                                         let label = match option.kind.as_str() {
-                                                            "AllowOnce" => "Allow once",
+                                                            "AllowOnce" => "Allow",
                                                             "AllowAlways" => "Always allow",
                                                             "RejectOnce" => "Reject",
                                                             "RejectAlways" => "Always reject",
                                                             _ => &option.name,
                                                         };
+                                                        // One accent primary; rejects stay quiet
+                                                        // ghosts so the card reads calm.
                                                         let (fill, stroke, text_color) =
                                                             match option.kind.as_str() {
-                                                                "AllowAlways" => (
-                                                                    theme::callout(theme::semantic().info).fill,
-                                                                    theme::callout(theme::semantic().info).border,
-                                                                    theme::ink(theme::semantic().info),
+                                                                "AllowOnce" => (
+                                                                    theme::accent(),
+                                                                    Color32::TRANSPARENT,
+                                                                    theme::text().on_accent,
                                                                 ),
                                                                 "RejectOnce" | "RejectAlways" => (
-                                                                    theme::callout(theme::semantic().danger).fill,
-                                                                    theme::callout(theme::semantic().danger).border,
+                                                                    Color32::TRANSPARENT,
+                                                                    theme::border::strong_color(),
                                                                     theme::ink(theme::semantic().danger),
                                                                 ),
                                                                 _ => (
                                                                     theme::state::selected(),
-                                                                    theme::border::strong_color(),
+                                                                    Color32::TRANSPARENT,
                                                                     theme::text().primary,
                                                                 ),
                                                             };
@@ -2594,12 +2639,14 @@ impl EditorApp {
                                                                         .strong()
                                                                         .color(text_color),
                                                                 )
-                                                                .min_size(egui::vec2(0.0, 30.0))
+                                                                .min_size(egui::vec2(64.0, 28.0))
                                                                 .fill(fill)
                                                                 .stroke(egui::Stroke::new(
                                                                     1.0, stroke,
                                                                 ))
-                                                                .corner_radius(6),
+                                                                .corner_radius(theme::corner(
+                                                                    theme::radius::CONTROL,
+                                                                )),
                                                             );
                                                         if response.clicked() {
                                                             permission_decisions.push((
@@ -3233,6 +3280,13 @@ impl EditorApp {
         if let Some(error) = output.error {
             self.show_error(error);
         }
+        if let Some(index) = output.preview
+            && let Some(attachment) = self.agent_attachments.get(index)
+        {
+            self.assistant_image_lightbox = Some(AssistantImageSource::Path(
+                attachment.file.path().to_path_buf(),
+            ));
+        }
         if history_navigated
             && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), prompt_id)
         {
@@ -3351,12 +3405,6 @@ impl EditorApp {
                     {
                         goal_action = Some(GoalAction::Clear);
                     }
-                } else if self.agent.goal_actions.iter().any(|action| action == "set")
-                    && ui.small_button("Goal").clicked()
-                {
-                    self.agent.prompt = "/goal ".into();
-                    let prompt_id = scoped_agent_id(agentic_mode, agent_pane, "agent_prompt");
-                    ui.memory_mut(|memory| memory.request_focus(prompt_id));
                 }
                 ui.add_enabled_ui(!self.agent.active, |ui| {
                     if self.agent.allow_run_everything {
